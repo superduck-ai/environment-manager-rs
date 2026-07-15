@@ -17,7 +17,7 @@ use super::{
 };
 use crate::{
     internal::logger::Logger,
-    internal::util::{claude_code_version, version},
+    internal::util::{claude_code_version, go_duration_nanoseconds, version},
 };
 
 const ENVIRONMENTS_BETA: &str = "environments-2025-11-01";
@@ -120,7 +120,7 @@ impl Poller {
             self.logger.error(
                 "poll request failed",
                 log_attributes([
-                    ("duration_ms", json!(poll_duration.as_millis())),
+                    ("duration", json!(go_duration_nanoseconds(poll_duration))),
                     ("error", json!(error.to_string())),
                 ]),
             );
@@ -152,7 +152,10 @@ impl Poller {
             self.logger.debug(
                 "queue empty",
                 log_attributes([
-                    ("poll_duration_ms", json!(poll_duration.as_millis())),
+                    (
+                        "poll_duration",
+                        json!(go_duration_nanoseconds(poll_duration)),
+                    ),
                     ("request_id", json!(request_id)),
                 ]),
             );
@@ -164,7 +167,7 @@ impl Poller {
                 "poll request returned non-OK status",
                 log_attributes([
                     ("status_code", json!(status.as_u16())),
-                    ("duration_ms", json!(poll_duration.as_millis())),
+                    ("duration", json!(go_duration_nanoseconds(poll_duration))),
                     ("request_id", json!(request_id)),
                     ("response_body", json!(String::from_utf8_lossy(&body))),
                 ]),
@@ -182,7 +185,10 @@ impl Poller {
             self.logger.warn(
                 "received unexpected response type",
                 log_attributes([
-                    ("poll_duration_ms", json!(poll_duration.as_millis())),
+                    (
+                        "poll_duration",
+                        json!(go_duration_nanoseconds(poll_duration)),
+                    ),
                     ("type", json!(work_response.r#type)),
                 ]),
             );
@@ -195,7 +201,10 @@ impl Poller {
         self.logger.info(
             "received work task",
             log_attributes([
-                ("poll_duration_ms", json!(poll_duration.as_millis())),
+                (
+                    "poll_duration",
+                    json!(go_duration_nanoseconds(poll_duration)),
+                ),
                 ("request_id", json!(request_id)),
                 ("work_id", json!(work_response.id)),
                 ("work_type", json!(work_response.data.r#type)),
@@ -217,7 +226,10 @@ impl Poller {
         let sleep_duration = Duration::from_secs(seconds);
         self.logger.debug(
             "sleeping with jitter after empty queue",
-            log_attributes([("sleep_duration_ms", json!(sleep_duration.as_millis()))]),
+            log_attributes([(
+                "sleep_duration",
+                json!(go_duration_nanoseconds(sleep_duration)),
+            )]),
         );
         tokio::select! {
             biased;

@@ -9,7 +9,10 @@ use wiremock::{
     matchers::{method, path, query_param},
 };
 
-use super::{Client, FunctionDeployMetadata, collect_function_files, require_dir_under};
+use super::{
+    Client, FunctionDeployMetadata, collect_function_files, functions::query_escape,
+    require_dir_under,
+};
 
 /// 对应 Go `supabaseAPIRequest`，便于逐请求断言 method/path/header/body。
 struct SupabaseApiRequest {
@@ -351,4 +354,24 @@ fn test_collect_function_files_and_trust_root_validation() {
     let root = std::fs::canonicalize(project.path()).expect("canonical trust root");
     let error = require_dir_under(outside.path(), &root).expect_err("拒绝 trust root 外目录");
     assert!(error.to_string().contains("outside trust root"));
+}
+
+/// 对应 Go：`url.QueryEscape` 的字节转义边界。
+///
+/// 特别固定 WHATWG form encoder 与 Go 不同的 `*`/`~`，并验证空格、保留字符和
+/// UTF-8 都按 Go 的大写十六进制字节序列写入 URL 或 `.env.local`。
+#[test]
+fn query_escape_matches_go_url_query_escape() {
+    let cases = [
+        ("", ""),
+        ("abcXYZ09-_.~", "abcXYZ09-_.~"),
+        (" ", "+"),
+        ("*", "%2A"),
+        ("+%/", "%2B%25%2F"),
+        ("a b*c~+%/中文", "a+b%2Ac~%2B%25%2F%E4%B8%AD%E6%96%87"),
+    ];
+
+    for (input, expected) in cases {
+        assert_eq!(query_escape(input), expected, "input={input:?}");
+    }
 }

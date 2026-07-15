@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::internal::logger::{
@@ -105,8 +106,8 @@ async fn test_periodic_invoker_start_stop_and_double_start() {
         invoker.start(),
         Err(PeriodicInvokerError::AlreadyRunning)
     ));
-    invoker.stop();
-    invoker.stop();
+    invoker.stop().await;
+    invoker.stop().await;
     invoker.stop_and_wait().await;
     assert!(!invoker.is_running());
 }
@@ -135,6 +136,63 @@ async fn test_periodic_invoker_continues_after_function_error() {
     invoker.stop_and_wait().await;
 }
 
+/// 验证统一 Stopper 先同步取消后，完整 Stop 仍会等待已进入的 callback。
+///
+/// 两个 Notify 把时序固定为“callback 已进入 → request_stop 已取消 → async Stop 等待
+/// → callback 获准返回”；在放行前 stop task 必须保持 Pending，证明同步阶段未丢句柄。
+#[tokio::test]
+async fn periodic_invoker_stop_waits_for_in_flight_callback() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let completed = Arc::new(AtomicUsize::new(0));
+    let callback_entered = Arc::clone(&entered);
+    let callback_release = Arc::clone(&release);
+    let callback_completed = Arc::clone(&completed);
+    let invoker = Arc::new(
+        PeriodicInvoker::new(util_test_logger(), Duration::from_secs(60), move || {
+            let entered = Arc::clone(&callback_entered);
+            let release = Arc::clone(&callback_release);
+            let completed = Arc::clone(&callback_completed);
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, io::Error>(())
+            }
+        })
+        .unwrap(),
+    );
+    invoker.start().unwrap();
+    entered.notified().await;
+
+    let stopper: Arc<dyn super::Stopper> = invoker.clone();
+    // 模拟 RAII Drop：先同步取消，再由正常清理路径执行完整异步 Stop。同步阶段
+    // 不能丢掉 JoinHandle，否则下面的 Stop 会在 callback 尚未完成时提前返回。
+    stopper.request_stop();
+    let stop_task = tokio::spawn(async move {
+        stopper.stop().await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while invoker.is_running() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Stop 应先把 running 置为 false");
+
+    assert_eq!(completed.load(Ordering::SeqCst), 0);
+    assert!(
+        !stop_task.is_finished(),
+        "callback 未返回时 Stop 不得提前完成"
+    );
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), stop_task)
+        .await
+        .expect("放行 callback 后 Stop 应完成")
+        .expect("Stop task 不应 panic");
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+}
+
 /// 对应 Go：`periodic_retry_test.go` 中的 `TestRetryOperationSucceedsAfterRetry`。
 ///
 /// 操作前两次返回可重试错误，第三次返回成功值，验证最大次数包含首次调用。
@@ -142,7 +200,6 @@ async fn test_periodic_invoker_continues_after_function_error() {
 async fn test_retry_operation_succeeds_after_retry() {
     let attempts = AtomicUsize::new(0);
     let value = retry_operation(
-        &CancellationToken::new(),
         |_| {
             let current = attempts.fetch_add(1, Ordering::SeqCst);
             async move {
@@ -170,7 +227,6 @@ async fn test_retry_operation_stops_for_non_retriable_error() {
     let attempts = AtomicUsize::new(0);
     let config = RetryConfig::new(3, Duration::ZERO).with_classifier(|_: &io::Error| false);
     let error = retry_operation(
-        &CancellationToken::new(),
         |_| {
             attempts.fetch_add(1, Ordering::SeqCst);
             async { Err::<(), _>(io::Error::other("fatal")) }
@@ -191,7 +247,6 @@ async fn test_retry_operation_stops_for_non_retriable_error() {
 async fn test_retry_operation_returns_last_error_after_exhaustion() {
     let attempts = AtomicUsize::new(0);
     let error = retry_operation(
-        &CancellationToken::new(),
         |_| {
             attempts.fetch_add(1, Ordering::SeqCst);
             async { Err::<(), _>(io::Error::other("last")) }
@@ -208,22 +263,49 @@ async fn test_retry_operation_returns_last_error_after_exhaustion() {
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
-/// 验证取消不会打断与 Go `time.Sleep` 对齐的退避，并会在下一次操作前被观察。
+/// 验证取消不会打断 Go `time.Sleep` 对齐的退避，也不会让通用重试器跳过下一次操作。
+///
+/// 测试 operation 模拟 Go 中带 context 的 HTTP 请求：token 取消后仍会进入闭包，再
+/// 返回普通取消错误。分类器必须看到该错误并结束重试，而不是由 retry 提前短路。
 #[tokio::test]
-async fn cancellation_is_observed_after_backoff() {
+async fn cancellation_during_backoff_still_invokes_operation_and_classifier() {
     let cancellation = CancellationToken::new();
-    let cancel = cancellation.clone();
-    tokio::spawn(async move {
-        tokio::task::yield_now().await;
-        cancel.cancel();
-    });
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let classifications = Arc::new(AtomicUsize::new(0));
+    let observed_attempts = Arc::clone(&attempts);
+    let operation_cancellation = cancellation.clone();
+    let observed_classifications = Arc::clone(&classifications);
+    let config =
+        RetryConfig::new(3, Duration::from_millis(10)).with_classifier(move |error: &io::Error| {
+            observed_classifications.fetch_add(1, Ordering::SeqCst);
+            error.to_string() != "cancelled"
+        });
+
     let error = retry_operation(
-        &cancellation,
-        |_| async { Err::<(), _>(io::Error::other("retry")) },
-        &RetryConfig::new(2, Duration::from_millis(10)),
+        move |attempt| {
+            let cancellation = operation_cancellation.clone();
+            let attempts = Arc::clone(&observed_attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 1 {
+                    cancellation.cancel();
+                    Err::<(), _>(io::Error::other("retry"))
+                } else if cancellation.is_cancelled() {
+                    Err(io::Error::other("cancelled"))
+                } else {
+                    panic!("第一次调用已经取消 token")
+                }
+            }
+        },
+        &config,
         retry_test_attributes(),
     )
     .await
     .unwrap_err();
-    assert!(matches!(error, RetryError::Cancelled));
+    match error {
+        RetryError::Operation(error) => assert_eq!(error.to_string(), "cancelled"),
+        other => panic!("unexpected retry result: {other}"),
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(classifications.load(Ordering::SeqCst), 2);
 }

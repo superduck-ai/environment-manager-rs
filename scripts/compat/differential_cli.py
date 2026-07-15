@@ -76,11 +76,15 @@ CUSTOM_NORMALIZERS = {
     "go_panic_runtime_hex",
     "structured_log_read_duration_ms",
 }
-# 读取 stdin 的耗时取决于 Linux 调度，只有真实触发 Go nil dereference 的这个 CLI
-# 场景需要忽略它。把限制写进 manifest 校验而不只依赖评审约定，避免后续用例误用。
+# 读取 stdin 的耗时取决于 Linux 调度，只有两条真实触发同一 Go nil dereference 的
+# CLI 场景需要忽略它：基础 panic 以及在其前面验证 `--stdin` warning 的变体。把
+# 限制写进 manifest 校验而不只依赖评审约定，避免后续用例误用。
 CASE_SCOPED_NORMALIZERS: dict[str, frozenset[str]] = {
     "structured_log_read_duration_ms": frozenset(
-        {"task_run_v0_missing_startup_context_panic"}
+        {
+            "task_run_stdin_deprecation_warning_panics",
+            "task_run_v0_missing_startup_context_panic",
+        }
     ),
 }
 HEX_TOKEN = re.compile(r"0x[0-9a-f]+")

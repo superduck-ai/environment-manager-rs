@@ -20,6 +20,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+use crate::internal::logger::{
+    LogAttributes, LogHandler, LogHandlerError, LogLevel, LogRecord, Logger,
+};
 
 /// 验证普通 Hook 的空命令、成功及带输出非零退出。
 #[tokio::test]
@@ -512,6 +515,125 @@ async fn orchestrator_cancellation_interrupts_backoff() {
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
+/// 验证 orchestrator 自身的所有 Go `slog.Duration` 属性保留原字段名和纳秒单位。
+#[tokio::test]
+async fn orchestrator_duration_logs_match_go_slog_duration() {
+    let (logger, records) = recording_orchestrator_logger();
+    let output = Arc::new(MemoryOutput::default());
+    let orchestrator = new_orchestrator(OrchestratorConfig {
+        poller: Some(Arc::new(SequencePoller::new([Ok(Some(
+            br#"{"id":"session-1"}"#.to_vec(),
+        ))]))),
+        poll_timeout: Duration::from_millis(1_500),
+        loop_timeout: Duration::from_secs(2),
+        session_output: Some(output),
+        logger: Some(logger),
+        ..OrchestratorConfig::default()
+    })
+    .unwrap();
+    orchestrator.run(&CancellationToken::new()).await.unwrap();
+
+    let records = records.lock().unwrap();
+    let starting = records
+        .iter()
+        .find(|record| record.message == "starting orchestrator")
+        .unwrap();
+    assert_eq!(starting.attributes["poll_timeout"], 1_500_000_000_i64);
+    assert_eq!(starting.attributes["loop_timeout"], 2_000_000_000_i64);
+    assert!(!starting.attributes.contains_key("poll_timeout_ms"));
+    assert!(!starting.attributes.contains_key("loop_timeout_ms"));
+
+    let polling = records
+        .iter()
+        .find(|record| record.message == "starting poll loop")
+        .unwrap();
+    assert_eq!(polling.attributes["poll_timeout"], 1_500_000_000_i64);
+    let remaining = polling.attributes["remaining_loop_time"].as_i64().unwrap();
+    assert!((1..=2_000_000_000).contains(&remaining));
+    assert!(!polling.attributes.contains_key("remaining_loop_time_ms"));
+}
+
+/// 验证失败耗时和退避时长不再以 Rust 专用 `_ms` 字段写入。
+#[tokio::test]
+async fn orchestrator_failure_duration_logs_match_go_slog_duration() {
+    let (logger, records) = recording_orchestrator_logger();
+    let orchestrator = new_orchestrator(OrchestratorConfig {
+        poller: Some(Arc::new(CancellingErrorPoller)),
+        poll_timeout: Duration::from_secs(30),
+        loop_timeout: Duration::from_secs(30),
+        logger: Some(logger),
+        ..OrchestratorConfig::default()
+    })
+    .unwrap();
+    orchestrator
+        .run(&CancellationToken::new())
+        .await
+        .unwrap_err();
+
+    let records = records.lock().unwrap();
+    let failed = records
+        .iter()
+        .find(|record| record.message == "poll failed")
+        .unwrap();
+    assert!(failed.attributes["duration"].as_i64().is_some());
+    assert!(!failed.attributes.contains_key("duration_ms"));
+
+    let backoff = records
+        .iter()
+        .find(|record| record.message == "backing off after poll failure")
+        .unwrap();
+    assert_eq!(backoff.attributes["backoff"], 2_000_000_000_i64);
+    assert!(!backoff.attributes.contains_key("backoff_ms"));
+}
+
+/// 验证命令 PollHook 与 HTTP Poller 的时长属性也使用 Go 纳秒整数。
+#[tokio::test]
+async fn poller_duration_logs_match_go_slog_duration() {
+    let (hook_logger, hook_records) = recording_orchestrator_logger();
+    let hook = new_poll_hook("/bin/true", Duration::from_secs(1), "", "", "", hook_logger);
+    assert!(
+        hook.poll(&CancellationToken::new())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    hook.sleep_with_jitter(&cancelled).await.unwrap_err();
+
+    {
+        let records = hook_records.lock().unwrap();
+        let empty = records
+            .iter()
+            .find(|record| record.message == "poll hook returned empty queue")
+            .unwrap();
+        assert!(empty.attributes["duration"].as_i64().is_some());
+        assert!(!empty.attributes.contains_key("duration_ms"));
+        assert_go_jitter_duration(&records, "sleep_duration");
+    }
+
+    let (base_url, _request) = spawn_http_response(200, &[], b"null").await;
+    let (poller_logger, poller_records) = recording_orchestrator_logger();
+    let poller = new_poller_with_worker_id(base_url, "env", "token", "worker", 0, poller_logger);
+    assert!(
+        poller
+            .poll(&CancellationToken::new())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    poller.sleep_with_jitter(&cancelled).await.unwrap_err();
+
+    let records = poller_records.lock().unwrap();
+    let empty = records
+        .iter()
+        .find(|record| record.message == "queue empty")
+        .unwrap();
+    assert!(empty.attributes["poll_duration"].as_i64().is_some());
+    assert!(!empty.attributes.contains_key("poll_duration_ms"));
+    assert_go_jitter_duration(&records, "sleep_duration");
+}
+
 /// 验证 loop timeout 事件触发后重置完整预算，timeout Hook 失败不会上抛。
 #[tokio::test]
 async fn orchestrator_timeout_hook_failure_is_non_fatal() {
@@ -561,6 +683,29 @@ fn shell_quote(value: &str) -> String {
 /// 对应 Go：`orchestratorTestLogger`，复用内存/丢弃兼容 logger。
 fn orchestrator_test_logger() -> crate::internal::logger::Logger {
     default_orchestrator_logger()
+}
+
+/// 创建会保存所有结构化属性的 logger，供 duration schema 测试逐字段检查。
+fn recording_orchestrator_logger() -> (Logger, Arc<Mutex<Vec<LogRecord>>>) {
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let logger = Logger::new(Arc::new(RecordingLogHandler {
+        records: Arc::clone(&records),
+        attributes: LogAttributes::new(),
+    }));
+    (logger, records)
+}
+
+/// 断言 jitter 日志使用 Go 字段名，并且随机值仍是 1、2、3 秒之一的纳秒数。
+fn assert_go_jitter_duration(records: &[LogRecord], field: &str) {
+    let record = records
+        .iter()
+        .find(|record| record.message == "sleeping with jitter after empty queue")
+        .unwrap();
+    assert!(matches!(
+        record.attributes[field].as_i64(),
+        Some(1_000_000_000 | 2_000_000_000 | 3_000_000_000)
+    ));
+    assert!(!record.attributes.contains_key("sleep_duration_ms"));
 }
 
 /// 生成测试响应使用的 gzip member，覆盖 Whoami 的 Go Transport 自动解压路径。
@@ -696,6 +841,43 @@ impl SessionOutput for MemoryOutput {
 #[derive(Default)]
 struct RecordingObserver {
     events: Mutex<Vec<OrchestratorEvent>>,
+}
+
+/// 保存日志及 `Logger::with_attrs` 固定属性的测试 handler。
+#[derive(Clone)]
+struct RecordingLogHandler {
+    records: Arc<Mutex<Vec<LogRecord>>>,
+    attributes: LogAttributes,
+}
+
+impl LogHandler for RecordingLogHandler {
+    /// duration 测试需要观察 debug 到 error 的全部级别。
+    fn enabled(&self, _level: LogLevel) -> bool {
+        true
+    }
+
+    /// 合并组件固定属性后保存记录，模拟生产 handler 最终看到的字段集合。
+    fn handle(&self, record: &LogRecord) -> Result<(), LogHandlerError> {
+        let mut record = record.clone();
+        record.attributes.extend(self.attributes.clone());
+        self.records.lock().unwrap().push(record);
+        Ok(())
+    }
+
+    /// 创建共享记录槽且追加固定属性的派生 handler。
+    fn with_attrs(&self, attributes: LogAttributes) -> Arc<dyn LogHandler> {
+        let mut combined = self.attributes.clone();
+        combined.extend(attributes);
+        Arc::new(Self {
+            records: Arc::clone(&self.records),
+            attributes: combined,
+        })
+    }
+
+    /// 测试不改变 group 编码，只保留共享记录槽和固定属性。
+    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
+        Arc::new(self.clone())
+    }
 }
 
 impl OrchestratorObserver for RecordingObserver {

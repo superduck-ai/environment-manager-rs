@@ -31,7 +31,10 @@ use tokio_tungstenite::{client_async_tls_with_config, connect_async_with_config}
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
-use crate::internal::logger::{LogAttributes, Logger};
+use crate::internal::{
+    logger::{LogAttributes, Logger},
+    util::format_go_duration,
+};
 
 use super::actions::{ActionError, Registry, ResponseSender};
 use super::helpers::{client_logger, marshal_protojson};
@@ -132,6 +135,43 @@ impl std::error::Error for GorillaDialFailure {}
 struct ProxySelection {
     url: Url,
     password_set: bool,
+}
+
+/// 主 Tunnel ping 写入的失败类别。
+///
+/// timeout 不是 tungstenite 错误，因此单独保存；WebSocket 分支保留原始错误，便于
+/// 像 Gorilla 一样剥离 Rust 库为底层 `io::Error` 添加的 `IO error:` 前缀。
+pub(super) enum PingWriteFailure {
+    Timeout,
+    WebSocket(WebSocketError),
+}
+
+/// 把 ping 写失败转换为 Go `pingLoop` 的错误优先级和文本。
+///
+/// # 参数
+/// - `cancellation`：本轮 Tunnel 的取消信号；Go 在 `WriteMessage` 失败后首先检查
+///   `ctx.Err()`，因此并发取消必须覆盖 timeout 或 socket 错误。
+/// - `failure`：Tokio timeout 或 tungstenite 写错误。
+///
+/// # 返回
+/// 返回供连接重试循环处理的兼容错误，不记录日志也不修改连接状态。
+pub(super) fn ping_write_failure(
+    cancellation: &CancellationToken,
+    failure: PingWriteFailure,
+) -> TunnelError {
+    if cancellation.is_cancelled() {
+        return TunnelError::message("context canceled");
+    }
+
+    match failure {
+        PingWriteFailure::Timeout => TunnelError::message("write tunnel ping: i/o timeout"),
+        PingWriteFailure::WebSocket(WebSocketError::Io(error)) => {
+            TunnelError::message(format!("write tunnel ping: {error}"))
+        }
+        PingWriteFailure::WebSocket(error) => {
+            TunnelError::message(format!("write tunnel ping: {error}"))
+        }
+    }
 }
 
 /// 把 Rust HTTP status 转成 Go `http.Response.Status` 的标准形式。
@@ -448,10 +488,20 @@ impl Client {
             let writer = writer
                 .as_mut()
                 .ok_or_else(|| TunnelError::message("not connected"))?;
-            tokio::time::timeout(WRITE_TIMEOUT, writer.send(Message::Ping(Vec::new().into())))
+            match tokio::time::timeout(WRITE_TIMEOUT, writer.send(Message::Ping(Vec::new().into())))
                 .await
-                .map_err(|_| TunnelError::message("write tunnel ping: i/o timeout"))?
-                .map_err(|error| TunnelError::message(format!("write tunnel ping: {error}")))?;
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(ping_write_failure(
+                        &cancellation,
+                        PingWriteFailure::WebSocket(error),
+                    ));
+                }
+                Err(_) => {
+                    return Err(ping_write_failure(&cancellation, PingWriteFailure::Timeout));
+                }
+            }
         }
     }
 
@@ -1818,12 +1868,4 @@ fn log_attributes<const N: usize>(pairs: [(&str, Value); N]) -> LogAttributes {
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value))
         .collect()
-}
-
-/// 以 Go duration 的秒/毫秒形式记录 retry 时长；当前退避总是整纳秒。
-fn format_go_duration(duration: Duration) -> String {
-    if duration.subsec_nanos() == 0 {
-        return format!("{}s", duration.as_secs());
-    }
-    format!("{}ms", duration.as_millis())
 }

@@ -38,7 +38,7 @@ use crate::internal::{
     process::execute_script,
     session::{ActivityRecorder, ActivityRecorderError, NoopActivityRecorder},
     sources::{ProcessMode, new_source_handler_manager},
-    util::{BoxError, Stopper, output_streamer},
+    util::{BoxError, Stopper, format_go_duration, output_streamer},
 };
 
 use super::{
@@ -54,6 +54,47 @@ const BAKU_TEMPLATE_DIR: &str = "/opt/baku-templates/vite-template";
 const BAKU_PROJECT_DIR: &str = "/home/claude/project";
 /// 脚本日志和失败结果最多保留的尾部字节数。
 const OUTPUT_TAIL_BYTES: usize = 4096;
+
+/// 保存 init script 的长任务 stopper，并复刻 Go `defer stopper.Stop()` 的覆盖范围。
+///
+/// 正常初始化结束时 [`Self::stop`] 会异步等待后台 callback；若整个 initialize future
+/// 被 abort 或因 panic 展开，Rust `Drop` 不能等待，但仍会同步传播取消，避免周期记录器
+/// 在已经失去所属初始化任务后继续运行。
+pub(super) struct InitActivityStopGuard {
+    stopper: Option<Arc<dyn Stopper>>,
+}
+
+impl InitActivityStopGuard {
+    /// 创建尚未持有 stopper 的 guard；init script 真正开始时才通过 [`Self::set`] 安装。
+    pub(super) fn empty() -> Self {
+        Self { stopper: None }
+    }
+
+    /// 保存已启动的长任务 stopper，使后续任意退出路径都至少发出同步取消。
+    pub(super) fn set(&mut self, stopper: Arc<dyn Stopper>) {
+        // 同一段 Initialize 只会启动一次 init script。若未来控制流变化导致重复设置，
+        // 先取消旧 stopper，避免静默遗留后台任务，同时让新 stopper 接管 guard。
+        if let Some(previous) = self.stopper.replace(stopper) {
+            previous.request_stop();
+        }
+    }
+
+    /// 正常控制流完成时取消并等待在途 callback，保持 Go Stop 的完成边界。
+    pub(super) async fn stop(mut self) {
+        if let Some(stopper) = self.stopper.take() {
+            stopper.stop().await;
+        }
+    }
+}
+
+impl Drop for InitActivityStopGuard {
+    /// initialize future 被丢弃时同步请求停止；无法在 `Drop` 中阻塞 Tokio worker。
+    fn drop(&mut self) {
+        if let Some(stopper) = self.stopper.take() {
+            stopper.request_stop();
+        }
+    }
+}
 
 /// Anthropic 环境在注册表中的静态元数据。
 pub static REGISTRATION: LazyLock<Registration> = LazyLock::new(|| Registration {
@@ -370,61 +411,66 @@ impl AnthropicEnvironmentType {
             }
         }
 
-        // Go 使用 defer，因此 stopper 必须存活到整个 Initialize 返回，而不只到脚本结束。
-        let mut _init_activity_guard: Option<StopOnDrop> = None;
-        if has_init_script {
-            if should_run_setup {
-                self.logger
-                    .info("Running init script", LogAttributes::new());
-                _init_activity_guard = Some(StopOnDrop::new(
-                    activity_recorder.record_long_running_activity(
+        // Go 使用 defer，因此 stopper 必须存活到整个 Initialize 返回，而不只到脚本
+        // 结束。先在内部 future 中保留所有提前返回，再统一异步 Stop，才能同时复刻
+        // defer 的覆盖范围和 Stop 内部等待 invoker 完成的语义。
+        let mut init_activity_guard = InitActivityStopGuard::empty();
+        let initialization_result = async {
+            if has_init_script {
+                if should_run_setup {
+                    self.logger
+                        .info("Running init script", LogAttributes::new());
+                    init_activity_guard.set(activity_recorder.record_long_running_activity(
                         LogCategory::Init,
                         "Running task setup script".to_owned(),
-                    ),
-                ));
-                let script = self.config_ref().init_script.clone();
-                if let Err(error) = self.run_init_script(cancellation, &script).await {
-                    activity_recorder.record_activity(
-                        ApiLogLevel::Error,
-                        LogCategory::Init,
-                        format!("Init script failed: {error}"),
-                        BTreeMap::new(),
-                    );
-                    let session_error = InitScriptError {
-                        exit_code: extract_exit_code(&error),
-                        output: error.output.clone(),
-                    };
-                    let _ = activity_recorder
-                        .record_failure_result(&session_error)
-                        .await;
-                    return Err(AnthropicError::with_source(
-                        "failed to run init script",
-                        error,
                     ));
+                    let script = self.config_ref().init_script.clone();
+                    if let Err(error) = self.run_init_script(cancellation, &script).await {
+                        activity_recorder.record_activity(
+                            ApiLogLevel::Error,
+                            LogCategory::Init,
+                            format!("Init script failed: {error}"),
+                            BTreeMap::new(),
+                        );
+                        let session_error = InitScriptError {
+                            exit_code: extract_exit_code(&error),
+                            output: error.output.clone(),
+                        };
+                        let _ = activity_recorder
+                            .record_failure_result(&session_error)
+                            .await;
+                        return Err(AnthropicError::with_source(
+                            "failed to run init script",
+                            error,
+                        ));
+                    }
+                } else {
+                    self.logger.info(
+                        "Fast resume: Skipping task setup script",
+                        LogAttributes::new(),
+                    );
                 }
-            } else {
-                self.logger.info(
-                    "Fast resume: Skipping task setup script",
-                    LogAttributes::new(),
-                );
             }
-        }
 
-        if is_baku && !has_sources {
-            let cwd = self.config_ref().cwd.clone();
-            if let Err(error) = self.start_dev_server(cancellation, &cwd).await {
-                self.logger.warn(
-                    "Failed to start dev server",
-                    attributes([("error", json!(error.to_string()))]),
-                );
+            if is_baku && !has_sources {
+                let cwd = self.config_ref().cwd.clone();
+                if let Err(error) = self.start_dev_server(cancellation, &cwd).await {
+                    self.logger.warn(
+                        "Failed to start dev server",
+                        attributes([("error", json!(error.to_string()))]),
+                    );
+                }
             }
-        }
 
-        self.logger.info(
-            "Anthropic environment initialization completed",
-            LogAttributes::new(),
-        );
-        Ok(())
+            self.logger.info(
+                "Anthropic environment initialization completed",
+                LogAttributes::new(),
+            );
+            Ok(())
+        }
+        .await;
+        init_activity_guard.stop().await;
+        initialization_result
     }
 
     /// 创建并在局部作用域内使用 sources manager。
@@ -595,7 +641,7 @@ impl AnthropicEnvironmentType {
                     attributes([
                         ("language", json!(language.name)),
                         ("version", json!(language.version)),
-                        ("duration", json!(format_duration(duration))),
+                        ("duration", json!(format_go_duration(duration))),
                         ("error", json!(error.to_string())),
                     ]),
                 );
@@ -611,7 +657,7 @@ impl AnthropicEnvironmentType {
                     attributes([
                         ("language", json!(language.name)),
                         ("version", json!(language.version)),
-                        ("duration", json!(format_duration(duration))),
+                        ("duration", json!(format_go_duration(duration))),
                     ]),
                 );
             }
@@ -622,7 +668,7 @@ impl AnthropicEnvironmentType {
                 attributes([
                     ("error_count", json!(errors.len())),
                     ("total_count", json!(languages.len())),
-                    ("duration", json!(format_duration(started.elapsed()))),
+                    ("duration", json!(format_go_duration(started.elapsed()))),
                     ("errors", json!(errors.join(", "))),
                 ]),
             );
@@ -635,7 +681,7 @@ impl AnthropicEnvironmentType {
             "Successfully installed all languages in parallel",
             attributes([
                 ("language_count", json!(languages.len())),
-                ("duration", json!(format_duration(started.elapsed()))),
+                ("duration", json!(format_go_duration(started.elapsed()))),
             ]),
         );
         Ok(())
@@ -727,7 +773,7 @@ impl AnthropicEnvironmentType {
                 ("language", json!(language.name)),
                 ("version", json!(language.version)),
                 ("exit_code", json!(result.exit_code)),
-                ("duration", json!(format_duration(result.duration))),
+                ("duration", json!(format_go_duration(result.duration))),
                 ("success", json!(success)),
             ]),
         );
@@ -745,7 +791,7 @@ impl AnthropicEnvironmentType {
                     ("language", json!(language.name)),
                     ("version", json!(language.version)),
                     ("exit_code", json!(result.exit_code)),
-                    ("duration", json!(format_duration(result.duration))),
+                    ("duration", json!(format_go_duration(result.duration))),
                     ("error", json!(error.to_string())),
                     ("output", json!(captured)),
                 ]),
@@ -776,7 +822,7 @@ impl AnthropicEnvironmentType {
             attributes([
                 ("language", json!(language.name)),
                 ("version", json!(language.version)),
-                ("duration", json!(format_duration(result.duration))),
+                ("duration", json!(format_go_duration(result.duration))),
             ]),
         );
         Ok(())
@@ -1227,36 +1273,6 @@ fn write_file_with_mode(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
     options.write(true).create(true).truncate(true).mode(mode);
     let mut file = options.open(path)?;
     file.write_all(data)
-}
-
-/// 将 `Duration` 格式化成接近 Go `time.Duration.String` 的紧凑文本。
-fn format_duration(duration: Duration) -> String {
-    if duration.as_secs() > 0 {
-        format!("{}.{:03}s", duration.as_secs(), duration.subsec_millis())
-    } else if duration.as_millis() > 0 {
-        format!("{}ms", duration.as_millis())
-    } else {
-        format!("{}µs", duration.as_micros())
-    }
-}
-
-/// stopper 的 RAII 包装；drop 时幂等请求停止。
-struct StopOnDrop(Option<Arc<dyn Stopper>>);
-
-impl StopOnDrop {
-    /// 保存非空 stopper。
-    fn new(stopper: Arc<dyn Stopper>) -> Self {
-        Self(Some(stopper))
-    }
-}
-
-impl Drop for StopOnDrop {
-    /// 与 Go `defer stopper.Stop()` 一样在所有返回路径停止活动。
-    fn drop(&mut self) {
-        if let Some(stopper) = self.0.take() {
-            stopper.stop();
-        }
-    }
 }
 
 /// 运行带参数命令、并发读取两个 pipe，并在取消时只杀直接 child。

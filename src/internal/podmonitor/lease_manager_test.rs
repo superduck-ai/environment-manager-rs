@@ -4,10 +4,15 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use futures_util::stream::poll_fn;
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -20,7 +25,7 @@ use crate::internal::{
 use super::get_default_health_file_path;
 use super::lease_manager::{
     claude_code_stuck_threshold_from, is_permanent_heartbeat_error, is_precondition_failed_error,
-    is_retriable_stop_error, new_lease_manager_with_stuck_threshold,
+    is_retriable_stop_error, new_lease_manager_with_stuck_threshold, read_stop_response_body,
 };
 use super::zz_recovered_types::{
     DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD, DEFAULT_SHUTDOWN_GRACE_PERIOD, HeartbeatError,
@@ -358,10 +363,39 @@ async fn test_call_stop_api_forced_and_stop_error_classification() {
     assert!(is_retriable_stop_error(&StopRequestError::Api(
         StopApiError::new(500, "server error")
     )));
-    assert!(!is_retriable_stop_error(&StopRequestError::Cancelled));
+    assert!(!is_retriable_stop_error(&StopRequestError::Cancelled {
+        message: "context canceled".to_owned(),
+    }));
     assert!(!is_retriable_stop_error(
         &StopRequestError::DeadlineExceeded
     ));
+}
+
+/// 验证预先取消仍会进入 stop operation，再由请求层产生不可重试取消错误。
+///
+/// 这条用例防止通用 retry 恢复“调用 operation 前直接返回 Cancelled”的旧分支；
+/// 取消必须由 `call_stop_api` 闭包观察，才能经过 classifier 和兼容日志流程。
+#[tokio::test]
+async fn test_call_stop_api_observes_pre_cancel_inside_operation() {
+    let manager = test_manager(
+        "https://api.example.test",
+        Duration::from_secs(3600),
+        Duration::ZERO,
+        "",
+        Duration::from_secs(3600),
+    );
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+
+    let error = manager
+        .call_stop_api(&cancellation, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, StopRequestError::Cancelled { .. }));
+    assert_eq!(
+        error.to_string(),
+        "stop API request failed: Post \"https://api.example.test/v1/environments/env-1/work/session-1/stop?organization_uuid=org-1\": context canceled"
+    );
 }
 
 /// 验证 HTTP 400 stop 错误在第一次尝试后立即返回。
@@ -392,6 +426,102 @@ async fn test_call_stop_api_reports_non_retriable_status_once() {
             ..
         })
     ));
+}
+
+/// 服务端发出非 2xx headers 后，即使响应体永久停住，取消也必须及时结束请求。
+///
+/// Go 的 `io.ReadAll(resp.Body)` 由 request context 中断且忽略读取错误；本测试使用原始
+/// HTTP server 故意声明更长正文但不结束连接，防止 Reqwest 自行把 EOF 当作完成。
+/// 取消与客户端交付 headers 存在真实竞态，因此允许请求层取消或 HTTP 400 两种结果，
+/// 但两者都必须在一秒内返回；下一个测试再确定性固定已经进入 body 阶段的 partial。
+#[tokio::test]
+async fn test_call_stop_api_cancels_stalled_error_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (headers_sent, headers_received) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                return;
+            }
+            request.extend_from_slice(&buffer[..read]);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 64\r\nConnection: close\r\n\r\npartial",
+            )
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        let _ = headers_sent.send(());
+        std::future::pending::<()>().await;
+    });
+
+    let manager = test_manager(
+        &format!("http://{address}"),
+        Duration::from_secs(3600),
+        Duration::ZERO,
+        "",
+        Duration::from_secs(3600),
+    );
+    let cancellation = CancellationToken::new();
+    let call_cancellation = cancellation.clone();
+    let call = tokio::spawn(async move { manager.call_stop_api(&call_cancellation, false).await });
+
+    tokio::time::timeout(Duration::from_secs(1), headers_received)
+        .await
+        .expect("server must send error headers")
+        .expect("server must signal before exiting");
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(1), call)
+        .await
+        .expect("cancellation must interrupt the stalled response body")
+        .expect("stop task must not panic")
+        .expect_err("HTTP 400 remains an API error after body cancellation");
+    assert!(matches!(
+        error,
+        StopRequestError::Cancelled { .. }
+            | StopRequestError::Api(StopApiError {
+                status_code: 400,
+                ..
+            })
+    ));
+
+    server.abort();
+    let _ = server.await;
+}
+
+/// 分片读取已进入 body 阶段后，取消必须立即返回并保留取消前的 partial body。
+#[tokio::test]
+async fn test_read_stop_response_body_preserves_partial_bytes_on_cancel() {
+    let chunk_delivered = Arc::new(tokio::sync::Notify::new());
+    let stream_notification = Arc::clone(&chunk_delivered);
+    let mut first_poll = true;
+    let stream = poll_fn(move |_context| {
+        if first_poll {
+            first_poll = false;
+            stream_notification.notify_one();
+            Poll::Ready(Some(Ok::<_, std::io::Error>(b"partial body".to_vec())))
+        } else {
+            Poll::Pending
+        }
+    });
+    let cancellation = CancellationToken::new();
+    let read_cancellation = cancellation.clone();
+    let read =
+        tokio::spawn(async move { read_stop_response_body(stream, &read_cancellation).await });
+
+    chunk_delivered.notified().await;
+    cancellation.cancel();
+    let body = tokio::time::timeout(Duration::from_secs(1), read)
+        .await
+        .expect("取消后 body reader 必须在一秒内完成")
+        .expect("body reader 不应 panic");
+    assert_eq!(body, b"partial body");
 }
 
 /// 验证 heartbeat marker 分类和“剩余租约 + 五秒”的宽限期。

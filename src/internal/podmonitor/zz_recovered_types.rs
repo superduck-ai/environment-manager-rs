@@ -135,8 +135,11 @@ impl HeartbeatError {
 #[derive(Debug, Error)]
 pub enum StopRequestError {
     /// `CancellationToken` 已被触发，对应 Go `context.Canceled` sentinel。
-    #[error("operation was cancelled")]
-    Cancelled,
+    #[error("{message}")]
+    Cancelled {
+        /// 保留 Go `http.Client.Do` 经 `fmt.Errorf` 包装后的完整错误文本。
+        message: String,
+    },
     /// 供 deadline 驱动的调用方保留 Go `context.DeadlineExceeded` sentinel 语义。
     #[error("operation deadline exceeded")]
     DeadlineExceeded,

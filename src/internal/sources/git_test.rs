@@ -6,16 +6,17 @@ use std::{
     process::Command,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tempfile::TempDir;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use super::git::{classify_git_error, pack_size};
+use super::git::{ActivityStopGuard, classify_git_error, pack_size};
 use super::*;
 use crate::internal::{
     api::{LogCategory, LogLevel, SessionError},
@@ -25,6 +26,45 @@ use crate::internal::{
     session::{ActivityRecorder, ActivityRecorderError, NoopActivityRecorder, NoopStopper},
     util::Stopper,
 };
+
+/// 只记录同步停止请求的 fixture，用于验证 Git defer guard 的丢弃路径。
+struct RequestTrackingStopper(Arc<AtomicUsize>);
+
+#[async_trait]
+impl Stopper for RequestTrackingStopper {
+    /// 保存 `Drop` 已经传播取消的可观察次数。
+    fn request_stop(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// fixture 没有后台任务；完整 Stop 发出同步请求后即可完成。
+    async fn stop(&self) {
+        self.request_stop();
+    }
+}
+
+/// Git process future 被 abort 时，RAII guard 仍必须同步停止活动记录器。
+#[tokio::test]
+async fn git_activity_guard_future_drop_requests_stop() {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let stopper: Arc<dyn Stopper> = Arc::new(RequestTrackingStopper(Arc::clone(&request_count)));
+    let guard_installed = Arc::new(Notify::new());
+    let task_guard_installed = Arc::clone(&guard_installed);
+    let task = tokio::spawn(async move {
+        let _guard = ActivityStopGuard::new(Some(stopper));
+        task_guard_installed.notify_one();
+        std::future::pending::<()>().await;
+    });
+
+    guard_installed.notified().await;
+    task.abort();
+    assert!(
+        task.await
+            .expect_err("abort 后任务必须以 JoinError 结束")
+            .is_cancelled()
+    );
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+}
 
 /// 生产 Git handler 默认接入真实 proxy factory，调用方无需二次注入。
 #[test]

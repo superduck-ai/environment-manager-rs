@@ -1,15 +1,13 @@
 //! 支持指数退避、错误分类和取消的异步重试。
 //!
 //! 与 Go 版本相同，最大次数包含第一次尝试，延迟序列为
-//! `base_delay * 2^(attempt-1)`。退避 sleep 不响应取消；操作阶段通过取消令牌复刻 Go
-//! 闭包中 `http.NewRequestWithContext` 的取消行为。
+//! `base_delay * 2^(attempt-1)`。通用循环不直接观察取消；具体 operation 负责像 Go
+//! 闭包中的 `http.NewRequestWithContext` 一样把取消转换成可分类错误。
 
 use std::{sync::Arc, time::Duration};
 
-use thiserror::Error;
-use tokio_util::sync::CancellationToken;
-
 use crate::internal::logger::{LogAttributes, default_slog_logger};
+use thiserror::Error;
 
 /// 判断某个具体错误是否允许重试的线程安全分类器。
 pub type ErrorClassifier<E> = Arc<dyn Fn(&E) -> bool + Send + Sync + 'static>;
@@ -50,26 +48,25 @@ pub enum RetryError<E> {
     /// 最大次数必须至少为一次。
     #[error("max_retries must be at least 1")]
     InvalidMaxRetries,
-    /// 操作被取消。
-    #[error("operation was cancelled")]
-    Cancelled,
     /// 操作遇到不可重试错误或耗尽次数。
     #[error("operation failed: {0}")]
     Operation(E),
 }
 
-/// 执行异步操作，直到成功、不可重试、取消或耗尽次数。
+/// 执行异步操作，直到成功、不可重试或耗尽次数。
 ///
 /// `log_attributes` 对应 Go 的 `[]interface{}` 固定日志属性；本函数会在其后按原始
-/// 顺序追加 attempt、delay、error 等字段。操作 future 在取消时会被丢弃，因此
-/// 调用方应确保 future 的 drop 是取消安全的，或在操作内部屏蔽取消。
+/// 顺序追加 attempt、delay、error 等字段。取消不是通用重试器的控制信号：需要取消
+/// 网络请求的调用方必须在 `operation` 内观察自己的 token，并把取消转换为普通错误，
+/// 让同一错误分类器和日志路径处理它。
 ///
 /// # 兼容性
 /// 四类重试事件必须经过 Go 进程级 `slog.Default()` 的 legacy stderr handler，
 /// 不能使用调用方的应用 JSON logger。退避 sleep 也故意不可被取消打断，与 Go
-/// `time.Sleep` 一致；取消会在下一次操作开始时被观察。
+/// `time.Sleep` 一致。即使调用方在退避期间取消，sleep 完成后仍必须调用一次
+/// `operation`；这复刻 Go 闭包在 `time.Sleep` 后创建带 context 的 HTTP 请求，并
+/// 由该请求返回 `context.Canceled` 的时序。
 pub async fn retry_operation<T, E, F, Fut>(
-    cancellation: &CancellationToken,
     mut operation: F,
     config: &RetryConfig<E>,
     log_attributes: LogAttributes,
@@ -100,14 +97,9 @@ where
             tokio::time::sleep(delay).await;
         }
 
-        let result = tokio::select! {
-            // Go 的 HTTP operation 在进入时若 context 已取消，会确定性返回取消错误。
-            // Tokio 默认会随机选择多个已就绪分支；这里固定让取消优先，避免一个立即
-            // 返回错误的 future 抢先执行并把已取消状态误报为“重试耗尽”。
-            biased;
-            _ = cancellation.cancelled() => return Err(RetryError::Cancelled),
-            result = operation(attempt + 1) => result,
-        };
+        // 不在通用层 select cancellation。Go RetryOperation 无取消分支；无论 context
+        // 是否已经取消，每一轮都同步调用 operation，并等待它返回后再执行分类和日志。
+        let result = operation(attempt + 1).await;
         match result {
             Ok(value) => return Ok(value),
             Err(error) => {

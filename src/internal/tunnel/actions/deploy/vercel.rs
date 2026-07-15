@@ -13,7 +13,7 @@ use sha1::{Digest as _, Sha1};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
-use crate::internal::tunnel::actions::ActionError;
+use crate::internal::{tunnel::actions::ActionError, util::format_go_duration};
 
 use super::zz_recovered_types::{Deployment, FileEntry, VercelClient, VercelErrorResponse};
 
@@ -453,58 +453,4 @@ fn clean_unix_path(path: &str) -> String {
     } else {
         components.join("/")
     }
-}
-
-/// 把 Rust `Duration` 转成 Go `time.Duration.String` 的常用正数格式。
-///
-/// action 公开路径使用 `2m0s`；完整实现也覆盖测试和错误路径中的零、小时、毫秒、
-/// 微秒和纳秒，并去掉小数尾部零。
-fn format_go_duration(duration: Duration) -> String {
-    let nanos = duration.as_nanos();
-    if nanos == 0 {
-        return "0s".to_owned();
-    }
-    if nanos < 1_000 {
-        return format!("{nanos}ns");
-    }
-    if nanos < 1_000_000 {
-        return format_subsecond(nanos, 1_000, "µs");
-    }
-    if nanos < 1_000_000_000 {
-        return format_subsecond(nanos, 1_000_000, "ms");
-    }
-
-    let total_seconds = duration.as_secs();
-    let hours = total_seconds / 3_600;
-    let minutes = (total_seconds % 3_600) / 60;
-    let seconds = total_seconds % 60;
-    let second_text = if duration.subsec_nanos() == 0 {
-        format!("{seconds}s")
-    } else {
-        let fraction = format!("{:09}", duration.subsec_nanos())
-            .trim_end_matches('0')
-            .to_owned();
-        format!("{seconds}.{fraction}s")
-    };
-    if hours > 0 {
-        format!("{hours}h{minutes}m{second_text}")
-    } else if minutes > 0 {
-        format!("{minutes}m{second_text}")
-    } else {
-        second_text
-    }
-}
-
-/// 格式化小于一秒的 Go duration 单位，并去掉九进制小数尾部零。
-fn format_subsecond(nanos: u128, unit_nanos: u128, suffix: &str) -> String {
-    let whole = nanos / unit_nanos;
-    let remainder = nanos % unit_nanos;
-    if remainder == 0 {
-        return format!("{whole}{suffix}");
-    }
-    let width = unit_nanos.ilog10() as usize;
-    let fraction = format!("{remainder:0width$}")
-        .trim_end_matches('0')
-        .to_owned();
-    format!("{whole}.{fraction}{suffix}")
 }

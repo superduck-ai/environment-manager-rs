@@ -28,7 +28,7 @@ use crate::internal::orchestrator::{
     new_whoami_client,
 };
 use crate::internal::sandbox::{install_sandbox_runtime, new_sandbox_runtime_with_config};
-use crate::internal::util::acquire_container_lock;
+use crate::internal::util::{acquire_container_lock, go_duration_nanoseconds};
 
 const LONG_ABOUT: &str = r#"The orchestrator command polls the API for session tasks and handing off work to be executed.
 
@@ -311,6 +311,42 @@ impl SandboxAdapter for SandboxRuntimeAdapter {
     }
 }
 
+/// 构造 Go `AddOrchestratorCommand.RunE` 的首条结构化配置日志属性。
+///
+/// # 参数
+/// - `arguments`：已经由 CLI 层完成默认值和 Go duration 解析的 orchestrator 参数。
+///
+/// # 返回
+/// 返回交给 JSON logger 的有序属性。两个 duration 必须编码为 `slog.Duration` 使用的
+/// 纳秒整数，不能使用 Rust `Debug` 文本，否则日志采集端看到的类型和单位都会变化。
+#[must_use]
+pub(super) fn orchestrator_configured_attributes(arguments: &OrchestratorArgs) -> LogAttributes {
+    attributes([
+        ("api_url", json!(arguments.api_url)),
+        (
+            "organization_id",
+            json!(arguments.organization_id.as_deref().unwrap_or_default()),
+        ),
+        (
+            "environment_id",
+            json!(arguments.environment_id.as_deref().unwrap_or_default()),
+        ),
+        (
+            "client_id",
+            json!(arguments.client_id.as_deref().unwrap_or_default()),
+        ),
+        (
+            "poll_timeout",
+            json!(go_duration_nanoseconds(arguments.poll_timeout)),
+        ),
+        (
+            "loop_timeout",
+            json!(go_duration_nanoseconds(arguments.loop_timeout)),
+        ),
+        ("skip_container_lock", json!(arguments.skip_container_lock)),
+    ])
+}
+
 /// 对应 Go：`cmd/cmd_orchestrator.go` 中 `AddOrchestratorCommand` 的 `RunE`。
 ///
 /// 严格保持初始化顺序：先持有容器锁，再读取 service key 和 whoami，随后创建 poller、
@@ -331,30 +367,7 @@ pub async fn run_orchestrator(
     let logger = create_logger_with_file_output(logger_level(arguments.log_level));
     logger.info(
         "orchestrator configured",
-        attributes([
-            ("api_url", json!(arguments.api_url)),
-            (
-                "organization_id",
-                json!(arguments.organization_id.as_deref().unwrap_or_default()),
-            ),
-            (
-                "environment_id",
-                json!(arguments.environment_id.as_deref().unwrap_or_default()),
-            ),
-            (
-                "client_id",
-                json!(arguments.client_id.as_deref().unwrap_or_default()),
-            ),
-            (
-                "poll_timeout",
-                json!(format!("{:?}", arguments.poll_timeout)),
-            ),
-            (
-                "loop_timeout",
-                json!(format!("{:?}", arguments.loop_timeout)),
-            ),
-            ("skip_container_lock", json!(arguments.skip_container_lock)),
-        ]),
+        orchestrator_configured_attributes(arguments),
     );
 
     let _container_lock = if arguments.skip_container_lock {

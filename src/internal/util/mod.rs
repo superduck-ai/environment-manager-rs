@@ -4,6 +4,7 @@
 //! 同时把手工清理闭包、goroutine 和 `context.Context` 分别替换为 RAII、
 //! Tokio 任务与 [`tokio_util::sync::CancellationToken`]。
 
+mod duration;
 mod git;
 mod lockfile;
 mod path_escape;
@@ -15,6 +16,7 @@ mod tailer;
 mod version;
 mod zz_recovered_types;
 
+pub(crate) use duration::{format_go_duration, go_duration_nanoseconds};
 pub use git::{GitRefError, update_remote_tracking_branch};
 pub use lockfile::{FileLockGuard, LockError, acquire_container_lock, acquire_lock};
 pub(crate) use path_escape::go_path_escape;
@@ -30,5 +32,7 @@ pub use zz_recovered_types::{
     TailLine, Tailer,
 };
 
+#[cfg(test)]
+mod duration_test;
 #[cfg(test)]
 mod periodic_retry_test;

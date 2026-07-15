@@ -270,7 +270,9 @@ pub(super) fn write_ccr_upstream_proxy_token(path: &Path, token: &str) -> Result
         return Err(ClaudeError::message("CCR upstream proxy token is empty"));
     }
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(directory).map_err(|error| {
+    let mut directory_builder = std::fs::DirBuilder::new();
+    directory_builder.recursive(true).mode(0o700);
+    directory_builder.create(directory).map_err(|error| {
         ClaudeError::message(format!(
             "failed to create CCR upstream proxy token directory: {error}"
         ))

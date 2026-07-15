@@ -17,8 +17,10 @@ use std::{
 use async_trait::async_trait;
 use serde_json::Value;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
-use tokio::sync::MutexGuard;
+use tokio::{
+    net::TcpListener,
+    sync::{MutexGuard, Notify},
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::internal::{
@@ -34,7 +36,7 @@ use crate::internal::{
 
 use super::{
     AnthropicEnvironmentType, Config, Language,
-    anthropic::{copy_dir, extract_exit_code},
+    anthropic::{InitActivityStopGuard, copy_dir, extract_exit_code},
     decode_config,
     embedded::SESSION_START_HOOK_SKILL,
     zz_recovered_types::HookConfig,
@@ -88,11 +90,90 @@ impl ActivityRecorder for RecordingActivityRecorder {
 /// drop/stop 时递增计数的测试 stopper。
 struct RecordingStopper(Arc<AtomicUsize>);
 
+#[async_trait]
 impl Stopper for RecordingStopper {
-    /// 记录一次 stop 调用。
-    fn stop(&self) {
+    /// 记录一次同步停止请求。
+    fn request_stop(&self) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }
+
+    /// 记录完整 stop；该 fixture 没有后台任务，因此同步请求后即可返回。
+    async fn stop(&self) {
+        self.request_stop();
+    }
+}
+
+/// 可控地阻塞完整 Stop 的测试 stopper，用于区分同步取消和异步等待两个阶段。
+#[derive(Default)]
+struct BlockingStopper {
+    request_count: AtomicUsize,
+    stop_entered: Notify,
+    release_stop: Notify,
+    completed_count: AtomicUsize,
+}
+
+#[async_trait]
+impl Stopper for BlockingStopper {
+    /// 记录同步取消已传播；该方法不得等待测试放行信号。
+    fn request_stop(&self) {
+        self.request_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 发出取消后阻塞到 fixture 放行，以证明 guard 的显式清理会等待。
+    async fn stop(&self) {
+        self.request_stop();
+        self.stop_entered.notify_one();
+        self.release_stop.notified().await;
+        self.completed_count.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// initialize 所属 future 被 abort 时，guard 必须同步请求停止长任务。
+#[tokio::test]
+async fn init_activity_guard_future_drop_requests_stop() {
+    let stopper = Arc::new(BlockingStopper::default());
+    let task_stopper: Arc<dyn Stopper> = stopper.clone();
+    let guard_installed = Arc::new(Notify::new());
+    let task_guard_installed = Arc::clone(&guard_installed);
+    let task = tokio::spawn(async move {
+        let mut guard = InitActivityStopGuard::empty();
+        guard.set(task_stopper);
+        task_guard_installed.notify_one();
+        std::future::pending::<()>().await;
+        drop(guard);
+    });
+
+    guard_installed.notified().await;
+    task.abort();
+    assert!(
+        task.await
+            .expect_err("abort 后任务必须以 JoinError 结束")
+            .is_cancelled()
+    );
+    assert_eq!(stopper.request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(stopper.completed_count.load(Ordering::SeqCst), 0);
+}
+
+/// 正常 initialize 返回路径调用显式 Stop 时，必须等待 stopper 的异步清理完成。
+#[tokio::test]
+async fn init_activity_guard_explicit_stop_waits_for_completion() {
+    let stopper = Arc::new(BlockingStopper::default());
+    let guard_stopper: Arc<dyn Stopper> = stopper.clone();
+    let mut guard = InitActivityStopGuard::empty();
+    guard.set(guard_stopper);
+    let stop_task = tokio::spawn(guard.stop());
+
+    stopper.stop_entered.notified().await;
+    assert_eq!(stopper.request_count.load(Ordering::SeqCst), 1);
+    assert_eq!(stopper.completed_count.load(Ordering::SeqCst), 0);
+    assert!(!stop_task.is_finished(), "未放行异步清理前 Stop 不得返回");
+
+    stopper.release_stop.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), stop_task)
+        .await
+        .expect("放行后 Stop 应在一秒内完成")
+        .expect("Stop task 不应 panic");
+    assert_eq!(stopper.completed_count.load(Ordering::SeqCst), 1);
 }
 
 /// 在作用域结束时恢复 CWD 和 HOME。

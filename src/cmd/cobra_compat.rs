@@ -28,6 +28,18 @@ const COMPLETION_ZSH_HELP: &str = include_str!("cobra_assets/completion_zsh_help
 const WORKING_DIRECTORY_MARKER: &str = "{{WORKING_DIRECTORY}}";
 const CODE_SIGN_USAGE: &str =
     "Usage:\n  environment-runner code-sign [flags]\n\nFlags:\n  -h, --help   help for code-sign\n";
+const COBRA_SUGGESTIONS_MINIMUM_DISTANCE: usize = 2;
+// 这里必须保留 Go `main.go` 调用 `Add*Command` 的注册顺序。Cobra 的
+// `SuggestionsFor` 直接遍历内部命令切片，不会像帮助模板那样先按名称排序；默认
+// completion 命令在 `ExecuteC` 中最后注入，因此也必须放在数组末尾。
+const ROOT_SUGGESTION_COMMANDS: [&str; 6] = [
+    "orchestrator",
+    "task-run",
+    "poll",
+    "print-sandbox-settings",
+    "setup",
+    "completion",
+];
 
 /// 可由 Cobra 在错误路径自动打印 usage 的命令范围。
 ///
@@ -36,6 +48,8 @@ const CODE_SIGN_USAGE: &str =
 pub enum CobraCommand {
     /// 根命令。
     Root,
+    /// Cobra 自动注入的 completion 父命令。
+    Completion,
     /// orchestrator 子命令。
     Orchestrator,
     /// task-run 子命令。
@@ -58,6 +72,7 @@ pub enum CobraCommand {
 pub fn render_help(command: CobraCommand) -> String {
     let template = match command {
         CobraCommand::Root => ROOT_HELP,
+        CobraCommand::Completion => COMPLETION_HELP,
         CobraCommand::Orchestrator => ORCHESTRATOR_HELP,
         CobraCommand::TaskRun => TASK_RUN_HELP,
         CobraCommand::Poll => POLL_HELP,
@@ -184,10 +199,30 @@ pub(super) fn render_clap_error(argv: &[OsString], error: &clap::Error) -> CliEr
     let command = command_for_arguments(&arguments);
     let message = match error.kind() {
         ErrorKind::InvalidSubcommand => {
+            // Cobra 对“有子命令但自身不可运行”的 completion 父命令有一个容易忽略的
+            // 回退：未知 shell 会作为普通位置参数留给父命令，随后因父命令没有 Run
+            // 而打印父帮助并成功退出。Clap 会更早报 InvalidSubcommand，因此必须在
+            // 错误翻译层恢复 Cobra 的成功型帮助，不能把 `completion` 误报成根未知命令。
+            if arguments
+                .first()
+                .is_some_and(|argument| argument == "completion")
+            {
+                if let Some(message) = completion_unknown_flag_message(&arguments) {
+                    return CliError::usage_rendered(render_runtime_error(
+                        CobraCommand::Completion,
+                        &message,
+                    ));
+                }
+                return CliError::help(render_completion_help(None));
+            }
             let unknown = arguments.first().map_or("", String::as_str);
-            let message = format!("unknown command {unknown:?} for \"environment-runner\"");
+            let suggestions = render_root_command_suggestions(unknown);
+            let message =
+                format!("unknown command {unknown:?} for \"environment-runner\"{suggestions}");
             // Cobra 的首轮打印额外附加 usage 提示，但 Execute 返回给 main 的 error
-            // 不含该提示；因此第二个 Error 只能重复基础消息，不能重复 Run 行。
+            // 不含该提示；建议块却属于 error 本身，因此前后两个 Error 都必须带上。
+            // 建议块本身以换行结束，PrintErrln/Fprintf 还会各追加一次换行；这里故意
+            // 保留建议与 Run 行之间以及最终 EOF 前的空行，不能把它们 trim 掉。
             return CliError::usage_rendered(format!(
                 "Error: {message}\nRun 'environment-runner --help' for usage.\nError: {message}\n"
             ));
@@ -206,6 +241,98 @@ pub(super) fn render_clap_error(argv: &[OsString], error: &clap::Error) -> CliEr
         _ => first_clap_error_line(error),
     };
     CliError::usage_rendered(render_runtime_error(command, &message))
+}
+
+/// 复刻 Cobra v1.9.1 根命令 `findSuggestions` 生成的建议后缀。
+///
+/// 对应 Go：`github.com/spf13/cobra/command.go` 中的 `findSuggestions` 和
+/// `SuggestionsFor`。候选只包含 Go 根命令中 `IsAvailableCommand()` 为真的命令；
+/// 隐藏的 `code-sign` 不得泄露，自动注入且公开的 `completion` 必须保留；默认 help
+/// 虽会显示在帮助模板中，但因它等于父命令的 `helpCommand` 而被明确排除。
+///
+/// # 参数
+/// - `typed_name`：用户传入的首个未知根子命令，保持原始大小写。
+///
+/// # 返回
+/// 没有候选时返回空字符串；存在候选时返回以两个换行开头、并以换行结尾的 Cobra
+/// 建议块。调用方必须把它拼入 error 本身，使 Cobra 和 `main.go` 的两次打印都包含
+/// 相同建议。
+fn render_root_command_suggestions(typed_name: &str) -> String {
+    let typed_name_lower = cobra_simple_lowercase(typed_name);
+    let suggestions: Vec<&str> = ROOT_SUGGESTION_COMMANDS
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            let candidate_lower = cobra_simple_lowercase(candidate);
+            cobra_levenshtein_distance(typed_name_lower.as_bytes(), candidate_lower.as_bytes())
+                <= COBRA_SUGGESTIONS_MINIMUM_DISTANCE
+                || candidate_lower.starts_with(&typed_name_lower)
+        })
+        .collect();
+
+    if suggestions.is_empty() {
+        return String::new();
+    }
+
+    let mut rendered = String::from("\n\nDid you mean this?\n");
+    for suggestion in suggestions {
+        rendered.push('\t');
+        rendered.push_str(suggestion);
+        rendered.push('\n');
+    }
+    rendered
+}
+
+/// 按 Go `strings.ToLower` 使用的 Unicode simple lowercase 规则转换字符串。
+///
+/// Cobra 的 `ld(..., true)` 和前缀建议都调用 Go `strings.ToLower`；该函数为每个输入
+/// rune 只产生一个小写 rune。Rust `str::to_lowercase` 使用 full lowercase，像 `İ`
+/// 会展开成 `i` 加组合点，从而把 `PİLL` 到 `poll` 的字节距离错误增大。这里从每个
+/// Rust lowercase iterator 只取首个字符，以复刻固定 Go 1.25.7 oracle 的 simple
+/// mapping，再由距离函数按 UTF-8 字节比较。
+///
+/// # 参数
+/// - `value`：Cobra 要参与不区分大小写比较的有效 UTF-8 字符串。
+///
+/// # 返回
+/// 每个输入 Unicode scalar 对应至多一个小写 scalar 的新字符串。
+fn cobra_simple_lowercase(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| character.to_lowercase().next().unwrap_or(character))
+        .collect()
+}
+
+/// 计算 Cobra v1.9.1 `ld` 使用的逐 UTF-8 字节 Levenshtein 距离。
+///
+/// Cobra 先对两个字符串做小写转换，再按 Go 字符串的字节索引执行动态规划，而不是
+/// 按 Unicode 字符或 grapheme 计算。调用方已经完成小写转换；本函数只接收字节切片，
+/// 以免未来重构时无意改用 Rust `char` 并改变非 ASCII 输入的候选边界。
+///
+/// # 参数
+/// - `left`：小写后的用户输入 UTF-8 字节。
+/// - `right`：小写后的候选命令 UTF-8 字节。
+///
+/// # 返回
+/// 把 `left` 通过单字节插入、删除或替换转换为 `right` 所需的最少操作次数。
+fn cobra_levenshtein_distance(left: &[u8], right: &[u8]) -> usize {
+    // Cobra 保存完整二维矩阵；这里只保留相邻两行以降低分配量，递推关系和字节索引
+    // 完全相同，不会改变距离或 SuggestionsMinimumDistance=2 的边界。
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    let mut current = vec![0; right.len() + 1];
+
+    for (left_index, left_byte) in left.iter().enumerate() {
+        current[0] = left_index + 1;
+        for (right_index, right_byte) in right.iter().enumerate() {
+            let substitution_cost = usize::from(left_byte != right_byte);
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + substitution_cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[right.len()]
 }
 
 /// 从固定帮助资产提取 Cobra `UsageString()` 的准确后缀。
@@ -266,6 +393,7 @@ fn completion_help_target(shell: Option<&str>) -> Option<String> {
 /// 根据首个子命令选择发生错误时应显示的 usage。
 fn command_for_arguments(arguments: &[String]) -> CobraCommand {
     match arguments.first().map(String::as_str) {
+        Some("completion") => CobraCommand::Completion,
         Some("orchestrator") => CobraCommand::Orchestrator,
         Some("task-run") => CobraCommand::TaskRun,
         Some("poll") => CobraCommand::Poll,
@@ -274,6 +402,80 @@ fn command_for_arguments(arguments: &[String]) -> CobraCommand {
         Some("code-sign") => CobraCommand::CodeSign,
         _ => CobraCommand::Root,
     }
+}
+
+/// 在 Clap 把未知 shell 分类为子命令错误时，优先恢复 Cobra 的父命令 flag 错误。
+///
+/// Cobra 会先把 `bsh` 留作 completion 父命令的位置参数，再解析随后 flag；因此
+/// `completion bsh --bad` 不是成功帮助，而是 completion usage 包裹的 unknown flag。
+/// `-h/--help` 是唯一允许继续走成功帮助的 flag，`--` 则只是位置参数分隔符。短
+/// flag 必须按 pflag 的簇语义逐个消费：`-hh` 合法，而 `-hfalse` 在消费 `h` 后应
+/// 把剩余的 `-false` 报为未知 shorthand，不能直接把整个参数交给 Clap 解释。
+fn completion_unknown_flag_message(arguments: &[String]) -> Option<String> {
+    for argument in arguments.iter().skip(1) {
+        // pflag 遇到 `--` 后停止 flag 解析；后续以连字符开头的字节也只是普通参数。
+        if argument == "--" {
+            break;
+        }
+        // 单独的 `-` 在 pflag 中是普通位置参数，不是一个空 shorthand。
+        if argument == "-" {
+            continue;
+        }
+        if argument == "-h" || argument == "--help" {
+            continue;
+        }
+        if let Some(value) = argument
+            .strip_prefix("--help=")
+            .or_else(|| argument.strip_prefix("-h="))
+        {
+            // pflag 的 bool flag 接受 strconv.ParseBool 的全部拼写；无论 true 还是
+            // false，completion 父命令最终都会因自身不可运行而打印帮助。
+            if is_go_boolean(value) {
+                continue;
+            }
+            return Some(format!(
+                "invalid argument {value:?} for \"-h, --help\" flag: strconv.ParseBool: parsing {value:?}: invalid syntax"
+            ));
+        }
+        if let Some(long_flag) = argument.strip_prefix("--") {
+            // 对应 pflag parseLongArg：第三个字节仍是 `-`，或名称以 `=` 开头，
+            // 都属于语法错误；它们不是一个名称分别为 `-bad`/空串的未知 flag。
+            if long_flag.starts_with(['-', '=']) {
+                return Some(format!("bad flag syntax: {argument}"));
+            }
+            let flag = argument.split('=').next().unwrap_or(argument);
+            return Some(format!("unknown flag: {flag}"));
+        }
+        if let Some(mut shorthand_cluster) = argument.strip_prefix('-') {
+            while !shorthand_cluster.is_empty() {
+                let shorthand = shorthand_cluster
+                    .chars()
+                    .next()
+                    .expect("非空 shorthand 簇必须含有首字符");
+                if shorthand == 'h' {
+                    // help 是 completion 父命令唯一已注册的 shorthand，并且是
+                    // NoOptDefVal=true 的 bool flag，所以不会吞掉簇中剩余字符。
+                    shorthand_cluster = &shorthand_cluster[shorthand.len_utf8()..];
+                    continue;
+                }
+                return Some(format!(
+                    "unknown shorthand flag: {shorthand:?} in -{shorthand_cluster}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// 判断文本是否属于 Go `strconv.ParseBool` 接受的固定集合。
+///
+/// 该函数只用于 Cobra/pflag 帮助 flag 的兼容分流，不把其他大小写或空白宽松接受，
+/// 避免非法值被误判成成功帮助并改变退出码。
+fn is_go_boolean(value: &str) -> bool {
+    matches!(
+        value,
+        "1" | "t" | "T" | "TRUE" | "true" | "True" | "0" | "f" | "F" | "FALSE" | "false" | "False"
+    )
 }
 
 /// 恢复 Cobra 对未知 flag 使用的 `unknown flag` 措辞。

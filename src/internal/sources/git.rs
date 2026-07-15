@@ -151,14 +151,14 @@ impl GitHandler<'_> {
             ),
         );
 
-        let _activity_guard = if process_mode != "allow-prefetched" {
+        let activity_guard = if process_mode != "allow-prefetched" {
             self.activity_recorder.as_ref().map(|recorder| {
                 let message = if process_mode == "resume" {
                     format!("Fetching repository {}", git_source.git_info.repo)
                 } else {
                     format!("Cloning repository {}", git_source.git_info.repo)
                 };
-                StopOnDrop::new(Some(
+                ActivityStopGuard::new(Some(
                     recorder.record_long_running_activity(LogCategory::Init, message),
                 ))
             })
@@ -166,7 +166,10 @@ impl GitHandler<'_> {
             None
         };
 
-        let git_url = self.git_url(git_source)?;
+        // Go 用 defer 覆盖本函数内全部 `return`。Rust 的 Drop 无法安全等待 Tokio
+        // callback，因此把业务体包进内部 future，收集结果后再异步 Stop。
+        let process_result = async {
+            let git_url = self.git_url(git_source)?;
         if git_source
             .git_info
             .url
@@ -272,7 +275,7 @@ impl GitHandler<'_> {
         if self.should_validate {
             let validation_guard = if process_mode == "allow-prefetched" {
                 self.activity_recorder.as_ref().map(|recorder| {
-                    StopOnDrop::new(Some(recorder.record_long_running_activity(
+                    ActivityStopGuard::new(Some(recorder.record_long_running_activity(
                         LogCategory::Init,
                         format!("Validating {} repository access", git_source.git_info.repo),
                     )))
@@ -293,7 +296,9 @@ impl GitHandler<'_> {
                     auth_provider.as_deref(),
                 )
                 .await;
-            drop(validation_guard);
+            if let Some(validation_guard) = validation_guard {
+                validation_guard.stop().await;
+            }
             if let Err(error) = validation_result {
                 let _error_type = classify_git_error(Some(&error));
                 return Err(SourcesError::message(format!(
@@ -394,7 +399,13 @@ impl GitHandler<'_> {
                 "duration_ms" => duration_ms,
             ),
         );
-        Ok(())
+            Ok(())
+        }
+        .await;
+        if let Some(activity_guard) = activity_guard {
+            activity_guard.stop().await;
+        }
+        process_result
     }
 
     /// 根据 custom URL 或 host 标签构造公开 Git URL。
@@ -2162,23 +2173,33 @@ pub(crate) fn classify_git_error(error: Option<&dyn fmt::Display>) -> &'static s
     "unknown"
 }
 
-/// 确保长任务 stopper 在所有提前返回分支上都被同步触发。
-struct StopOnDrop {
+/// 保存长任务 stopper，在正常返回时等待、future 被丢弃时至少同步请求停止。
+pub(super) struct ActivityStopGuard {
     stopper: Option<Arc<dyn Stopper>>,
 }
 
-impl StopOnDrop {
+impl ActivityStopGuard {
     /// 包装可选 stopper；`None` 保持 Go nil stopper 的 no-op 语义。
-    fn new(stopper: Option<Arc<dyn Stopper>>) -> Self {
+    pub(super) fn new(stopper: Option<Arc<dyn Stopper>>) -> Self {
         Self { stopper }
+    }
+
+    /// 对应 Go defer 中的 `stopper.Stop()`；正常控制流返回前取消并等待在途 callback。
+    pub(super) async fn stop(mut self) {
+        if let Some(stopper) = self.stopper.take() {
+            stopper.stop().await;
+        }
     }
 }
 
-impl Drop for StopOnDrop {
-    /// 离开当前业务作用域时发出幂等停止信号。
+impl Drop for ActivityStopGuard {
+    /// future 被 abort 或 panic 展开时无法异步等待，但必须立即传播取消请求。
+    ///
+    /// 正常 [`Self::stop`] 会先取走 stopper，因此不会重复请求；若 `stop().await`
+    /// 本身被丢弃，`Stopper::stop` 的契约保证它已在首次 poll 时同步发出取消。
     fn drop(&mut self) {
         if let Some(stopper) = self.stopper.take() {
-            stopper.stop();
+            stopper.request_stop();
         }
     }
 }

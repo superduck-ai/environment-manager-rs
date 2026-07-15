@@ -143,7 +143,7 @@ class DifferentialCliTest(unittest.TestCase):
         )
 
     def test_read_duration_normalizer_is_explicitly_case_scoped(self) -> None:
-        """耗时归一化只能由 v0 missing startup panic 用例启用。"""
+        """耗时归一化只能由两条真实触发 v0 panic 的 CLI 用例启用。"""
         manifest = differential_cli.load_json(differential_cli.DEFAULT_CASES)
         enabled_cases = [
             case["name"]
@@ -151,7 +151,11 @@ class DifferentialCliTest(unittest.TestCase):
             if "structured_log_read_duration_ms" in case.get("normalizers", [])
         ]
         self.assertEqual(
-            enabled_cases, ["task_run_v0_missing_startup_context_panic"]
+            enabled_cases,
+            [
+                "task_run_v0_missing_startup_context_panic",
+                "task_run_stdin_deprecation_warning_panics",
+            ],
         )
         differential_cli.validate_manifest(manifest)
 

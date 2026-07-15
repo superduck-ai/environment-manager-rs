@@ -24,6 +24,7 @@ use super::code_sign::{
     calculate_backoff, do_attempts_with_retry, do_single_attempt, read_code_sign_config,
     scan_positive_integer,
 };
+use super::orchestrator::orchestrator_configured_attributes;
 use super::setup::{
     check_npm_available, install_sandbox_runtime, load_service_key, run_api_healthcheck,
 };
@@ -146,6 +147,18 @@ fn orchestrator_defaults_match_go_command() {
     assert_eq!(args.reclaim_older_than_ms, 0);
     assert!(!args.skip_git_config);
     assert!(!args.skip_container_lock);
+
+    let configured = orchestrator_configured_attributes(&args);
+    assert_eq!(
+        configured.get("poll_timeout"),
+        Some(&json!(300_000_000_000_i64))
+    );
+    assert_eq!(
+        configured.get("loop_timeout"),
+        Some(&json!(300_000_000_000_i64))
+    );
+    assert!(configured["poll_timeout"].is_i64());
+    assert!(configured["loop_timeout"].is_i64());
 }
 
 /// orchestrator 的路径、hook、整数、duration 和 bool flag 应完整落入类型模型。
@@ -359,6 +372,178 @@ fn unknown_flag_uses_cobra_error_prefix() {
     assert_eq!(error.exit_code(), 1);
     assert!(error.rendered().starts_with("Error:"));
     assert!(error.rendered().contains("Usage:"));
+}
+
+/// Cobra 应为编辑距离不超过二的未知根命令输出建议，并在两次错误中重复建议块。
+#[test]
+fn close_unknown_command_uses_cobra_suggestion_transcript() {
+    let error = parse_from("dev", ["environment-runner", "pll"])
+        .expect_err("nearby root command must fail with a suggestion");
+
+    assert_eq!(error.kind(), CliErrorKind::Usage);
+    assert_eq!(error.exit_code(), 1);
+    assert_eq!(
+        error.rendered(),
+        concat!(
+            "Error: unknown command \"pll\" for \"environment-runner\"\n\n",
+            "Did you mean this?\n",
+            "\tpoll\n\n",
+            "Run 'environment-runner --help' for usage.\n",
+            "Error: unknown command \"pll\" for \"environment-runner\"\n\n",
+            "Did you mean this?\n",
+            "\tpoll\n\n",
+        )
+    );
+}
+
+/// Cobra 的前缀建议应使用 Go 注册顺序，并排除隐藏的 `code-sign` 命令。
+#[test]
+fn root_command_suggestions_preserve_cobra_filtering_and_order() {
+    let prefix = parse_from("dev", ["environment-runner", "p"])
+        .expect_err("ambiguous prefix must remain an unknown command");
+    let rendered = prefix.rendered();
+    let first_block = concat!(
+        "Did you mean this?\n",
+        "\tpoll\n",
+        "\tprint-sandbox-settings\n",
+    );
+    assert_eq!(rendered.matches(first_block).count(), 2);
+
+    let hidden = parse_from("dev", ["environment-runner", "code-sig"])
+        .expect_err("hidden code-sign typo must remain unknown");
+    assert!(
+        !hidden.rendered().contains("Did you mean this?"),
+        "Cobra IsAvailableCommand excludes hidden commands from suggestions"
+    );
+
+    let help = parse_from("dev", ["environment-runner", "hlp"])
+        .expect_err("default help command typo must remain unknown");
+    assert!(
+        !help.rendered().contains("Did you mean this?"),
+        "Cobra treats the generated help command as unavailable for suggestions"
+    );
+
+    let uppercase = parse_from("dev", ["environment-runner", "PLL"])
+        .expect_err("command matching is case-sensitive before suggestions");
+    assert_eq!(uppercase.rendered().matches("\tpoll\n").count(), 2);
+
+    let unicode_simple_lowercase = parse_from("dev", ["environment-runner", "PİLL"])
+        .expect_err("Unicode command matching remains case-sensitive");
+    assert_eq!(
+        unicode_simple_lowercase
+            .rendered()
+            .matches("\tpoll\n")
+            .count(),
+        2,
+        "Go strings.ToLower uses simple rather than expanding lowercase mappings"
+    );
+}
+
+/// Cobra 会让不可运行的 completion 父命令为未知 shell 打印帮助并以零退出。
+#[test]
+fn unknown_completion_shell_falls_back_to_parent_help() {
+    let error = parse_from("dev", ["environment-runner", "completion", "bsh"])
+        .expect_err("completion parent help is represented as a successful early exit");
+
+    assert_eq!(error.kind(), CliErrorKind::Help);
+    assert_eq!(error.exit_code(), 0);
+    assert_eq!(error.rendered(), cobra_compat::render_completion_help(None));
+}
+
+/// 未知 completion shell 后仍有非法 flag 时，Cobra 应先报告父命令 flag 错误。
+#[test]
+fn unknown_completion_shell_with_flag_uses_completion_error() {
+    let error = parse_from("dev", ["environment-runner", "completion", "bsh", "--bad"])
+        .expect_err("unknown completion flag must fail");
+
+    assert_eq!(error.kind(), CliErrorKind::Usage);
+    assert_eq!(error.exit_code(), 1);
+    assert_eq!(
+        error.rendered(),
+        cobra_compat::render_runtime_error(CobraCommand::Completion, "unknown flag: --bad")
+    );
+
+    let delimited = parse_from(
+        "dev",
+        ["environment-runner", "completion", "bsh", "--", "--bad"],
+    )
+    .expect_err("flags after -- remain completion parent arguments");
+    assert_eq!(delimited.kind(), CliErrorKind::Help);
+    assert_eq!(delimited.exit_code(), 0);
+    assert_eq!(
+        delimited.rendered(),
+        cobra_compat::render_completion_help(None)
+    );
+
+    let shorthand = parse_from("dev", ["environment-runner", "completion", "bsh", "-x"])
+        .expect_err("unknown shorthand must fail");
+    assert_eq!(shorthand.exit_code(), 1);
+    assert_eq!(
+        shorthand.rendered(),
+        cobra_compat::render_runtime_error(
+            CobraCommand::Completion,
+            "unknown shorthand flag: 'x' in -x",
+        )
+    );
+
+    let help_false = parse_from(
+        "dev",
+        ["environment-runner", "completion", "bsh", "--help=false"],
+    )
+    .expect_err("non-runnable completion parent still prints help");
+    assert_eq!(help_false.kind(), CliErrorKind::Help);
+    assert_eq!(help_false.exit_code(), 0);
+    assert_eq!(
+        help_false.rendered(),
+        cobra_compat::render_completion_help(None)
+    );
+
+    let lone_dash = parse_from("dev", ["environment-runner", "completion", "bsh", "-"])
+        .expect_err("single dash remains a positional completion argument");
+    assert_eq!(lone_dash.kind(), CliErrorKind::Help);
+    assert_eq!(lone_dash.exit_code(), 0);
+
+    let malformed_long = parse_from("dev", ["environment-runner", "completion", "bsh", "---bad"])
+        .expect_err("three leading dashes are invalid pflag syntax");
+    assert_eq!(
+        malformed_long.rendered(),
+        cobra_compat::render_runtime_error(CobraCommand::Completion, "bad flag syntax: ---bad",)
+    );
+
+    let attached_bool = parse_from(
+        "dev",
+        ["environment-runner", "completion", "bsh", "-hfalse"],
+    )
+    .expect_err("characters after the bool shorthand form another shorthand cluster");
+    assert_eq!(
+        attached_bool.rendered(),
+        cobra_compat::render_runtime_error(
+            CobraCommand::Completion,
+            "unknown shorthand flag: 'f' in -false",
+        )
+    );
+
+    let repeated_help = parse_from("dev", ["environment-runner", "completion", "bsh", "-hh"])
+        .expect_err("repeating the bool help shorthand remains valid");
+    assert_eq!(repeated_help.kind(), CliErrorKind::Help);
+    assert_eq!(repeated_help.exit_code(), 0);
+
+    let help_then_unknown = parse_from("dev", ["environment-runner", "completion", "bsh", "-hx"])
+        .expect_err("pflag must report only the unconsumed shorthand suffix");
+    assert_eq!(
+        help_then_unknown.rendered(),
+        cobra_compat::render_runtime_error(
+            CobraCommand::Completion,
+            "unknown shorthand flag: 'x' in -x",
+        )
+    );
+
+    let empty_long_name = parse_from("dev", ["environment-runner", "completion", "bsh", "--=x"])
+        .expect_err("a long flag cannot have an empty name");
+    assert_eq!(
+        empty_long_name.rendered(),
+        cobra_compat::render_runtime_error(CobraCommand::Completion, "bad flag syntax: --=x")
+    );
 }
 
 /// 无参数打印命令只产生显式调用标记，不在解析测试中写 stdout。

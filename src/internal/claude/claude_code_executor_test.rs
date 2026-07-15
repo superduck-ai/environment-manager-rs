@@ -278,6 +278,34 @@ fn test_write_ccr_upstream_proxy_token() {
     }));
 }
 
+/// 验证递归创建 CCR 目录时，中间目录也使用 Go `MkdirAll(..., 0700)` 的权限。
+///
+/// token 目录可能由调用方覆盖为多级路径；所有新建层级都必须从创建瞬间禁止
+/// group/other 访问，不能先以默认 0755 创建后再只收紧末级目录。
+#[test]
+fn ccr_token_recursive_directories_are_private() {
+    let temp = TempDir::new().unwrap();
+    let first = temp.path().join("private");
+    let second = first.join("nested");
+    let directory = second.join("ccr");
+    let path = directory.join("session_token");
+
+    write_ccr_upstream_proxy_token(&path, "private-token").unwrap();
+
+    for created_directory in [&first, &second, &directory] {
+        assert_eq!(
+            fs::metadata(created_directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "{} should be private",
+            created_directory.display()
+        );
+    }
+}
+
 /// 验证原子 rename 替换 symlink 本身，而不是跟随链接覆盖外部目标。
 #[test]
 fn ccr_token_atomic_replace_does_not_follow_destination_symlink() {

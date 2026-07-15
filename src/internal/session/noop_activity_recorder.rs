@@ -18,9 +18,13 @@ use super::{ActivityRecorder, ActivityRecorderError, NoopActivityRecorder};
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoopStopper;
 
+#[async_trait]
 impl Stopper for NoopStopper {
+    /// 接受同步停止请求但不执行任何操作。
+    fn request_stop(&self) {}
+
     /// 接受停止请求但不执行任何操作。
-    fn stop(&self) {}
+    async fn stop(&self) {}
 }
 
 impl NoopActivityRecorder {

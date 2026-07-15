@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use reqwest::header::CONTENT_TYPE;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -123,7 +124,7 @@ pub fn is_precondition_failed_error(error: Option<&(dyn Error + 'static)>) -> bo
 #[must_use]
 pub fn is_retriable_stop_error(error: &StopRequestError) -> bool {
     match error {
-        StopRequestError::Cancelled | StopRequestError::DeadlineExceeded => false,
+        StopRequestError::Cancelled { .. } | StopRequestError::DeadlineExceeded => false,
         StopRequestError::Api(error) => error.status_code >= 500,
         StopRequestError::Request(_) => true,
     }
@@ -854,19 +855,32 @@ impl LeaseManager {
         let config =
             RetryConfig::new(3, Duration::from_secs(1)).with_classifier(is_retriable_stop_error);
         let result = retry_operation(
-            cancellation,
             |_| {
                 let client = self.inner.api_client.http_client.clone();
                 let endpoint = endpoint.clone();
                 let body = body.clone();
+                let cancellation = cancellation.clone();
                 async move {
-                    let response = client
+                    let cancellation_message = format!(
+                        "stop API request failed: Post \"{}\": context canceled",
+                        endpoint.as_str()
+                    );
+                    let request = client
                         .post(endpoint)
                         .header(CONTENT_TYPE, "application/json")
                         .body(body)
-                        .send()
-                        .await
-                        .map_err(|error| {
+                        .send();
+                    let response = tokio::select! {
+                        // Go 每轮都会创建带 context 的请求。即使 token 在不可取消的
+                        // backoff 中触发，本轮 operation 仍被调用，再由请求层返回取消
+                        // sentinel，进入统一 classifier 与 error_not_retryable 日志路径。
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            return Err(StopRequestError::Cancelled {
+                                message: cancellation_message,
+                            });
+                        }
+                        response = request => response.map_err(|error| {
                             if error.is_timeout() {
                                 StopRequestError::DeadlineExceeded
                             } else {
@@ -874,12 +888,19 @@ impl LeaseManager {
                                     "stop API request failed: {error}"
                                 ))
                             }
-                        })?;
+                        })?,
+                    };
                     let status = response.status();
                     if status.is_success() {
                         return Ok(());
                     }
-                    let response_body = response.bytes().await.unwrap_or_default();
+                    // Go 的 response body 仍绑定创建请求时的 context：收到非 2xx
+                    // headers 后若发生取消，io.ReadAll 会立即返回“已读部分 + error”，
+                    // 调用方忽略 error 并继续按 HTTP status 分类。Reqwest 的 Response
+                    // 不认识本项目 CancellationToken，因此逐 chunk select，取消时保留
+                    // 已经收到的正文并停止等待，避免卡到五分钟 client timeout。
+                    let response_body =
+                        read_stop_response_body(response.bytes_stream(), &cancellation).await;
                     let response_text = String::from_utf8_lossy(&response_body);
                     let response_text = response_text.trim();
                     let message = if response_text.is_empty() {
@@ -916,7 +937,6 @@ impl LeaseManager {
                 );
                 Ok(())
             }
-            Err(RetryError::Cancelled) => Err(StopRequestError::Cancelled),
             Err(RetryError::InvalidMaxRetries) => Err(StopRequestError::Request(
                 "stop API retry configuration requires at least one attempt".to_owned(),
             )),
@@ -1004,9 +1024,53 @@ impl LeaseManager {
     }
 }
 
+/// 读取 stop API 的错误响应体，并在取消时返回已经收到的部分字节。
+///
+/// 对应 Go `callStopAPI` 中绑定 request context 的 `io.ReadAll(resp.Body)`。Go 调用方
+/// 忽略读取错误但保留 partial body；这里把任意 stream 错误和取消都视为读取结束，
+/// 既不把它们升级成新的请求错误，也不会等待 Reqwest 的全局超时。
+///
+/// # 参数
+/// - `response_stream`：按网络到达顺序产生 response body chunk 的一次性 stream。
+/// - `cancellation`：本轮 stop 请求的取消令牌；触发后不再等待下一块数据。
+///
+/// # 返回
+/// 取消或读取错误前已经完整收到的所有 chunk，保持原始字节顺序。
+pub(super) async fn read_stop_response_body<S, B, E>(
+    response_stream: S,
+    cancellation: &CancellationToken,
+) -> Vec<u8>
+where
+    S: futures_util::Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+{
+    futures_util::pin_mut!(response_stream);
+    let mut response_body = Vec::new();
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => break,
+            next = response_stream.next() => next,
+        };
+        match next {
+            Some(Ok(chunk)) => response_body.extend_from_slice(chunk.as_ref()),
+            // Go 明确忽略 io.ReadAll 的读取错误；已经累积的部分正文仍参与错误文案，
+            // 不能把 body read error 替换成请求错误。
+            Some(Err(_)) | None => break,
+        }
+    }
+    response_body
+}
+
+#[async_trait]
 impl Stopper for LeaseManager {
-    /// 供 session 同步清理路径使用：只发出取消，不阻塞 Tokio 任务回收。
-    fn stop(&self) {
-        self.request_stop();
+    /// 通过统一接口同步取消 lease 后台任务，但不等待它们退出。
+    fn request_stop(&self) {
+        LeaseManager::request_stop(self);
+    }
+
+    /// 通过统一接口执行与固有 `Stop` 相同的取消并等待流程。
+    async fn stop(&self) {
+        LeaseManager::stop(self).await;
     }
 }

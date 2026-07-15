@@ -24,9 +24,9 @@ use url::Url;
 
 use super::actions::{ResponseSender, new_registry};
 use super::client::{
-    EnvironmentProxyConfig, connect_websocket_with_proxy_config, gorilla_websocket_config,
-    proxy_for_websocket_target, read_tunnel_data_message, should_offer_socks5_auth,
-    socks5_proxy_port,
+    EnvironmentProxyConfig, PingWriteFailure, connect_websocket_with_proxy_config,
+    gorilla_websocket_config, ping_write_failure, proxy_for_websocket_target,
+    read_tunnel_data_message, should_offer_socks5_auth, socks5_proxy_port,
 };
 use super::{
     HttpResponseSender, HttpTunnelRequest, HttpTunnelResponseError, TunnelRequest, TunnelResponse,
@@ -65,6 +65,41 @@ async fn start_tunnel_server() -> (
     );
     let (port, task) = start_server(router).await;
     (port, header_rx, socket_rx, task)
+}
+
+/// 验证 ping 写失败遵循 Go `pingLoop` 的取消优先级和底层网络错误文本。
+///
+/// Gorilla 直接包装 `net.Error`，不会带 tungstenite 的 `IO error:` 前缀；如果写失败
+/// 与 context 取消并发发生，Go 则固定返回 `context canceled`。
+#[test]
+fn ping_write_failure_matches_go_error_priority() {
+    let cancellation = CancellationToken::new();
+    assert_eq!(
+        ping_write_failure(&cancellation, PingWriteFailure::Timeout).to_string(),
+        "write tunnel ping: i/o timeout"
+    );
+    assert_eq!(
+        ping_write_failure(
+            &cancellation,
+            PingWriteFailure::WebSocket(tokio_tungstenite::tungstenite::Error::Io(
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "socket write failed",)
+            ),),
+        )
+        .to_string(),
+        "write tunnel ping: socket write failed"
+    );
+
+    cancellation.cancel();
+    assert_eq!(
+        ping_write_failure(
+            &cancellation,
+            PingWriteFailure::WebSocket(tokio_tungstenite::tungstenite::Error::Io(
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "socket write failed",)
+            ),),
+        )
+        .to_string(),
+        "context canceled"
+    );
 }
 
 /// 启动一次性原始 WebSocket 握手服务器，精确控制响应 header。

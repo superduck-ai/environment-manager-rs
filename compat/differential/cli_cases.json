@@ -43,6 +43,83 @@
       "normalizers": []
     },
     {
+      "name": "unknown_command_near_poll",
+      "argv0": "environment-runner",
+      "args": ["pll"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_unknown_shell_parent_help",
+      "argv0": "environment-runner",
+      "args": ["completion", "bsh"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_unknown_shell_bad_flag",
+      "argv0": "environment-runner",
+      "args": ["completion", "bsh", "--bad"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_unknown_shell_short_flag",
+      "argv0": "environment-runner",
+      "args": ["completion", "bsh", "-x"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_unknown_shell_help_false",
+      "argv0": "environment-runner",
+      "args": ["completion", "bsh", "--help=false"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_unknown_shell_lone_dash",
+      "argv0": "environment-runner",
+      "args": ["completion", "bsh", "-"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_unknown_shell_bad_flag_syntax",
+      "argv0": "environment-runner",
+      "args": ["completion", "bsh", "---bad"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_unknown_shell_attached_bool_shorthand",
+      "argv0": "environment-runner",
+      "args": ["completion", "bsh", "-hfalse"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_unknown_shell_repeated_help_shorthand",
+      "argv0": "environment-runner",
+      "args": ["completion", "bsh", "-hh"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_unknown_shell_help_then_unknown_shorthand",
+      "argv0": "environment-runner",
+      "args": ["completion", "bsh", "-hx"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_unknown_shell_empty_long_flag_name",
+      "argv0": "environment-runner",
+      "args": ["completion", "bsh", "--=x"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
       "name": "unknown_root_flag",
       "argv0": "environment-runner",
       "args": ["--definitely-unknown"],
@@ -144,6 +221,13 @@
       "name": "task_run_v0_missing_startup_context_panic",
       "argv0": "environment-runner",
       "args": ["task-run", "--session", "session-v0-missing-startup", "--upgrade-claude-code=false"],
+      "stdin": "{\"environment\":{\"environment_type\":\"byoc\"}}",
+      "normalizers": ["rfc3339_timestamp", "structured_log_read_duration_ms", "go_panic_runtime_hex"]
+    },
+    {
+      "name": "task_run_stdin_deprecation_warning_panics",
+      "argv0": "environment-runner",
+      "args": ["task-run", "--session=session-v0-missing-startup", "--stdin", "--upgrade-claude-code=false"],
       "stdin": "{\"environment\":{\"environment_type\":\"byoc\"}}",
       "normalizers": ["rfc3339_timestamp", "structured_log_read_duration_ms", "go_panic_runtime_hex"]
     },

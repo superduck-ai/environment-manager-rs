@@ -153,9 +153,13 @@ impl ActivityRecorder for RecordingActivityRecorder {
 /// 对应 Go：`noopTestStopper`，安装测试没有真实长任务需要停止。
 struct NoopTestStopper;
 
+#[async_trait]
 impl Stopper for NoopTestStopper {
+    /// 对应同步取消阶段；fixture 没有后台任务，因此保持空操作。
+    fn request_stop(&self) {}
+
     /// 对应 Go：`noopTestStopper.Stop`；空实现是该 fixture 的真实契约。
-    fn stop(&self) {}
+    async fn stop(&self) {}
 }
 
 /// 创建全部 Go 零值字段的 Claude config。

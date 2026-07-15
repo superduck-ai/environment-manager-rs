@@ -18,6 +18,7 @@ use super::{
     OrchestratorEvent, OrchestratorObserver, OrchestratorResult, RawMessage, SessionOutput,
     StdoutSessionOutput, default_orchestrator_logger, log_attributes,
 };
+use crate::internal::util::go_duration_nanoseconds;
 
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_LOOP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -98,10 +99,10 @@ impl Orchestrator {
         self.logger.info(
             "starting poll loop",
             log_attributes([
-                ("poll_timeout_ms", json!(poll_timeout.as_millis())),
+                ("poll_timeout", json!(go_duration_nanoseconds(poll_timeout))),
                 (
-                    "remaining_loop_time_ms",
-                    json!(remaining_loop_time.as_millis()),
+                    "remaining_loop_time",
+                    json!(go_duration_nanoseconds(remaining_loop_time)),
                 ),
             ]),
         );
@@ -119,7 +120,7 @@ impl Orchestrator {
                     self.logger.error(
                         "poll failed",
                         log_attributes([
-                            ("duration_ms", json!(poll_duration.as_millis())),
+                            ("duration", json!(go_duration_nanoseconds(poll_duration))),
                             ("error", json!(error.to_string())),
                         ]),
                     );
@@ -141,7 +142,7 @@ impl Orchestrator {
                         "backing off after poll failure",
                         log_attributes([
                             ("consecutive_failures", json!(*consecutive_failures)),
-                            ("backoff_ms", json!(backoff.as_millis())),
+                            ("backoff", json!(go_duration_nanoseconds(backoff))),
                         ]),
                     );
 
@@ -178,7 +179,7 @@ impl Orchestrator {
 
         self.logger.info(
             "poll timeout reached, queue empty",
-            log_attributes([("poll_timeout_ms", json!(poll_timeout.as_millis()))]),
+            log_attributes([("poll_timeout", json!(go_duration_nanoseconds(poll_timeout)))]),
         );
         Ok(None)
     }
@@ -217,12 +218,12 @@ impl Orchestrator {
             "starting orchestrator",
             log_attributes([
                 (
-                    "poll_timeout_ms",
-                    json!(self.config.poll_timeout.as_millis()),
+                    "poll_timeout",
+                    json!(go_duration_nanoseconds(self.config.poll_timeout)),
                 ),
                 (
-                    "loop_timeout_ms",
-                    json!(self.config.loop_timeout.as_millis()),
+                    "loop_timeout",
+                    json!(go_duration_nanoseconds(self.config.loop_timeout)),
                 ),
                 ("max_poll_failures", json!(self.config.max_poll_failures)),
             ]),

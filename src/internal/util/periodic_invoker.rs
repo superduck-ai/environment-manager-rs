@@ -10,13 +10,14 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::internal::logger::{LogAttributes, Logger};
 
-use super::{BoxError, Stopper};
+use super::{BoxError, Stopper, format_go_duration};
 
 type PeriodicFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send + 'static>>;
 type PeriodicFunction = Arc<dyn Fn() -> PeriodicFuture + Send + Sync + 'static>;
@@ -25,7 +26,7 @@ type PeriodicFunction = Arc<dyn Fn() -> PeriodicFuture + Send + Sync + 'static>;
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum PeriodicInvokerError {
     /// 间隔必须大于零。
-    #[error("interval must be positive, got {}", go_duration(*interval))]
+    #[error("interval must be positive, got {}", format_go_duration(*interval))]
     NonPositiveInterval {
         /// 调用方传入的无效间隔。
         interval: Duration,
@@ -99,7 +100,8 @@ impl PeriodicInvoker {
             return Err(PeriodicInvokerError::AlreadyRunning);
         }
 
-        // 已完成任务的 JoinHandle 可以安全丢弃；未完成的旧任务保留给 stop_and_wait。
+        // 已完成任务的 JoinHandle 可以安全丢弃；正常 Stop 会在返回前取走并汇合
+        // 未完成任务，因此这里通常只清理异常 drop 后留下的已完成句柄。
         state.tasks.retain(|task| !task.is_finished());
 
         let cancellation = CancellationToken::new();
@@ -115,31 +117,52 @@ impl PeriodicInvoker {
         Ok(())
     }
 
-    /// 同步请求停止当前周期任务。
+    /// 同步请求后台周期任务停止，但不等待在途 callback 返回。
     ///
-    /// 该方法只发送 cancellation，不阻塞当前线程；因此可以通过 `dyn Stopper`
-    /// 从 Drop 或同步清理路径安全调用。需要等待退出时使用 [`Self::stop_and_wait`]。
-    pub fn stop(&self) {
+    /// 该入口对应 Go `cancel()` 阶段，供无法 `.await` 的 `Drop` guard 使用。取消后
+    /// 仍保留全部 `JoinHandle`，因此正常控制流稍后调用 [`Self::stop`] 时仍可恢复 Go
+    /// `wg.Wait()` 的完成边界。方法可重复调用，不会重新启动或提前丢弃任务。
+    pub fn request_stop(&self) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(cancellation) = state.cancellation.take() {
+        if let Some(cancellation) = &state.cancellation {
             cancellation.cancel();
         }
         state.running = false;
     }
 
-    /// 请求停止并等待本实例此前启动的所有后台任务完全退出。
-    pub async fn stop_and_wait(&self) {
-        self.stop();
+    /// 对应 Go：`periodic_invoker.go` 中的 `(*PeriodicInvoker).Stop`。
+    ///
+    /// 先把 `running` 置为 false，再发送取消，并等待所有已启动 callback 完整返回。
+    /// 等待使用 async JoinHandle 而不是阻塞 Tokio worker，但返回边界与 Go 的
+    /// `cancel(); wg.Wait()` 相同：调用方继续执行时不会再收到本 invoker 的副作用。
+    pub async fn stop(&self) {
         let tasks = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // 取消、切换状态和取走句柄必须保持在同一个临界区；否则另一个线程可能
+            // 在 request_stop 与第二次加锁之间重新 start，造成新任务未被取消却被等待。
+            if let Some(cancellation) = &state.cancellation {
+                cancellation.cancel();
+            }
+            state.running = false;
+            let _ = state.cancellation.take();
             std::mem::take(&mut state.tasks)
         };
+        Self::wait_for_tasks(tasks).await;
+    }
+
+    /// 兼容迁移期调用点的显式名称；语义与 [`Self::stop`] 完全相同。
+    pub async fn stop_and_wait(&self) {
+        self.stop().await;
+    }
+
+    /// 等待一组后台任务，并把 callback panic 恢复成调用方可见的 panic。
+    async fn wait_for_tasks(tasks: Vec<JoinHandle<()>>) {
         for task in tasks {
             if let Err(error) = task.await {
                 // Go goroutine 中未恢复的 panic 会终止进程。Tokio 默认把 panic 包进
@@ -162,7 +185,7 @@ impl PeriodicInvoker {
     /// 对应 Go：`periodic_invoker.go` 中的 `(*PeriodicInvoker).run`。
     ///
     /// 立即调用一次 callback，随后按固定间隔持续执行；单次错误只记录而不终止。
-    /// `cancellation` 被触发后退出循环，JoinHandle 由 `stop_and_wait` 汇合。
+    /// `cancellation` 被触发后退出循环，JoinHandle 由 `stop` 汇合。
     async fn run(
         logger: Logger,
         function: PeriodicFunction,
@@ -215,24 +238,23 @@ where
     PeriodicInvoker::new(logger, interval, function)
 }
 
+#[async_trait]
 impl Stopper for PeriodicInvoker {
-    /// 通过统一 Stopper 接口同步发送取消信号。
-    fn stop(&self) {
-        PeriodicInvoker::stop(self);
+    /// 通过统一 Stopper 接口同步取消，保留任务句柄供后续异步等待。
+    fn request_stop(&self) {
+        PeriodicInvoker::request_stop(self);
+    }
+
+    /// 通过统一 Stopper 接口取消并等待在途 callback 完成。
+    async fn stop(&self) {
+        PeriodicInvoker::stop(self).await;
     }
 }
 
 impl Drop for PeriodicInvoker {
     /// 最后一个 owner 销毁时保证至少发送取消，避免后台任务永久继续运行。
     fn drop(&mut self) {
-        let state = self
-            .state
-            .get_mut()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(cancellation) = state.cancellation.take() {
-            cancellation.cancel();
-        }
-        state.running = false;
+        self.request_stop();
     }
 }
 
@@ -250,15 +272,4 @@ fn periodic_error_attributes(
     ]
     .into_iter()
     .collect()
-}
-
-/// 把当前可表达的非负 Duration 格式化为 Go `time.Duration.String()` 文本。
-fn go_duration(duration: Duration) -> String {
-    if duration.is_zero() {
-        "0s".to_owned()
-    } else if duration.subsec_nanos() == 0 {
-        format!("{}s", duration.as_secs())
-    } else {
-        format!("{}ns", duration.as_nanos())
-    }
 }

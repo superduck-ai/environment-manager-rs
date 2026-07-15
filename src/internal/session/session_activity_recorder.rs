@@ -235,7 +235,9 @@ impl SessionActivityRecorder {
                 .into_iter()
                 .collect(),
             );
-            timer_invoker.stop();
+            // Go `Stop` 会等待 invoker goroutine 完全退出；定时器任务本身可以异步
+            // 等待，因此这里不能只发送 cancellation 后提前结束。
+            timer_invoker.stop().await;
         });
 
         invoker

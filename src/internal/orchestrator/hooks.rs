@@ -26,6 +26,7 @@ use super::{
 use crate::internal::{
     logger::Logger,
     process::{go_spawn_error, resolve_go_command},
+    util::{format_go_duration, go_duration_nanoseconds},
 };
 
 impl Hook {
@@ -156,12 +157,12 @@ impl Hook {
         outcome: CommandOutcome,
     ) -> OrchestratorResult<()> {
         let output = String::from_utf8_lossy(&outcome.combined_output()).into_owned();
-        let duration = format_duration(outcome.duration);
+        let duration = format_go_duration(outcome.duration);
         if let Some(error) = outcome.error {
             hook_logger.error(
                 "hook execution failed",
                 log_attributes([
-                    ("duration", json!(duration_nanoseconds(outcome.duration))),
+                    ("duration", json!(go_duration_nanoseconds(outcome.duration))),
                     ("output", json!(output)),
                     ("error", json!(error)),
                 ]),
@@ -175,7 +176,7 @@ impl Hook {
         hook_logger.info(
             "hook execution completed",
             log_attributes([
-                ("duration", json!(duration_nanoseconds(outcome.duration))),
+                ("duration", json!(go_duration_nanoseconds(outcome.duration))),
                 ("output", json!(output)),
             ]),
         );
@@ -226,11 +227,6 @@ pub(crate) fn log_sandbox_cleanup_failed(logger: &Logger, error: &str) {
         "sandbox cleanup failed",
         log_attributes([("error", json!(error))]),
     );
-}
-
-/// 把 Tokio `Duration` 转成 Go `slog.Duration` 在 JSON handler 中使用的纳秒整数。
-fn duration_nanoseconds(duration: Duration) -> i64 {
-    duration.as_nanos().min(i64::MAX as u128) as i64
 }
 
 /// 把 Hook 的 Go 零值超时映射为“不设置独立 deadline”。
@@ -582,9 +578,4 @@ fn exit_status_error(status: std::process::ExitStatus) -> String {
         }
     }
     status.to_string()
-}
-
-/// 使用 Rust 的紧凑 Duration 调试格式，得到接近 Go `time.Duration.String()` 的文案。
-pub(crate) fn format_duration(duration: Duration) -> String {
-    format!("{duration:?}")
 }

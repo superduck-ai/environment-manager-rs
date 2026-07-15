@@ -327,7 +327,7 @@ async fn test_record_long_running_activity_posts_progress_and_auto_stops() {
         events[1].data.as_ref().expect("终报日志应包含 data")["content"],
         "Cloning repository (still running after 0 minutes.  This is the last message about this...)"
     );
-    stopper.stop();
+    stopper.stop().await;
 }
 
 /// 验证 noop recorder 的三个入口都不会失败且 stopper 始终有效。
@@ -350,5 +350,5 @@ async fn test_noop_activity_recorder() {
         .await
         .expect("noop recorder 不应返回错误");
     let stopper = recorder.record_long_running_activity(LogCategory::Init, "ignored".to_owned());
-    stopper.stop();
+    stopper.stop().await;
 }

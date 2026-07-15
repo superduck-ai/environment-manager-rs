@@ -12,9 +12,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     OrchestratorError, OrchestratorResult, PollHook, PollHookContext, PollerInterface, RawMessage,
-    format_duration, log_attributes, run_command_capture,
+    log_attributes, run_command_capture,
 };
-use crate::internal::logger::Logger;
+use crate::internal::{
+    logger::Logger,
+    util::{format_go_duration, go_duration_nanoseconds},
+};
 
 /// 对应 Go `NewPollHook`，创建命令型 poller。
 ///
@@ -84,14 +87,14 @@ impl PollHook {
             self.logger.error(
                 "poll hook execution failed",
                 log_attributes([
-                    ("duration_ms", json!(outcome.duration.as_millis())),
+                    ("duration", json!(go_duration_nanoseconds(outcome.duration))),
                     ("stderr", json!(stderr)),
                     ("error", json!(error)),
                 ]),
             );
             return Err(OrchestratorError::message(format!(
                 "poll hook failed after {}: {error} (stderr: {stderr})",
-                format_duration(outcome.duration)
+                format_go_duration(outcome.duration)
             )));
         }
 
@@ -100,7 +103,7 @@ impl PollHook {
         if output.is_empty() || output == "null" {
             self.logger.debug(
                 "poll hook returned empty queue",
-                log_attributes([("duration_ms", json!(outcome.duration.as_millis()))]),
+                log_attributes([("duration", json!(go_duration_nanoseconds(outcome.duration)))]),
             );
             return Ok(None);
         }
@@ -109,7 +112,7 @@ impl PollHook {
             self.logger.error(
                 "poll hook returned invalid JSON",
                 log_attributes([
-                    ("duration_ms", json!(outcome.duration.as_millis())),
+                    ("duration", json!(go_duration_nanoseconds(outcome.duration))),
                     ("output", json!(output)),
                     ("error", json!(error.to_string())),
                 ]),
@@ -121,7 +124,7 @@ impl PollHook {
 
         self.logger.info(
             "poll hook returned work",
-            log_attributes([("duration_ms", json!(outcome.duration.as_millis()))]),
+            log_attributes([("duration", json!(go_duration_nanoseconds(outcome.duration)))]),
         );
         Ok(Some(output.as_bytes().to_vec()))
     }
@@ -141,7 +144,10 @@ impl PollHook {
         let sleep_duration = Duration::from_secs(seconds);
         self.logger.debug(
             "sleeping with jitter after empty queue",
-            log_attributes([("sleep_duration_ms", json!(sleep_duration.as_millis()))]),
+            log_attributes([(
+                "sleep_duration",
+                json!(go_duration_nanoseconds(sleep_duration)),
+            )]),
         );
 
         tokio::select! {

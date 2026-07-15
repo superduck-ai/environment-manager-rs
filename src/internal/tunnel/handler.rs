@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use xxhash_rust::xxh64::Xxh64;
 
 use super::helpers::{canonical_mime_header_key, handler_logger};
-use crate::internal::logger::LogAttributes;
+use crate::internal::{logger::LogAttributes, util::go_duration_nanoseconds};
 
 use super::{
     Handler, Header, HttpTunnelRequest, HttpTunnelResponseChunk, HttpTunnelResponseError,
@@ -1000,11 +1000,10 @@ impl Handler {
         duration: std::time::Duration,
     ) {
         let logger = handler_logger(self);
-        let duration_nanoseconds = i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX);
         let attributes: LogAttributes = [
             ("bytes", Value::from(total_bytes)),
             ("chunks", Value::from(total_chunks)),
-            ("duration", Value::from(duration_nanoseconds)),
+            ("duration", Value::from(go_duration_nanoseconds(duration))),
             ("request_id", Value::String(request.request_id.clone())),
             ("status_code", Value::from(status_code)),
             ("xxhash", Value::from(hash)),

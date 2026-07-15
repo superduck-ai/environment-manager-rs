@@ -233,11 +233,23 @@ pub(crate) fn is_function_slug(value: &str) -> bool {
 
 /// 复刻 Go `url.QueryEscape`（空格写成 `+`）。
 pub(crate) fn query_escape(value: &str) -> String {
-    let encoded = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("value", value)
-        .finish();
-    encoded
-        .strip_prefix("value=")
-        .unwrap_or(&encoded)
-        .to_owned()
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            // Go 的 encodeQueryComponent 只保留 RFC 3986 unreserved 字节；
+            // WHATWG form serializer 会额外保留 `*` 并转义 `~`，不能在这里复用。
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                escaped.push(char::from(byte));
+            }
+            b' ' => escaped.push('+'),
+            _ => {
+                escaped.push('%');
+                escaped.push(char::from(HEX[usize::from(byte >> 4)]));
+                escaped.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+        }
+    }
+    escaped
 }
