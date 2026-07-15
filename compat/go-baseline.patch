@@ -1,0 +1,352 @@
+This patch is captured from Go commit 0706a81d488857f87cf13b68f5c8d2bb54b61834.
+SHA256 of the raw git diff: fa90df15874d704b257f68c16ca0983c24af705e82d980ef3e762d852bae87ca
+
+diff --git a/.gitignore b/.gitignore
+index 9f11b75..6958e9b 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,5 @@
+ .idea/
++
++# 编译产物
++/environment-manager
++/environment-manager_linux_*
+diff --git a/internal/claude/claude_code_executor.go b/internal/claude/claude_code_executor.go
+index 9958a30..9ff0cbe 100644
+--- a/internal/claude/claude_code_executor.go
++++ b/internal/claude/claude_code_executor.go
+@@ -16,6 +16,7 @@ import (
+ 	"log/slog"
+ 	"os"
+ 	"os/exec"
++	"path/filepath"
+ 	"strings"
+ 	"time"
+ 
+@@ -36,10 +37,16 @@ var initScriptOnlyEnvVars = map[string]struct{}{
+ }
+ 
+ const (
+-	claudeCodeLogPath       = "/tmp/claude-code.log"
+-	defaultAPIBaseURL       = "api.anthropic.com"
+-	defaultMCPConfigPath    = "/tmp/mcp-config.json"
+-	sessionIngressTokenPath = "/home/claude/.claude/remote/.session_ingress_token"
++	claudeCodeLogPath = "/tmp/claude-code.log"
++	defaultAPIBaseURL = "api.anthropic.com"
++	// defaultCCRUpstreamProxyTokenPath 是 Claude 内置 upstreamproxy 模块约定的固定路径。
++	// relay 初始化时只从这里读取 SessionIngressAuthToken；不能改用普通环境变量，
++	// 否则 token 会更容易通过进程环境、诊断信息或子进程继承链泄漏。
++	defaultCCRUpstreamProxyTokenPath      = "/run/ccr/session_token"
++	defaultMCPConfigPath                  = "/tmp/mcp-config.json"
++	sessionIngressTokenPath               = "/home/claude/.claude/remote/.session_ingress_token"
++	ccrUpstreamProxyEnabledEnvironmentKey = "CCR_UPSTREAM_PROXY_ENABLED"
++	claudeCodeRemoteEnvironmentKey        = "CLAUDE_CODE_REMOTE"
+ )
+ 
+ // Recovered declarations:
+@@ -69,6 +76,94 @@ func filterInitOnlyFromEnviron(env []string) []string {
+ 	return filtered
+ }
+ 
++func isTruthyEnvironmentValue(value string) bool {
++	// 与 Claude/SuperDuck 的布尔环境变量语义保持一致，兼容部署系统常见写法。
++	switch strings.ToLower(strings.TrimSpace(value)) {
++	case "1", "true", "yes", "on":
++		return true
++	default:
++		return false
++	}
++}
++
++func (e *ClaudeCodeExecutor) effectiveEnvironmentValue(key string) string {
++	// 环境变量有三层来源。越靠近本次任务的配置优先级越高：
++	// 宿主进程环境 < ClaudeConfig < StartupContext。
++	// 这样服务端可以针对单个 session 明确开启或关闭 relay，而不会被镜像默认值覆盖。
++	value := os.Getenv(key)
++	if e.cfg != nil {
++		if configured, ok := e.cfg.Environment[key]; ok {
++			value = configured
++		}
++	}
++	if e.startupContext != nil {
++		if configured, ok := e.startupContext.EnvironmentVariables[key]; ok {
++			value = configured
++		}
++	}
++	return value
++}
++
++func (e *ClaudeCodeExecutor) shouldPrepareCCRUpstreamProxyToken() bool {
++	// token 文件只服务于远程 code-session 的 CCRv2 upstream proxy。
++	// 对本地测试、普通 Claude 调用或未开启代理的任务写入该文件，既没有意义，
++	// 也会无谓地扩大 SessionIngressAuthToken 在磁盘上的暴露时间。
++	return e.startupContext != nil &&
++		e.startupContext.UseCodeSessions &&
++		isTruthyEnvironmentValue(e.effectiveEnvironmentValue(claudeCodeRemoteEnvironmentKey)) &&
++		isTruthyEnvironmentValue(e.effectiveEnvironmentValue(ccrUpstreamProxyEnabledEnvironmentKey))
++}
++
++func writeCCRUpstreamProxyToken(path string, token string) error {
++	if path == "" {
++		return errors.New("CCR upstream proxy token path is empty")
++	}
++	if token == "" {
++		return errors.New("CCR upstream proxy token is empty")
++	}
++
++	// /run/ccr 只允许当前容器用户进入，token 文件本身只允许当前用户读写。
++	// 即使基础镜像预先创建过权限较宽的目录，也主动收紧为 0700。
++	dir := filepath.Dir(path)
++	if err := os.MkdirAll(dir, 0o700); err != nil {
++		return fmt.Errorf("failed to create CCR upstream proxy token directory: %w", err)
++	}
++	if err := os.Chmod(dir, 0o700); err != nil {
++		return fmt.Errorf("failed to secure CCR upstream proxy token directory: %w", err)
++	}
++
++	// 先在同一目录写临时文件，再 rename 到固定路径。rename 在同一文件系统内是
++	// 原子操作，Claude relay 不会观察到半写入 token，也不会读取到上一次任务的残留内容。
++	temporary, err := os.CreateTemp(dir, ".session_token-*")
++	if err != nil {
++		return fmt.Errorf("failed to create temporary CCR upstream proxy token file: %w", err)
++	}
++	temporaryPath := temporary.Name()
++	closed := false
++	defer func() {
++		// 任意失败路径都关闭文件并清除临时文件；成功 rename 后 Remove 是无害的。
++		if !closed {
++			_ = temporary.Close()
++		}
++		_ = os.Remove(temporaryPath)
++	}()
++
++	if err := temporary.Chmod(0o600); err != nil {
++		return fmt.Errorf("failed to secure temporary CCR upstream proxy token file: %w", err)
++	}
++	if _, err := temporary.WriteString(token); err != nil {
++		return fmt.Errorf("failed to write temporary CCR upstream proxy token file: %w", err)
++	}
++	if err := temporary.Close(); err != nil {
++		return fmt.Errorf("failed to close temporary CCR upstream proxy token file: %w", err)
++	}
++	closed = true
++	if err := os.Rename(temporaryPath, path); err != nil {
++		return fmt.Errorf("failed to install CCR upstream proxy token file: %w", err)
++	}
++	return nil
++}
++
+ // Original symbol: claude.NewClaudeCodeExecutor
+ // DWARF signature: claude.NewClaudeCodeExecutor(logger log/slog.Logger *, cfg github.com/anthropics/anthropic/api-go/environment-manager/internal/config.ClaudeConfig *, sessionID string, startupContext github.com/anthropics/anthropic/api-go/environment-manager/internal/config.StartupContext *, authContext github.com/anthropics/anthropic/api-go/environment-manager/internal/auth.AuthContext *, mcpRegistrations []*github.com/anthropics/anthropic/api-go/environment-manager/internal/mcp.MCPServerRegistration, outcomes github.com/anthropics/anthropic/api-go/environment-manager/internal/claude.Outcomes *, activityRecorder github.com/anthropics/anthropic/api-go/environment-manager/internal/session.ActivityRecorder, otelLogHandler log/slog.Handler, leaseManager github.com/anthropics/anthropic/api-go/environment-manager/internal/podmonitor.LeaseManager *, targetVersion string) (github.com/anthropics/anthropic/api-go/environment-manager/internal/claude.ClaudeCodeExecutor *, error)
+ func NewClaudeCodeExecutor(logger *slog.Logger, cfg *config.ClaudeConfig, sessionID string, startupContext *config.StartupContext, authContext *auth.AuthContext, mcpRegistrations []*mcp.MCPServerRegistration, outcomes *Outcomes, activityRecorder session.ActivityRecorder, otelLogHandler slog.Handler, leaseManager *podmonitor.LeaseManager, targetVersion string) (*ClaudeCodeExecutor, error) {
+@@ -261,6 +356,8 @@ func (e *ClaudeCodeExecutor) Execute(ctx context.Context) error {
+ 	}
+ 
+ 	appendEnv("CLAUDE_CODE_SESSION_ID=%s", e.sessionID)
++	// Claude upstreamproxy 会单独检查 REMOTE_SESSION_ID，并用它构造 CONNECT Basic 用户名。
++	// 仅设置 CLAUDE_CODE_SESSION_ID 不足以启用 relay。
+ 	appendEnv("CLAUDE_CODE_REMOTE_SESSION_ID=%s", e.sessionID)
+ 	appendEnv("CLAUDE_CODE_ENVIRONMENT_RUNNER_VERSION=%s", util.Version)
+ 	if diagPath := diag.GetClaudeCodeDiagFilePath(ctx); diagPath != "" {
+@@ -302,6 +399,22 @@ func (e *ClaudeCodeExecutor) Execute(ctx context.Context) error {
+ 				appendEnv("CLAUDE_SESSION_INGRESS_TOKEN_FILE=%s", sessionIngressTokenPath)
+ 				e.logger.InfoContext(ctx, "Wrote session ingress token to file for bash access", "path", sessionIngressTokenPath)
+ 			}
++
++			// WebSocket 的 Bearer token 与 CONNECT 内的 Basic 凭证都源自同一个
++			// SessionIngressAuthToken。这里在启动 Claude 之前准备固定 token 文件；
++			// Claude 成功启动本地 relay 后会主动 unlink，executor 的 defer 再负责异常兜底。
++			if e.shouldPrepareCCRUpstreamProxyToken() {
++				relayTokenPath := defaultCCRUpstreamProxyTokenPath
++				if err := writeCCRUpstreamProxyToken(relayTokenPath, token); err != nil {
++					return fmt.Errorf("failed to prepare CCR upstream proxy token: %w", err)
++				}
++				e.logger.InfoContext(ctx, "Prepared session ingress token for CCR upstream proxy relay", "path", relayTokenPath)
++				defer func() {
++					if err := os.Remove(relayTokenPath); err != nil && !os.IsNotExist(err) {
++						e.logger.WarnContext(ctx, "Failed to remove CCR upstream proxy token file", "error", err, "path", relayTokenPath)
++					}
++				}()
++			}
+ 		}
+ 
+ 		if token := e.authContext.GetAnthropicOAuthToken(); token != "" {
+@@ -623,10 +736,23 @@ func (e *ClaudeCodeExecutor) Destroy(ctx context.Context) error {
+ 		if !os.IsNotExist(err) {
+ 			e.logger.WarnContext(ctx, "Failed to remove session ingress token file", "error", err, "path", sessionIngressTokenPath)
+ 		}
+-		return nil
++	} else {
++		e.logger.InfoContext(ctx, "Removed session ingress token file", "path", sessionIngressTokenPath)
++	}
++
++	if e.shouldPrepareCCRUpstreamProxyToken() {
++		// 正常情况下 Claude 已在 relay 就绪后删除该文件。Destroy 仍做幂等清理，
++		// 覆盖 Claude 初始化失败、被取消或尚未读取 token 就退出等情况。
++		relayTokenPath := defaultCCRUpstreamProxyTokenPath
++		if err := os.Remove(relayTokenPath); err != nil {
++			if !os.IsNotExist(err) {
++				e.logger.WarnContext(ctx, "Failed to remove CCR upstream proxy token file", "error", err, "path", relayTokenPath)
++			}
++		} else {
++			e.logger.InfoContext(ctx, "Removed CCR upstream proxy token file", "path", relayTokenPath)
++		}
+ 	}
+ 
+-	e.logger.InfoContext(ctx, "Removed session ingress token file", "path", sessionIngressTokenPath)
+ 	return nil
+ }
+ 
+diff --git a/internal/claude/claude_code_executor_test.go b/internal/claude/claude_code_executor_test.go
+index e16df0d..ed26a51 100644
+--- a/internal/claude/claude_code_executor_test.go
++++ b/internal/claude/claude_code_executor_test.go
+@@ -78,6 +78,148 @@ func TestAddTokenViaFileDescriptor(t *testing.T) {
+ 	}
+ }
+ 
++func TestWriteCCRUpstreamProxyToken(t *testing.T) {
++	t.Parallel()
++
++	tokenDir := filepath.Join(t.TempDir(), "run", "ccr")
++	tokenPath := filepath.Join(tokenDir, "session_token")
++
++	if err := writeCCRUpstreamProxyToken(tokenPath, "first-token"); err != nil {
++		t.Fatalf("writeCCRUpstreamProxyToken() error = %v", err)
++	}
++	// 模拟上一次运行留下权限过宽的旧文件，验证原子替换会恢复为 0600。
++	if err := os.Chmod(tokenPath, 0o644); err != nil {
++		t.Fatalf("Chmod(%q) error = %v", tokenPath, err)
++	}
++	if err := writeCCRUpstreamProxyToken(tokenPath, "replacement-token"); err != nil {
++		t.Fatalf("writeCCRUpstreamProxyToken() replacement error = %v", err)
++	}
++
++	content, err := os.ReadFile(tokenPath)
++	if err != nil {
++		t.Fatalf("ReadFile(%q) error = %v", tokenPath, err)
++	}
++	if string(content) != "replacement-token" {
++		t.Fatalf("token content = %q, want %q", content, "replacement-token")
++	}
++
++	tokenInfo, err := os.Stat(tokenPath)
++	if err != nil {
++		t.Fatalf("Stat(%q) error = %v", tokenPath, err)
++	}
++	if got := tokenInfo.Mode().Perm(); got != 0o600 {
++		t.Fatalf("token mode = %o, want 600", got)
++	}
++
++	dirInfo, err := os.Stat(tokenDir)
++	if err != nil {
++		t.Fatalf("Stat(%q) error = %v", tokenDir, err)
++	}
++	if got := dirInfo.Mode().Perm(); got != 0o700 {
++		t.Fatalf("token directory mode = %o, want 700", got)
++	}
++
++	// 成功路径也不能遗留包含敏感 token 的临时文件。
++	temporaryFiles, err := filepath.Glob(filepath.Join(tokenDir, ".session_token-*"))
++	if err != nil {
++		t.Fatalf("Glob() error = %v", err)
++	}
++	if len(temporaryFiles) != 0 {
++		t.Fatalf("temporary token files remain: %v", temporaryFiles)
++	}
++}
++
++func TestWriteCCRUpstreamProxyTokenRejectsEmptyInputs(t *testing.T) {
++	t.Parallel()
++
++	for _, test := range []struct {
++		name  string
++		path  string
++		token string
++	}{
++		{name: "empty path", token: "token"},
++		{name: "empty token", path: filepath.Join(t.TempDir(), "session_token")},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			if err := writeCCRUpstreamProxyToken(test.path, test.token); err == nil {
++				t.Fatal("writeCCRUpstreamProxyToken() error = nil, want error")
++			}
++		})
++	}
++}
++
++func TestShouldPrepareCCRUpstreamProxyToken(t *testing.T) {
++	// 清空宿主环境，保证每个 case 只验证显式提供的配置优先级。
++	t.Setenv(claudeCodeRemoteEnvironmentKey, "")
++	t.Setenv(ccrUpstreamProxyEnabledEnvironmentKey, "")
++
++	for _, test := range []struct {
++		name           string
++		cfgEnvironment map[string]string
++		startup        *config.StartupContext
++		want           bool
++	}{
++		{
++			name: "enabled CCR v2 remote session",
++			cfgEnvironment: map[string]string{
++				claudeCodeRemoteEnvironmentKey: "true",
++			},
++			startup: &config.StartupContext{
++				UseCodeSessions: true,
++				EnvironmentVariables: map[string]string{
++					ccrUpstreamProxyEnabledEnvironmentKey: "1",
++				},
++			},
++			want: true,
++		},
++		{
++			name: "not a CCR v2 session",
++			cfgEnvironment: map[string]string{
++				claudeCodeRemoteEnvironmentKey:        "true",
++				ccrUpstreamProxyEnabledEnvironmentKey: "true",
++			},
++			startup: &config.StartupContext{},
++		},
++		{
++			name: "not remote",
++			cfgEnvironment: map[string]string{
++				ccrUpstreamProxyEnabledEnvironmentKey: "true",
++			},
++			startup: &config.StartupContext{UseCodeSessions: true},
++		},
++		{
++			name: "proxy disabled",
++			cfgEnvironment: map[string]string{
++				claudeCodeRemoteEnvironmentKey: "true",
++			},
++			startup: &config.StartupContext{UseCodeSessions: true},
++		},
++		{
++			name: "startup context overrides config",
++			cfgEnvironment: map[string]string{
++				claudeCodeRemoteEnvironmentKey:        "true",
++				ccrUpstreamProxyEnabledEnvironmentKey: "true",
++			},
++			startup: &config.StartupContext{
++				UseCodeSessions: true,
++				EnvironmentVariables: map[string]string{
++					ccrUpstreamProxyEnabledEnvironmentKey: "false",
++				},
++			},
++		},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			executor := &ClaudeCodeExecutor{
++				cfg:            &config.ClaudeConfig{Environment: test.cfgEnvironment},
++				startupContext: test.startup,
++			}
++			if got := executor.shouldPrepareCCRUpstreamProxyToken(); got != test.want {
++				t.Fatalf("shouldPrepareCCRUpstreamProxyToken() = %t, want %t", got, test.want)
++			}
++		})
++	}
++}
++
+ func TestBuildArgsFromGatewayConfigMergesAppendSystemPrompt(t *testing.T) {
+ 	t.Parallel()
+ 

@@ -1,0 +1,362 @@
+//! `internal/auth` 的行为回归测试，机械对应 Go 的 `auth_test.go`。
+//!
+//! 测试函数保持 Go 名称的 snake_case 映射，使兼容清单能够逐场景核对；Go 版本
+//! 的 logger 由生产入口保留；多数领域测试使用无日志入口隔离数据断言，日志顺序
+//! 则由 input 生产链路的记录型 handler 单独覆盖。
+
+use std::sync::Arc;
+
+use crate::internal::logger::{
+    LogAttributes, LogHandler, LogHandlerError, LogLevel, LogRecord, Logger,
+};
+
+use super::*;
+
+/// 对应 Go：`authConfigJSON`。
+///
+/// 将测试认证配置编码成生产解析器实际接收的 JSON 字节，避免 fixture 手写 JSON 时
+/// 绕过 `type` 字段 rename 或意外改变序列化行为。
+fn auth_config_json(configurations: &[AuthConfig]) -> Vec<u8> {
+    serde_json::to_vec(configurations).expect("测试认证配置必须能够序列化")
+}
+
+/// 对应 Go：`authTestLogger`。
+///
+/// 丢弃测试日志但保留完整 Logger facade 调用路径的 handler。
+struct DiscardHandler;
+
+impl LogHandler for DiscardHandler {
+    fn enabled(&self, _level: LogLevel) -> bool {
+        false
+    }
+
+    fn handle(&self, _record: &LogRecord) -> Result<(), LogHandlerError> {
+        Ok(())
+    }
+
+    fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
+        Arc::new(Self)
+    }
+
+    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
+        Arc::new(Self)
+    }
+}
+
+/// 返回丢弃事件的 logger，保留 Go 测试辅助函数的符号映射。
+fn auth_test_logger() -> Logger {
+    Logger::new(Arc::new(DiscardHandler))
+}
+
+/// 对应 Go：`TestNewAuthContextWithSessionIDParsesAllRecoveredProviders`。
+///
+/// 验证全部恢复的 provider、getter，以及 session 与 ingress token 的覆盖 setter。
+#[test]
+fn test_new_auth_context_with_session_id_parses_all_recovered_providers() {
+    let _logger = auth_test_logger();
+    let auth_json = auth_config_json(&[
+        AuthConfig {
+            auth_type: "session_ingress".into(),
+            token: "session-ingress-token".into(),
+        },
+        AuthConfig {
+            auth_type: "anthropic_api".into(),
+            token: "anthropic-api-token".into(),
+        },
+        AuthConfig {
+            auth_type: "anthropic_oauth".into(),
+            token: "anthropic-oauth-token".into(),
+        },
+        AuthConfig {
+            auth_type: "vercel_deploy".into(),
+            token: "vercel-token".into(),
+        },
+        AuthConfig {
+            auth_type: "antspace_deploy".into(),
+            token: r#"{"url":"https://control.example.test","auth_token":"antspace-token"}"#
+                .into(),
+        },
+        AuthConfig {
+            auth_type: "supabase".into(),
+            token: r#"{"project_ref":"project-ref","anon_key":"anon-key","db_pass":"db-pass","pat":"supabase-pat"}"#
+                .into(),
+        },
+    ]);
+
+    let mut context = new_auth_context_with_session_id(&auth_json, "session-123")
+        .expect("全部已恢复 provider 应当解析成功");
+    assert_eq!(context.get_session_id(), "session-123");
+    assert_eq!(context.get_session_ingress_token(), "session-ingress-token");
+    assert_eq!(context.get_anthropic_api_token(), "anthropic-api-token");
+    assert_eq!(context.get_anthropic_oauth_token(), "anthropic-oauth-token");
+    assert_eq!(context.get_vercel_deploy_token(), "vercel-token");
+    assert_eq!(
+        context.get_antspace_control_plane_url(),
+        "https://control.example.test"
+    );
+    assert_eq!(context.get_antspace_auth_token(), "antspace-token");
+    assert_eq!(context.get_supabase_project_ref(), "project-ref");
+    assert_eq!(context.get_supabase_anon_key(), "anon-key");
+    assert_eq!(context.get_supabase_db_pass(), "db-pass");
+    assert_eq!(context.get_supabase_pat(), "supabase-pat");
+    assert!(context.has_supabase());
+
+    context.set_session_id("session-456");
+    context.set_session_ingress_token("new-ingress-token");
+    assert_eq!(context.get_session_id(), "session-456");
+    assert_eq!(context.get_session_ingress_token(), "new-ingress-token");
+}
+
+/// 对应 Go：`TestNewAuthContextWithSessionIDHandlesEmptyAuth`。
+///
+/// 验证 nil/空 auth wire 值只保留 session ID，不凭空产生任何 provider 凭据。
+#[test]
+fn test_new_auth_context_with_session_id_handles_empty_auth() {
+    let _logger = auth_test_logger();
+    let context = new_auth_context_with_session_id(&[], "session-123").expect("空 auth 必须被接受");
+    assert_eq!(context.get_session_id(), "session-123");
+    assert!(context.get_session_ingress_token().is_empty());
+    assert!(context.get_anthropic_api_token().is_empty());
+    assert!(!context.has_supabase());
+}
+
+/// 补充 Go `encoding/json` 的零值边界：顶层 null、嵌套 null 和缺失凭据字段。
+#[test]
+fn auth_null_and_missing_nested_fields_keep_go_zero_values() {
+    let top_level_null = new_auth_context_with_session_id(b"null", "session-null")
+        .expect("顶层 null 等同 nil slice");
+    assert_eq!(top_level_null.get_session_id(), "session-null");
+    assert!(top_level_null.get_session_ingress_token().is_empty());
+
+    let missing_fields = br#"[
+        {"type":"antspace_deploy","token":"{}"},
+        {"type":"supabase","token":"{\"project_ref\":null}"}
+    ]"#;
+    let context = new_auth_context_with_session_id(missing_fields, "session")
+        .expect("Go struct 对缺失/null string 字段使用空零值");
+    assert!(context.get_antspace_control_plane_url().is_empty());
+    assert!(context.get_antspace_auth_token().is_empty());
+    assert!(context.get_supabase_project_ref().is_empty());
+    assert!(context.get_supabase_anon_key().is_empty());
+    assert!(!context.has_supabase());
+
+    let nested_null = br#"[{"type":"antspace_deploy","token":"null"}]"#;
+    let context = new_auth_context_with_session_id(nested_null, "session")
+        .expect("token 字符串中的 JSON null 解为嵌套凭据零值");
+    assert!(context.get_antspace_control_plane_url().is_empty());
+
+    let null_element = new_auth_context_with_session_id(b"[null]", "session")
+        .expect_err("Go 把 null 元素解为 AuthConfig 零值后报告未知 provider");
+    assert_eq!(null_element.to_string(), "unknown auth provider type: ");
+}
+
+/// 对应 Go：`TestNewAuthContextWithSessionIDReportsErrors`。
+///
+/// 对非法顶层 JSON、每种 provider 的空 token、嵌套凭据 JSON 和未知 provider
+/// 逐项校验兼容错误文本，防止错误归类顺序在迁移中变化。
+#[test]
+fn test_new_auth_context_with_session_id_reports_errors() {
+    let _logger = auth_test_logger();
+    let invalid =
+        new_auth_context_with_session_id(b"{bad json", "session").expect_err("非法 JSON 必须失败");
+    assert!(
+        invalid
+            .to_string()
+            .contains("failed to parse auth configuration")
+    );
+
+    let cases = [
+        (
+            AuthConfig {
+                auth_type: "session_ingress".into(),
+                token: String::new(),
+            },
+            "session_ingress auth configuration missing required 'token' field",
+        ),
+        (
+            AuthConfig {
+                auth_type: "anthropic_api".into(),
+                token: String::new(),
+            },
+            "anthropic_api auth configuration missing required 'token' field",
+        ),
+        (
+            AuthConfig {
+                auth_type: "anthropic_oauth".into(),
+                token: String::new(),
+            },
+            "anthropic_oauth auth configuration missing required 'token' field",
+        ),
+        (
+            AuthConfig {
+                auth_type: "vercel_deploy".into(),
+                token: String::new(),
+            },
+            "vercel_deploy auth configuration missing required 'token' field",
+        ),
+        (
+            AuthConfig {
+                auth_type: "antspace_deploy".into(),
+                token: String::new(),
+            },
+            "antspace_deploy auth configuration missing required 'token' field",
+        ),
+        (
+            AuthConfig {
+                auth_type: "antspace_deploy".into(),
+                token: "not-json".into(),
+            },
+            "failed to parse antspace deploy credentials",
+        ),
+        (
+            AuthConfig {
+                auth_type: "supabase".into(),
+                token: String::new(),
+            },
+            "supabase auth configuration missing required 'token' field",
+        ),
+        (
+            AuthConfig {
+                auth_type: "supabase".into(),
+                token: "not-json".into(),
+            },
+            "failed to parse supabase credentials",
+        ),
+        (
+            AuthConfig {
+                auth_type: "unknown".into(),
+                token: "token".into(),
+            },
+            "unknown auth provider type: unknown",
+        ),
+    ];
+
+    for (configuration, expected) in cases {
+        let error =
+            new_auth_context_with_session_id(&auth_config_json(&[configuration]), "session")
+                .expect_err("错误 fixture 必须被拒绝");
+        assert!(
+            error.to_string().contains(expected),
+            "错误 {error:?} 应包含 {expected:?}"
+        );
+    }
+}
+
+/// 对应 Go：`TestGitHubSourceAuthProviderAuthenticatesHTTPSURLs`。
+///
+/// 验证普通 token 与 username/password token 都只注入 HTTPS URL，且路径、host
+/// 与 scheme 不发生变化。
+#[test]
+fn test_git_hub_source_auth_provider_authenticates_https_urls() {
+    let logger = auth_test_logger();
+    let context = AuthContext::default();
+    let permission = Permission::from("read");
+
+    let provider = new_github_source_auth_provider(logger.clone(), "ghp-secret");
+    assert_eq!(provider.auth_type(), GitHubAuthType::Token);
+    let (authenticated, ok) = provider.authenticate_url(
+        &context,
+        "https://github.com/anthropic/demo.git",
+        &permission,
+    );
+    assert!(ok);
+    let parsed = url::Url::parse(&authenticated).expect("认证 URL 应可解析");
+    assert_eq!(parsed.username(), "ghp-secret");
+    assert_eq!(parsed.scheme(), "https");
+    assert_eq!(parsed.host_str(), Some("github.com"));
+    assert_eq!(parsed.path(), "/anthropic/demo.git");
+
+    let colon_provider = new_github_source_auth_provider(logger, "x-access-token:secret");
+    let (authenticated, ok) = colon_provider.authenticate_url(
+        &context,
+        "https://github.com/anthropic/demo.git",
+        &permission,
+    );
+    assert!(ok);
+    let parsed = url::Url::parse(&authenticated).expect("用户名/密码 URL 应可解析");
+    assert_eq!(parsed.username(), "x-access-token");
+    assert_eq!(parsed.password(), Some("secret"));
+
+    let (without_path, ok) = provider.authenticate_url(
+        &context,
+        "https://github.com?tab=repositories#top",
+        &permission,
+    );
+    assert!(ok);
+    assert_eq!(
+        without_path,
+        "https://ghp-secret@github.com?tab=repositories#top"
+    );
+
+    let (explicit_root, ok) =
+        provider.authenticate_url(&context, "https://github.com/", &permission);
+    assert!(ok);
+    assert_eq!(explicit_root, "https://ghp-secret@github.com/");
+}
+
+/// 对应 Go：`TestGitHubSourceAuthProviderHandlesProxyJWTAndUnsupportedURLs`。
+///
+/// 验证 git proxy JWT 的固定用户名，以及 SSH、HTTP、非法 URL 和空 token 均
+/// 原样返回并报告未认证。
+#[test]
+fn test_git_hub_source_auth_provider_handles_proxy_jwt_and_unsupported_urls() {
+    let logger = auth_test_logger();
+    let context = AuthContext::default();
+    let permission = Permission::from("read");
+    let provider = new_github_source_auth_provider(logger.clone(), "sk-ant-ccsr-jwt");
+    assert_eq!(provider.auth_type(), GitHubAuthType::GitProxyJwt);
+
+    let (authenticated, ok) = provider.authenticate_url(
+        &context,
+        "https://github.com/anthropic/demo.git",
+        &permission,
+    );
+    assert!(ok);
+    let parsed = url::Url::parse(&authenticated).expect("proxy URL 应可解析");
+    assert_eq!(parsed.username(), "unused");
+    assert_eq!(parsed.password(), Some("sk-ant-ccsr-jwt"));
+
+    for source in [
+        "git@github.com:anthropic/demo.git",
+        "ssh://git@github.com/anthropic/demo.git",
+        "http://github.com/anthropic/demo.git",
+        "https://%",
+    ] {
+        assert_eq!(
+            provider.authenticate_url(&context, source, &permission),
+            (source.to_owned(), false)
+        );
+    }
+
+    let empty_provider = new_github_source_auth_provider(logger, "");
+    let public = "https://github.com/anthropic/demo.git";
+    assert_eq!(
+        empty_provider.authenticate_url(&context, public, &permission),
+        (public.to_owned(), false)
+    );
+}
+
+/// 对应 Go：`TestGitHubSourceAuthProviderSanitizesOutput`。
+///
+/// 验证认证 URL、proxy userinfo 与裸 token 都不会从 git 子进程输出中泄漏，同时
+/// 保留公开仓库 URL 以便诊断。
+#[test]
+fn test_git_hub_source_auth_provider_sanitizes_output() {
+    let provider = new_github_source_auth_provider(auth_test_logger(), "sk-ant-ccsr-secret");
+    let public = "https://github.com/anthropic/demo.git";
+    let authenticated = "https://unused:sk-ant-ccsr-secret@github.com/anthropic/demo.git";
+    let output = format!(
+        "fatal: could not read from {authenticated} using unused:sk-ant-ccsr-secret and sk-ant-ccsr-secret"
+    );
+    let sanitized = provider.sanitize_output(&output, public, authenticated);
+
+    for secret in [
+        authenticated,
+        "unused:sk-ant-ccsr-secret",
+        "sk-ant-ccsr-secret",
+    ] {
+        assert!(!sanitized.contains(secret), "输出泄漏了 {secret:?}");
+    }
+    assert!(sanitized.contains(public));
+    assert!(sanitized.contains("unused:***"));
+}

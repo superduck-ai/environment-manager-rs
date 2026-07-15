@@ -1,0 +1,58 @@
+The setup command pre-installs all required dependencies for orchestrator mode.
+
+This command is intended to be run during container image build to ensure that
+all dependencies are available when the worker starts. It installs:
+
+  - Claude Code (@anthropic-ai/claude-code) via npm
+  - Sandbox Runtime (@anthropic-ai/sandbox-runtime) via npm
+
+Running setup does NOT disable auto-updates. The orchestrator and task-run
+commands still check for updates on each session. The benefit of running setup
+is faster first session startup since dependencies are pre-installed.
+
+Prerequisites:
+  - npm must be available in PATH (comes with Node.js)
+  - Node.js must be installed (for running the installed packages)
+
+Optionally, provide an environment service key to verify API connectivity:
+  --service-key-file /path/to/key    Verify environment can reach the API
+
+The healthcheck calls /v1/environments/whoami to validate the service key
+and confirm network connectivity. Recommended for manual testing.
+
+Note: Language runtimes (Node.js, Python, Go) must be pre-installed in the
+container image. The environment manager only creates symlinks to these during
+session initialization.
+
+Usage:
+  environment-runner setup [flags]
+
+Examples:
+  # Basic usage - install everything with defaults (no healthcheck)
+  environment-runner setup
+
+  # Specify versions
+  environment-runner setup --claude-code-version 2.0.20 --sandbox-runtime-version 1.2.3
+
+  # Skip certain installations
+  environment-runner setup --skip-sandbox-runtime
+
+  # Setup with healthcheck - for manual testing
+  environment-runner setup --service-key-file /path/to/key
+
+  # Setup with healthcheck via env var
+  export ENVIRONMENT_SERVICE_KEY="sk-ant-..."
+  environment-runner setup
+
+  # Verbose output
+  environment-runner setup --log-level debug
+
+Flags:
+      --api-url string                   API base URL for connectivity healthcheck (default "https://api.anthropic.com")
+      --claude-code-version string       Version of Claude Code to install (latest, stable, or specific version like 2.0.20) (default "latest")
+  -h, --help                             help for setup
+      --log-level string                 Log level (debug, info, warn, error) (default "info")
+      --sandbox-runtime-version string   Version of sandbox-runtime to install (latest or specific version) (default "latest")
+      --service-key-file string          Path to environment service key file for API healthcheck. Falls back to ENVIRONMENT_SERVICE_KEY env var if not set. When provided, verifies connectivity by calling /v1/environments/whoami
+      --skip-claude-code                 Skip Claude Code installation
+      --skip-sandbox-runtime             Skip sandbox-runtime installation

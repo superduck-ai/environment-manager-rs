@@ -1,0 +1,264 @@
+//! 可启动、停止并可重复启动的周期异步任务。
+//!
+//! Go 实现会立即调用一次函数，随后按固定间隔调用。这里保持该时序，
+//! 并用 `CancellationToken` 和受控 `JoinHandle` 保证停止后没有遗留任务。
+
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use thiserror::Error;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::internal::logger::{LogAttributes, Logger};
+
+use super::{BoxError, Stopper};
+
+type PeriodicFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send + 'static>>;
+type PeriodicFunction = Arc<dyn Fn() -> PeriodicFuture + Send + Sync + 'static>;
+
+/// 周期调用器的状态错误。
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum PeriodicInvokerError {
+    /// 间隔必须大于零。
+    #[error("interval must be positive, got {}", go_duration(*interval))]
+    NonPositiveInterval {
+        /// 调用方传入的无效间隔。
+        interval: Duration,
+    },
+    /// 同一个实例不能同时运行两份任务。
+    #[error("periodic invoker already running")]
+    AlreadyRunning,
+    /// `start` 必须在 Tokio runtime 上下文中调用。
+    #[error("periodic invoker requires an active Tokio runtime")]
+    NoRuntime,
+}
+
+#[derive(Default)]
+struct InvokerState {
+    running: bool,
+    cancellation: Option<CancellationToken>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+/// 管理单个周期函数生命周期的异步组件。
+pub struct PeriodicInvoker {
+    logger: Logger,
+    interval: Duration,
+    function: PeriodicFunction,
+    state: Mutex<InvokerState>,
+}
+
+impl PeriodicInvoker {
+    /// 创建周期调用器。
+    ///
+    /// 与 Go 构造函数的 panic 不同，配置错误通过 `Result` 返回，避免配置输入
+    /// 导致整个服务崩溃。函数使用 async future，网络调用无需阻塞 Tokio worker。
+    pub fn new<F, Fut, E>(
+        logger: Logger,
+        interval: Duration,
+        function: F,
+    ) -> Result<Self, PeriodicInvokerError>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), E>> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        if interval.is_zero() {
+            return Err(PeriodicInvokerError::NonPositiveInterval { interval });
+        }
+        let function = Arc::new(move || {
+            let future = function();
+            Box::pin(async move { future.await.map_err(|error| Box::new(error) as BoxError) })
+                as PeriodicFuture
+        });
+        Ok(Self {
+            logger,
+            interval,
+            function,
+            state: Mutex::new(InvokerState::default()),
+        })
+    }
+
+    /// 启动后台任务，并保证函数在等待第一个间隔前先执行一次。
+    ///
+    /// 该方法同步返回，便于与 Go `Start` 以及 session 初始化路径直接对应；
+    /// 它只负责 spawn，实际 callback 始终在 Tokio worker 上异步执行。
+    pub fn start(&self) -> Result<(), PeriodicInvokerError> {
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| PeriodicInvokerError::NoRuntime)?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.running {
+            return Err(PeriodicInvokerError::AlreadyRunning);
+        }
+
+        // 已完成任务的 JoinHandle 可以安全丢弃；未完成的旧任务保留给 stop_and_wait。
+        state.tasks.retain(|task| !task.is_finished());
+
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let logger = self.logger.clone();
+        let function = Arc::clone(&self.function);
+        let interval = self.interval;
+        let task = runtime.spawn(Self::run(logger, function, interval, task_cancellation));
+
+        state.running = true;
+        state.cancellation = Some(cancellation);
+        state.tasks.push(task);
+        Ok(())
+    }
+
+    /// 同步请求停止当前周期任务。
+    ///
+    /// 该方法只发送 cancellation，不阻塞当前线程；因此可以通过 `dyn Stopper`
+    /// 从 Drop 或同步清理路径安全调用。需要等待退出时使用 [`Self::stop_and_wait`]。
+    pub fn stop(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cancellation) = state.cancellation.take() {
+            cancellation.cancel();
+        }
+        state.running = false;
+    }
+
+    /// 请求停止并等待本实例此前启动的所有后台任务完全退出。
+    pub async fn stop_and_wait(&self) {
+        self.stop();
+        let tasks = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut state.tasks)
+        };
+        for task in tasks {
+            if let Err(error) = task.await {
+                // Go goroutine 中未恢复的 panic 会终止进程。Tokio 默认把 panic 包进
+                // JoinError；这里重新抛出，不能静默降级为一条 Rust-only warning。
+                if error.is_panic() {
+                    std::panic::resume_unwind(error.into_panic());
+                }
+            }
+        }
+    }
+
+    /// 查询当前是否已经启动且尚未停止。
+    pub fn is_running(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .running
+    }
+
+    /// 对应 Go：`periodic_invoker.go` 中的 `(*PeriodicInvoker).run`。
+    ///
+    /// 立即调用一次 callback，随后按固定间隔持续执行；单次错误只记录而不终止。
+    /// `cancellation` 被触发后退出循环，JoinHandle 由 `stop_and_wait` 汇合。
+    async fn run(
+        logger: Logger,
+        function: PeriodicFunction,
+        interval: Duration,
+        cancellation: CancellationToken,
+    ) {
+        if let Err(error) = function().await {
+            logger.error(
+                "periodic function failed",
+                periodic_error_attributes(error.as_ref(), interval),
+            );
+        }
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `interval` 的第一次 tick 立即就绪；先消费它，避免和上面的立即调用重复。
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => break,
+                _ = ticker.tick() => {
+                    if let Err(error) = function().await {
+                        // 这里不能与首次调用合并成同一个 logger helper：Go 的两个
+                        // slog 调用点具有不同 source 行号，差分门禁需要独立 caller。
+                        logger.error(
+                            "periodic function failed",
+                            periodic_error_attributes(error.as_ref(), interval),
+                        );
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// 对应 Go：`periodic_invoker.go` 中的 `NewPeriodicInvoker`。
+///
+/// 这是保持机械符号名称的自由函数入口；Rust 无法表达 nil logger/函数，间隔配置
+/// 错误仍由 [`PeriodicInvoker::new`] 的类型化结果返回。
+pub fn new_periodic_invoker<F, Fut, E>(
+    logger: Logger,
+    interval: Duration,
+    function: F,
+) -> Result<PeriodicInvoker, PeriodicInvokerError>
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), E>> + Send + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    PeriodicInvoker::new(logger, interval, function)
+}
+
+impl Stopper for PeriodicInvoker {
+    /// 通过统一 Stopper 接口同步发送取消信号。
+    fn stop(&self) {
+        PeriodicInvoker::stop(self);
+    }
+}
+
+impl Drop for PeriodicInvoker {
+    /// 最后一个 owner 销毁时保证至少发送取消，避免后台任务永久继续运行。
+    fn drop(&mut self) {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cancellation) = state.cancellation.take() {
+            cancellation.cancel();
+        }
+        state.running = false;
+    }
+}
+
+/// 构造 Go 周期错误日志的有序属性，并把 Duration 编码为纳秒整数。
+fn periodic_error_attributes(
+    error: &(dyn std::error::Error + Send + Sync),
+    interval: Duration,
+) -> LogAttributes {
+    [
+        ("error".to_owned(), serde_json::json!(error.to_string())),
+        (
+            "interval".to_owned(),
+            serde_json::json!(i64::try_from(interval.as_nanos()).unwrap_or(i64::MAX)),
+        ),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// 把当前可表达的非负 Duration 格式化为 Go `time.Duration.String()` 文本。
+fn go_duration(duration: Duration) -> String {
+    if duration.is_zero() {
+        "0s".to_owned()
+    } else if duration.subsec_nanos() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ns", duration.as_nanos())
+    }
+}

@@ -1,0 +1,200 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "go_head": "0706a81d488857f87cf13b68f5c8d2bb54b61834",
+    "go_worktree_diff_sha256": "fa90df15874d704b257f68c16ca0983c24af705e82d980ef3e762d852bae87ca",
+    "go_version": "1.25.7",
+    "binary_version": "0.1.0"
+  },
+  "cases": [
+    {
+      "name": "root_no_args",
+      "argv0": "environment-runner",
+      "args": [],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "root_help",
+      "argv0": "environment-runner",
+      "args": ["--help"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "root_version",
+      "argv0": "environment-runner",
+      "args": ["--version"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "root_short_version",
+      "argv0": "environment-runner",
+      "args": ["-v"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "unknown_command",
+      "argv0": "environment-runner",
+      "args": ["definitely-unknown"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "unknown_root_flag",
+      "argv0": "environment-runner",
+      "args": ["--definitely-unknown"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_help",
+      "argv0": "environment-runner",
+      "args": ["completion", "--help"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_without_shell",
+      "argv0": "environment-runner",
+      "args": ["completion"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_zsh_help",
+      "argv0": "environment-runner",
+      "args": ["completion", "zsh", "--help"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "completion_zsh_script",
+      "argv0": "environment-runner",
+      "args": ["completion", "zsh", "--no-descriptions"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "orchestrator_help",
+      "argv0": "environment-runner",
+      "args": ["orchestrator", "--help"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "task_run_help",
+      "argv0": "environment-runner",
+      "args": ["task-run", "--help"],
+      "stdin": "",
+      "normalizers": ["temporary_directory"]
+    },
+    {
+      "name": "poll_help",
+      "argv0": "environment-runner",
+      "args": ["poll", "--help"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "setup_help",
+      "argv0": "environment-runner",
+      "args": ["setup", "--help"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "print_sandbox_settings_help",
+      "argv0": "environment-runner",
+      "args": ["print-sandbox-settings", "--help"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "print_sandbox_settings",
+      "argv0": "environment-runner",
+      "args": ["print-sandbox-settings"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "print_sandbox_settings_ignores_positionals",
+      "argv0": "environment-runner",
+      "args": ["print-sandbox-settings", "ignored-by-go"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "task_run_missing_session",
+      "argv0": "environment-runner",
+      "args": ["task-run"],
+      "stdin": "",
+      "normalizers": ["temporary_directory"]
+    },
+    {
+      "name": "task_run_conflicting_version_flags",
+      "argv0": "environment-runner",
+      "args": ["task-run", "--session", "session-differential", "--upgrade-claude-code=false", "--claude-agent-version=current"],
+      "stdin": "",
+      "normalizers": ["temporary_directory"]
+    },
+    {
+      "name": "task_run_v0_missing_startup_context_panic",
+      "argv0": "environment-runner",
+      "args": ["task-run", "--session", "session-v0-missing-startup", "--upgrade-claude-code=false"],
+      "stdin": "{\"environment\":{\"environment_type\":\"byoc\"}}",
+      "normalizers": ["rfc3339_timestamp", "structured_log_read_duration_ms", "go_panic_runtime_hex"]
+    },
+    {
+      "name": "orchestrator_invalid_duration",
+      "argv0": "environment-runner",
+      "args": ["orchestrator", "--poll-timeout", "not-a-duration"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "poll_invalid_integer",
+      "argv0": "environment-runner",
+      "args": ["poll", "--reclaim-older-than-ms", "not-an-integer"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "poll_missing_service_key",
+      "argv0": "environment-runner",
+      "args": ["poll"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "setup_invalid_log_level",
+      "argv0": "environment-runner",
+      "args": ["setup", "--log-level", "trace"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "code_sign_hidden_command_unsupported",
+      "argv0": "environment-runner",
+      "args": ["code-sign"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "code_sign_argv0_unsupported",
+      "argv0": "code-sign",
+      "args": [],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "code_sign_argv0_missing_file",
+      "argv0": "code-sign",
+      "args": ["-Y", "sign"],
+      "stdin": "",
+      "normalizers": []
+    }
+  ]
+}

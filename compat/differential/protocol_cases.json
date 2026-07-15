@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "go_head": "0706a81d488857f87cf13b68f5c8d2bb54b61834",
+    "go_worktree_diff_sha256": "fa90df15874d704b257f68c16ca0983c24af705e82d980ef3e762d852bae87ca",
+    "go_version": "1.25.7",
+    "rust_version": "1.97.0",
+    "target": "aarch64-unknown-linux-gnu"
+  },
+  "normalizers": [
+    {
+      "protocol": "input",
+      "path": "$.cases[*].logs[*].attributes[name=parse_duration_ms].value",
+      "kind": "nonnegative_integer"
+    }
+  ],
+  "protocols": {
+    "http_api": {
+      "request_targets": [
+        "/ok?mode=success",
+        "/not-implemented",
+        "/failure",
+        "/v1/environments/./work/../ack"
+      ],
+      "outcome_names": [
+        "success",
+        "not_implemented",
+        "non_ok",
+        "work_ack_dot_segments",
+        "cancelled_no_retry",
+        "connection_refused"
+      ]
+    },
+    "input": {
+      "case_names": [
+        "v0_full",
+        "v0_null_optional",
+        "v0_missing_auth_invalid_mcp_base64",
+        "v0_invalid_environment",
+        "v0_missing_startup_context",
+        "v0_null_startup_context",
+        "v1_code_session_full",
+        "v1_healthcheck_null_optional",
+        "v1_session_context_full",
+        "v1_session_context_missing",
+        "v1_session_context_null",
+        "v1_invalid_base64"
+      ]
+    },
+    "mcp": {
+      "case_names": [
+        "unauthorized",
+        "initialize",
+        "initialized_notification",
+        "tools_list",
+        "tools_call",
+        "tool_not_found",
+        "method_not_found",
+        "parse_error"
+      ]
+    },
+    "process_edge": {
+      "case_names": [
+        "lookpath_missing",
+        "lookpath_non_executable",
+        "lookpath_errdot",
+        "lookpath_errdot_last_zero",
+        "lookpath_errdot_last_one",
+        "lookpath_non_utf8_directory",
+        "lookpath_non_utf8_name",
+        "run_non_utf8_enoent",
+        "run_non_utf8_eacces",
+        "run_pre_cancel_non_utf8_enoent",
+        "run_pre_cancel_missing_basename",
+        "combined_raw_bytes",
+        "reader_first_reap",
+        "combined_output_reap",
+        "cancel_reader_first",
+        "cancel_combined_output",
+        "extra_files_fd3"
+      ]
+    },
+    "tunnel_protojson": {
+      "case_names": [
+        "http_request",
+        "http_cancel",
+        "ws_open",
+        "ws_binary_message",
+        "ws_text_message_default_bool",
+        "ws_close",
+        "http_response_headers",
+        "http_response_chunk",
+        "ws_response_error"
+      ]
+    },
+    "tunnel_http_runtime": {
+      "case_names": [
+        "stream_flush_and_request",
+        "custom_reason_phrase",
+        "empty_reason_phrase",
+        "invalid_method",
+        "invalid_header",
+        "fragment_header_error",
+        "connection_refused",
+        "fragment_connection_refused",
+        "raw_query_printable_bytes",
+        "slow_connect_outside_header_timeout",
+        "response_before_slow_body_complete",
+        "slow_response_header_timeout",
+        "multi_member_auto_gzip",
+        "invalid_auto_gzip",
+        "truncated_auto_gzip",
+        "partial_truncated_auto_gzip",
+        "checksum_auto_gzip",
+        "early_eof_response",
+        "malformed_status_response",
+        "invalid_header_response",
+        "conflicting_content_length",
+        "malformed_chunk",
+        "connection_reset_before_headers",
+        "cancel"
+      ]
+    },
+    "tunnel_ws_runtime": {
+      "case_names": [
+        "success_frames_and_close",
+        "bad_handshake",
+        "abnormal_eof"
+      ]
+    }
+  }
+}

@@ -1,0 +1,1012 @@
+//! Go `lease_manager.go` 对应的异步租约实现。
+//!
+//! 协议层保持原有 heartbeat CAS、stop body、状态码分类和健康文件格式；并发层则用
+//! 单调时钟计算本地卡死阈值，用绝对 UTC 时间计算服务端租约，用 `Notify` 代替可重置
+//! timer。三个循环全部登记到 `TaskTracker`，因此退出顺序可被明确等待和测试。
+
+use std::error::Error;
+use std::ffi::OsString;
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant};
+
+use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
+use futures_util::FutureExt;
+use reqwest::header::CONTENT_TYPE;
+use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
+use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
+use url::Url;
+
+use crate::internal::api::HttpClient;
+use crate::internal::logger::{LogAttributes, LogLevel, Logger, default_slog_logger};
+use crate::internal::util::{RetryConfig, RetryError, Stopper, retry_operation};
+
+use super::zz_recovered_types::{
+    DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD, DEFAULT_SHUTDOWN_GRACE_PERIOD, HealthFileError,
+    HeartbeatError, HeartbeatResponse, LeaseInfo, LeaseManager, LeaseManagerError,
+    LeaseManagerInner, LeaseState, Lifecycle, NO_SERVER_HEARTBEAT, SHUTDOWN_GRACE_PERIOD_BUFFER,
+    StopApiError, StopRequest, StopRequestError,
+};
+
+/// 从 `HOME` 生成默认健康文件路径；缺少 `HOME` 时回退到 `/tmp`。
+///
+/// 当前迁移只面向 Linux ARM64，因此这里刻意采用 Linux 进程环境语义，不引入跨平台
+/// home-directory 依赖。
+#[must_use]
+pub fn get_default_health_file_path() -> PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_else(|| OsString::from("/tmp"));
+    PathBuf::from(home).join(".agent-health/envmgr-healthy")
+}
+
+/// 读取 `CLAUDE_CODE_STUCK_THRESHOLD_SECONDS`，非法值回退到十分钟。
+pub(super) fn get_claude_code_stuck_threshold() -> Duration {
+    let value = std::env::var("CLAUDE_CODE_STUCK_THRESHOLD_SECONDS").ok();
+    claude_code_stuck_threshold_from(value.as_deref())
+}
+
+/// 解析卡死阈值，供构造函数和无需修改进程环境的并发测试共用。
+pub(super) fn claude_code_stuck_threshold_from(value: Option<&str>) -> Duration {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD;
+    };
+    if let Ok(seconds) = value.parse::<u64>()
+        && seconds > 0
+    {
+        return Duration::from_secs(seconds);
+    }
+
+    // Go 在构造 LeaseManager 之前就解析环境变量，因此这里必须使用全局
+    // slog.Default，而不能借用稍后传入 manager 的 logger。
+    default_slog_logger().warn(
+        "invalid_claude_code_stuck_threshold",
+        log_attributes([
+            ("value", json!(value)),
+            (
+                "default_seconds",
+                json!(DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD.as_secs()),
+            ),
+        ]),
+    );
+    DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD
+}
+
+/// 按 Go marker 规则判断 heartbeat 错误是否永久不可恢复。
+///
+/// `None` 对应 Go 的 `nil error`。已知 HTTP 错误优先使用状态码；未知错误仍检查原 Go
+/// 使用的英文 marker，以兼容调用方包装后的错误文本。
+#[must_use]
+pub fn is_permanent_heartbeat_error(error: Option<&(dyn Error + 'static)>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    if let Some(heartbeat_error) = error.downcast_ref::<HeartbeatError>()
+        && let Some(status) = heartbeat_error.status_code()
+    {
+        return matches!(status, 401 | 403 | 404 | 412);
+    }
+
+    let text = error.to_string();
+    [
+        "401",
+        "403",
+        "404",
+        "412",
+        "Unauthorized",
+        "Forbidden",
+        "Precondition Failed",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+/// 判断 heartbeat 错误是否为 HTTP 412 前置条件失败。
+#[must_use]
+pub fn is_precondition_failed_error(error: Option<&(dyn Error + 'static)>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    if let Some(heartbeat_error) = error.downcast_ref::<HeartbeatError>()
+        && heartbeat_error.status_code() == Some(412)
+    {
+        return true;
+    }
+    let text = error.to_string();
+    text.contains("412") || text.contains("Precondition Failed")
+}
+
+/// 按 Go sentinel 规则判断 stop 失败是否可重试。
+///
+/// 取消与 deadline 永不重试，明确的 HTTP 4xx 永不重试，HTTP 5xx 与网络/构造错误重试。
+#[must_use]
+pub fn is_retriable_stop_error(error: &StopRequestError) -> bool {
+    match error {
+        StopRequestError::Cancelled | StopRequestError::DeadlineExceeded => false,
+        StopRequestError::Api(error) => error.status_code >= 500,
+        StopRequestError::Request(_) => true,
+    }
+}
+
+/// 创建 LeaseManager，并从环境读取 Claude Code 卡死阈值。
+///
+/// `api_client` 复用 `internal::api::HttpClient` 的 base URL、超时与 Reqwest 连接池；
+/// heartbeat/stop 的特殊状态码语义仍由本模块解释，不经过通用 JSON 200-only helper。
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn new_lease_manager(
+    parent_cancellation: CancellationToken,
+    session_id: impl Into<String>,
+    environment_id: impl Into<String>,
+    organization_uuid: impl Into<String>,
+    api_client: HttpClient,
+    logger: Option<Logger>,
+    interval: Duration,
+    safety_window: Duration,
+    health_file_path: impl Into<PathBuf>,
+) -> LeaseManager {
+    new_lease_manager_with_stuck_threshold(
+        parent_cancellation,
+        session_id,
+        environment_id,
+        organization_uuid,
+        api_client,
+        logger,
+        interval,
+        safety_window,
+        health_file_path,
+        get_claude_code_stuck_threshold(),
+    )
+}
+
+/// 以显式卡死阈值构造 manager，避免测试修改进程级环境变量。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn new_lease_manager_with_stuck_threshold(
+    parent_cancellation: CancellationToken,
+    session_id: impl Into<String>,
+    environment_id: impl Into<String>,
+    organization_uuid: impl Into<String>,
+    api_client: HttpClient,
+    logger: Option<Logger>,
+    interval: Duration,
+    safety_window: Duration,
+    health_file_path: impl Into<PathBuf>,
+    claude_code_stuck_threshold: Duration,
+) -> LeaseManager {
+    LeaseManager {
+        inner: Arc::new(LeaseManagerInner {
+            session_id: session_id.into(),
+            interval,
+            safety_window,
+            environment_id: environment_id.into(),
+            organization_uuid: organization_uuid.into(),
+            api_client,
+            // 对应 Go `NewLeaseManager` 的 nil logger 回退；从这里开始内部始终持有
+            // concrete logger，避免某些日志改走格式不同的 tracing 管线。
+            logger: logger.unwrap_or_else(|| default_slog_logger().clone()),
+            health_file_path: health_file_path.into(),
+            claude_code_stuck_threshold,
+            state: std::sync::RwLock::new(LeaseState::default()),
+            cancellation: parent_cancellation.child_token(),
+            tasks: tokio_util::task::TaskTracker::new(),
+            heartbeat_loop_exited: CancellationToken::new(),
+            expiry_changed: tokio::sync::Notify::new(),
+            activity_changed: tokio::sync::Notify::new(),
+        }),
+    }
+}
+
+/// 把固定大小的键值数组转换为 logger 的稳定有序属性。
+fn log_attributes<const N: usize>(entries: [(&str, Value); N]) -> LogAttributes {
+    entries
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect()
+}
+
+/// 判断服务端状态是否已经进入停止流程。
+fn is_stopping_state(state: &str) -> bool {
+    matches!(state, "stopping" | "stopped")
+}
+
+/// 把 panic payload 转成可记录文本，同时避免再次 panic。
+fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|value| (*value).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
+
+impl LeaseManager {
+    /// 以关联函数形式提供与 [`new_lease_manager`] 相同的构造入口。
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        parent_cancellation: CancellationToken,
+        session_id: impl Into<String>,
+        environment_id: impl Into<String>,
+        organization_uuid: impl Into<String>,
+        api_client: HttpClient,
+        logger: Option<Logger>,
+        interval: Duration,
+        safety_window: Duration,
+        health_file_path: impl Into<PathBuf>,
+    ) -> Self {
+        new_lease_manager(
+            parent_cancellation,
+            session_id,
+            environment_id,
+            organization_uuid,
+            api_client,
+            logger,
+            interval,
+            safety_window,
+            health_file_path,
+        )
+    }
+
+    /// 获取短时状态读锁；poison 时恢复内部值以延续停止流程。
+    fn read_state(&self) -> RwLockReadGuard<'_, LeaseState> {
+        self.inner
+            .state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 获取短时状态写锁；poison 时恢复内部值以延续停止流程。
+    fn write_state(&self) -> RwLockWriteGuard<'_, LeaseState> {
+        self.inner
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 写入构造阶段已完成默认值归一化的兼容 logger。
+    #[track_caller]
+    fn log(&self, level: LogLevel, message: &'static str, attributes: LogAttributes) {
+        self.inner.logger.log(level, message, attributes);
+    }
+
+    /// 发送初始 heartbeat，然后原子登记 heartbeat、expiry、stuck 三个任务。
+    ///
+    /// 初始请求期间生命周期保持 `Starting`。显式停止会先把它改为 `Stopping`，所以
+    /// `TaskTracker::close()` 与这里的 spawn 不会发生“wait 已返回后又新增任务”的竞态。
+    pub async fn start(&self) -> Result<(), LeaseManagerError> {
+        {
+            let mut state = self.write_state();
+            if state.lifecycle != Lifecycle::Created {
+                return Err(LeaseManagerError::AlreadyStarted);
+            }
+            state.lifecycle = Lifecycle::Starting;
+        }
+
+        if let Err(error) = self.send_heartbeat().await {
+            let mut state = self.write_state();
+            if state.lifecycle == Lifecycle::Starting {
+                state.lifecycle = Lifecycle::Created;
+            }
+            return Err(LeaseManagerError::InitialHeartbeat(error));
+        }
+
+        {
+            let mut state = self.write_state();
+            if state.lifecycle != Lifecycle::Starting {
+                if state.shutdown_started {
+                    // Go 即使 initial heartbeat 已把状态推进到 stopping，也仍会启动
+                    // heartbeatLoop；该 loop 的 defer 负责关闭 Stop 等待的 stopChan。
+                    self.spawn_background_tasks();
+                } else {
+                    return Err(LeaseManagerError::StoppedWhileStarting);
+                }
+            } else {
+                state.lifecycle = Lifecycle::Running;
+                // spawn 本身不 await；持锁登记任务可与 stop 的 lifecycle 修改形成原子边界。
+                self.spawn_background_tasks();
+            }
+        }
+
+        self.log(
+            LogLevel::Info,
+            "lease_manager_started",
+            log_attributes([
+                ("session_id", json!(self.inner.session_id)),
+                (
+                    "heartbeat_interval_seconds",
+                    json!(self.inner.interval.as_secs()),
+                ),
+                (
+                    "safety_window_seconds",
+                    json!(self.inner.safety_window.as_secs()),
+                ),
+            ]),
+        );
+        Ok(())
+    }
+
+    /// 将三个后台循环登记到同一个 TaskTracker。
+    fn spawn_background_tasks(&self) {
+        let heartbeat = self.clone();
+        drop(
+            self.inner
+                .tasks
+                .spawn(async move { heartbeat.run_heartbeat_task().await }),
+        );
+
+        let expiry = self.clone();
+        drop(
+            self.inner
+                .tasks
+                .spawn(async move { expiry.lease_expiry_loop().await }),
+        );
+
+        let stuck = self.clone();
+        drop(
+            self.inner
+                .tasks
+                .spawn(async move { stuck.claude_code_stuck_loop().await }),
+        );
+    }
+
+    /// 捕获 heartbeat loop panic，并复刻 Go defer 中的取消与宽限期设置。
+    async fn run_heartbeat_task(self) {
+        let result = AssertUnwindSafe(self.heartbeat_loop()).catch_unwind().await;
+        if let Err(payload) = result {
+            self.log(
+                LogLevel::Error,
+                "heartbeat_loop_panic",
+                log_attributes([
+                    ("session_id", json!(self.inner.session_id)),
+                    ("panic", json!(panic_payload_to_string(payload.as_ref()))),
+                ]),
+            );
+            self.set_grace_period_and_cancel();
+        }
+        // 独立 token 精确对应 Go heartbeatLoop 的 `defer close(stopChan)`。
+        self.inner.heartbeat_loop_exited.cancel();
+    }
+
+    /// 周期发送 heartbeat；临时错误保留租约计时，永久错误先 stop 再取消。
+    async fn heartbeat_loop(&self) {
+        let mut ticker = tokio::time::interval(self.inner.interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // Tokio interval 的首 tick 立即就绪；消费它以匹配 Go NewTicker 首次等待一个周期。
+        ticker.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if self.inner.cancellation.is_cancelled() {
+                        // 对应 Go `heartbeatLoop` 的 ticker 分支（lease_manager.go:331）。
+                        // 即使消息和属性与 context.Done 分支相同，也必须保留独立的真实
+                        // Logger 调用点：Go slog source 的行号是外部 JSON 日志契约，合并
+                        // 到共享 helper 会让两个 oracle source 无法无歧义映射。
+                        self.inner.logger.info(
+                            "heartbeat_loop_stopped",
+                            log_attributes([
+                                ("session_id", json!(self.inner.session_id)),
+                                // Go 的 context.Canceled.Error() 固定为该小写文本。
+                                ("error", json!("context canceled")),
+                            ]),
+                        );
+                        return;
+                    }
+                }
+                _ = self.inner.cancellation.cancelled() => {
+                    // 对应 Go `heartbeatLoop` 的 context.Done 分支
+                    //（lease_manager.go:365）。不得与上方 ticker 分支合并，原因同上。
+                    self.inner.logger.info(
+                        "heartbeat_loop_stopped",
+                        log_attributes([
+                            ("session_id", json!(self.inner.session_id)),
+                            ("error", json!("context canceled")),
+                        ]),
+                    );
+                    return;
+                }
+            }
+
+            if let Err(error) = self.send_heartbeat().await {
+                if is_permanent_heartbeat_error(Some(&error)) {
+                    let message = if is_precondition_failed_error(Some(&error)) {
+                        "heartbeat_precondition_failed"
+                    } else {
+                        "permanent_heartbeat_error"
+                    };
+                    self.log(
+                        LogLevel::Error,
+                        message,
+                        log_attributes([
+                            ("session_id", json!(self.inner.session_id)),
+                            ("error", json!(error.to_string())),
+                        ]),
+                    );
+                    let cancellation = self.inner.cancellation.clone();
+                    if let Err(stop_error) = self.call_stop_api(&cancellation, false).await {
+                        self.log(
+                            LogLevel::Error,
+                            "failed_to_stop_after_heartbeat_error",
+                            log_attributes([
+                                ("session_id", json!(self.inner.session_id)),
+                                ("error", json!(stop_error.to_string())),
+                            ]),
+                        );
+                    }
+                    self.set_grace_period_and_cancel();
+                    return;
+                }
+
+                self.log(
+                    LogLevel::Warn,
+                    "heartbeat_failed",
+                    log_attributes([
+                        ("session_id", json!(self.inner.session_id)),
+                        ("error", json!(error.to_string())),
+                    ]),
+                );
+                continue;
+            }
+
+            // 即便 send_heartbeat 已因 lease_not_extended 调用 stop 并取消 context，Go
+            // 仍会继续读取 terminal state、再次调用 stop，然后才返回；不能在此提前退出。
+            let state = self.read_state().instance_state.clone();
+            if is_stopping_state(&state) {
+                self.log(
+                    LogLevel::Info,
+                    "session_entered_terminal_state",
+                    log_attributes([
+                        ("session_id", json!(self.inner.session_id)),
+                        ("state", json!(state)),
+                    ]),
+                );
+                let cancellation = self.inner.cancellation.clone();
+                if let Err(error) = self.call_stop_api(&cancellation, false).await {
+                    self.log(
+                        LogLevel::Error,
+                        "failed_to_stop_terminal_session",
+                        log_attributes([
+                            ("session_id", json!(self.inner.session_id)),
+                            ("state", json!(state)),
+                            ("error", json!(error.to_string())),
+                        ]),
+                    );
+                }
+                self.set_grace_period_and_cancel();
+                return;
+            }
+        }
+    }
+
+    /// 发送一次 heartbeat，并在 200 响应后原子更新租约和活动状态。
+    pub(crate) async fn send_heartbeat(&self) -> Result<(), HeartbeatError> {
+        let now = Utc::now();
+        let expected_last_heartbeat = self
+            .read_state()
+            .server_last_heartbeat
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(NO_SERVER_HEARTBEAT)
+            .to_owned();
+        let endpoint = self
+            .endpoint("heartbeat", Some(&expected_last_heartbeat))
+            .map_err(HeartbeatError::InvalidRequest)?;
+
+        let request = self.inner.api_client.http_client.post(endpoint).send();
+        let response = tokio::select! {
+            _ = self.inner.cancellation.cancelled() => return Err(HeartbeatError::Cancelled),
+            response = request => response.map_err(|error| HeartbeatError::Request(error.to_string()))?,
+        };
+        let status = response.status();
+        let body = tokio::select! {
+            _ = self.inner.cancellation.cancelled() => return Err(HeartbeatError::Cancelled),
+            body = response.bytes() => body.map_err(|error| HeartbeatError::Request(error.to_string()))?,
+        };
+        if status != reqwest::StatusCode::OK {
+            return Err(HeartbeatError::Http {
+                status_code: status.as_u16(),
+                body: String::from_utf8_lossy(&body).trim().to_owned(),
+            });
+        }
+
+        let heartbeat: HeartbeatResponse = serde_json::from_slice(&body)
+            .map_err(|error| HeartbeatError::Decode(error.to_string()))?;
+        if !heartbeat.lease_extended {
+            self.log(
+                LogLevel::Warn,
+                "heartbeat_lease_not_extended",
+                log_attributes([
+                    ("session_id", json!(self.inner.session_id)),
+                    ("state", json!(heartbeat.state)),
+                ]),
+            );
+            self.write_state().instance_state = heartbeat.state.clone();
+
+            if is_stopping_state(&heartbeat.state) {
+                let cancellation = self.inner.cancellation.clone();
+                if let Err(error) = self.call_stop_api(&cancellation, false).await {
+                    self.log(
+                        LogLevel::Error,
+                        "failed_to_stop_after_lease_not_extended",
+                        log_attributes([
+                            ("session_id", json!(self.inner.session_id)),
+                            ("state", json!(heartbeat.state)),
+                            ("error", json!(error.to_string())),
+                        ]),
+                    );
+                }
+                self.set_grace_period_and_cancel();
+            }
+            return Ok(());
+        }
+
+        let lease_updated_at = heartbeat.lease_updated_at;
+        let lease_expires_at = lease_updated_at
+            .checked_add_signed(ChronoDuration::seconds(heartbeat.ttl_seconds))
+            .ok_or_else(|| {
+                HeartbeatError::Decode("lease expiry is outside datetime range".into())
+            })?;
+        let lease_ttl = u64::try_from(heartbeat.ttl_seconds)
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::ZERO);
+        {
+            let mut state = self.write_state();
+            state.last_heartbeat = Some(now);
+            state.lease_ttl = lease_ttl;
+            state.lease_expires_at = Some(lease_expires_at);
+            state.instance_state = heartbeat.state.clone();
+            state.server_last_heartbeat = Some(heartbeat.last_heartbeat.clone());
+            if state.last_claude_code_activity != Some(lease_updated_at) {
+                // 两种时钟必须在同一个临界区内同步推进：墙钟用于复刻 Go 日志值，
+                // 单调时钟用于 deadline，避免 NTP 调整让卡死检测提前或延后。
+                state.last_updated_at = Some(Utc::now());
+                state.last_updated_instant = Some(Instant::now());
+            }
+            state.last_claude_code_activity = Some(lease_updated_at);
+        }
+
+        self.schedule_lease_expiry_check();
+        self.schedule_claude_code_stuck_check();
+        self.log(
+            LogLevel::Info,
+            "heartbeat_success",
+            log_attributes([
+                ("session_id", json!(self.inner.session_id)),
+                ("state", json!(heartbeat.state)),
+                ("ttl_seconds", json!(heartbeat.ttl_seconds)),
+                ("lease_extended", json!(true)),
+            ]),
+        );
+        if let Err(error) = self.update_health_file().await {
+            self.log(
+                LogLevel::Warn,
+                "failed_to_update_health_file",
+                log_attributes([
+                    ("session_id", json!(self.inner.session_id)),
+                    ("path", json!(self.inner.health_file_path)),
+                    ("error", json!(error.to_string())),
+                ]),
+            );
+        }
+        Ok(())
+    }
+
+    /// 通知卡死检测任务重新计算 deadline；不额外创建 timer task。
+    fn schedule_claude_code_stuck_check(&self) {
+        self.inner.activity_changed.notify_one();
+    }
+
+    /// 返回距离绝对租约过期时间的剩余时长；未知或已过期时为零。
+    #[must_use]
+    pub fn time_until_expiry(&self) -> Duration {
+        self.read_state()
+            .lease_expires_at
+            .map(|expires_at| (expires_at - Utc::now()).to_std().unwrap_or(Duration::ZERO))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// 通知租约检测任务重新计算安全窗口 deadline；不额外创建 timer task。
+    fn schedule_lease_expiry_check(&self) {
+        self.inner.expiry_changed.notify_one();
+    }
+
+    /// 计算 expiry loop 下一次等待；没有租约时返回 `None`。
+    fn lease_expiry_delay(&self) -> Option<Duration> {
+        self.read_state().lease_expires_at.map(|expires_at| {
+            (expires_at - Utc::now())
+                .to_std()
+                .unwrap_or(Duration::ZERO)
+                .saturating_sub(self.inner.safety_window)
+        })
+    }
+
+    /// 长驻租约过期循环，在 heartbeat 更新时被 Notify 唤醒并重算 deadline。
+    async fn lease_expiry_loop(&self) {
+        loop {
+            let delay = self.lease_expiry_delay();
+            match delay {
+                None => {
+                    tokio::select! {
+                        _ = self.inner.cancellation.cancelled() => return,
+                        _ = self.inner.expiry_changed.notified() => continue,
+                    }
+                }
+                Some(delay) => {
+                    tokio::select! {
+                        _ = self.inner.cancellation.cancelled() => return,
+                        _ = self.inner.expiry_changed.notified() => continue,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+            }
+
+            if self
+                .lease_expiry_delay()
+                .is_some_and(|remaining| !remaining.is_zero())
+            {
+                continue;
+            }
+            let lease_expires_at = self.read_state().lease_expires_at;
+            self.log(
+                LogLevel::Error,
+                "lease_expiry_detected",
+                log_attributes([
+                    ("session_id", json!(self.inner.session_id)),
+                    ("lease_expires_at", json!(lease_expires_at)),
+                ]),
+            );
+            let cancellation = self.inner.cancellation.clone();
+            if let Err(error) = self.call_stop_api(&cancellation, false).await {
+                self.log(
+                    LogLevel::Error,
+                    "failed_to_stop_expired_session",
+                    log_attributes([
+                        ("session_id", json!(self.inner.session_id)),
+                        ("error", json!(error.to_string())),
+                    ]),
+                );
+            }
+            self.set_grace_period_and_cancel();
+            return;
+        }
+    }
+
+    /// 计算 stuck loop 下一次等待；尚无活动或阈值为零时返回 `None`。
+    fn claude_code_stuck_delay(&self) -> Option<Duration> {
+        let state = self.read_state();
+        if self.inner.claude_code_stuck_threshold.is_zero() {
+            return None;
+        }
+        state.last_updated_instant.map(|last_updated_at| {
+            self.inner
+                .claude_code_stuck_threshold
+                .saturating_sub(last_updated_at.elapsed())
+        })
+    }
+
+    /// 长驻 Claude Code 卡死循环；只有服务端活动时间戳不再推进达到阈值才终止。
+    async fn claude_code_stuck_loop(&self) {
+        loop {
+            let delay = self.claude_code_stuck_delay();
+            match delay {
+                None => {
+                    tokio::select! {
+                        _ = self.inner.cancellation.cancelled() => return,
+                        _ = self.inner.activity_changed.notified() => continue,
+                    }
+                }
+                Some(delay) => {
+                    tokio::select! {
+                        _ = self.inner.cancellation.cancelled() => return,
+                        _ = self.inner.activity_changed.notified() => continue,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+            }
+
+            if self
+                .claude_code_stuck_delay()
+                .is_some_and(|remaining| !remaining.is_zero())
+            {
+                continue;
+            }
+            let (last_updated_at, last_activity) = {
+                let state = self.read_state();
+                (state.last_updated_at, state.last_claude_code_activity)
+            };
+            if last_updated_at.is_none() {
+                continue;
+            }
+            self.log(
+                LogLevel::Error,
+                "claude_code_stuck_detected",
+                log_attributes([
+                    ("session_id", json!(self.inner.session_id)),
+                    ("last_updated_at", json!(last_updated_at)),
+                    ("last_claude_code_activity", json!(last_activity)),
+                    (
+                        "threshold_seconds",
+                        json!(self.inner.claude_code_stuck_threshold.as_secs()),
+                    ),
+                ]),
+            );
+            let cancellation = self.inner.cancellation.clone();
+            if let Err(error) = self.call_stop_api(&cancellation, false).await {
+                self.log(
+                    LogLevel::Error,
+                    "failed_to_stop_stuck_session",
+                    log_attributes([
+                        ("session_id", json!(self.inner.session_id)),
+                        ("error", json!(error.to_string())),
+                    ]),
+                );
+            }
+            self.set_grace_period_and_cancel();
+            return;
+        }
+    }
+
+    /// 只在第一个 fatal 路径中计算宽限期，然后取消并关闭 tracker。
+    ///
+    /// 所有权/退出顺序为：持写锁写入 `Stopping` 和 grace → 释放锁 → 取消 token →
+    /// `TaskTracker::close()`。当前任务随后返回，其他两个任务在 select 中观察取消；
+    /// heartbeat loop 退出时再触发独立的 loop-exited token；`stop_and_wait` 先等该 token，
+    /// 再等 tracker 计数归零，因而与 Go 的 `stopChan` 关闭点一致。
+    pub(super) fn set_grace_period_and_cancel(&self) {
+        {
+            let mut state = self.write_state();
+            if state.shutdown_started {
+                return;
+            }
+            let grace_period = state
+                .lease_expires_at
+                .and_then(|expires_at| {
+                    (expires_at - Utc::now()
+                        + ChronoDuration::from_std(SHUTDOWN_GRACE_PERIOD_BUFFER).ok()?)
+                    .to_std()
+                    .ok()
+                })
+                .filter(|duration| !duration.is_zero())
+                .unwrap_or(DEFAULT_SHUTDOWN_GRACE_PERIOD);
+            state.shutdown_grace_period = grace_period;
+            state.shutdown_started = true;
+            state.lifecycle = Lifecycle::Stopping;
+        }
+        self.inner.cancellation.cancel();
+        self.inner.tasks.close();
+        self.inner.expiry_changed.notify_waiters();
+        self.inner.activity_changed.notify_waiters();
+    }
+
+    /// 返回 fatal 退出路径计算出的宽限期；尚未 fatal 时为零。
+    #[must_use]
+    pub fn get_grace_period(&self) -> Duration {
+        self.read_state().shutdown_grace_period
+    }
+
+    /// 返回最近 heartbeat、绝对过期时间和服务端状态的一致快照。
+    #[must_use]
+    pub fn get_lease_info(&self) -> LeaseInfo {
+        let state = self.read_state();
+        LeaseInfo {
+            last_heartbeat: state.last_heartbeat,
+            lease_expires_at: state.lease_expires_at,
+            instance_state: state.instance_state.clone(),
+        }
+    }
+
+    /// 返回 manager 子 token 的 clone，供 session/orchestrator 监听退出。
+    ///
+    /// 这是 Go `LeaseManager.Context` 的 Tokio 等价物：克隆共享同一取消状态，不会
+    /// 创建独立生命周期，也不会把取消权限暴露成可替换的全局 context。
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.inner.cancellation.clone()
+    }
+
+    /// 使用调用方提供的 token 发送 `force=true` stop 请求。
+    pub async fn call_stop_api_forced(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), StopRequestError> {
+        self.call_stop_api(cancellation, true).await
+    }
+
+    /// 构造 heartbeat 或 stop URL，并按 segment 规则转义 ID。
+    fn endpoint(&self, action: &str, expected_last_heartbeat: Option<&str>) -> Result<Url, String> {
+        let mut endpoint = Url::parse(self.inner.api_client.base_url())
+            .map_err(|error| format!("invalid API base URL: {error}"))?;
+        {
+            let mut segments = endpoint
+                .path_segments_mut()
+                .map_err(|_| "API base URL cannot contain path segments".to_owned())?;
+            segments.pop_if_empty();
+            segments
+                .push("v1")
+                .push("environments")
+                .push(&self.inner.environment_id)
+                .push("work")
+                .push(&self.inner.session_id)
+                .push(action);
+        }
+        let mut query = endpoint.query_pairs_mut();
+        query.clear();
+        query.append_pair("organization_uuid", &self.inner.organization_uuid);
+        if let Some(expected_last_heartbeat) = expected_last_heartbeat {
+            query.append_pair("expected_last_heartbeat", expected_last_heartbeat);
+        }
+        drop(query);
+        Ok(endpoint)
+    }
+
+    /// 调用 stop API，并以 1 秒、2 秒退避最多尝试三次。
+    pub(crate) async fn call_stop_api(
+        &self,
+        cancellation: &CancellationToken,
+        force: bool,
+    ) -> Result<(), StopRequestError> {
+        let body = serde_json::to_vec(&StopRequest { force }).map_err(|error| {
+            StopRequestError::Request(format!("failed to marshal stop request body: {error}"))
+        })?;
+        let endpoint = self.endpoint("stop", None).map_err(|error| {
+            StopRequestError::Request(format!("failed to create stop request: {error}"))
+        })?;
+        let config =
+            RetryConfig::new(3, Duration::from_secs(1)).with_classifier(is_retriable_stop_error);
+        let result = retry_operation(
+            cancellation,
+            |_| {
+                let client = self.inner.api_client.http_client.clone();
+                let endpoint = endpoint.clone();
+                let body = body.clone();
+                async move {
+                    let response = client
+                        .post(endpoint)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .send()
+                        .await
+                        .map_err(|error| {
+                            if error.is_timeout() {
+                                StopRequestError::DeadlineExceeded
+                            } else {
+                                StopRequestError::Request(format!(
+                                    "stop API request failed: {error}"
+                                ))
+                            }
+                        })?;
+                    let status = response.status();
+                    if status.is_success() {
+                        return Ok(());
+                    }
+                    let response_body = response.bytes().await.unwrap_or_default();
+                    let response_text = String::from_utf8_lossy(&response_body);
+                    let response_text = response_text.trim();
+                    let message = if response_text.is_empty() {
+                        format!("stop API returned status: {}", status.as_u16())
+                    } else {
+                        format!(
+                            "stop API returned status: {}: {response_text}",
+                            status.as_u16()
+                        )
+                    };
+                    Err(StopRequestError::Api(StopApiError::new(
+                        status.as_u16(),
+                        message,
+                    )))
+                }
+            },
+            &config,
+            log_attributes([
+                ("session_id", json!(self.inner.session_id)),
+                ("force", json!(force)),
+            ]),
+        )
+        .await;
+
+        match result {
+            Ok(()) => {
+                self.log(
+                    LogLevel::Info,
+                    "Session terminated",
+                    log_attributes([
+                        ("session_id", json!(self.inner.session_id)),
+                        ("force", json!(force)),
+                    ]),
+                );
+                Ok(())
+            }
+            Err(RetryError::Cancelled) => Err(StopRequestError::Cancelled),
+            Err(RetryError::InvalidMaxRetries) => Err(StopRequestError::Request(
+                "stop API retry configuration requires at least one attempt".to_owned(),
+            )),
+            Err(RetryError::Operation(error)) => Err(error),
+        }
+    }
+
+    /// 更新健康文件；空路径无操作，内容为 UTC RFC3339Nano 加换行。
+    pub(crate) async fn update_health_file(&self) -> Result<(), HealthFileError> {
+        let path = &self.inner.health_file_path;
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent()
+            && parent != Path::new("")
+        {
+            let mut directory = tokio::fs::DirBuilder::new();
+            directory.recursive(true);
+            #[cfg(unix)]
+            directory.mode(0o755);
+            directory
+                .create(parent)
+                .await
+                .map_err(|source| HealthFileError::CreateDirectory {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+        }
+        let content = format!(
+            "{}\n",
+            Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
+        );
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o644);
+        let mut file = options
+            .open(path)
+            .await
+            .map_err(|source| HealthFileError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        file.write_all(content.as_bytes())
+            .await
+            .map_err(|source| HealthFileError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        file.flush().await.map_err(|source| HealthFileError::Write {
+            path: path.clone(),
+            source,
+        })
+    }
+
+    /// 同步发出显式停止信号，并关闭 tracker 以允许等待完成。
+    fn request_stop(&self) {
+        {
+            let mut state = self.write_state();
+            if state.lifecycle != Lifecycle::Stopped {
+                state.lifecycle = Lifecycle::Stopping;
+            }
+        }
+        self.inner.cancellation.cancel();
+        self.inner.tasks.close();
+        self.inner.expiry_changed.notify_waiters();
+        self.inner.activity_changed.notify_waiters();
+    }
+
+    /// 对应 Go `Stop`：取消后等待 heartbeat loop 关闭信号和全部受追踪任务退出。
+    ///
+    /// Go 的 `stopChan` 只由 heartbeat loop 的 defer 关闭，因此尚未 `start` 或初始
+    /// heartbeat 失败时该方法会一直等待。独立的 `heartbeat_loop_exited` token 保留这一
+    /// 可观察行为；调用方若要限制等待时间，应在外层使用 `tokio::time::timeout`。
+    pub async fn stop(&self) {
+        self.stop_and_wait().await;
+    }
+
+    /// 以明确名称执行“发出停止、等待 heartbeat 关闭点、再等待任务归零”的完整序列。
+    pub async fn stop_and_wait(&self) {
+        self.request_stop();
+        self.inner.heartbeat_loop_exited.cancelled().await;
+        self.inner.tasks.wait().await;
+        self.write_state().lifecycle = Lifecycle::Stopped;
+    }
+}
+
+impl Stopper for LeaseManager {
+    /// 供 session 同步清理路径使用：只发出取消，不阻塞 Tokio 任务回收。
+    fn stop(&self) {
+        self.request_stop();
+    }
+}

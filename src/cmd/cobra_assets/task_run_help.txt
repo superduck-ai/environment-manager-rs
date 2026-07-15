@@ -1,0 +1,45 @@
+Connects directly to the API to execute an existing session id.
+
+Provide a JSON object via stdin with the following structure:
+{
+  "startup_context": {
+    "sources": [...],
+    "cwd": "..."
+  },
+  "environment": {
+    "environment_type": "...",
+    "version": "...",
+    ...
+  },
+  "auth": [
+    {
+      "type": "github_app",
+      "url": "github.com",  
+      "token": "ghs_..."
+		}
+	]
+}
+
+Usage:
+  environment-runner task-run [flags]
+
+Flags:
+      --allowed-tools string                    Comma-separated list of allowed tools for Claude (e.g., 'Bash,Edit,Write,MultiEdit,Agent,Glob,Grep,LS,View,Search,NotebookEdit,NotebookRead,TodoRead,TodoWrite')
+      --claude-agent-version claude --version   Target Claude Agent version (latest, current, stable, or specific version like 2.0.20), located at claude --version. Use 'current' to skip installation and updates. Defaults to 'latest' if not specified.
+      --claude-path string                      Path to the Claude CLI executable or a wrapper binary. When specified, this executable runs instead of the default 'claude' command. Wrapper binaries must forward all arguments and connect stdin/stdout directly to Claude Code.
+      --debug                                   Enable debug mode when executing the Claude Agent.
+      --environment-id string                   Environment ID for API calls (required for self-hosted)
+  -h, --help                                    help for task-run
+      --input-format string                     Input format for stdin data: 'v0' (startup_context/environment/auth) or 'v1' (work response with packed secret) (default "v0")
+      --local-append-system-prompt string       Additional system prompt content to append locally (useful for self-hosted environments to inject custom instructions)
+      --local-testing                           Disable Claude WebSocket connections and git configuration (run in standalone mode for local testing)
+      --log-level string                        Log level (debug, info, warn, error) (default "info")
+      --organization-id string                  Organization ID for API calls (required for self-hosted)
+      --print-code-logs                         Print Claude Code logs to console when execution completes or fails
+      --session string                          ID of the session to manage (required)
+      --session-mode string                     Session mode: 'new' (default for Cloud), 'resume' (skip git clone and setup scripts), 'resume-cached' (default for self-hosted), 'setup-only' (exit after setup) (default "new")
+      --skip-git-config                         Skip git configuration setup (use container's existing .gitconfig)
+      --stdin                                   Deprecated: stdin is now always used. This flag is ignored.
+      --upgrade-claude-code                     Deprecated: use --claude-agent-version instead. When true (default), upgrades Claude Agent to latest version. (default true)
+      --verbose-claude-logs                     Enable verbose logging of Claude Agent output to console (automatically enabled with --local-testing)
+      --working-directory string                Default working directory for the session (used when session context doesn't specify cwd) (default "{{WORKING_DIRECTORY}}")

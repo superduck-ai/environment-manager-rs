@@ -1,0 +1,320 @@
+//! source handler 的注册、分派与 Git 后处理编排。
+//!
+//! 本文件机械对应 Go `sources.go`。handler 顺序、缺失 handler 的非 fatal 记录、
+//! 单个处理失败后的立即返回，以及 remote URL 更新的 best-effort 行为均保持不变。
+
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
+
+use serde_json::json;
+use tokio_util::sync::CancellationToken;
+
+use super::{
+    ProcessMode, SourceHandler, SourceHandlerManager, SourceSlot, SourcesError, SourcesResult,
+    new_git_handler,
+};
+use crate::internal::{
+    api::SourceProcessingError,
+    auth::AuthContext,
+    logger::{LogAttributes, LogLevel, Logger, default_slog_logger},
+    session::ActivityRecorder,
+};
+
+/// 对应 Go `NewSourceHandlerManager`，校验 base directory 并注册默认 Git handler。
+///
+/// 空路径严格返回 `base directory cannot be empty`；其余参数原样传给 Git handler，
+/// manager 自身不复制认证或 branch 业务。`'recorder` 贯穿 manager、默认 Git handler
+/// 与动态 handler 容器，保证任何一个对象都不能逃出 activity recorder 的有效期。
+#[allow(clippy::too_many_arguments)]
+pub fn new_source_handler_manager<'recorder>(
+    logger: Option<Logger>,
+    base_dir: impl Into<PathBuf>,
+    auth_context: Option<Arc<AuthContext>>,
+    sdk_base_url: impl Into<String>,
+    repo_branches: Option<HashMap<String, String>>,
+    activity_recorder: Option<Arc<dyn ActivityRecorder + 'recorder>>,
+    process_mode: ProcessMode,
+    should_validate: bool,
+) -> SourcesResult<SourceHandlerManager<'recorder>> {
+    let base_dir = base_dir.into();
+    if base_dir.as_os_str().is_empty() {
+        return Err(SourcesError::message("base directory cannot be empty"));
+    }
+
+    let git_handler = new_git_handler(
+        logger.clone(),
+        base_dir.clone(),
+        auth_context,
+        sdk_base_url,
+        repo_branches,
+        activity_recorder.clone(),
+        process_mode,
+        should_validate,
+    );
+    // trait object 显式继承 recorder 生命周期；默认的 `dyn Trait` 会隐含 `'static`，
+    // 那会再次迫使局部 recorder 做不安全生命周期擦除。
+    let git_handler: Arc<dyn SourceHandler + 'recorder> = Arc::new(git_handler);
+    Ok(SourceHandlerManager {
+        logger,
+        handlers: vec![git_handler],
+        base_dir,
+        activity_recorder,
+        should_validate,
+    })
+}
+
+impl<'recorder> SourceHandlerManager<'recorder> {
+    /// 对应 Go `RegisterHandler`；`None` 与 nil interface 一样被静默忽略。
+    ///
+    /// 新 handler 最长只能活到 `'recorder`；因此测试或初始化代码可以注册借用局部
+    /// 状态的实现，但 manager 不能把它保存到该状态销毁之后。
+    pub fn register_handler(&mut self, handler: Option<Arc<dyn SourceHandler + 'recorder>>) {
+        if let Some(handler) = handler {
+            self.handlers.push(handler);
+        }
+    }
+
+    /// 对应 Go `ProcessSources`，按输入顺序串行处理 source。
+    ///
+    /// 串行是外部语义的一部分：后一个 source 能观察到前一个 source 建立的目录。
+    /// 缺失 handler 只记录非 fatal 结果并继续；handler 失败记录 fatal 结果并立即返回。
+    pub async fn process_sources<S>(
+        &self,
+        cancellation: &CancellationToken,
+        sources: &[S],
+    ) -> SourcesResult<()>
+    where
+        S: SourceSlot,
+    {
+        if sources.is_empty() {
+            self.log(
+                LogLevel::Debug,
+                "No sources to process",
+                LogAttributes::new(),
+            );
+            return Ok(());
+        }
+
+        self.log(
+            LogLevel::Debug,
+            "Starting to process sources",
+            log_attributes([("num_sources", json!(sources.len()))]),
+        );
+        let started = Instant::now();
+        let mut processed_count = 0_usize;
+
+        for (index, slot) in sources.iter().enumerate() {
+            let Some(source) = slot.source_value() else {
+                return Err(SourcesError::message(format!("source[{index}] is nil")));
+            };
+            let source_type = source.get_type();
+            self.log(
+                LogLevel::Debug,
+                "Processing source",
+                log_attributes([
+                    ("source_index", json!(index + 1)),
+                    ("total_count", json!(sources.len())),
+                    ("source_type", json!(source_type)),
+                ]),
+            );
+
+            let Some(handler) = self.find_handler(source_type) else {
+                if let Some(recorder) = &self.activity_recorder {
+                    let error = SourceProcessingError {
+                        fatal: false,
+                        source_type: source_type.to_owned(),
+                    };
+                    let _ = recorder.record_failure_result(&error).await;
+                }
+                self.log(
+                    LogLevel::Warn,
+                    "No handler found for source type, skipping",
+                    log_attributes([("source_type", json!(source_type))]),
+                );
+                continue;
+            };
+
+            if let Err(error) = handler.process(cancellation, source).await {
+                if let Some(recorder) = &self.activity_recorder {
+                    let source_error = SourceProcessingError {
+                        fatal: true,
+                        source_type: source_type.to_owned(),
+                    };
+                    let _ = recorder.record_failure_result(&source_error).await;
+                }
+                self.log(
+                    LogLevel::Error,
+                    "Failed to process source",
+                    log_attributes([
+                        ("source_type", json!(source_type)),
+                        ("error", json!(error.to_string())),
+                    ]),
+                );
+                return Err(SourcesError::message(format!(
+                    "failed to process source type {source_type}: {error}"
+                )));
+            }
+
+            processed_count += 1;
+            self.log(
+                LogLevel::Debug,
+                "Source processed successfully",
+                log_attributes([
+                    ("source_type", json!(source_type)),
+                    ("source_index", json!(index + 1)),
+                    ("total_count", json!(sources.len())),
+                ]),
+            );
+        }
+
+        self.log(
+            LogLevel::Debug,
+            "Completed processing all sources",
+            log_attributes([
+                ("duration_ms", json!(started.elapsed().as_millis())),
+                ("total_count", json!(sources.len())),
+                ("processed_count", json!(processed_count)),
+            ]),
+        );
+        Ok(())
+    }
+
+    /// 对应 Go `UpdateRemoteURLs`，对所有 Git source best-effort 更新 origin。
+    ///
+    /// 找不到具备更新能力的 handler 时返回成功。单仓库更新失败只写 warning，后续
+    /// source 仍继续处理，方法最终也返回成功。
+    pub async fn update_remote_urls<S>(
+        &self,
+        cancellation: &CancellationToken,
+        sources: &[S],
+    ) -> SourcesResult<()>
+    where
+        S: SourceSlot,
+    {
+        if sources.is_empty() {
+            self.log(
+                LogLevel::Debug,
+                "No sources to update",
+                LogAttributes::new(),
+            );
+            return Ok(());
+        }
+
+        self.log(
+            LogLevel::Debug,
+            "Updating git remote URLs for existing repositories",
+            log_attributes([("num_sources", json!(sources.len()))]),
+        );
+
+        let Some(updater) = self
+            .handlers
+            .iter()
+            .find_map(|handler| handler.as_git_remote_updater())
+        else {
+            self.log(
+                LogLevel::Warn,
+                "No git handler found for updating remote URL",
+                LogAttributes::new(),
+            );
+            return Ok(());
+        };
+
+        for slot in sources {
+            let Some(source) = slot.source_value() else {
+                continue;
+            };
+            if source.get_type() != "git_repository" {
+                continue;
+            }
+            if let Err(error) = updater.update_remote_url(cancellation, source).await {
+                self.log(
+                    LogLevel::Warn,
+                    "Failed to update remote URL, continuing",
+                    log_attributes([
+                        ("source_type", json!(source.get_type())),
+                        ("error", json!(error.to_string())),
+                    ]),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// 对应 Go `SetupGitProxyAfterSourcesProcessed`，把全部 source 交给首个 Git handler。
+    ///
+    /// 空输入和缺少 Git handler 都是成功 no-op；具体 proxy 的缺失或启动失败由 Git
+    /// handler 返回，避免在 manager 层吞掉本应终止初始化的错误。
+    pub async fn setup_git_proxy_after_sources_processed<S>(
+        &self,
+        cancellation: &CancellationToken,
+        sources: &[S],
+    ) -> SourcesResult<()>
+    where
+        S: SourceSlot,
+    {
+        if sources.is_empty() {
+            return Ok(());
+        }
+
+        let Some(git_handler) = self
+            .handlers
+            .iter()
+            .find_map(|handler| handler.as_git_handler())
+        else {
+            self.log(
+                LogLevel::Debug,
+                "No git handler found for proxy setup",
+                LogAttributes::new(),
+            );
+            return Ok(());
+        };
+
+        let source_values = sources
+            .iter()
+            .map(SourceSlot::source_value)
+            .collect::<Vec<_>>();
+        git_handler
+            .setup_git_proxy_after_sources_processed(cancellation, &source_values)
+            .await
+    }
+
+    /// 按注册顺序查找第一个可处理给定标签的 handler。
+    fn find_handler(&self, source_type: &str) -> Option<&Arc<dyn SourceHandler + 'recorder>> {
+        self.handlers
+            .iter()
+            .find(|handler| handler.can_handle(source_type))
+    }
+
+    /// 把一条 source manager 记录写入注入 logger，并保留 Go 属性顺序。
+    ///
+    /// 测试构造器允许 `None`；该非生产分支使用 Go 进程级 `slog.Default()` 兼容
+    /// handler，而不是产生没有 Go source 的 `tracing` 事件。
+    fn log(&self, level: LogLevel, message: &str, attributes: LogAttributes) {
+        let logger = match self.logger.as_ref() {
+            Some(logger) => logger,
+            None => default_slog_logger(),
+        };
+        logger.log(level, message, attributes);
+    }
+
+    /// 返回构造时保存的 base directory，供上层 adapter 无损复用 manager 配置。
+    #[must_use]
+    pub fn base_dir(&self) -> &std::path::Path {
+        &self.base_dir
+    }
+
+    /// 返回是否启用 repository access validation。
+    #[must_use]
+    pub fn should_validate(&self) -> bool {
+        self.should_validate
+    }
+}
+
+/// 创建保持 Go `slog` 参数顺序的 source manager 日志属性。
+fn log_attributes(
+    entries: impl IntoIterator<Item = (impl Into<String>, serde_json::Value)>,
+) -> LogAttributes {
+    entries
+        .into_iter()
+        .map(|(key, value)| (key.into(), value))
+        .collect()
+}
