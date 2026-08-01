@@ -34,7 +34,7 @@ use environment_manager::{
         WsTunnelMessage, WsTunnelOpen, tunnel_request, tunnel_response,
     },
     internal::{
-        api::{ClientOptions, HttpClient, RetryConfig, WorkClient},
+        api::{ClientOptions, HttpClient, RetryConfig},
         logger::default_slog_logger,
         mcp::{BaseServer, Tool, ToolConfig, ToolHandler, new_tool_result_text},
         tunnel::{
@@ -445,10 +445,10 @@ async fn protocol_differential_transcript() {
 }
 
 /// 启动进程内 HTTP mock，通过真实 `HttpClient` 覆盖 HTML JSON、默认传输 header、
-/// gzip 与通用响应分支，并通过真实 `WorkClient` 固定 `.`/`..` 动态 ID 的原始 ACK
-/// request-target。
+/// gzip 与通用响应分支。动态 ID 的 `.`/`..` 点段已由后端格式约束排除，因此不再
+/// 作为 Go/Rust 差分输入；其他请求 wire 行为仍逐字段比较。
 async fn capture_http_api_transcript() -> ProtocolHttpTranscript {
-    let requests = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(4)));
+    let requests = Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(3)));
     let state = ApiCaptureState {
         requests: Arc::clone(&requests),
     };
@@ -540,13 +540,6 @@ async fn capture_http_api_transcript() -> ProtocolHttpTranscript {
         )
         .await;
 
-    // 不手工拼接探针 URL：必须调用生产 WorkClient，才能同时覆盖共享 PathEscape、
-    // URL parser 和 Reqwest/Hyper 写入 request-target 的完整链路。Go 会保留两个 dot
-    // segment，所以服务端看到的原始目标必须是 `/v1/environments/./work/../ack`。
-    let work_ack = WorkClient::new(client.clone(), "fixed-work-token", None)
-        .acknowledge_work(&request_cancellation, ".", "..")
-        .await;
-
     // Go 在最后一次（这里也是唯一一次）attempt 被取消时仍套 exhausted 错误；只有
     // 尚有下一次重试并进入 backoff 才返回 retry-cancelled。使用固定 `.invalid` URL；
     // token 已预先取消，绝不会访问 DNS 或外部网络，且 transcript 不含随机 server 端口。
@@ -604,11 +597,6 @@ async fn capture_http_api_transcript() -> ProtocolHttpTranscript {
                 name: "non_ok",
                 result: String::new(),
                 error: result_error_string(failure),
-            },
-            ProtocolHttpOutcome {
-                name: "work_ack_dot_segments",
-                result: String::new(),
-                error: result_error_string(work_ack),
             },
             ProtocolHttpOutcome {
                 name: "cancelled_no_retry",

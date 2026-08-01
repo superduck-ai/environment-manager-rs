@@ -1,5 +1,8 @@
 # Go/Rust 符号映射门禁
 
+经产品决策明确接受、不会继续复刻的少量协议差异记录在
+[`accepted-differences.md`](accepted-differences.md)。
+
 `go-rust-symbols.csv` 由 `scripts/compat/generate_symbol_map.py` 从只读 Go 基线和当前
 Rust 源码重新生成。CSV 将机械期望路径与实际命中的 Rust 路径、行号和符号分开，
 因此文件拆分或方法 owner 变化不会被一个模糊的同名函数掩盖。

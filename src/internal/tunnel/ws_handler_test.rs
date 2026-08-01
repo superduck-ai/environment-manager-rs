@@ -8,7 +8,7 @@ use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::http::HeaderMap;
 use axum::routing::any;
 use futures_util::{SinkExt as _, StreamExt as _};
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -116,6 +116,21 @@ impl RecordingWsSender {
         })
         .await
         .expect("等待 websocket tunnel close 超时")
+    }
+
+    /// 等待本地连接上报首个 WebSocket 协议错误。
+    async fn wait_error(&self) -> WsTunnelError {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let notified = self.event_ready.notified();
+                if let Some(error) = self.errors.lock().unwrap().first().cloned() {
+                    return error;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("等待 websocket tunnel error 超时")
     }
 }
 
@@ -244,9 +259,9 @@ async fn test_local_websocket_abnormal_eof_is_reported_as_close_1006() {
     peer.await.unwrap();
 }
 
-/// Gorilla 不校验 text UTF-8，非法字节也必须作为非 binary 消息原样转发。
+/// 上游 Tungstenite 必须拒绝不符合 RFC 6455 的非法 UTF-8 text frame。
 #[tokio::test]
-async fn test_local_websocket_invalid_utf8_text_forwards_raw_bytes() {
+async fn test_local_websocket_invalid_utf8_text_reports_protocol_error() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = i32::from(listener.local_addr().unwrap().port());
     let (release_tx, release_rx) = oneshot::channel();
@@ -256,8 +271,7 @@ async fn test_local_websocket_invalid_utf8_text_forwards_raw_bytes() {
         let mut raw = socket.into_inner();
         // FIN + text，payload 只有一个非法 UTF-8 字节。服务端帧不需 mask。
         raw.write_all(&[0x81, 0x01, 0xff]).await.unwrap();
-        // 保持 TCP 存活到断言完成；否则 EOF 的 1006 close 与消息转发并发，
-        // 测试会把合法的后续 close 错当成 UTF-8 行为失败。
+        // 保持 TCP 存活到断言完成，确保观察到的是 UTF-8 协议错误而不是随后 EOF。
         let _ = release_rx.await;
         raw.shutdown().await.unwrap();
     });
@@ -279,20 +293,19 @@ async fn test_local_websocket_invalid_utf8_text_forwards_raw_bytes() {
         .await
         .unwrap();
 
-    let message = sender.wait_message().await;
-    assert_eq!(message.tunnel_id, "ws-invalid-utf8");
-    assert_eq!(message.data, [0xff]);
-    assert!(!message.is_binary);
+    let error = sender.wait_error().await;
+    assert_eq!(error.tunnel_id, "ws-invalid-utf8");
+    assert!(error.error_message.contains("invalid UTF-8"));
+    assert!(sender.messages.lock().unwrap().is_empty());
     assert!(sender.closes.lock().unwrap().is_empty());
-    assert!(sender.errors.lock().unwrap().is_empty());
     cancellation.cancel();
     release_tx.send(()).unwrap();
     peer.await.unwrap();
 }
 
-/// 分片 text 跨帧组合后即使 UTF-8 非法，也必须保留完整原始 payload。
+/// 分片 text 组合为非法 UTF-8 后也必须由标准协议状态机拒绝。
 #[tokio::test]
-async fn test_local_websocket_fragmented_invalid_utf8_forwards_raw_bytes() {
+async fn test_local_websocket_fragmented_invalid_utf8_reports_protocol_error() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = i32::from(listener.local_addr().unwrap().port());
     let peer = tokio::spawn(async move {
@@ -300,7 +313,7 @@ async fn test_local_websocket_fragmented_invalid_utf8_forwards_raw_bytes() {
         let socket = tokio_tungstenite::accept_async(stream).await.unwrap();
         let mut raw = socket.into_inner();
         // 首帧是未完结 text 0xc3，终结 continuation 的 0x28 不能
-        // 构成 UTF-8；Gorilla 仍返回两字节组合后的 text message。
+        // 构成 UTF-8；上游 Tungstenite 会在组装完整消息后报告协议错误。
         raw.write_all(&[0x01, 0x01, 0xc3, 0x80, 0x01, 0x28])
             .await
             .unwrap();
@@ -323,11 +336,10 @@ async fn test_local_websocket_fragmented_invalid_utf8_forwards_raw_bytes() {
         .await
         .unwrap();
 
-    let message = sender.wait_message().await;
-    assert_eq!(message.tunnel_id, "ws-fragmented-invalid-utf8");
-    assert_eq!(message.data, [0xc3, 0x28]);
-    assert!(!message.is_binary);
-    assert!(sender.errors.lock().unwrap().is_empty());
+    let error = sender.wait_error().await;
+    assert_eq!(error.tunnel_id, "ws-fragmented-invalid-utf8");
+    assert!(error.error_message.contains("invalid UTF-8"));
+    assert!(sender.messages.lock().unwrap().is_empty());
     peer.await.unwrap();
 }
 
@@ -417,45 +429,39 @@ async fn test_replacing_local_websocket_does_not_wait_or_send_close_frame() {
     new_peer.await.unwrap();
 }
 
-/// 写 deadline 后保留 Gorilla 首错和 registry，但绝不能迟到刷出缓存帧。
+/// 写 deadline 后必须立即移除 tunnel，并让本地 socket 在有限时间内关闭。
 #[tokio::test]
-async fn test_timed_out_local_websocket_preserves_first_error_without_late_flush() {
+async fn test_timed_out_local_websocket_is_removed_and_socket_discarded() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = i32::from(listener.local_addr().unwrap().port());
     let (ready_tx, ready_rx) = oneshot::channel();
     let (after_timeout_tx, after_timeout_rx) = oneshot::channel();
-    let (message_tx, message_rx) = oneshot::channel();
-    let (finish_tx, finish_rx) = oneshot::channel();
+    let (closed_tx, closed_rx) = oneshot::channel();
     let peer = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
             .max_frame_size(None)
             .max_message_size(None);
-        let mut socket = tokio_tungstenite::accept_async_with_config(stream, Some(config))
+        let socket = tokio_tungstenite::accept_async_with_config(stream, Some(config))
             .await
             .unwrap();
         ready_tx.send(()).unwrap();
-        // 在 client deadline 内不读，确保 32 MiB frame 只写出前缀；测试
-        // 明确通知超时后，再发 ping 触发 tungstenite 的自动回复路径。
+        // 在 client deadline 内不读，确保 32 MiB frame 只能写出一部分。收到通知后
+        // 才开始排空内核缓冲，最终必须观察到 environment-manager 丢弃连接产生的 EOF。
         after_timeout_rx.await.unwrap();
-        socket
-            .send(TungsteniteMessage::Ping(b"must-not-flush".to_vec().into()))
-            .await
-            .unwrap();
-        socket
-            .send(TungsteniteMessage::Binary(
-                b"still-readable".to_vec().into(),
-            ))
-            .await
-            .unwrap();
-        let received_complete_data = matches!(
-            timeout(Duration::from_millis(500), socket.next()).await,
-            Ok(Some(Ok(
-                TungsteniteMessage::Text(_) | TungsteniteMessage::Binary(_)
-            )))
-        );
-        message_tx.send(received_complete_data).unwrap();
-        let _ = finish_rx.await;
+        let mut raw = socket.into_inner();
+        let closed = timeout(Duration::from_secs(2), async {
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                match raw.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await
+        .is_ok();
+        closed_tx.send(closed).unwrap();
     });
 
     let handler = new_ws_handler(None);
@@ -491,9 +497,7 @@ async fn test_timed_out_local_websocket_preserves_first_error_without_late_flush
         .await
         .expect_err("a peer that does not read must hit the test write deadline");
     assert_eq!(error.to_string(), "write websocket message: i/o timeout");
-    let registered = handler.lookup_tunnel("ws-write-timeout").await.unwrap();
-    let marker = Arc::downgrade(&registered.write_poisoned);
-    drop(registered);
+    assert!(handler.lookup_tunnel("ws-write-timeout").await.is_none());
 
     let later_write = handler
         .send_message(
@@ -505,25 +509,10 @@ async fn test_timed_out_local_websocket_preserves_first_error_without_late_flush
             },
         )
         .await
-        .expect_err("a timed-out connection must reject every later write");
+        .expect_err("a timed-out connection must be absent from the registry");
     assert_eq!(
         later_write.to_string(),
-        "write websocket message: i/o timeout"
-    );
-    after_timeout_tx.send(()).unwrap();
-
-    // Go 的读循环不会因 writeErr 停止；即使 pong 被禁止写出，后续本地
-    // application message 仍必须能回传后端。
-    let inbound = sender.wait_message().await;
-    assert_eq!(inbound.tunnel_id, "ws-write-timeout");
-    assert_eq!(inbound.data, b"still-readable");
-    assert!(inbound.is_binary);
-    assert!(
-        !timeout(Duration::from_secs(2), message_rx)
-            .await
-            .unwrap()
-            .unwrap(),
-        "the timed-out frame must never arrive as a complete future message"
+        "tunnel not found: ws-write-timeout"
     );
 
     let close_error = handler
@@ -536,21 +525,22 @@ async fn test_timed_out_local_websocket_preserves_first_error_without_late_flush
             },
         )
         .await
-        .expect_err("Gorilla close must return the persistent first write error");
+        .expect_err("a timed-out connection cannot be closed a second time");
     assert_eq!(
         close_error.to_string(),
-        "close websocket tunnel: i/o timeout"
+        "tunnel not found: ws-write-timeout"
     );
-    assert!(handler.lookup_tunnel("ws-write-timeout").await.is_none());
-    finish_tx.send(()).unwrap();
+    assert!(sender.messages.lock().unwrap().is_empty());
+
+    after_timeout_tx.send(()).unwrap();
+    assert!(
+        timeout(Duration::from_secs(3), closed_rx)
+            .await
+            .unwrap()
+            .unwrap(),
+        "写失败后本地 socket 必须被丢弃"
+    );
     peer.await.unwrap();
-    timeout(Duration::from_secs(2), async {
-        while marker.upgrade().is_some() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("write-poison marker must not form a connection reference cycle");
 }
 
 #[tokio::test]

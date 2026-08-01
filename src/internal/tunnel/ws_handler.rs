@@ -5,10 +5,7 @@
 //! Rust 将连接拆成读写半部以替代 Gorilla WebSocket 的显式写 mutex，线上的消息顺序不变。
 
 use std::collections::BTreeMap;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -17,8 +14,7 @@ use serde_json::Value;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
-use tokio_tungstenite::tungstenite::protocol::frame::Frame;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::{CloseCode, Data, OpCode};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 use tokio_util::sync::CancellationToken;
 
@@ -104,12 +100,9 @@ impl WsHandler {
             outbound.headers_mut().insert(SEC_WEBSOCKET_PROTOCOL, value);
         }
 
-        // Gorilla 首次写失败后会永久保存 `writeErr`，读循环也不会借 ping
-        // 自动重试未完成的应用帧。marker 只装入这一条本地连接，主 Tunnel
-        // 继续使用无 marker 的默认兼容配置。
-        let write_poisoned = Arc::new(AtomicBool::new(false));
-        let websocket_config =
-            gorilla_websocket_config().gorilla_write_poisoned(Arc::clone(&write_poisoned));
+        // 本地连接使用上游 Tungstenite 的标准协议状态机。项目不再向依赖内部
+        // 注入 write-poison；任何写失败都会在应用层立即取消并移除整条 tunnel。
+        let websocket_config = gorilla_websocket_config();
         let handshake = tokio::select! {
             () = cancellation.cancelled() => return Err(TunnelError::message("context canceled")),
             handshake = tokio::time::timeout(
@@ -153,8 +146,6 @@ impl WsHandler {
         let tunnel = Arc::new(WsTunnel {
             tunnel_id: request.tunnel_id.clone(),
             sink: tokio::sync::Mutex::new(sink),
-            write_error: std::sync::Mutex::new(None),
-            write_poisoned,
             sender: Arc::clone(&sender),
             cancellation: cancellation.child_token(),
         });
@@ -206,11 +197,9 @@ impl WsHandler {
     /// 使用显式 deadline 向本地 WebSocket 发送一条消息。
     ///
     /// 对应 Go `(*WSHandler).SendMessage` 的写 deadline。生产调用固定为
-    /// 10 秒；参数化仅用于在测试中不真实等待十秒。首次写入超时或
-    /// 底层失败后，像 Gorilla `writeErr` 一样保留连接登记和首个错误；
-    /// 后续写不再触碰 sink，而是立即返回相同错误。超时分支会在取消
-    /// send future 之前设置共享 marker，使读循环不能因 ping/close 自动
-    /// flush tungstenite 里未完成的 frame。
+    /// 10 秒；参数化仅用于在测试中不真实等待十秒。首次写入超时或底层失败后，
+    /// 连接的写状态已经不可判断，因而立即从 registry 移除并取消读循环。后续消息
+    /// 会稳定得到 `tunnel not found`，不会尝试复用可能残留半帧的 socket。
     pub(super) async fn send_message_with_timeout(
         &self,
         cancellation: &CancellationToken,
@@ -229,37 +218,25 @@ impl WsHandler {
         let outbound = if message.is_binary {
             Message::Binary(message.data.into())
         } else {
-            // Gorilla WebSocket 的 `WriteMessage(TextMessage, data)` 不预先校验 UTF-8。
-            // 使用 tungstenite 原始 text frame 可保留同样的任意字节行为，同时避免 unsafe。
-            Message::Frame(Frame::message(message.data, OpCode::Data(Data::Text), true))
+            // 后端协议用 bytes 表示 WS payload，但 RFC 6455 要求 text frame 是 UTF-8。
+            // 上游 Tungstenite 的 `Message::Text` 只接受字符串，因此在接触 socket 前
+            // 拒绝错误标记为 text 的任意二进制数据，调用方应改用 `is_binary=true`。
+            let text = String::from_utf8(message.data).map_err(|error| {
+                TunnelError::message(format!("write websocket message: invalid UTF-8: {error}"))
+            })?;
+            Message::Text(text.into())
         };
         let mut sink = tunnel.sink.lock().await;
-        if let Some(error) = Self::stored_write_error(&tunnel) {
-            return Err(TunnelError::message(format!(
-                "write websocket message: {error}"
-            )));
-        }
-
-        let send = sink.send(outbound);
-        tokio::pin!(send);
-        let deadline = tokio::time::sleep(write_timeout);
-        tokio::pin!(deadline);
-        let error = tokio::select! {
-            // 与 `timeout` 一样，在 write 与 deadline 同时 ready 时优先接收
-            // 已完成 write；deadline 真正获胜时则先 poison，再取消 future。
-            biased;
-            result = &mut send => match result {
-                Ok(()) => return Ok(()),
-                Err(error) => Self::remember_first_write_error(
-                    &tunnel,
-                    local_websocket_write_error_text(&error),
-                ),
-            },
-            () = &mut deadline => Self::remember_first_write_error(
-                &tunnel,
-                "i/o timeout".to_owned(),
-            ),
+        let error = match tokio::time::timeout(write_timeout, sink.send(outbound)).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => local_websocket_write_error_text(&error),
+            Err(_) => "i/o timeout".to_owned(),
         };
+
+        // timeout 会先丢弃未完成的 send future；随后必须释放写锁再取消读半部，
+        // 否则清理任务可能等待同一 split socket，形成不必要的锁顺序依赖。
+        drop(sink);
+        Self::close_tunnel_instance(&self.tunnels, Arc::clone(&tunnel)).await;
         Err(TunnelError::message(format!(
             "write websocket message: {error}"
         )))
@@ -322,14 +299,6 @@ impl WsHandler {
 
         let close_message = websocket_close_message(code, reason);
         let mut sink = tunnel.sink.lock().await;
-        if let Some(error) = Self::stored_write_error(&tunnel) {
-            // Gorilla 在 `WriteMessage(Close)` 前先读取持久 `writeErr`，因此
-            // close 必须返回首个写错；随后底层 `Conn.Close` 直接关 TCP，
-            // 不能让 tungstenite `close()` 刷出超时帧。
-            return Err(TunnelError::message(format!(
-                "close websocket tunnel: {error}"
-            )));
-        }
         // Go 的 deadline 覆盖 close frame 写入；把 send 与底层 shutdown 置于
         // 同一十秒窗口，避免恶意或停滞的本地 peer 占住主 Tunnel 分派任务。
         let (write_result, close_result) = tokio::time::timeout(WEBSOCKET_WRITE_TIMEOUT, async {
@@ -348,33 +317,6 @@ impl WsHandler {
             ))),
             (Ok(()), Ok(())) => Ok(()),
         }
-    }
-
-    /// 读取 Gorilla 风格的持久首写错误。
-    ///
-    /// mutex 只保护一个短字符串，不跨任何 `.await`；即使其他任务 panic
-    /// 导致 poison，也仍取回已记录值，避免把锁实现细节暴露为协议差异。
-    fn stored_write_error(tunnel: &WsTunnel) -> Option<String> {
-        tunnel
-            .write_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    /// 保存第一条底层写错误并原样复用于这条连接的后续操作。
-    ///
-    /// marker 必须先于错误锁置位：timeout 分支返回后 Tokio 会立即取消
-    /// `send` future，读任务可能随即获得底层 BiLock；先 poison 可保证它
-    /// 看不到一个仍允许自动 flush 的短暂窗口。配置只持有同一个 `Arc`，
-    /// 不指回 `WsTunnel`，因此连接回收时不存在引用环。
-    fn remember_first_write_error(tunnel: &WsTunnel, error: String) -> String {
-        tunnel.write_poisoned.store(true, Ordering::Release);
-        let mut stored = tunnel
-            .write_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        stored.get_or_insert(error).clone()
     }
 
     /// 记录本地 WebSocket 成功建立事件，字段名与 Go slog 调用保持一致。
@@ -399,6 +341,9 @@ impl WsHandler {
     ) {
         loop {
             let next = tokio::select! {
+                // 写失败会触发 cancellation；若此时本地 socket 也可读，必须先退出，
+                // 避免继续驱动一个已经判定不可复用的 WebSocket 状态机。
+                biased;
                 () = tunnel.cancellation.cancelled() => break,
                 next = stream.next() => next,
             };
@@ -427,25 +372,6 @@ impl WsHandler {
                             tunnel_id: tunnel.tunnel_id.clone(),
                             data: data.to_vec(),
                             is_binary: true,
-                        })
-                        .await
-                    {
-                        log_send_failure(logger.as_ref(), &tunnel.tunnel_id, &error.to_string());
-                        break;
-                    }
-                }
-                Ok(Message::Frame(frame))
-                    if matches!(frame.header().opcode, OpCode::Data(Data::Text)) =>
-                {
-                    // Gorilla `ReadMessage` 不校验 text UTF-8。vendored tungstenite
-                    // 用 raw text Frame 暴露这类输入，使用 payload 可以向后端
-                    // 保留每个原始字节，同时仍正确标记 `is_binary=false`。
-                    if let Err(error) = tunnel
-                        .sender
-                        .send_message(WsTunnelMessage {
-                            tunnel_id: tunnel.tunnel_id.clone(),
-                            data: frame.into_payload().to_vec(),
-                            is_binary: false,
                         })
                         .await
                     {
@@ -571,9 +497,8 @@ fn local_websocket_write_error_text(error: &WebSocketError) -> String {
 /// 把本地 WebSocket 读错转成稳定的协议错误文本。
 ///
 /// `Io` 去掉 tungstenite 特有的 `IO error:` 外壳，与 Gorilla 透传
-/// `net.Error` 一致。Tunnel 专用兼容配置会把非法 UTF-8 text 作为原始
-/// `Message::Frame` 交给读循环；这里保留 `Utf8` 分支，是为了让无效 close
-/// reason 等其他 UTF-8 协议错误仍得到稳定、明确的错误文本。
+/// `net.Error` 一致。上游 Tungstenite 会拒绝非法 UTF-8 text 和无效 close reason；
+/// `Utf8` 分支把依赖内部错误转换为稳定、明确的 Tunnel 错误文本。
 fn local_websocket_error_text(error: &WebSocketError) -> String {
     match error {
         WebSocketError::Io(error) => error.to_string(),

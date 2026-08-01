@@ -61,16 +61,16 @@ type protocolHTTPTranscript struct {
 	Outcomes      []protocolHTTPOutcome `json:"outcomes"`
 }
 
-// TestProtocolDifferentialTranscript 从真实 Go HttpClient 发出三次通用 JSON 请求，并从
-// 真实 WorkClient 发出一次 ACK，覆盖 HTML JSON 编码、默认传输 header、gzip 成功
-// 响应、501 sentinel、普通非 200 错误，以及 `.`/`..` 动态 ID 在原始
-// request-target 中不得被清理的行为。服务端完全位于当前测试进程，不依赖 staging、
-// DNS 或外部网络；随机监听端口只用于连接，不写入 transcript。
+// TestProtocolDifferentialTranscript 从真实 Go HttpClient 发出三次通用 JSON 请求，
+// 覆盖 HTML JSON 编码、默认传输 header、gzip 成功响应、501 sentinel 和普通非 200
+// 错误。动态 ID 的 `.`/`..` 点段已由受控后端格式约束排除，不再作为差分输入。
+// 服务端完全位于当前测试进程，不依赖 staging、DNS 或外部网络；随机监听端口只用于
+// 连接，不写入 transcript。
 func TestProtocolDifferentialTranscript(t *testing.T) {
 	t.Helper()
 
 	var requestsMu sync.Mutex
-	requests := make([]protocolHTTPRequest, 0, 4)
+	requests := make([]protocolHTTPRequest, 0, 3)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -105,10 +105,6 @@ func TestProtocolDifferentialTranscript(t *testing.T) {
 		case "/not-implemented":
 			w.WriteHeader(http.StatusNotImplemented)
 			_, _ = io.WriteString(w, "missing")
-		case "/v1/environments/./work/../ack":
-			// Go 的 Transport 会把 URL.Path 原样写入 RequestURI；这里按包含 dot
-			// segment 的路径返回 204，避免 redirect 或 router clean 掩盖 wire 差异。
-			w.WriteHeader(http.StatusNoContent)
 		default:
 			w.WriteHeader(http.StatusTeapot)
 			_, _ = io.WriteString(w, "teapot")
@@ -133,7 +129,7 @@ func TestProtocolDifferentialTranscript(t *testing.T) {
 	client.httpClient = server.Client()
 
 	payload := map[string]interface{}{"hello": "world", "html": "<\u2028&>", "sequence": 7}
-	outcomes := make([]protocolHTTPOutcome, 0, 6)
+	outcomes := make([]protocolHTTPOutcome, 0, 5)
 	var response struct {
 		OK   bool   `json:"ok"`
 		Echo string `json:"echo"`
@@ -154,13 +150,6 @@ func TestProtocolDifferentialTranscript(t *testing.T) {
 
 	err = client.PostJSON(context.Background(), server.URL+"/failure", payload, "fixed-api-token", "protocol failure")
 	outcomes = append(outcomes, protocolHTTPOutcome{Name: "non_ok", Result: "", Error: errorString(err)})
-
-	// 该调用必须经过生产 WorkClient，而不是手工构造 URL。`.` 和 `..` 都是合法的
-	// 非空 ID；Go 的 url.PathEscape 会保留它们，Transport 也不会清理绝对 URL 中的
-	// dot segment，因此 transcript 必须精确记录 `/v1/environments/./work/../ack`。
-	workClient := NewWorkClient(client, "fixed-work-token", slog.New(slog.NewTextHandler(io.Discard, nil)))
-	err = workClient.AcknowledgeWork(context.Background(), ".", "..")
-	outcomes = append(outcomes, protocolHTTPOutcome{Name: "work_ack_dot_segments", Result: "", Error: errorString(err)})
 
 	// 最后一次（这里也是唯一一次）attempt 被取消时，Go 仍返回 exhausted 包装；只有
 	// 尚可继续重试并进入 backoff 时才返回 retry-cancelled。固定 `.invalid` URL 不会

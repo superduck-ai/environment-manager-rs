@@ -19,14 +19,12 @@
       "request_targets": [
         "/ok?mode=success",
         "/not-implemented",
-        "/failure",
-        "/v1/environments/./work/../ack"
+        "/failure"
       ],
       "outcome_names": [
         "success",
         "not_implemented",
         "non_ok",
-        "work_ack_dot_segments",
         "cancelled_no_retry",
         "connection_refused"
       ]

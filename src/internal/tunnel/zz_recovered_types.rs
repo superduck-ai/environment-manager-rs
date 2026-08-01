@@ -4,7 +4,7 @@
 //! `tunnel::mod` 重新导出；本文件保存运行时状态和统一错误边界。
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures_util::stream::{SplitSink, SplitStream};
@@ -78,10 +78,6 @@ pub(crate) struct WsTunnel {
     pub(crate) tunnel_id: String,
     /// 分离后的写半部；避免长时间 read 阻塞后端下行消息。
     pub(crate) sink: tokio::sync::Mutex<LocalWebSocketSink>,
-    /// Gorilla 在首次写失败后永久保存的底层错误文本；后续写必须复用首错。
-    pub(crate) write_error: Mutex<Option<String>>,
-    /// 与 vendored tungstenite 配置共享的写毒化标记；不反向持有 tunnel。
-    pub(crate) write_poisoned: Arc<AtomicBool>,
     /// 本地上行消息的协议 sender。
     pub(crate) sender: Arc<dyn WsResponseSender>,
     /// 主动关闭及替换同 ID 连接时使用的取消令牌。

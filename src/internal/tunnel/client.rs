@@ -23,9 +23,7 @@ use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::handshake::client::{
     Request as WebSocketRequest, Response as WebSocketResponse,
 };
-use tokio_tungstenite::tungstenite::protocol::frame::coding::{
-    CloseCode, Data as FrameData, OpCode,
-};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
 use tokio_tungstenite::{client_async_tls_with_config, connect_async_with_config};
 use tokio_util::sync::CancellationToken;
@@ -926,11 +924,11 @@ pub(super) async fn connect_websocket(
     connect_websocket_with_config(request, gorilla_websocket_config()).await
 }
 
-/// 使用进程级代理快照和调用方提供的 WebSocket 兼容配置建立连接。
+/// 使用进程级代理快照和调用方提供的 WebSocket 配置建立连接。
 ///
-/// 本地 [`WsHandler`](super::WsHandler) 通过此入口额外安装单连接 write-poison
-/// marker；主 Tunnel 仍调用 [`connect_websocket`]，不会共享或继承该 marker。
-/// 配置按值移入新连接，调用结束后不保留指向 handler 的反向引用。
+/// 主 Tunnel 与本地 [`WsHandler`](super::WsHandler) 共用这一入口，确保直连、
+/// HTTP CONNECT 和 SOCKS5 三条拨号路径采用相同的 frame/message 限制。配置按值
+/// 移入连接，不保存任何指向 handler 的反向引用。
 pub(super) async fn connect_websocket_with_config(
     request: WebSocketRequest,
     websocket_config: WebSocketConfig,
@@ -955,8 +953,8 @@ pub(super) async fn connect_websocket_with_proxy_config(
 /// 使用显式代理快照和显式 WebSocket 配置建立连接。
 ///
 /// 该内部汇合点保证直连、HTTP CONNECT 与 SOCKS5 三条路径使用完全相同的
-/// frame/message 限制、握手兼容规则和可选 write-poison marker。配置只会被
-/// 当前连接持有，不会写回进程级代理快照。
+/// frame/message 限制和标准 WebSocket 握手规则。配置只会被当前连接持有，
+/// 不会写回进程级代理快照。
 async fn connect_websocket_with_proxy_and_websocket_config(
     request: WebSocketRequest,
     config: &EnvironmentProxyConfig,
@@ -983,20 +981,17 @@ async fn connect_websocket_with_proxy_and_websocket_config(
         .map_err(GorillaDialFailure::from_websocket_error)
 }
 
-/// 构造与 Gorilla 拨号器一致的 WebSocket 配置。
+/// 构造 Tunnel 使用的标准 WebSocket 配置。
 ///
 /// Go 路径没有调用 `SetReadLimit`，因此 text/binary 消息和单帧都没有
 /// Gorilla 层的 64 MiB/16 MiB 上限。tungstenite 默认值恰好带这两个
-/// 上限，必须显式取消。vendored compatibility 开关还会对
-/// `Connection`/`Upgrade` 按 token-list 验证、不校验服务端子协议，
-/// 并保留非法 UTF-8 text 的原始字节。该开关默认关闭，只有本
-/// Tunnel helper 启用，不改变 Axum 等其他使用者的严格行为。
+/// 上限，必须显式取消。握手校验、子协议协商和 text UTF-8 校验则直接采用
+/// 上游 Tungstenite 的 RFC 行为，不再维护项目私有的 Gorilla 补丁。
 #[must_use]
 pub(super) fn gorilla_websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(None)
         .max_frame_size(None)
-        .gorilla_compatibility(true)
 }
 
 /// 在一个不可重置的 deadline 内读取下一条 Tunnel 应用消息。
@@ -1033,14 +1028,6 @@ where
                 Message::Binary(data) => return Ok(data.to_vec()),
                 Message::Pong(_) => on_pong(),
                 Message::Ping(_) => {}
-                Message::Frame(frame)
-                    if matches!(frame.header().opcode, OpCode::Data(FrameData::Text)) =>
-                {
-                    // vendored tungstenite 只在 Gorilla 兼容开关下，用原始
-                    // Frame 暴露无效 UTF-8 text。Go 主 Tunnel 会将这些字节
-                    // 原样交给 ProtoJSON，因此这里也返回 payload 而非忽略。
-                    return Ok(frame.into_payload().to_vec());
-                }
                 Message::Frame(_) => {}
                 Message::Close(frame) => {
                     return Err(TunnelError::message(format!(

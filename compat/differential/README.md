@@ -101,8 +101,6 @@ Input transcript 故意不比较 logger `source`，因为 Go/Rust 文件名与�
   Transport 自动 `Accept-Encoding: gzip`、原始请求 body 及 gzip 成功响应解码。
 - `not_implemented`：mock 返回 501 和 `missing`，比较 Go sentinel 对外错误文本。
 - `non_ok`：mock 返回 418 和 `teapot`，比较普通非 OK 错误文本。
-- `work_ack_dot_segments`：通过真实 `WorkClient` 比较包含 `.`/`..` 动态 ID 的原始
-  ACK request-target，禁止 URL 库在发送前清理 path segment。
 - `cancelled_no_retry`：预先取消一次零重试 POST，比较最后 attempt 的 Go exhausted
   包装顺序，防止 Rust 提前返回不同的 cancellation 文本。
 - `connection_refused`：连接刚关闭的 loopback 端口，仅在 probe 内把随机地址替换为

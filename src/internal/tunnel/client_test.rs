@@ -186,30 +186,42 @@ fn test_websocket_config_has_no_incoming_frame_or_message_limit() {
     let config = gorilla_websocket_config();
     assert_eq!(config.max_frame_size, None);
     assert_eq!(config.max_message_size, None);
-    assert!(config.gorilla_compatibility);
-    assert!(config.gorilla_write_poisoned.is_none());
 }
 
-/// Gorilla 将 `Connection` 和 `Upgrade` 都按 HTTP token-list 解析。
+/// 上游 Tungstenite 接受 RFC 常规握手响应，正常 Tunnel 不依赖私有兼容开关。
 #[tokio::test]
-async fn test_gorilla_handshake_accepts_connection_and_upgrade_token_lists() {
-    let (port, server) =
-        start_raw_handshake_server("keep-alive, Upgrade", "h2c, WebSocket", None).await;
-    let request = format!("ws://127.0.0.1:{port}/token-list")
+async fn test_upstream_handshake_accepts_standard_response_headers() {
+    let (port, server) = start_raw_handshake_server("Upgrade", "websocket", None).await;
+    let request = format!("ws://127.0.0.1:{port}/standard")
         .into_client_request()
         .unwrap();
 
     let (_socket, response) =
         connect_websocket_with_proxy_config(request, &EnvironmentProxyConfig::default())
             .await
-            .expect("Gorilla token-list response must complete the handshake");
+            .expect("standard response must complete the handshake");
     assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
     server.await.unwrap();
 }
 
-/// Gorilla 保留服务端子协议文本，但不验证它是否在请求列表内。
+/// 不再 vendoring 后，异常 token-list 响应由上游严格握手器拒绝。
 #[tokio::test]
-async fn test_gorilla_handshake_does_not_validate_server_subprotocol() {
+async fn test_upstream_handshake_rejects_nonstandard_token_list_response() {
+    let (port, server) =
+        start_raw_handshake_server("keep-alive, Upgrade", "h2c, WebSocket", None).await;
+    let request = format!("ws://127.0.0.1:{port}/token-list")
+        .into_client_request()
+        .unwrap();
+
+    connect_websocket_with_proxy_config(request, &EnvironmentProxyConfig::default())
+        .await
+        .expect_err("upstream handshake must reject nonstandard token-list response");
+    server.await.unwrap();
+}
+
+/// 服务端必须从客户端报价中选择子协议，不能任意返回未声明值。
+#[tokio::test]
+async fn test_upstream_handshake_rejects_unoffered_server_subprotocol() {
     let (port, server) =
         start_raw_handshake_server("Upgrade", "websocket", Some("server-only")).await;
     let mut request = format!("ws://127.0.0.1:{port}/subprotocol")
@@ -220,17 +232,9 @@ async fn test_gorilla_handshake_does_not_validate_server_subprotocol() {
         http::HeaderValue::from_static("client-offered"),
     );
 
-    let (_socket, response) =
-        connect_websocket_with_proxy_config(request, &EnvironmentProxyConfig::default())
-            .await
-            .expect("Gorilla must accept an unrequested response subprotocol");
-    assert_eq!(
-        response
-            .headers()
-            .get("sec-websocket-protocol")
-            .and_then(|value| value.to_str().ok()),
-        Some("server-only")
-    );
+    connect_websocket_with_proxy_config(request, &EnvironmentProxyConfig::default())
+        .await
+        .expect_err("upstream handshake must reject an unoffered server subprotocol");
     server.await.unwrap();
 }
 

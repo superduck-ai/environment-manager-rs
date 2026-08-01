@@ -135,35 +135,6 @@ class DifferentialProtocolTest(unittest.TestCase):
                 "mcp", document, manifest, "go"
             )
 
-    def test_validate_transcript_rejects_cleaned_dot_segments(self) -> None:
-        """URL 库若清理 `.`/`..`，即使请求仍到达 mock 也必须在门禁失败。"""
-        manifest = {
-            "protocols": {
-                "http_api": {
-                    "request_targets": [
-                        "/v1/environments/./work/../ack"
-                    ],
-                    "outcome_names": ["work_ack_dot_segments"],
-                }
-            }
-        }
-        document = {
-            "schema_version": 1,
-            "protocol": "http_api",
-            "requests": [
-                {
-                    # 这是常见 URL parser 清理后的错误结果；比较器必须逐字节拒绝，
-                    # 不能把它归一化回 Go 基线的原始 request-target。
-                    "target": "/v1/environments/ack",
-                }
-            ],
-            "outcomes": [{"name": "work_ack_dot_segments"}],
-        }
-        with self.assertRaises(differential_protocol.ProtocolDifferentialError):
-            differential_protocol.validate_transcript(
-                "http_api", document, manifest, "rust"
-            )
-
     def test_validate_runtime_transcript_rejects_reordered_case(self) -> None:
         """真实 Tunnel runtime 场景即使双方一起重排也必须被 manifest 拒绝。"""
         manifest = {

@@ -25,7 +25,7 @@
 ///
 /// # 兼容性
 /// 这里只复刻 `PathEscape` 本身，不负责完整 URL parser 对 `.`/`..` path segment
-/// 的归一化。调用方必须在随后构造请求时继续保留这里生成的原始 escaped path。
+/// 的归一化；上游 `url` 会按 WHATWG 清理后端明确禁止的完整 `.`/`..` ID。
 #[must_use]
 pub(crate) fn go_path_escape(value: &str) -> String {
     const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
