@@ -79,12 +79,11 @@ impl LogHandler for SourceHandler {
     }
 }
 
-/// 在 Linux ARM64 上生成两个生产 LogWriter caller 的确定性 JSONL transcript。
+/// 在 Linux 上生成两个生产 LogWriter caller 的确定性 JSONL transcript。
 #[test]
 #[ignore = "由 scripts/compat/run_logger_source_differential.sh 显式运行"]
 fn write_logger_source_differential_transcript() {
     assert_eq!(std::env::consts::OS, "linux");
-    assert_eq!(std::env::consts::ARCH, "aarch64");
     let output = std::env::var_os("LOGGER_SOURCE_TRANSCRIPT_OUTPUT")
         .expect("LOGGER_SOURCE_TRANSCRIPT_OUTPUT is required");
     let handler = SourceHandler::default();

@@ -34,7 +34,7 @@ use super::zz_recovered_types::{
 
 /// 从 `HOME` 生成默认健康文件路径；缺少 `HOME` 时回退到 `/tmp`。
 ///
-/// 当前迁移只面向 Linux ARM64，因此这里刻意采用 Linux 进程环境语义，不引入跨平台
+/// 当前迁移面向 Linux GNU，因此这里刻意采用 Linux 进程环境语义，不引入跨平台
 /// home-directory 依赖。
 #[must_use]
 pub fn get_default_health_file_path() -> PathBuf {

@@ -1,4 +1,4 @@
-//! `environment-manager` Linux ARM64 二进制入口。
+//! `environment-manager` Linux GNU 二进制入口。
 //!
 //! 对应 Go `main.go`：这里只规范化 argv、解析兼容 CLI、选择 stdout/stderr 并把
 //! 强类型调用交给运行时。业务逻辑位于镜像模块树，避免入口随着迁移变成第二套实现。

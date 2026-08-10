@@ -3,7 +3,7 @@ name = "environment-manager"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-description = "Linux ARM64 environment manager compatible with environment-runner"
+description = "Linux environment manager compatible with environment-runner"
 license = "UNLICENSED"
 
 [[bin]]

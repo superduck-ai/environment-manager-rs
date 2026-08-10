@@ -121,8 +121,8 @@ fn completed_command_result(status: io::Result<std::process::ExitStatus>) -> Com
 
 /// 对应 Go `processWasSignaled`，判断 Linux wait status 是否由信号结束。
 ///
-/// `ExitStatusExt::signal` 只在 Unix 可用；本项目唯一支持目标是 Linux ARM64，
-/// 因此这里不增加其他平台的退化分支。
+/// `ExitStatusExt::signal` 只在 Unix 可用；本项目支持 Linux GNU 的任意 CPU
+/// 架构，因此这里不增加其他操作系统的退化分支。
 #[must_use]
 fn process_was_signaled(status: &std::process::ExitStatus) -> bool {
     status.signal().is_some()

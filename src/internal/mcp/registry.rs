@@ -369,40 +369,48 @@ fn exit_status_error(status: &ExitStatus) -> String {
         return format!("exit status {code}");
     }
     let signal = status.signal().unwrap_or_default();
-    // 目标唯一固定为 Linux ARM64；这里机械复制 Go syscall.Signal.String 的 Linux
-    // 名称，避免外部终止 `claude` 时把 Rust 的裸信号编号写入 error 属性。
+    // 使用 libc 针对当前 Linux 目标定义的信号编号，避免假定所有 CPU
+    // 架构都沿用 ARM64 编号，同时保持 Go syscall.Signal.String 的名称。
     let name = match signal {
-        1 => "hangup",
-        2 => "interrupt",
-        3 => "quit",
-        4 => "illegal instruction",
-        5 => "trace/breakpoint trap",
-        6 => "aborted",
-        7 => "bus error",
-        8 => "floating point exception",
-        9 => "killed",
-        10 => "user defined signal 1",
-        11 => "segmentation fault",
-        12 => "user defined signal 2",
-        13 => "broken pipe",
-        14 => "alarm clock",
-        15 => "terminated",
-        16 => "stack fault",
-        17 => "child exited",
-        18 => "continued",
-        19 => "stopped (signal)",
-        20 => "stopped",
-        21 => "stopped (tty input)",
-        22 => "stopped (tty output)",
-        23 => "urgent I/O condition",
-        24 => "CPU time limit exceeded",
-        25 => "file size limit exceeded",
-        26 => "virtual timer expired",
-        27 => "profiling timer expired",
-        28 => "window changed",
-        29 => "I/O possible",
-        30 => "power failure",
-        31 => "bad system call",
+        libc::SIGHUP => "hangup",
+        libc::SIGINT => "interrupt",
+        libc::SIGQUIT => "quit",
+        libc::SIGILL => "illegal instruction",
+        libc::SIGTRAP => "trace/breakpoint trap",
+        libc::SIGABRT => "aborted",
+        libc::SIGBUS => "bus error",
+        libc::SIGFPE => "floating point exception",
+        libc::SIGKILL => "killed",
+        libc::SIGUSR1 => "user defined signal 1",
+        libc::SIGSEGV => "segmentation fault",
+        libc::SIGUSR2 => "user defined signal 2",
+        libc::SIGPIPE => "broken pipe",
+        libc::SIGALRM => "alarm clock",
+        libc::SIGTERM => "terminated",
+        // MIPS 和 SPARC 的 Linux signal ABI 没有 SIGSTKFLT；其他架构按 libc
+        // 定义保留 Go 对 "stack fault" 的命名。
+        #[cfg(not(any(
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "sparc",
+            target_arch = "sparc64"
+        )))]
+        libc::SIGSTKFLT => "stack fault",
+        libc::SIGCHLD => "child exited",
+        libc::SIGCONT => "continued",
+        libc::SIGSTOP => "stopped (signal)",
+        libc::SIGTSTP => "stopped",
+        libc::SIGTTIN => "stopped (tty input)",
+        libc::SIGTTOU => "stopped (tty output)",
+        libc::SIGURG => "urgent I/O condition",
+        libc::SIGXCPU => "CPU time limit exceeded",
+        libc::SIGXFSZ => "file size limit exceeded",
+        libc::SIGVTALRM => "virtual timer expired",
+        libc::SIGPROF => "profiling timer expired",
+        libc::SIGWINCH => "window changed",
+        libc::SIGIO => "I/O possible",
+        libc::SIGPWR => "power failure",
+        libc::SIGSYS => "bad system call",
         _ => return format!("signal: signal {signal}"),
     };
     format!("signal: {name}")

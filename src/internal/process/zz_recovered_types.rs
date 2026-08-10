@@ -348,31 +348,31 @@ fn push_go_quoted_character(output: &mut String, character: char) {
     }
 }
 
-/// 把 Rust I/O errno 转成 Go Linux/ARM64 `syscall.Errno.Error()` 文本。
+/// 把 Rust I/O errno 转成 Go Linux `syscall.Errno.Error()` 文本。
 ///
 /// exec、pipe close 和临时脚本清理实际只会产生这个集合中的少量 errno；保留完整
 /// 常见表可避免 Rust `io::Error` 附加 `(os error N)` 或使用不同措辞。
 pub(super) fn go_errno_text(error: &io::Error) -> String {
     match error.raw_os_error() {
-        Some(1) => "operation not permitted".to_owned(),
-        Some(2) => "no such file or directory".to_owned(),
-        Some(4) => "interrupted system call".to_owned(),
-        Some(5) => "input/output error".to_owned(),
-        Some(7) => "argument list too long".to_owned(),
-        Some(8) => "exec format error".to_owned(),
-        Some(9) => "bad file descriptor".to_owned(),
-        Some(11) => "resource temporarily unavailable".to_owned(),
-        Some(12) => "cannot allocate memory".to_owned(),
-        Some(13) => "permission denied".to_owned(),
-        Some(14) => "bad address".to_owned(),
-        Some(20) => "not a directory".to_owned(),
-        Some(21) => "is a directory".to_owned(),
-        Some(22) => "invalid argument".to_owned(),
-        Some(23) => "too many open files in system".to_owned(),
-        Some(24) => "too many open files".to_owned(),
-        Some(26) => "text file busy".to_owned(),
-        Some(36) => "file name too long".to_owned(),
-        Some(40) => "too many levels of symbolic links".to_owned(),
+        Some(libc::EPERM) => "operation not permitted".to_owned(),
+        Some(libc::ENOENT) => "no such file or directory".to_owned(),
+        Some(libc::EINTR) => "interrupted system call".to_owned(),
+        Some(libc::EIO) => "input/output error".to_owned(),
+        Some(libc::E2BIG) => "argument list too long".to_owned(),
+        Some(libc::ENOEXEC) => "exec format error".to_owned(),
+        Some(libc::EBADF) => "bad file descriptor".to_owned(),
+        Some(libc::EAGAIN) => "resource temporarily unavailable".to_owned(),
+        Some(libc::ENOMEM) => "cannot allocate memory".to_owned(),
+        Some(libc::EACCES) => "permission denied".to_owned(),
+        Some(libc::EFAULT) => "bad address".to_owned(),
+        Some(libc::ENOTDIR) => "not a directory".to_owned(),
+        Some(libc::EISDIR) => "is a directory".to_owned(),
+        Some(libc::EINVAL) => "invalid argument".to_owned(),
+        Some(libc::ENFILE) => "too many open files in system".to_owned(),
+        Some(libc::EMFILE) => "too many open files".to_owned(),
+        Some(libc::ETXTBSY) => "text file busy".to_owned(),
+        Some(libc::ENAMETOOLONG) => "file name too long".to_owned(),
+        Some(libc::ELOOP) => "too many levels of symbolic links".to_owned(),
         Some(number) => format!("errno {number}"),
         None => error.to_string(),
     }
