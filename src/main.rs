@@ -75,6 +75,15 @@ async fn run() -> i32 {
         Invocation::TaskRun(arguments) => {
             task_run_command_result(environment_manager::cmd::run_task_run(&arguments).await)
         }
+        Invocation::ProvisionPackages(arguments) => {
+            match environment_manager::cmd::run_provision_packages(&arguments).await {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("Error: {error}");
+                    environment_manager::cmd::provision_packages_exit_code(&error)
+                }
+            }
+        }
     }
 }
 
@@ -134,3 +143,7 @@ fn write_cli_text(stream: OutputStream, text: &str) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "main_test.rs"]
+mod main_test;

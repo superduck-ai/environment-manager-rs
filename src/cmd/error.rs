@@ -42,6 +42,7 @@ pub enum CliErrorKind {
 pub struct CliError {
     kind: CliErrorKind,
     rendered: String,
+    exit_code: i32,
 }
 
 impl CliError {
@@ -64,7 +65,15 @@ impl CliError {
         if kind == CliErrorKind::Usage {
             rendered = cobra_error_prefix(&rendered);
         }
-        Self { kind, rendered }
+        let exit_code = match kind {
+            CliErrorKind::Help | CliErrorKind::Version => 0,
+            CliErrorKind::Usage | CliErrorKind::Validation | CliErrorKind::Internal => 1,
+        };
+        Self {
+            kind,
+            rendered,
+            exit_code,
+        }
     }
 
     /// 创建根命令无子命令时的帮助提前退出。
@@ -73,6 +82,7 @@ impl CliError {
         Self {
             kind: CliErrorKind::Help,
             rendered,
+            exit_code: 0,
         }
     }
 
@@ -82,6 +92,7 @@ impl CliError {
         Self {
             kind: CliErrorKind::Version,
             rendered,
+            exit_code: 0,
         }
     }
 
@@ -94,6 +105,7 @@ impl CliError {
         Self {
             kind: CliErrorKind::Usage,
             rendered,
+            exit_code: 1,
         }
     }
 
@@ -106,6 +118,7 @@ impl CliError {
         Self {
             kind: CliErrorKind::Validation,
             rendered,
+            exit_code: 1,
         }
     }
 
@@ -116,6 +129,21 @@ impl CliError {
         Self {
             kind: CliErrorKind::Internal,
             rendered: format!("Error: internal CLI wiring error: {message}\n"),
+            exit_code: 1,
+        }
+    }
+
+    /// 创建由子命令自行定义文本与退出码、且不追加 usage 的参数错误。
+    ///
+    /// `provision-packages` 在 Go 中设置 `SilenceErrors`/`SilenceUsage`，并通过
+    /// `commandExitError` 把 flag/位置参数失败稳定映射为退出码 2；该构造函数只服务
+    /// 这种显式命令契约，普通 Cobra 命令仍使用统一退出码 1。
+    #[must_use]
+    pub(crate) fn command_exit(rendered: impl Into<String>, exit_code: i32) -> Self {
+        Self {
+            kind: CliErrorKind::Usage,
+            rendered: rendered.into(),
+            exit_code,
         }
     }
 
@@ -128,10 +156,7 @@ impl CliError {
     /// 返回兼容 Go 入口的进程退出码。
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
-        match self.kind {
-            CliErrorKind::Help | CliErrorKind::Version => 0,
-            CliErrorKind::Usage | CliErrorKind::Validation | CliErrorKind::Internal => 1,
-        }
+        self.exit_code
     }
 
     /// 返回文本应写入的输出流。

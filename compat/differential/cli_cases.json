@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "baseline": {
-    "go_head": "0706a81d488857f87cf13b68f5c8d2bb54b61834",
-    "go_worktree_diff_sha256": "fa90df15874d704b257f68c16ca0983c24af705e82d980ef3e762d852bae87ca",
+    "go_head": "65e3c65ce3f0f3b69819775d35ac448d9cd1b4fb",
+    "go_worktree_diff_sha256": "d0606591baf87fc0c16ea1d0d8dc7b7934fcd67dcc1d5a619c6e390c799de775",
     "go_version": "1.25.7",
     "binary_version": "0.1.0"
   },
@@ -167,6 +167,48 @@
       "args": ["task-run", "--help"],
       "stdin": "",
       "normalizers": ["temporary_directory"]
+    },
+    {
+      "name": "provision_packages_help",
+      "argv0": "environment-runner",
+      "args": ["provision-packages", "--help"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "provision_packages_unknown_flag",
+      "argv0": "environment-runner",
+      "args": ["provision-packages", "--definitely-unknown"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "provision_packages_positionals",
+      "argv0": "environment-runner",
+      "args": ["provision-packages", "unexpected"],
+      "stdin": "",
+      "normalizers": []
+    },
+    {
+      "name": "provision_packages_missing_protocol",
+      "argv0": "environment-runner",
+      "args": ["provision-packages", "--stdin"],
+      "stdin": "{}",
+      "normalizers": ["provision_result_duration_ms"]
+    },
+    {
+      "name": "provision_packages_invalid_manifest",
+      "argv0": "environment-runner",
+      "args": ["provision-packages", "--protocol", "v1", "--stdin"],
+      "stdin": "{\"version\":",
+      "normalizers": ["provision_result_duration_ms"]
+    },
+    {
+      "name": "provision_packages_rejected_sensitive_option",
+      "argv0": "environment-runner",
+      "args": ["provision-packages", "--protocol", "v1", "--stdin"],
+      "stdin": "{\"version\":1,\"packages\":{\"type\":\"packages\",\"pip\":[\"--codex-sensitive-differential-marker\"]}}",
+      "normalizers": ["provision_result_duration_ms"]
     },
     {
       "name": "poll_help",

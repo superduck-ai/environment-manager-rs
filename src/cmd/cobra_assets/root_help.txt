@@ -9,6 +9,7 @@ Available Commands:
   orchestrator           Poll for session tasks and hand off for execution
   poll                   Make a single poll request for work
   print-sandbox-settings Print the default sandbox runtime settings
+  provision-packages     Installs Environment packages from a versioned stdin manifest
   setup                  Install dependencies for orchestrator mode
   task-run               Handles execution of a provided session
 

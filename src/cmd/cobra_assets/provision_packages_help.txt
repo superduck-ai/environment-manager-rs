@@ -1,0 +1,9 @@
+Installs Environment packages from a versioned stdin manifest
+
+Usage:
+  environment-runner provision-packages [flags]
+
+Flags:
+  -h, --help              help for provision-packages
+      --protocol string   Package provisioning protocol version
+      --stdin             Read the package manifest from stdin

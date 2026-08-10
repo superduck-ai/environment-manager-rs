@@ -1,6 +1,6 @@
 # 确定性差分范围
 
-`scripts/compat/run_differential.sh` 是 Linux ARM64 的统一差分入口。它先执行 27 个
+`scripts/compat/run_differential.sh` 是 Linux ARM64 的统一差分入口。它先执行 45 个
 CLI 场景，再生成并比较 `http_api`、`input`、`mcp`、`process_edge`、
 `tunnel_protojson`、`tunnel_http_runtime` 和 `tunnel_ws_runtime` 七份 transcript。
 Go 侧使用固定 Go 1.25.7 digest 镜像和 `go test -overlay`；overlay backing file
@@ -53,6 +53,12 @@ PID 只用于 probe 内部读取 `/proc` 和清理，不写入 transcript。zomb
 比较；不允许归一化 timing、state 或 error 语义。对于这些协议 transcript，除了上述
 producer 转换和唯一的 input duration comparator 规则之外，不允许任何
 normalizer。CLI 的独立 normalizer 则必须按下方用例逐项审核。
+
+`provision-packages` 的六条 CLI 用例覆盖 help、未知 flag、位置参数、缺协议、非法
+manifest 和敏感 option-like spec。后三条终态结果包含单调时钟产生的
+`duration_ms`；`provision_result_duration_ms` 只在这三条用例中启用，并且只接受唯一
+顶层失败 JSON 字段或完整匹配公开诊断格式的字段。其他 JSON key、顺序、枚举、退出码、
+换行和额外文本仍逐字节比较，原始 capture 继续保留真实耗时。
 
 ## Input parser cases
 

@@ -16,6 +16,7 @@ const ROOT_HELP: &str = include_str!("cobra_assets/root_help.txt");
 const COMPLETION_HELP: &str = include_str!("cobra_assets/completion_help.txt");
 const ORCHESTRATOR_HELP: &str = include_str!("cobra_assets/orchestrator_help.txt");
 const TASK_RUN_HELP: &str = include_str!("cobra_assets/task_run_help.txt");
+const PROVISION_PACKAGES_HELP: &str = include_str!("cobra_assets/provision_packages_help.txt");
 const POLL_HELP: &str = include_str!("cobra_assets/poll_help.txt");
 const SETUP_HELP: &str = include_str!("cobra_assets/setup_help.txt");
 const PRINT_SANDBOX_SETTINGS_HELP: &str =
@@ -32,9 +33,10 @@ const COBRA_SUGGESTIONS_MINIMUM_DISTANCE: usize = 2;
 // 这里必须保留 Go `main.go` 调用 `Add*Command` 的注册顺序。Cobra 的
 // `SuggestionsFor` 直接遍历内部命令切片，不会像帮助模板那样先按名称排序；默认
 // completion 命令在 `ExecuteC` 中最后注入，因此也必须放在数组末尾。
-const ROOT_SUGGESTION_COMMANDS: [&str; 6] = [
+const ROOT_SUGGESTION_COMMANDS: [&str; 7] = [
     "orchestrator",
     "task-run",
+    "provision-packages",
     "poll",
     "print-sandbox-settings",
     "setup",
@@ -54,6 +56,8 @@ pub enum CobraCommand {
     Orchestrator,
     /// task-run 子命令。
     TaskRun,
+    /// 一次性 package provisioning 子命令。
+    ProvisionPackages,
     /// poll 子命令。
     Poll,
     /// setup 子命令。
@@ -75,6 +79,7 @@ pub fn render_help(command: CobraCommand) -> String {
         CobraCommand::Completion => COMPLETION_HELP,
         CobraCommand::Orchestrator => ORCHESTRATOR_HELP,
         CobraCommand::TaskRun => TASK_RUN_HELP,
+        CobraCommand::ProvisionPackages => PROVISION_PACKAGES_HELP,
         CobraCommand::Poll => POLL_HELP,
         CobraCommand::Setup => SETUP_HELP,
         CobraCommand::PrintSandboxSettings => PRINT_SANDBOX_SETTINGS_HELP,
@@ -173,6 +178,7 @@ pub(super) fn requested_help(argv: &[OsString]) -> Option<String> {
         "completion" => completion_help_target(arguments.get(1).map(String::as_str)),
         "orchestrator" => Some(render_help(CobraCommand::Orchestrator)),
         "task-run" => Some(render_help(CobraCommand::TaskRun)),
+        "provision-packages" => Some(render_help(CobraCommand::ProvisionPackages)),
         "poll" => Some(render_help(CobraCommand::Poll)),
         "setup" => Some(render_help(CobraCommand::Setup)),
         "print-sandbox-settings" => Some(render_help(CobraCommand::PrintSandboxSettings)),
@@ -197,6 +203,14 @@ pub(super) fn requested_version(version: &str, argv: &[OsString]) -> Option<Stri
 pub(super) fn render_clap_error(argv: &[OsString], error: &clap::Error) -> CliError {
     let arguments = lossy_arguments(argv);
     let command = command_for_arguments(&arguments);
+    if command == CobraCommand::ProvisionPackages
+        && !matches!(
+            error.kind(),
+            ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        )
+    {
+        return CliError::command_exit("Error: invalid provision-packages flags\n", 2);
+    }
     let message = match error.kind() {
         ErrorKind::InvalidSubcommand => {
             // Cobra 对“有子命令但自身不可运行”的 completion 父命令有一个容易忽略的
@@ -371,6 +385,7 @@ fn help_command_target(arguments: &[String]) -> Option<String> {
         Some("completion") => completion_help_target(arguments.get(1).map(String::as_str)),
         Some("orchestrator") => Some(render_help(CobraCommand::Orchestrator)),
         Some("task-run") => Some(render_help(CobraCommand::TaskRun)),
+        Some("provision-packages") => Some(render_help(CobraCommand::ProvisionPackages)),
         Some("poll") => Some(render_help(CobraCommand::Poll)),
         Some("setup") => Some(render_help(CobraCommand::Setup)),
         Some("print-sandbox-settings") => Some(render_help(CobraCommand::PrintSandboxSettings)),
@@ -396,6 +411,7 @@ fn command_for_arguments(arguments: &[String]) -> CobraCommand {
         Some("completion") => CobraCommand::Completion,
         Some("orchestrator") => CobraCommand::Orchestrator,
         Some("task-run") => CobraCommand::TaskRun,
+        Some("provision-packages") => CobraCommand::ProvisionPackages,
         Some("poll") => CobraCommand::Poll,
         Some("setup") => CobraCommand::Setup,
         Some("print-sandbox-settings") => CobraCommand::PrintSandboxSettings,

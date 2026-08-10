@@ -6,29 +6,33 @@
 ## 版本
 
 - 仓库：`/Users/arthur/GolandProjects/environment-manager`
-- Git HEAD：`0706a81d488857f87cf13b68f5c8d2bb54b61834`
-- Git describe：`0706a81-dirty`
+- Git HEAD：`65e3c65ce3f0f3b69819775d35ac448d9cd1b4fb`
+- Git describe：`65e3c65-dirty`
 - `go.mod`：Go 1.25
 - 参考 ELF Go 版本：Go 1.25.7
-- 原始工作树 diff SHA-256：`fa90df15874d704b257f68c16ca0983c24af705e82d980ef3e762d852bae87ca`
+- 原始工作树 diff SHA-256：`d0606591baf87fc0c16ea1d0d8dc7b7934fcd67dcc1d5a619c6e390c799de775`
 - 捕获的 diff：`compat/go-baseline.patch`
 
-## 已修改文件
+## 当前 HEAD 新增行为
 
-- `.gitignore`
+- `c88632d6e3c139417ec09eb4a10ec800ba4859e0`：CCR ingress token 文件逻辑。
+- `4a0b1c8818b3bf70a4b7320b4ebd80e8f62fe855`：一次性 package provisioning 命令。
+- `65e3c65ce3f0f3b69819775d35ac448d9cd1b4fb`：移除 legacy skill preparation flow。
+
+关键基线文件：
+
 - `internal/claude/claude_code_executor.go`
-  - SHA-256：`26a70bad574108d8b3344003b965e8edc79085f2087bf362456c01ca3791628b`
+  - SHA-256：`9b8541e81f706e243609cbce69371c8936753f00d089b3ad5cdd4d746d97f7f7`
 - `internal/claude/claude_code_executor_test.go`
   - SHA-256：`4ce510a82b4b1c73d31526a30368d3d39a2a55e3e55234237190824fee237e1b`
 
-CCR upstream proxy token 的未提交实现属于正式迁移基线，不得遗漏。
+当前工作树另将 `FUNCTION_INDEX.md` 与 `index.html` 暂存为删除；二者不参与 Go
+构建，但仍进入原始 diff 摘要和 `compat/go-baseline.patch`，防止迁移期间静默漂移。
 
 ## 相关未跟踪输入
 
 - `Makefile`，SHA-256：`cc5f4b15b15901813f7b0ede9b72b0d91cc8b78f8e06989f0e8a143a5b057311`
-- `asm-analysis/**`
-- `docs/plans/2026-06-30-asm-vs-source-comparison.md`
-- `environment-manager-06-25`，SHA-256：`1c6a4f260f77ad12fa19186ad1fbe0b85f5a2f904bafbd5b11039f49be5f58c0`
+- `environment-manager-06-25`（由 `.gitignore` 排除），SHA-256：`1c6a4f260f77ad12fa19186ad1fbe0b85f5a2f904bafbd5b11039f49be5f58c0`
 
 `.idea/**`、编译产物和纯反汇编临时错误输出不作为 Rust 代码输入；ASM 对照报告及
 参考 ELF 只在 Go 源码或测试无法确定行为时作为补充 oracle。
@@ -37,7 +41,8 @@ CCR upstream proxy token 的未提交实现属于正式迁移基线，不得遗�
 出现任何清单外的新路径。这是 fail-closed 约束，因为新 `.go`、包内汇编、syso 或
 未来 `//go:embed` 资源可能绕过 tracked diff 并改变 Go oracle。
 
-当前唯一未跟踪构建输入是根目录 `Makefile`，其内容摘要固化在
+当前 `git ls-files --others --exclude-standard` 唯一返回项也是唯一未跟踪构建输入：
+根目录 `Makefile`。其内容摘要固化在
 `compat/go-untracked-build-inputs.sha256`。门禁会重新分类并计算未跟踪 Go/Proto、
 vendor、Makefile 以及 Go 包目录内 native 文件；构建输入被删除、修改或新增都会
 失败。整个检查只读 Go 工作树。

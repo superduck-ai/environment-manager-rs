@@ -61,6 +61,7 @@ def main() -> int:
         "completion_help.txt": ["completion", "--help"],
         "orchestrator_help.txt": ["orchestrator", "--help"],
         "task_run_help.txt": ["task-run", "--help"],
+        "provision_packages_help.txt": ["provision-packages", "--help"],
         "poll_help.txt": ["poll", "--help"],
         "setup_help.txt": ["setup", "--help"],
         "print_sandbox_settings_help.txt": ["print-sandbox-settings", "--help"],

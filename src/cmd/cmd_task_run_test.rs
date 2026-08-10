@@ -509,13 +509,13 @@ async fn task_run_v0_missing_startup_context_uses_direct_go_panic_output() {
         )
     );
     let required_frames: &[&[u8]] = &[
-        b"[signal SIGSEGV: segmentation violation code=0x1 addr=0xc0 pc=0x61a128]\n",
+        b"[signal SIGSEGV: segmentation violation code=0x1 addr=0xc0 pc=0x635588]\n",
         b"goroutine 1 [running]:\n",
-        b"internal/input.(*V0Parser).Parse(0x0, {0xa01f08, 0xfc8540}, {0x0, 0x2b, 0x200})\n",
+        b"internal/input.(*V0Parser).Parse(0x0, {0xa188f8, 0xffdda0}, {0x0, 0x2b, 0x200})\n",
         b"internal/input/v0_parser.go:58 +0x188\n",
-        b"cmd.loadContextFromStdin({0xa01f08, 0xfc8540}, 0x0, {0x0, 0x1a}, {0x8a8721, 0x2}, {0x0, 0x48})\n",
+        b"cmd.loadContextFromStdin({0xa188f8, 0xffdda0}, 0x0, {0x0, 0x1a}, {0x8bc9e1, 0x2}, {0x0, 0x48})\n",
         b"cmd/cmd_task_run.go:576 +0x2b4\n",
-        b"cmd.AddTaskRunCommand.func1(0x0, {0x8a8c93?, 0x4?, 0x8a8c97?})\n",
+        b"cmd.AddTaskRunCommand.func1(0x0, {0x8bcf78?, 0x4?, 0x8bcf7c?})\n",
         b"cmd/cmd_task_run.go:152 +0x378\n",
         b"github.com/spf13/cobra.(*Command).execute(0x0, {0x0, 0x3, 0x3})\n",
         b"cobra@v1.9.1/command.go:1015 +0x7d4\n",
@@ -524,7 +524,7 @@ async fn task_run_v0_missing_startup_context_uses_direct_go_panic_output() {
         b"github.com/spf13/cobra.(*Command).Execute(...)\n",
         b"cobra@v1.9.1/command.go:1071\n",
         b"main.main()\n",
-        b"./main.go:44 +0x2bc\n",
+        b"./main.go:45 +0x2c8\n",
     ];
     let mut cursor = 0;
     for frame in required_frames {

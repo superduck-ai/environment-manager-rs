@@ -35,7 +35,6 @@ use crate::internal::{
 };
 
 use super::{
-    extract_skill_zips, link_workspace_skills_dir_to_claude_dir,
     tunnel_register::default_create_tunnel_client_func,
     zz_recovered_types::{
         ClaudeExecutorFactory, CommandFailure, CreateTunnelClientFunc, EnvironmentLeaseAdapter,
@@ -126,7 +125,7 @@ impl Manager {
     /// 执行 environment manager 的完整生命周期。
     ///
     /// 顺序严格保持：环境配置与类型创建、三路并行初始化、非致命 MCP/plugin 处理、
-    /// skills、lease、executor、setup-only 或 executor+tunnel 并发，以及逆序清理。
+    /// lease、executor、setup-only 或 executor+tunnel 并发，以及逆序清理。
     /// Go 的 `registerMCPServersAsync` 已合并为本函数创建并等待的 MCP Tokio task；
     /// `initializeEnvironmentAsync` 则由同一并行阶段直接执行配置应用和 environment
     /// future。两条路径都返回拥有所有权的结果，不再通过 WaitGroup 后写裸指针。
@@ -247,7 +246,6 @@ impl Manager {
             None => Arc::new(NoopActivityRecorder),
         };
 
-        link_workspace_skills_dir_to_claude_dir(&self.logger);
         self.logger.info(
             "Starting parallel initialization: MCP servers, plugin marketplace, and environment setup",
             LogAttributes::new(),
@@ -395,7 +393,6 @@ impl Manager {
         }
 
         if skip_claude_code {
-            extract_skill_zips(&self.logger);
             self.logger.info(
                 "ENVRUNNER_SKIP_CLAUDE_CODE mode: environment initialized, waiting for shutdown signal",
                 LogAttributes::new(),
@@ -414,8 +411,6 @@ impl Manager {
             }
             _ => Outcomes::new(),
         };
-        extract_skill_zips(&self.logger);
-
         let lease_request = ManagerLeaseRequest {
             cancellation: cancellation.clone(),
             session_id: session_id.clone(),

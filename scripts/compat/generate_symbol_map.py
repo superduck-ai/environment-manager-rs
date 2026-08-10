@@ -639,10 +639,12 @@ def generated_proto(relative: Path, source: str) -> bool:
 
 
 def go_files(go_root: Path) -> list[Path]:
-    """返回兼容门禁覆盖的 Go 主程序、cmd、internal 与生成协议文件。"""
+    """返回兼容门禁覆盖的 Go 根包、cmd、internal 与生成协议文件。"""
 
     roots = [go_root / "cmd", go_root / "internal", go_root / "gen"]
-    files = [go_root / "main.go"] if (go_root / "main.go").exists() else []
+    # 根包现在包含 `main_test.go`。基线门禁会拒绝未审核的未跟踪 Go 文件，因此
+    # 扫描全部 tracked/可见根级 `.go` 文件不会重新引入历史临时 probe 风险。
+    files = list(go_root.glob("*.go"))
     for root in roots:
         if root.exists():
             files.extend(root.rglob("*.go"))

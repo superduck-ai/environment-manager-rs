@@ -74,12 +74,20 @@ GO_PANIC_DYNAMIC_HEX_SLOTS: tuple[tuple[str, tuple[int, ...], int], ...] = (
 )
 CUSTOM_NORMALIZERS = {
     "go_panic_runtime_hex",
+    "provision_result_duration_ms",
     "structured_log_read_duration_ms",
 }
 # 读取 stdin 的耗时取决于 Linux 调度，只有两条真实触发同一 Go nil dereference 的
 # CLI 场景需要忽略它：基础 panic 以及在其前面验证 `--stdin` warning 的变体。把
 # 限制写进 manifest 校验而不只依赖评审约定，避免后续用例误用。
 CASE_SCOPED_NORMALIZERS: dict[str, frozenset[str]] = {
+    "provision_result_duration_ms": frozenset(
+        {
+            "provision_packages_invalid_manifest",
+            "provision_packages_missing_protocol",
+            "provision_packages_rejected_sensitive_option",
+        }
+    ),
     "structured_log_read_duration_ms": frozenset(
         {
             "task_run_stdin_deprecation_warning_panics",
@@ -90,6 +98,13 @@ CASE_SCOPED_NORMALIZERS: dict[str, frozenset[str]] = {
 HEX_TOKEN = re.compile(r"0x[0-9a-f]+")
 JSON_NUMBER_TOKEN = re.compile(
     r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z"
+)
+PROVISION_DIAGNOSTIC = re.compile(
+    r"^(Error: package provisioning status=(?:failed|succeeded) "
+    r"manager=(?:|apt|cargo|gem|go|npm|pip) "
+    r"stage=(?:|decode|validate|preflight|prepare|start|install|finalize) "
+    r"package_count=(?:unknown|[0-9]+) duration_ms=)([0-9]+) "
+    r"(exit_code=(?:unknown|-?[0-9]+)\n?)$"
 )
 
 # 凭证和会改变后端分支的环境变量全部从差分进程移除。PATH 被保留是为了动态
@@ -175,6 +190,9 @@ def normalize_text(text: str, normalizers: list[str]) -> str:
             normalized = normalize_go_panic_runtime_hex(
                 normalized, "<GO_RUNTIME_HEX>"
             )
+            continue
+        if normalizer == "provision_result_duration_ms":
+            normalized = normalize_provision_result_duration_ms(normalized)
             continue
         if normalizer == "structured_log_read_duration_ms":
             normalized = normalize_structured_log_read_duration_ms(normalized)
@@ -287,6 +305,37 @@ def normalize_structured_log_read_duration_ms(text: str) -> str:
         start, end = span
         normalized_lines.append(
             f'{line[:start]}"<READ_DURATION_MS>"{line[end:]}'
+        )
+    return "".join(normalized_lines)
+
+
+def normalize_provision_result_duration_ms(text: str) -> str:
+    """只替换 package provisioning 终态 JSON 和配套诊断中的耗时。
+
+    命令使用单调时钟记录真实执行时间，Go/Rust 即便行为一致也无法逐值复现。
+    JSON 必须是含唯一顶层失败状态的对象；诊断则必须完整匹配公开的有界格式，
+    任何字段名、顺序、枚举值、换行或额外文本变化都会继续触发差分失败。
+    """
+
+    normalized_lines: list[str] = []
+    for line in text.splitlines(keepends=True):
+        span = _top_level_json_number_span(
+            line,
+            "duration_ms",
+            required_string_field=("status", "failed"),
+        )
+        if span is not None:
+            start, end = span
+            normalized_lines.append(
+                f'{line[:start]}"<PROVISION_DURATION_MS>"{line[end:]}'
+            )
+            continue
+        match = PROVISION_DIAGNOSTIC.fullmatch(line)
+        if match is None:
+            normalized_lines.append(line)
+            continue
+        normalized_lines.append(
+            f"{match.group(1)}<PROVISION_DURATION_MS> {match.group(3)}"
         )
     return "".join(normalized_lines)
 

@@ -174,6 +174,45 @@ class DifferentialCliTest(unittest.TestCase):
         with self.assertRaises(differential_cli.DifferentialError):
             differential_cli.validate_manifest(invalid_manifest)
 
+    def test_provision_duration_normalizer_is_narrow_and_case_scoped(self) -> None:
+        """package 耗时归一化只改协议字段，不吞掉其他数字或用户文本。"""
+        text = (
+            '{"version":1,"status":"failed","category":"invalid_manifest",'
+            '"stage":"validate","duration_ms":17,"other":42}\n'
+            'Error: package provisioning status=failed manager= stage=validate '
+            'package_count=unknown duration_ms=18 exit_code=unknown\n'
+            'duration_ms=19\n'
+        )
+        self.assertEqual(
+            differential_cli.normalize_text(
+                text, ["provision_result_duration_ms"]
+            ),
+            '{"version":1,"status":"failed","category":"invalid_manifest",'
+            '"stage":"validate","duration_ms":"<PROVISION_DURATION_MS>",'
+            '"other":42}\n'
+            'Error: package provisioning status=failed manager= stage=validate '
+            'package_count=unknown duration_ms=<PROVISION_DURATION_MS> '
+            'exit_code=unknown\n'
+            'duration_ms=19\n',
+        )
+
+        manifest = differential_cli.load_json(differential_cli.DEFAULT_CASES)
+        differential_cli.validate_manifest(manifest)
+        invalid_manifest = {
+            "schema_version": 1,
+            "cases": [
+                {
+                    "name": "unrelated_case",
+                    "argv0": "environment-runner",
+                    "args": [],
+                    "stdin": "",
+                    "normalizers": ["provision_result_duration_ms"],
+                }
+            ],
+        }
+        with self.assertRaises(differential_cli.DifferentialError):
+            differential_cli.validate_manifest(invalid_manifest)
+
     def test_manifest_rejects_unknown_normalizer(self) -> None:
         """宽泛或拼错的 normalizer 不能被静默忽略。"""
         manifest = {

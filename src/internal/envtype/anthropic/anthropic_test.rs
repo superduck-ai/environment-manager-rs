@@ -38,7 +38,6 @@ use super::{
     AnthropicEnvironmentType, Config, Language,
     anthropic::{InitActivityStopGuard, copy_dir, extract_exit_code},
     decode_config,
-    embedded::SESSION_START_HOOK_SKILL,
     zz_recovered_types::HookConfig,
 };
 
@@ -472,35 +471,6 @@ async fn test_bootstrap_hooks_under_dir_writes_files_and_preserves_existing() {
         .unwrap();
     assert_eq!(fs::read(settings).unwrap(), b"existing-settings");
     assert_eq!(fs::read(hook).unwrap(), b"existing-hook");
-}
-
-/// 验证 SessionStart skill 的恢复字节、0600 mode 与保留语义。
-#[tokio::test]
-async fn test_bootstrap_claude_skills_under_dir_writes_skill_and_preserves_existing() {
-    let temp = TempDir::new().unwrap();
-    let environment = environment(Some(Config::default()));
-    environment
-        .bootstrap_claude_skills_under_dir(&CancellationToken::new(), temp.path())
-        .await
-        .unwrap();
-    let skill = temp
-        .path()
-        .join(".claude/skills/session-start-hook/SKILL.md");
-    assert_eq!(
-        fs::read(&skill).unwrap(),
-        SESSION_START_HOOK_SKILL.as_bytes()
-    );
-    assert_eq!(SESSION_START_HOOK_SKILL.len(), 4931);
-    assert_eq!(
-        fs::metadata(&skill).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    fs::write(&skill, b"existing-skill").unwrap();
-    environment
-        .bootstrap_claude_skills_under_dir(&CancellationToken::new(), temp.path())
-        .await
-        .unwrap();
-    assert_eq!(fs::read(skill).unwrap(), b"existing-skill");
 }
 
 /// 验证 Supabase 两份环境文件的字节和 mode。

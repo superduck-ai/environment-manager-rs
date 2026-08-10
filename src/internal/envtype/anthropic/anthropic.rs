@@ -1,6 +1,6 @@
 //! Anthropic 环境的初始化编排与外部副作用实现。
 //!
-//! 本文件机械对应 Go `anthropic.go`：sources 模式选择、Baku 模板、hook/skill、
+//! 本文件机械对应 Go `anthropic.go`：sources 模式选择、Baku 模板、hook、
 //! 语言脚本、用户 init script、Git 命令顺序和非 fatal 边界均保持不变。
 
 use std::{
@@ -43,7 +43,6 @@ use crate::internal::{
 
 use super::{
     AnthropicEnvironmentType, AnthropicError, Config, Language, RunScriptError, decode_config,
-    embedded::SESSION_START_HOOK_SKILL,
     install_scripts,
     zz_recovered_types::{HookConfig, ScopedActivityRecorder, SharedScopedRecorder, boxed},
 };
@@ -210,7 +209,7 @@ impl AnthropicEnvironmentType {
 
     /// 完成 Anthropic 环境初始化。
     ///
-    /// sources 和语言/init 脚本错误是 fatal；Git proxy、Claude hook/skill 和最终 Baku
+    /// sources 和语言/init 脚本错误是 fatal；Git proxy、Claude hook 和最终 Baku
     /// dev server 是 best effort。文件系统副作用不因取消回滚，外部命令只杀直接 child。
     pub async fn initialize(
         &mut self,
@@ -378,13 +377,6 @@ impl AnthropicEnvironmentType {
                 } else {
                     "Failed to bootstrap Claude settings"
                 },
-                attributes([("error", json!(error.to_string()))]),
-            );
-        }
-
-        if let Err(error) = self.bootstrap_claude_skills(cancellation).await {
-            self.logger.warn(
-                "Failed to bootstrap Claude skills",
                 attributes([("error", json!(error.to_string()))]),
             );
         }
@@ -896,60 +888,6 @@ impl AnthropicEnvironmentType {
                 attributes([("path", json!(stop_hook_path))]),
             );
         }
-        Ok(())
-    }
-
-    /// 在用户 HOME 和 `/home/claude` 依次引导 SessionStart skill。
-    pub async fn bootstrap_claude_skills(
-        &self,
-        cancellation: &CancellationToken,
-    ) -> Result<(), AnthropicError> {
-        let home = user_home_dir()?;
-        self.bootstrap_claude_skills_under_dir(cancellation, &home)
-            .await
-            .map_err(|error| {
-                AnthropicError::with_source(
-                    format!("failed to bootstrap Claude skills in {}", home.display()),
-                    error,
-                )
-            })?;
-        self.bootstrap_claude_skills_under_dir(cancellation, Path::new("/home/claude"))
-            .await
-            .map_err(|error| {
-                AnthropicError::with_source(
-                    "failed to bootstrap Claude skills in /home/claude",
-                    error,
-                )
-            })
-    }
-
-    /// 在单个目录写入 SessionStart skill，并保留已有文件。
-    pub async fn bootstrap_claude_skills_under_dir(
-        &self,
-        _cancellation: &CancellationToken,
-        directory: &Path,
-    ) -> Result<(), AnthropicError> {
-        let skill_dir = directory
-            .join(".claude")
-            .join("skills")
-            .join("session-start-hook");
-        let skill_path = skill_dir.join("SKILL.md");
-        create_dir_all_with_mode(&skill_dir, 0o755).map_err(|error| {
-            AnthropicError::with_source("failed to create skills directory", error)
-        })?;
-        if fs::metadata(&skill_path).is_ok() {
-            self.logger.info(
-                "Session start hook skill already exists",
-                attributes([("path", json!(skill_path))]),
-            );
-            return Ok(());
-        }
-        write_file_with_mode(&skill_path, SESSION_START_HOOK_SKILL.as_bytes(), 0o600)
-            .map_err(|error| AnthropicError::with_source("failed to write skill file", error))?;
-        self.logger.info(
-            "Successfully created session start hook skill",
-            attributes([("path", json!(skill_path))]),
-        );
         Ok(())
     }
 

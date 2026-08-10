@@ -16,6 +16,8 @@ mod orchestrator;
 mod poll;
 #[path = "cmd_print_sandbox_settings.rs"]
 mod print_sandbox_settings;
+#[path = "cmd_provision_packages.rs"]
+mod provision_packages;
 #[path = "cmd_setup.rs"]
 mod setup;
 #[path = "cmd_task_run.rs"]
@@ -36,6 +38,10 @@ pub use error::{CliError, CliErrorKind, OutputStream, RuntimeError};
 pub use orchestrator::{OrchestratorArgs, SandboxBackend, run_orchestrator};
 pub use poll::{PollArgs, run_poll};
 pub use print_sandbox_settings::{PrintSandboxSettingsArgs, run_print_sandbox_settings};
+pub use provision_packages::{
+    CommandExitError, ProvisionPackagesArgs, exit_code as provision_packages_exit_code,
+    run_provision_packages,
+};
 pub use setup::{SetupArgs, run_setup};
 pub use task_run::{InputFormat, SessionMode, TaskRunArgs, run_task_run};
 pub use utils::{LogLevel, parse_go_duration, parse_log_level};
@@ -57,6 +63,8 @@ pub enum Invocation {
     TaskRun(TaskRunArgs),
     /// 发起一次非阻塞取任务请求的 poll 命令。
     Poll(PollArgs),
+    /// 从严格 v1 stdin manifest 一次性安装系统与语言 package。
+    ProvisionPackages(ProvisionPackagesArgs),
     /// Git/SSH 通过 argv0 或隐藏子命令调用的签名包装器。
     CodeSign(CodeSignArgs),
     /// 输出默认 sandbox-runtime 配置的命令。
@@ -86,10 +94,11 @@ pub fn command(version: &'static str) -> Command {
         )
         .subcommand(completion::command())
         .subcommand(orchestrator::add_orchestrator_command())
+        .subcommand(task_run::add_task_run_command())
+        .subcommand(provision_packages::add_provision_packages_command())
         .subcommand(poll::add_poll_command())
         .subcommand(print_sandbox_settings::command())
         .subcommand(setup::add_setup_command())
-        .subcommand(task_run::add_task_run_command())
         .subcommand(code_sign::add_code_sign_command())
 }
 
@@ -160,6 +169,9 @@ where
             orchestrator::from_matches(subcommand_matches).map(Invocation::Orchestrator)
         }
         "task-run" => task_run::from_matches(subcommand_matches).map(Invocation::TaskRun),
+        "provision-packages" => {
+            provision_packages::from_matches(subcommand_matches).map(Invocation::ProvisionPackages)
+        }
         "poll" => poll::from_matches(subcommand_matches).map(Invocation::Poll),
         "code-sign" => code_sign::from_matches(subcommand_matches).map(Invocation::CodeSign),
         "print-sandbox-settings" => print_sandbox_settings::from_matches(subcommand_matches)

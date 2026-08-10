@@ -33,15 +33,15 @@ Rust 源码重新生成。CSV 将机械期望路径与实际命中的 Rust 路�
 python3 scripts/compat/generate_symbol_map.py --summary
 python3 scripts/compat/generate_symbol_map.py --check
 python3 scripts/compat/generate_symbol_map.py --check --require-complete \
-  --expected-go-tests 278 --summary
+  --expected-go-tests 295 --summary
 ```
 
 `--check` 验证 CSV 与两棵源码树一致；`--require-complete` 还会拒绝 `pending`、
 `symbol-missing`、`ambiguous`、`name-only-match` 和缺少 wrapper 的生成文件。明确的
 `generated-exempt` 是审计豁免，不会被报告成 `migrated`。
 
-Linux ARM64 发布门禁额外传入 `--expected-go-tests 278`。它同时校验当前只读 Go
-基线仍精确包含 278 个顶层 `Test*` 场景，以及这 278 项在 CSV 中全部处于
+Linux ARM64 发布门禁额外传入 `--expected-go-tests 295`。它同时校验当前只读 Go
+基线仍精确包含 295 个顶层 `Test*` 场景，以及这 295 项在 CSV 中全部处于
 `migrated`；因此仅补普通 helper 或减少测试入口都不能让门禁误通过。
 
 ## Go 工作树输入边界

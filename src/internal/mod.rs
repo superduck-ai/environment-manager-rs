@@ -15,6 +15,7 @@ pub mod manager;
 pub mod mcp;
 pub mod o11y;
 pub mod orchestrator;
+pub mod packages;
 pub mod podmonitor;
 pub mod process;
 pub mod sandbox;

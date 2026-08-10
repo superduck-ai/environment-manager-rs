@@ -34,7 +34,7 @@ REQUIRED_ORDERED_FRAGMENTS = (
     "github.com/spf13/cobra.(*Command).Execute(...)\n",
     "\tgithub.com/spf13/cobra@v1.9.1/command.go:1071\n",
     "main.main()\n",
-    "\t./main.go:44 +0x2bc\n",
+    "\t./main.go:45 +0x2c8\n",
 )
 CASE = {
     "name": "task_run_v0_missing_startup_context_panic",

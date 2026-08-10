@@ -945,13 +945,13 @@ def special_direct_rows(call: Call, go_sites: list[GoSite]) -> list[tuple[str, .
             ]
 
     # Go 的两个 select 分支行号不同。Rust 的 signal 属性保留相同 wire 值，所以可在
-    # 不增加外部字段的前提下，用 source-only 属性值谓词精确选择 361 或 363。
+    # 不增加外部字段的前提下，用 source-only 属性值谓词精确选择 356 或 358。
     if (
         call.path == "src/internal/manager/manager.rs"
         and message == "Received signal, shutting down gracefully"
     ):
-        signal_site = go_site_at(go_sites, go_path, 361)
-        cancellation_site = go_site_at(go_sites, go_path, 363)
+        signal_site = go_site_at(go_sites, go_path, 356)
+        cancellation_site = go_site_at(go_sites, go_path, 358)
         if signal_site is None or cancellation_site is None:
             return None
         expression = " ".join(call.arguments)

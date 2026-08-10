@@ -46,10 +46,11 @@ fn root_command_exposes_expected_surface() {
         [
             "completion",
             "orchestrator",
+            "task-run",
+            "provision-packages",
             "poll",
             "print-sandbox-settings",
             "setup",
-            "task-run",
             "code-sign",
         ]
     );
@@ -404,6 +405,7 @@ fn root_command_suggestions_preserve_cobra_filtering_and_order() {
     let rendered = prefix.rendered();
     let first_block = concat!(
         "Did you mean this?\n",
+        "\tprovision-packages\n",
         "\tpoll\n",
         "\tprint-sandbox-settings\n",
     );

@@ -35,6 +35,13 @@ go_oracle_image="$3"
 export PATH="${CARGO_HOME:-${HOME}/.cargo}/bin:${PATH}"
 export GO_SOURCE_ROOT="${go_root}"
 export GO_SOURCE_DIR="${go_root}"
+# Go 的 ProxyFromEnvironment 无条件绕过 localhost 与 loopback IP；Reqwest 只读取
+# NO_PROXY。在 OrbStack/Surge 注入 HTTP_PROXY 但未注入 NO_PROXY 时，loopback fixture
+# 会错误地绕到 macOS 代理。权威测试环境显式补齐这一条 Go 传输层不变量，同时保留
+# 调用方已有的 NO_PROXY 项，避免 API、Git proxy 与协议探针出现伪 503。
+existing_no_proxy="${NO_PROXY:-${no_proxy:-}}"
+export NO_PROXY="localhost,127.0.0.0/8,::1${existing_no_proxy:+,${existing_no_proxy}}"
+export no_proxy="${NO_PROXY}"
 # 权威 VM 同时编译 lib、bin、集成测试和 Clippy；增量目录不影响
 # 验收结果，却会对每种 profile/flags 保留一份大量 object。权威门禁
 # 固定禁用增量编译，避免有限的 OrbStack 根盘影响稳定性。
@@ -90,7 +97,7 @@ run_gate "Go/Rust 符号映射完整且新鲜" \
     --go-root "${go_root}" \
     --rust-root . \
     --check \
-    --expected-go-tests 278 \
+    --expected-go-tests 295 \
     --require-complete
 run_gate "Go logger source 映射 100% oracle 且新鲜" \
   env PYTHONDONTWRITEBYTECODE=1 \

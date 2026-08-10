@@ -1,352 +1,1890 @@
-This patch is captured from Go commit 0706a81d488857f87cf13b68f5c8d2bb54b61834.
-SHA256 of the raw git diff: fa90df15874d704b257f68c16ca0983c24af705e82d980ef3e762d852bae87ca
+This patch is captured from Go commit 65e3c65ce3f0f3b69819775d35ac448d9cd1b4fb.
+SHA256 of the raw git diff: d0606591baf87fc0c16ea1d0d8dc7b7934fcd67dcc1d5a619c6e390c799de775
 
-diff --git a/.gitignore b/.gitignore
-index 9f11b75..6958e9b 100644
---- a/.gitignore
-+++ b/.gitignore
-@@ -1 +1,5 @@
- .idea/
-+
-+# 编译产物
-+/environment-manager
-+/environment-manager_linux_*
-diff --git a/internal/claude/claude_code_executor.go b/internal/claude/claude_code_executor.go
-index 9958a30..9ff0cbe 100644
---- a/internal/claude/claude_code_executor.go
-+++ b/internal/claude/claude_code_executor.go
-@@ -16,6 +16,7 @@ import (
- 	"log/slog"
- 	"os"
- 	"os/exec"
-+	"path/filepath"
- 	"strings"
- 	"time"
- 
-@@ -36,10 +37,16 @@ var initScriptOnlyEnvVars = map[string]struct{}{
- }
- 
- const (
--	claudeCodeLogPath       = "/tmp/claude-code.log"
--	defaultAPIBaseURL       = "api.anthropic.com"
--	defaultMCPConfigPath    = "/tmp/mcp-config.json"
--	sessionIngressTokenPath = "/home/claude/.claude/remote/.session_ingress_token"
-+	claudeCodeLogPath = "/tmp/claude-code.log"
-+	defaultAPIBaseURL = "api.anthropic.com"
-+	// defaultCCRUpstreamProxyTokenPath 是 Claude 内置 upstreamproxy 模块约定的固定路径。
-+	// relay 初始化时只从这里读取 SessionIngressAuthToken；不能改用普通环境变量，
-+	// 否则 token 会更容易通过进程环境、诊断信息或子进程继承链泄漏。
-+	defaultCCRUpstreamProxyTokenPath      = "/run/ccr/session_token"
-+	defaultMCPConfigPath                  = "/tmp/mcp-config.json"
-+	sessionIngressTokenPath               = "/home/claude/.claude/remote/.session_ingress_token"
-+	ccrUpstreamProxyEnabledEnvironmentKey = "CCR_UPSTREAM_PROXY_ENABLED"
-+	claudeCodeRemoteEnvironmentKey        = "CLAUDE_CODE_REMOTE"
- )
- 
- // Recovered declarations:
-@@ -69,6 +76,94 @@ func filterInitOnlyFromEnviron(env []string) []string {
- 	return filtered
- }
- 
-+func isTruthyEnvironmentValue(value string) bool {
-+	// 与 Claude/SuperDuck 的布尔环境变量语义保持一致，兼容部署系统常见写法。
-+	switch strings.ToLower(strings.TrimSpace(value)) {
-+	case "1", "true", "yes", "on":
-+		return true
-+	default:
-+		return false
-+	}
-+}
-+
-+func (e *ClaudeCodeExecutor) effectiveEnvironmentValue(key string) string {
-+	// 环境变量有三层来源。越靠近本次任务的配置优先级越高：
-+	// 宿主进程环境 < ClaudeConfig < StartupContext。
-+	// 这样服务端可以针对单个 session 明确开启或关闭 relay，而不会被镜像默认值覆盖。
-+	value := os.Getenv(key)
-+	if e.cfg != nil {
-+		if configured, ok := e.cfg.Environment[key]; ok {
-+			value = configured
-+		}
-+	}
-+	if e.startupContext != nil {
-+		if configured, ok := e.startupContext.EnvironmentVariables[key]; ok {
-+			value = configured
-+		}
-+	}
-+	return value
-+}
-+
-+func (e *ClaudeCodeExecutor) shouldPrepareCCRUpstreamProxyToken() bool {
-+	// token 文件只服务于远程 code-session 的 CCRv2 upstream proxy。
-+	// 对本地测试、普通 Claude 调用或未开启代理的任务写入该文件，既没有意义，
-+	// 也会无谓地扩大 SessionIngressAuthToken 在磁盘上的暴露时间。
-+	return e.startupContext != nil &&
-+		e.startupContext.UseCodeSessions &&
-+		isTruthyEnvironmentValue(e.effectiveEnvironmentValue(claudeCodeRemoteEnvironmentKey)) &&
-+		isTruthyEnvironmentValue(e.effectiveEnvironmentValue(ccrUpstreamProxyEnabledEnvironmentKey))
-+}
-+
-+func writeCCRUpstreamProxyToken(path string, token string) error {
-+	if path == "" {
-+		return errors.New("CCR upstream proxy token path is empty")
-+	}
-+	if token == "" {
-+		return errors.New("CCR upstream proxy token is empty")
-+	}
-+
-+	// /run/ccr 只允许当前容器用户进入，token 文件本身只允许当前用户读写。
-+	// 即使基础镜像预先创建过权限较宽的目录，也主动收紧为 0700。
-+	dir := filepath.Dir(path)
-+	if err := os.MkdirAll(dir, 0o700); err != nil {
-+		return fmt.Errorf("failed to create CCR upstream proxy token directory: %w", err)
-+	}
-+	if err := os.Chmod(dir, 0o700); err != nil {
-+		return fmt.Errorf("failed to secure CCR upstream proxy token directory: %w", err)
-+	}
-+
-+	// 先在同一目录写临时文件，再 rename 到固定路径。rename 在同一文件系统内是
-+	// 原子操作，Claude relay 不会观察到半写入 token，也不会读取到上一次任务的残留内容。
-+	temporary, err := os.CreateTemp(dir, ".session_token-*")
-+	if err != nil {
-+		return fmt.Errorf("failed to create temporary CCR upstream proxy token file: %w", err)
-+	}
-+	temporaryPath := temporary.Name()
-+	closed := false
-+	defer func() {
-+		// 任意失败路径都关闭文件并清除临时文件；成功 rename 后 Remove 是无害的。
-+		if !closed {
-+			_ = temporary.Close()
-+		}
-+		_ = os.Remove(temporaryPath)
-+	}()
-+
-+	if err := temporary.Chmod(0o600); err != nil {
-+		return fmt.Errorf("failed to secure temporary CCR upstream proxy token file: %w", err)
-+	}
-+	if _, err := temporary.WriteString(token); err != nil {
-+		return fmt.Errorf("failed to write temporary CCR upstream proxy token file: %w", err)
-+	}
-+	if err := temporary.Close(); err != nil {
-+		return fmt.Errorf("failed to close temporary CCR upstream proxy token file: %w", err)
-+	}
-+	closed = true
-+	if err := os.Rename(temporaryPath, path); err != nil {
-+		return fmt.Errorf("failed to install CCR upstream proxy token file: %w", err)
-+	}
-+	return nil
-+}
-+
- // Original symbol: claude.NewClaudeCodeExecutor
- // DWARF signature: claude.NewClaudeCodeExecutor(logger log/slog.Logger *, cfg github.com/anthropics/anthropic/api-go/environment-manager/internal/config.ClaudeConfig *, sessionID string, startupContext github.com/anthropics/anthropic/api-go/environment-manager/internal/config.StartupContext *, authContext github.com/anthropics/anthropic/api-go/environment-manager/internal/auth.AuthContext *, mcpRegistrations []*github.com/anthropics/anthropic/api-go/environment-manager/internal/mcp.MCPServerRegistration, outcomes github.com/anthropics/anthropic/api-go/environment-manager/internal/claude.Outcomes *, activityRecorder github.com/anthropics/anthropic/api-go/environment-manager/internal/session.ActivityRecorder, otelLogHandler log/slog.Handler, leaseManager github.com/anthropics/anthropic/api-go/environment-manager/internal/podmonitor.LeaseManager *, targetVersion string) (github.com/anthropics/anthropic/api-go/environment-manager/internal/claude.ClaudeCodeExecutor *, error)
- func NewClaudeCodeExecutor(logger *slog.Logger, cfg *config.ClaudeConfig, sessionID string, startupContext *config.StartupContext, authContext *auth.AuthContext, mcpRegistrations []*mcp.MCPServerRegistration, outcomes *Outcomes, activityRecorder session.ActivityRecorder, otelLogHandler slog.Handler, leaseManager *podmonitor.LeaseManager, targetVersion string) (*ClaudeCodeExecutor, error) {
-@@ -261,6 +356,8 @@ func (e *ClaudeCodeExecutor) Execute(ctx context.Context) error {
- 	}
- 
- 	appendEnv("CLAUDE_CODE_SESSION_ID=%s", e.sessionID)
-+	// Claude upstreamproxy 会单独检查 REMOTE_SESSION_ID，并用它构造 CONNECT Basic 用户名。
-+	// 仅设置 CLAUDE_CODE_SESSION_ID 不足以启用 relay。
- 	appendEnv("CLAUDE_CODE_REMOTE_SESSION_ID=%s", e.sessionID)
- 	appendEnv("CLAUDE_CODE_ENVIRONMENT_RUNNER_VERSION=%s", util.Version)
- 	if diagPath := diag.GetClaudeCodeDiagFilePath(ctx); diagPath != "" {
-@@ -302,6 +399,22 @@ func (e *ClaudeCodeExecutor) Execute(ctx context.Context) error {
- 				appendEnv("CLAUDE_SESSION_INGRESS_TOKEN_FILE=%s", sessionIngressTokenPath)
- 				e.logger.InfoContext(ctx, "Wrote session ingress token to file for bash access", "path", sessionIngressTokenPath)
- 			}
-+
-+			// WebSocket 的 Bearer token 与 CONNECT 内的 Basic 凭证都源自同一个
-+			// SessionIngressAuthToken。这里在启动 Claude 之前准备固定 token 文件；
-+			// Claude 成功启动本地 relay 后会主动 unlink，executor 的 defer 再负责异常兜底。
-+			if e.shouldPrepareCCRUpstreamProxyToken() {
-+				relayTokenPath := defaultCCRUpstreamProxyTokenPath
-+				if err := writeCCRUpstreamProxyToken(relayTokenPath, token); err != nil {
-+					return fmt.Errorf("failed to prepare CCR upstream proxy token: %w", err)
-+				}
-+				e.logger.InfoContext(ctx, "Prepared session ingress token for CCR upstream proxy relay", "path", relayTokenPath)
-+				defer func() {
-+					if err := os.Remove(relayTokenPath); err != nil && !os.IsNotExist(err) {
-+						e.logger.WarnContext(ctx, "Failed to remove CCR upstream proxy token file", "error", err, "path", relayTokenPath)
-+					}
-+				}()
-+			}
- 		}
- 
- 		if token := e.authContext.GetAnthropicOAuthToken(); token != "" {
-@@ -623,10 +736,23 @@ func (e *ClaudeCodeExecutor) Destroy(ctx context.Context) error {
- 		if !os.IsNotExist(err) {
- 			e.logger.WarnContext(ctx, "Failed to remove session ingress token file", "error", err, "path", sessionIngressTokenPath)
- 		}
--		return nil
-+	} else {
-+		e.logger.InfoContext(ctx, "Removed session ingress token file", "path", sessionIngressTokenPath)
-+	}
-+
-+	if e.shouldPrepareCCRUpstreamProxyToken() {
-+		// 正常情况下 Claude 已在 relay 就绪后删除该文件。Destroy 仍做幂等清理，
-+		// 覆盖 Claude 初始化失败、被取消或尚未读取 token 就退出等情况。
-+		relayTokenPath := defaultCCRUpstreamProxyTokenPath
-+		if err := os.Remove(relayTokenPath); err != nil {
-+			if !os.IsNotExist(err) {
-+				e.logger.WarnContext(ctx, "Failed to remove CCR upstream proxy token file", "error", err, "path", relayTokenPath)
-+			}
-+		} else {
-+			e.logger.InfoContext(ctx, "Removed CCR upstream proxy token file", "path", relayTokenPath)
-+		}
- 	}
- 
--	e.logger.InfoContext(ctx, "Removed session ingress token file", "path", sessionIngressTokenPath)
- 	return nil
- }
- 
-diff --git a/internal/claude/claude_code_executor_test.go b/internal/claude/claude_code_executor_test.go
-index e16df0d..ed26a51 100644
---- a/internal/claude/claude_code_executor_test.go
-+++ b/internal/claude/claude_code_executor_test.go
-@@ -78,6 +78,148 @@ func TestAddTokenViaFileDescriptor(t *testing.T) {
- 	}
- }
- 
-+func TestWriteCCRUpstreamProxyToken(t *testing.T) {
-+	t.Parallel()
-+
-+	tokenDir := filepath.Join(t.TempDir(), "run", "ccr")
-+	tokenPath := filepath.Join(tokenDir, "session_token")
-+
-+	if err := writeCCRUpstreamProxyToken(tokenPath, "first-token"); err != nil {
-+		t.Fatalf("writeCCRUpstreamProxyToken() error = %v", err)
-+	}
-+	// 模拟上一次运行留下权限过宽的旧文件，验证原子替换会恢复为 0600。
-+	if err := os.Chmod(tokenPath, 0o644); err != nil {
-+		t.Fatalf("Chmod(%q) error = %v", tokenPath, err)
-+	}
-+	if err := writeCCRUpstreamProxyToken(tokenPath, "replacement-token"); err != nil {
-+		t.Fatalf("writeCCRUpstreamProxyToken() replacement error = %v", err)
-+	}
-+
-+	content, err := os.ReadFile(tokenPath)
-+	if err != nil {
-+		t.Fatalf("ReadFile(%q) error = %v", tokenPath, err)
-+	}
-+	if string(content) != "replacement-token" {
-+		t.Fatalf("token content = %q, want %q", content, "replacement-token")
-+	}
-+
-+	tokenInfo, err := os.Stat(tokenPath)
-+	if err != nil {
-+		t.Fatalf("Stat(%q) error = %v", tokenPath, err)
-+	}
-+	if got := tokenInfo.Mode().Perm(); got != 0o600 {
-+		t.Fatalf("token mode = %o, want 600", got)
-+	}
-+
-+	dirInfo, err := os.Stat(tokenDir)
-+	if err != nil {
-+		t.Fatalf("Stat(%q) error = %v", tokenDir, err)
-+	}
-+	if got := dirInfo.Mode().Perm(); got != 0o700 {
-+		t.Fatalf("token directory mode = %o, want 700", got)
-+	}
-+
-+	// 成功路径也不能遗留包含敏感 token 的临时文件。
-+	temporaryFiles, err := filepath.Glob(filepath.Join(tokenDir, ".session_token-*"))
-+	if err != nil {
-+		t.Fatalf("Glob() error = %v", err)
-+	}
-+	if len(temporaryFiles) != 0 {
-+		t.Fatalf("temporary token files remain: %v", temporaryFiles)
-+	}
-+}
-+
-+func TestWriteCCRUpstreamProxyTokenRejectsEmptyInputs(t *testing.T) {
-+	t.Parallel()
-+
-+	for _, test := range []struct {
-+		name  string
-+		path  string
-+		token string
-+	}{
-+		{name: "empty path", token: "token"},
-+		{name: "empty token", path: filepath.Join(t.TempDir(), "session_token")},
-+	} {
-+		t.Run(test.name, func(t *testing.T) {
-+			if err := writeCCRUpstreamProxyToken(test.path, test.token); err == nil {
-+				t.Fatal("writeCCRUpstreamProxyToken() error = nil, want error")
-+			}
-+		})
-+	}
-+}
-+
-+func TestShouldPrepareCCRUpstreamProxyToken(t *testing.T) {
-+	// 清空宿主环境，保证每个 case 只验证显式提供的配置优先级。
-+	t.Setenv(claudeCodeRemoteEnvironmentKey, "")
-+	t.Setenv(ccrUpstreamProxyEnabledEnvironmentKey, "")
-+
-+	for _, test := range []struct {
-+		name           string
-+		cfgEnvironment map[string]string
-+		startup        *config.StartupContext
-+		want           bool
-+	}{
-+		{
-+			name: "enabled CCR v2 remote session",
-+			cfgEnvironment: map[string]string{
-+				claudeCodeRemoteEnvironmentKey: "true",
-+			},
-+			startup: &config.StartupContext{
-+				UseCodeSessions: true,
-+				EnvironmentVariables: map[string]string{
-+					ccrUpstreamProxyEnabledEnvironmentKey: "1",
-+				},
-+			},
-+			want: true,
-+		},
-+		{
-+			name: "not a CCR v2 session",
-+			cfgEnvironment: map[string]string{
-+				claudeCodeRemoteEnvironmentKey:        "true",
-+				ccrUpstreamProxyEnabledEnvironmentKey: "true",
-+			},
-+			startup: &config.StartupContext{},
-+		},
-+		{
-+			name: "not remote",
-+			cfgEnvironment: map[string]string{
-+				ccrUpstreamProxyEnabledEnvironmentKey: "true",
-+			},
-+			startup: &config.StartupContext{UseCodeSessions: true},
-+		},
-+		{
-+			name: "proxy disabled",
-+			cfgEnvironment: map[string]string{
-+				claudeCodeRemoteEnvironmentKey: "true",
-+			},
-+			startup: &config.StartupContext{UseCodeSessions: true},
-+		},
-+		{
-+			name: "startup context overrides config",
-+			cfgEnvironment: map[string]string{
-+				claudeCodeRemoteEnvironmentKey:        "true",
-+				ccrUpstreamProxyEnabledEnvironmentKey: "true",
-+			},
-+			startup: &config.StartupContext{
-+				UseCodeSessions: true,
-+				EnvironmentVariables: map[string]string{
-+					ccrUpstreamProxyEnabledEnvironmentKey: "false",
-+				},
-+			},
-+		},
-+	} {
-+		t.Run(test.name, func(t *testing.T) {
-+			executor := &ClaudeCodeExecutor{
-+				cfg:            &config.ClaudeConfig{Environment: test.cfgEnvironment},
-+				startupContext: test.startup,
-+			}
-+			if got := executor.shouldPrepareCCRUpstreamProxyToken(); got != test.want {
-+				t.Fatalf("shouldPrepareCCRUpstreamProxyToken() = %t, want %t", got, test.want)
-+			}
-+		})
-+	}
-+}
-+
- func TestBuildArgsFromGatewayConfigMergesAppendSystemPrompt(t *testing.T) {
- 	t.Parallel()
- 
+diff --git a/FUNCTION_INDEX.md b/FUNCTION_INDEX.md
+deleted file mode 100644
+index 33d0239..0000000
+--- a/FUNCTION_INDEX.md
++++ /dev/null
+@@ -1,1376 +0,0 @@
+-# Function Index
+-
+-Recovered from `/Users/arthur/WebstormProjects/reverse-engineering-claude-code-antspace/environment-manager`.
+-
+-Function signatures are generated from DWARF where available. Third-party or Go internal types that are unsafe to import may be shown as `interface{}` in the Go skeleton; the raw DWARF signature is kept above each declaration.
+-
+-## `cmd/cmd_code_sign.go`
+-
+-- `[implemented] func AddCodeSignCommand(rootCmd *cobra.Command)`
+-- `[implemented] func calculateBackoff(attempt int, config retryConfig) time.Duration`
+-- `[implemented] func runCodeSign(cmd *cobra.Command, args []string) error`
+-- `[implemented] func handleSSHSign(args []string) error`
+-- `[implemented] func readCodeSignConfig() (*CodeSignConfig, error)`
+-- `[implemented] func getGitObjectFormat(workingDir string) string`
+-- `[implemented] func doSingleAttempt(ctx context.Context, client *http.Client, url string, requestData []uint8, bearerToken string) (json.RawMessage, error)`
+-- `[implemented] func doAttemptsWithRetry(ctx context.Context, client *http.Client, url string, requestData []uint8, bearerToken string, retryConf retryConfig) (json.RawMessage, error)`
+-- `[implemented] func callMCPServer(config *CodeSignConfig, request MCPRequest) (json.RawMessage, error)`
+-
+-Non-emitted symbols:
+-- `cmd.doSingleAttempt.deferwrap1`
+-
+-## `cmd/cmd_orchestrator.go`
+-
+-- `[implemented] func AddOrchestratorCommand(rootCmd *cobra.Command)`
+-
+-Non-emitted symbols:
+-- `cmd.AddOrchestratorCommand.func1`
+-- `cmd.AddOrchestratorCommand.func1.1`
+-
+-Implementation status:
+-- The `orchestrator` command now reconstructs the recovered RunE flow: logging setup, container lock handling, service-key loading, whoami identity validation, poller or poll-hook selection, sandbox backend handling, default self-invocation execute hook, orchestrator construction, and SIGINT/SIGTERM shutdown.
+-
+-## `cmd/cmd_poll.go`
+-
+-- `[implemented] func AddPollCommand(rootCmd *cobra.Command)`
+-
+-Implementation status:
+-- Restored the `poll` command flag wiring, service-key loading from env/file, whoami identity discovery and explicit ID validation, fallback to provided identity when whoami fails, non-blocking poll request, null output for empty queues, and pretty JSON output for work payloads. Tests cover successful work output, empty queue output, service-key errors, identity mismatch, whoami fallback, and invalid work JSON errors via a local HTTP server.
+-
+-Non-emitted symbols:
+-- `cmd.AddPollCommand.func1`
+-
+-## `cmd/cmd_print_sandbox_settings.go`
+-
+-- `[implemented] func AddPrintSandboxSettingsCommand(rootCmd *cobra.Command)`
+-- `[implemented] func runPrintSandboxSettings(command *cobra.Command, args []string) error`
+-
+-Implementation status:
+-- The `print-sandbox-settings` command now emits the recovered default sandbox runtime settings as indented JSON, including the Anthropic allowlist, default read/write filesystem policy, and git config write allowance.
+-
+-## `cmd/cmd_setup.go`
+-
+-- `[implemented] func AddSetupCommand(rootCmd *cobra.Command)`
+-- `[implemented] func loadServiceKey(serviceKeyFile string) (string, error)`
+-- `[implemented] func runAPIHealthcheck(ctx context.Context, logger *slog.Logger, apiURL string, serviceKey string) error`
+-- `[implemented] func runSetup(ctx context.Context, logLevel string, claudeCodeVersion string, sandboxRuntimeVersion string, skipClaudeCode bool, skipSandboxRuntime bool, apiURL string, serviceKeyFile string) error`
+-- `[implemented] func runPreflightChecks(ctx context.Context, logger *slog.Logger) error`
+-- `[implemented] func checkNpmAvailable(ctx context.Context, logger *slog.Logger) error`
+-- `[implemented] func installClaudeCode(ctx context.Context, logger *slog.Logger, version string) error`
+-- `[implemented] func installSandboxRuntime(ctx context.Context, logger *slog.Logger, version string) error`
+-
+-Implementation status:
+-- Restored the `setup` command flag wiring, log-level parsing, optional preflight, service-key file/env loading, optional whoami healthcheck, Claude Code install wrapper, sandbox-runtime install wrapper, and skip flags for image build workflows. Tests cover service-key loading precedence/errors, healthcheck success/failure, skip-all setup path, invalid log levels, fake-npm preflight success/failure, sandbox-runtime `current` skip mode, and cobra command registration/execution in skip mode. Real Claude Code npm installation is intentionally not exercised by tests.
+-
+-Non-emitted symbols:
+-- `cmd.AddSetupCommand.func1`
+-
+-## `cmd/cmd_task_run.go`
+-
+-- `[implemented] func AddTaskRunCommand(rootCmd *cobra.Command)`
+-- `[implemented] func getDefaultWorkingDirectory() string`
+-- `[implemented] func loadContextFromStdin(ctx context.Context, logger *slog.Logger, sessionID string, inputFormat string, workingDirectory string) (*TaskContext, error)`
+-- `[implemented] func (s *stdinConfigClient) GetEnvironmentForSession(ctx context.Context, sessionID string) (*api.GetEnvironmentConfigResponse, error)`
+-- `[implemented] func (s *stdinConfigClient) GetAuthContext() *auth.AuthContext`
+-- `[implemented] func (s *stdinConfigClient) GetOutcomes() *claude.Outcomes`
+-- `[implemented] func acknowledgeWorkIfNeeded(ctx context.Context, logger *slog.Logger, taskCtx *TaskContext, workID string, environmentID string, skipAck bool) error`
+-- `[implemented] func validateAPIBaseURL(apiBaseURL string) error`
+-- `[implemented] func initDiagLogging(ctx context.Context, flusher diag.LogFlusher, logger *slog.Logger) (context.Context, func(), error)`
+-
+-Implementation status:
+-- The `task-run` command now restores recovered flag wiring, stdin input parsing through v0/v1 parsers, session/work/environment ID propagation, Claude version selection, local-testing defaults, container locking, optional work ACK, session ingress/no-op backend selection, diagnostic logging initialization, `start_task_run` diagnostic event, activity recorder construction, Claude Agent installation/update path, environment type registry, stdin-backed config client, manager construction, and execution through the diagnostic context.
+-
+-Non-emitted symbols:
+-- `cmd.AddTaskRunCommand.func1`
+-- `cmd.AddTaskRunCommand.func1.4`
+-- `cmd.AddTaskRunCommand.func1.deferwrap1`
+-- `cmd.AddTaskRunCommand.func1.3`
+-- `cmd.AddTaskRunCommand.func1.1`
+-- `cmd.initDiagLogging.func2`
+-- `cmd.initDiagLogging.func1`
+-
+-## `cmd/utils.go`
+-
+-- `[implemented] func parseLogLevel(levelStr string) (slog.Level, error)`
+-- `[implemented] func markRequiredFlags(cmd *cobra.Command, flags []string)`
+-
+-Implementation status:
+-- Restored shared command helpers for log-level parsing and required flag registration. Tests cover all accepted log levels, invalid-level errors, required flag annotations, and panic behavior for missing flags.
+-
+-## `internal/api/ccr_backend.go`
+-
+-- `[implemented] func NewCCRBackend(httpClient *HttpClient, authToken string, sessionID string, logger *slog.Logger) *CCRBackend`
+-- `[implemented] func (b *CCRBackend) RegisterWorker(ctx context.Context) (int64, error)`
+-- `[implemented] func (b *CCRBackend) WorkerEpoch() int64`
+-- `[implemented] func (b *CCRBackend) PostEvent(ctx context.Context, event *SessionEvent) error`
+-- `[implemented] func (b *CCRBackend) FlushLogs(ctx context.Context, logs []DiagLogEntry) error`
+-- `[implemented] func (b *CCRBackend) OtlpEndpoints() OtlpEndpoints`
+-- `[implemented] func (b *CCRBackend) endpoint(suffix string) string`
+-
+-Implementation status:
+-- CCR backend construction, worker registration, event posting, diagnostics flushing, OTLP endpoint construction, and escaped session worker endpoints are restored on top of `HttpClient`.
+-
+-## `internal/api/client.go`
+-
+-- `[implemented] func NewHttpClient(baseURL string, logger *slog.Logger, optionalRetryConfig *RetryConfig) *HttpClient`
+-- `[implemented] func NewHttpClientWithOptions(baseURL string, logger *slog.Logger, opts ClientOptions) *HttpClient`
+-- `[implemented] func (c *HttpClient) setAuthHeader(req *http.Request, authToken string)`
+-- `[implemented] func (c *HttpClient) PostJSON(ctx context.Context, endpoint string, requestBody interface{}, authToken string, operationName string) error`
+-- `[implemented] func (c *HttpClient) PostJSONWithResponse(ctx context.Context, endpoint string, requestBody interface{}, authToken string, operationName string, dest interface{}) error`
+-- `[implemented] func (c *HttpClient) doPostJSON(ctx context.Context, endpoint string, requestBody interface{}, authToken string, operationName string) ([]uint8, error)`
+-
+-Implementation status:
+-- Restored HTTP client construction, URL normalization, default timeout/retry config, Bearer auth, JSON POST request creation, default/version headers, retryable execution, response JSON decoding, and recovered non-OK/not-implemented errors.
+-
+-Non-emitted symbols:
+-- `api.(*HttpClient).doPostJSON.func1`
+-
+-## `internal/api/get_session_context.go`
+-
+-- `[implemented] func NewSessionsClient(httpClient *HttpClient, authToken string, logger *slog.Logger) *SessionsClient`
+-- `[implemented] func (c *SessionsClient) GetSessionContext(ctx context.Context, sessionID string) (*SessionContext, error)`
+-
+-Implementation status:
+-- Restored session-context GET requests with escaped session IDs, Anthropic headers, retryable execution, response parsing, and recovered auth/not-found/status errors.
+-
+-Non-emitted symbols:
+-- `api.(*SessionsClient).GetSessionContext.func1`
+-
+-## `internal/api/noop_backend.go`
+-
+-- `[implemented] func NewNoopBackend() *NoopBackend`
+-- `[implemented] func (b *NoopBackend) PostEvent(arg0 context.Context, arg1 *SessionEvent) error`
+-- `[implemented] func (b *NoopBackend) FlushLogs(arg0 context.Context, arg1 []DiagLogEntry) error`
+-- `[implemented] func (b *NoopBackend) OtlpEndpoints() OtlpEndpoints`
+-
+-## `internal/api/retry.go`
+-
+-- `[implemented] func calculateBackoff(attempt int, config *RetryConfig) time.Duration`
+-- `[implemented] func (c *HttpClient) RetryableHTTPDo(ctx context.Context, req *http.Request, retryConfig *RetryConfig) (*http.Response, error)`
+-
+-Implementation status:
+-- Restored retryable HTTP execution with body replay, recovered retryable status set, exponential backoff with jitter, context cancellation handling, and final retry exhaustion error.
+-
+-## `internal/api/session_ingress_backend.go`
+-
+-- `[implemented] func NewSessionIngressBackend(apiBaseURL string, authToken string, sessionID string, logger *slog.Logger) *SessionIngressBackend`
+-- `[implemented] func (b *SessionIngressBackend) PostEvent(ctx context.Context, event *SessionEvent) error`
+-- `[implemented] func (b *SessionIngressBackend) FlushLogs(ctx context.Context, logs []DiagLogEntry) error`
+-- `[implemented] func (b *SessionIngressBackend) OtlpEndpoints() OtlpEndpoints`
+-
+-Implementation status:
+-- Restored session ingress backend construction, event/log forwarding, and OTLP endpoint/header assembly.
+-
+-## `internal/api/session_ingress_client.go`
+-
+-- `[implemented] func (c *HttpSessionIngressClient) sessionEndpoint(sessionID string, suffix string) string`
+-- `[implemented] func (c *HttpSessionIngressClient) postJSON(ctx context.Context, endpoint string, requestBody interface{}, operationName string) error`
+-- `[implemented] func (c *HttpSessionIngressClient) PostSessionEvent(ctx context.Context, sessionID string, event *SessionEvent) error`
+-- `[implemented] func (c *HttpSessionIngressClient) PostForwardDiagLogs(ctx context.Context, sessionID string, logs []DiagLogEntry) error`
+-- `[implemented] func diagLogsToWireFormat(logs []DiagLogEntry) []map[string]interface{}`
+-
+-Implementation status:
+-- Restored v1/v2 session ingress endpoints, OTEL propagation, authenticated JSON posting, session event envelope, diagnostic log wire formatting, empty-log no-op, and recovered non-OK/not-implemented errors.
+-
+-Non-emitted symbols:
+-- `api.(*HttpSessionIngressClient).postJSON.func1`
+-
+-## `internal/api/session_ingress_types.go`
+-
+-- `[implemented] func (e ClaudeCodeExecutionError) GetUserMessage() string`
+-- `[implemented] func (e ClaudeCodeExecutionError) IsFatal() bool`
+-- `[implemented] func (e SourceProcessingError) GetUserMessage() string`
+-- `[implemented] func (e SourceProcessingError) IsFatal() bool`
+-- `[implemented] func (e InitScriptError) GetUserMessage() string`
+-- `[implemented] func (e InitScriptError) IsFatal() bool`
+-- `[implemented] func NewEnvManagerLogEvent(data *EnvManagerLogEventData) *SessionEvent`
+-- `[implemented] func NewEnvManagerLogEventData(level LogLevel, category LogCategory, content string, extra map[string]interface{}) *EnvManagerLogEventData`
+-- `[implemented] func NewSyntheticAssistantMessage(errorText string) *SessionEvent`
+-- `[implemented] func NewResultEvent(subtype string, errors []string) *SessionEvent`
+-
+-## `internal/api/work_client.go`
+-
+-- `[implemented] func NewWorkClient(httpClient *HttpClient, authToken string, logger *slog.Logger) *WorkClient`
+-- `[implemented] func (c *WorkClient) AcknowledgeWork(ctx context.Context, environmentID string, workID string) error`
+-
+-Implementation status:
+-- Restored work ACK client construction and POST flow, including escaped environment/work IDs, recovered Anthropic headers, version headers, retryable execution, success statuses, and status/body errors.
+-
+-Non-emitted symbols:
+-- `api.(*WorkClient).AcknowledgeWork.func1`
+-
+-## `internal/auth/context.go`
+-
+-- `[implemented] func NewAuthContextWithSessionID(logger *slog.Logger, authJSON json.RawMessage, sessionID string) (*AuthContext, error)`
+-- `[implemented] func (a *AuthContext) GetSessionIngressToken() string`
+-- `[implemented] func (a *AuthContext) GetAnthropicAPIToken() string`
+-- `[implemented] func (a *AuthContext) GetAnthropicOAuthToken() string`
+-- `[implemented] func (a *AuthContext) GetVercelDeployToken() string`
+-- `[implemented] func (a *AuthContext) GetSessionID() string`
+-- `[implemented] func (a *AuthContext) SetSessionID(sessionID string)`
+-- `[implemented] func (a *AuthContext) SetSessionIngressToken(token string)`
+-- `[implemented] func (a *AuthContext) GetSupabaseProjectRef() string`
+-- `[implemented] func (a *AuthContext) GetSupabaseAnonKey() string`
+-- `[implemented] func (a *AuthContext) GetSupabaseDBPass() string`
+-- `[implemented] func (a *AuthContext) GetSupabasePAT() string`
+-- `[implemented] func (a *AuthContext) GetAntspaceControlPlaneURL() string`
+-- `[implemented] func (a *AuthContext) GetAntspaceAuthToken() string`
+-- `[implemented] func (a *AuthContext) HasSupabase() bool`
+-
+-Implementation status:
+-- Auth context parsing is restored for recovered `session_ingress`, `anthropic_api`, `anthropic_oauth`, `vercel_deploy`, `antspace_deploy`, and `supabase` auth provider shapes. Tests cover empty auth, all getters/setters, nested Antspace/Supabase credential JSON, missing-token errors, invalid JSON, invalid nested credentials, and unknown provider errors.
+-
+-## `internal/auth/github_source_provider.go`
+-
+-- `[implemented] func NewGitHubSourceAuthProvider(logger *slog.Logger, token string) SourceAuthProvider`
+-- `[implemented] func (g *GitHubSourceAuthProvider) AuthenticateURL(ctx context.Context, authCtx *AuthContext, sourceURL string, permission Permission) (string, bool)`
+-- `[implemented] func (g *GitHubSourceAuthProvider) SanitizeOutput(output string, gitURL string, authenticatedURL string) string`
+-
+-Implementation status:
+-- GitHub source auth provider recovery is implemented for direct HTTPS token auth and recovered `sk-ant-ccsr-` git-proxy JWT auth. It rejects SSH/non-HTTPS/unparseable URLs, splits `username:password` tokens into URL userinfo, uses `unused:<jwt>` for proxy JWTs, logs diagnostic parse/JWT failures, and sanitizes authenticated URLs/tokens from git output. Tests cover normal token auth, username/password token auth, proxy JWT auth, unsupported URLs, empty tokens, and output sanitization.
+-
+-## `internal/claude/claude_code_executor.go`
+-
+-- `[implemented] func filterInitOnlyFromEnviron(env []string) []string`
+-- `[implemented] func NewClaudeCodeExecutor(logger *slog.Logger, cfg *config.ClaudeConfig, sessionID string, startupContext *config.StartupContext, authContext *auth.AuthContext, mcpRegistrations []*mcp.MCPServerRegistration, outcomes *Outcomes, activityRecorder session.ActivityRecorder, otelLogHandler slog.Handler, leaseManager *podmonitor.LeaseManager, targetVersion string) (*ClaudeCodeExecutor, error)`
+-- `[implemented] func addTokenViaFileDescriptor(ctx context.Context, logger *slog.Logger, token string, tokenName string, extraFiles *[]*os.File, filesToClose *[]*os.File) (int, error)`
+-- `[implemented] func (e *ClaudeCodeExecutor) Execute(ctx context.Context) error`
+-- `[implemented] func (e *ClaudeCodeExecutor) buildArgsFromGatewayConfig(ctx context.Context, baseArgs []string) ([]string, error)`
+-- `[implemented] func (e *ClaudeCodeExecutor) writeMCPConfigFileFromGateway(ctx context.Context) (string, error)`
+-- `[implemented] func (e *ClaudeCodeExecutor) Destroy(ctx context.Context) error`
+-- `[implemented] func (e *ClaudeCodeExecutor) SetClaudePath(path string)`
+-- `[implemented] func (e *ClaudeCodeExecutor) printCodeLogs(ctx context.Context)`
+-
+-Non-emitted symbols:
+-- `claude.(*ClaudeCodeExecutor).Execute.func5`
+-- `claude.(*ClaudeCodeExecutor).Execute.func4`
+-- `claude.(*ClaudeCodeExecutor).Execute.func3`
+-- `claude.(*ClaudeCodeExecutor).Execute.func2`
+-- `claude.(*ClaudeCodeExecutor).Execute.func1`
+-
+-Implementation status:
+-- `filterInitOnlyFromEnviron` now preserves the process environment while removing recovered init-only keys such as `CCR_PLUGINS_JSON` before `claude --init-only`.
+-- `NewClaudeCodeExecutor` now restores recovered argument validation, default API host handling, logging attributes, and executor field initialization.
+-- `addTokenViaFileDescriptor` now restores pipe-backed token passing through child process file descriptors, including close/error handling and fd logging.
+-- `Execute` now restores the main Claude Code command path: recovered base args, gateway args, repository multi-root `--add-dir`, endpoint/session URL args, debug flag handling, working directory/stdin setup, filtered environment overlays, recovered session/version/diagnostic env vars, token file descriptors, session ingress token file emission, Claude log file/header writing, stderr forwarding through `logger.LogWriter`, optional `ENV_MANAGER_STREAM_CC_LOGS` tailing, `/tmp/claude-command`, command execution, completion/error logging, failure recording, and optional code-log printing.
+-- `buildArgsFromGatewayConfig` now restores sandbox-gateway argument expansion, MCP config file emission, and local append-system-prompt merging.
+-- `writeMCPConfigFileFromGateway` now decodes gateway-provided base64 MCP config content, writes it to the recovered default path when needed, applies recovered permission defaults, and logs the result.
+-- `Destroy` now logs shutdown and removes the recovered session ingress token file path.
+-- `SetClaudePath` now updates the executor's Claude binary path.
+-- `printCodeLogs` now reads the recovered Claude Code log path and prints the recovered stdout banner/content/footer shape.
+-
+-## `internal/claude/config_helpers.go`
+-
+-- `[implemented] func GetClaudePath(ctx context.Context, logger *slog.Logger, cfg *config.ClaudeConfig) string`
+-
+-Implementation status:
+-- Restored Claude binary path selection: explicit config/CLI path first, then `CLAUDE_DEFAULT_PATH`, then the default `claude` binary.
+-
+-## `internal/claude/init.go`
+-
+-- `[implemented] func RunInit(ctx context.Context, logger *slog.Logger, cfg *config.ClaudeConfig, workingDir string) error`
+-
+-Implementation status:
+-- Restored the `claude --init-only` runner used by setup-only mode, including working directory, filtered environment, config environment overlay, duration logging, exit-code handling, and diagnostic events.
+-
+-## `internal/claude/install.go`
+-
+-- `[implemented] func isSpecificVersion(version string) bool`
+-- `[implemented] func getInstalledVersion(ctx context.Context, claudePath string) string`
+-- `[implemented] func installViaNpm(ctx context.Context, logger *slog.Logger, version string) error`
+-- `[implemented] func upgradeViaCLI(ctx context.Context, logger *slog.Logger, claudePath string, version string) error`
+-- `[implemented] func InstallOrUpdateClaudeCode(ctx context.Context, logger *slog.Logger, claudePath string, targetVersion string, activityRecorder session.ActivityRecorder) (string, error)`
+-- `[implemented] func handleInstallError(ctx context.Context, logger *slog.Logger, activityRecorder session.ActivityRecorder, err error, existingVersion string, operation string) (string, error)`
+-
+-Implementation status:
+-- Restored Claude Code version parsing, installed-version probing, npm install target selection, CLI upgrade, skip/current/latest/specific version handling, post-install verification, exact-version mismatch detection, and fallback behavior when an update fails but an existing version is available. Tests use fake `claude` and `npm` binaries to cover version detection, npm targets, CLI upgrade args, skip/current behavior, npm install+verify, upgrade+verify, fallback on failed upgrade, and fatal install errors without invoking real installation.
+-
+-## `internal/claude/outcomes.go`
+-
+-- `[implemented] func NewOutcomes() *Outcomes`
+-- `[implemented] func (o *Outcomes) Add(repository string, branches []string)`
+-- `[implemented] func (o *Outcomes) Get(repository string) []string`
+-- `[implemented] func (o *Outcomes) GetFirst(repository string) string`
+-- `[implemented] func (o *Outcomes) Repositories() []string`
+-- `[implemented] func (o *Outcomes) AsMap() map[string][]string`
+-- `[implemented] func (o *Outcomes) Len() int`
+-- `[implemented] func (o *Outcomes) IsEmpty() bool`
+-- `[implemented] func (o *Outcomes) Validate() *Outcomes`
+-- `[implemented] func (o *Outcomes) ValidateWithLogger(logger *slog.Logger) *Outcomes`
+-- `[implemented] func (o *Outcomes) String() string`
+-
+-Implementation status:
+-- Restored repository-to-branches outcome storage, copy-on-add/as-map behavior, first-branch lookup, repository enumeration, length/empty/string helpers, and validation that preserves empty branch lists while truncating multi-branch repositories to the first branch. Tests cover helper behavior, copy semantics, validation, nil validation receivers, and summary strings.
+-
+-## `internal/claude/session_urls.go`
+-
+-- `[implemented] func buildSessionURLs(baseURL string, sessionID string, apiVersion string, useCodeSessions bool) (string, string)`
+-
+-Implementation status:
+-- Restored session URL construction for session-ingress WebSocket/HTTP URLs and code-sessions URLs, including scheme stripping, local host handling, and `.orb.local` handling.
+-
+-## `internal/config/config.go`
+-
+-- `[implemented] func DefaultClaudeConfig() *ClaudeConfig`
+-- `[implemented] func (b BaseSource) GetType() string`
+-- `[implemented] func (b BaseSource) IsRepository() bool`
+-- `[implemented] func (b BaseSource) GetDirectory(baseDir string) string`
+-- `[implemented] func (g GitRepositorySource) Validate() error`
+-- `[implemented] func (g GitRepositorySource) IsRepository() bool`
+-- `[implemented] func (g GitRepositorySource) GetDirectory(baseDir string) string`
+-- `[implemented] func (c *McpServerConfig) IsRemote() bool`
+-- `[implemented] func (c *McpServerConfig) Validate() error`
+-- `[implemented] func (sc *StartupContext) UnmarshalJSON(data []uint8) error`
+-- `[implemented] func (sc *StartupContext) Validate() error`
+-- `[implemented] func (s *Session) Validate() error`
+-
+-Implementation status:
+-- Restored default Claude config construction, source helpers, git repository validation and checkout directory derivation, MCP server local/remote validation, startup context custom JSON decoding with typed source dispatch and MCP extra-field preservation, startup validation, and session validation. Tests cover valid and invalid sources, MCP local/remote cases, full startup context field mapping, unknown source handling, and session validation failures.
+-
+-## `internal/config/session_mode.go`
+-
+-- `[implemented] func (s SessionMode) IsValid() bool`
+-- `[implemented] func (s SessionMode) String() string`
+-- `[implemented] func ParseSessionMode(s string) (SessionMode, error)`
+-
+-Implementation status:
+-- Restored the recovered session mode constants and parser, including default empty mode -> `new`, validation for `new`, `setup-only`, `resume`, and `resume-cached`, and explicit invalid-mode errors. Tests cover all valid modes, defaulting, string conversion, and invalid values.
+-
+-## `internal/envtype/anthropic/anthropic.go`
+-
+-- `[implemented] func New(data json.RawMessage, logger *slog.Logger) (envtype.EnvironmentType, error)`
+-- `[implemented] func (a *anthropicEnvironmentType) SetStartupContext(ctx *config.StartupContext)`
+-- `[implemented] func (a *anthropicEnvironmentType) SetAuthContext(authCtx *auth.AuthContext)`
+-- `[implemented] func (a *anthropicEnvironmentType) SetSessionMode(mode config.SessionMode)`
+-- `[implemented] func (a *anthropicEnvironmentType) isBakuEnvironment() bool`
+-- `[implemented] func (a *anthropicEnvironmentType) Initialize(ctx context.Context, activityRecorder session.ActivityRecorder) error`
+-- `[implemented] func (a *anthropicEnvironmentType) GetCWD() string`
+-- `[implemented] func (a *anthropicEnvironmentType) GetClaudeEnvironmentVariables() map[string]string`
+-- `[implemented] func (a *anthropicEnvironmentType) runInitScript(ctx context.Context, scriptContent string) (string, error)`
+-- `[implemented] func extractExitCode(err error) int`
+-- `[implemented] func (a *anthropicEnvironmentType) installLanguages(ctx context.Context) error`
+-- `[implemented] func (a *anthropicEnvironmentType) installLanguage(ctx context.Context, lang Language) error`
+-- `[implemented] func (a *anthropicEnvironmentType) bootstrapHooksInAllDirs(ctx context.Context, cfg hookConfig) error`
+-- `[implemented] func (a *anthropicEnvironmentType) bootstrapHooksUnderDir(ctx context.Context, dir string, cfg hookConfig) error`
+-- `[implemented] func (a *anthropicEnvironmentType) bootstrapClaudeSkills(ctx context.Context) error`
+-- `[implemented] func (a *anthropicEnvironmentType) bootstrapClaudeSkillsUnderDir(ctx context.Context, dir string) error`
+-- `[implemented] func (a *anthropicEnvironmentType) initializeBakuProject(ctx context.Context) (string, error)`
+-- `[implemented] func (a *anthropicEnvironmentType) writeSupabaseEnvFiles(ctx context.Context, projectDir string) error`
+-- `[implemented] func (a *anthropicEnvironmentType) findExistingBakuProject() (string, error)`
+-- `[implemented] func (a *anthropicEnvironmentType) initGitRepo(ctx context.Context, dir string) error`
+-- `[implemented] func (a *anthropicEnvironmentType) startDevServer(ctx context.Context, dir string) error`
+-- `[implemented] func (a *anthropicEnvironmentType) isSupervisordRunning() bool`
+-- `[implemented] func copyDir(src string, dst string) error`
+-
+-Implementation status:
+-- Anthropic configuration shape is restored from DWARF (`Config`, `Language`, `anthropicEnvironmentType`, `hookConfig`). `New`, context setters, `Initialize`, `isBakuEnvironment`, `GetCWD`, `GetClaudeEnvironmentVariables`, `runInitScript`, language installation, Claude settings/hooks bootstrap, Claude skill bootstrap, Baku project initialization, Supabase env file writing, git repository initialization, supervisord dev-server startup, supervisord port detection, `copyDir`, and `extractExitCode` are implemented. The main initialization path now wires source processing, working-directory setup, nonfatal bootstrap calls, language setup, init scripts, Baku detection, Supabase rehydration, and dev-server startup.
+-
+-Non-emitted symbols:
+-- `anthropic.(*anthropicEnvironmentType).runInitScript.func1`
+-- `anthropic.(*anthropicEnvironmentType).runInitScript.func1.deferwrap1`
+-- `anthropic.(*anthropicEnvironmentType).installLanguages.gowrap1`
+-- `anthropic.(*anthropicEnvironmentType).installLanguages.func1`
+-- `anthropic.(*anthropicEnvironmentType).installLanguages.func1.deferwrap1`
+-- `anthropic.(*anthropicEnvironmentType).installLanguage.func1`
+-- `anthropic.(*anthropicEnvironmentType).startDevServer.func1`
+-- `anthropic.copyDir.func1`
+-- `anthropic.copyDir.func1.deferwrap1`
+-
+-## `internal/envtype/anthropic/embedded.go`
+-
+-Non-emitted symbols:
+-- `[implemented] anthropic.sessionStartHookSkill`
+-
+-Implementation status:
+-- Recovered the embedded `startup-hook-skill` Markdown payload written by `bootstrapClaudeSkillsUnderDir`.
+-
+-## `internal/envtype/anthropic/config.go`
+-
+-- `[implemented] func DecodeConfig(data json.RawMessage) (*Config, error)`
+-
+-Implementation status:
+-- `DecodeConfig` now unmarshals the recovered JSON shape, wraps JSON errors with the recovered anthropic-config context, and requires `cwd`.
+-
+-## `internal/envtype/anthropic/install_scripts/install_scripts.go`
+-
+-- `[implemented] func Python(version string) string`
+-- `[implemented] func Node(version string) string`
+-- `[implemented] func Go(version string) string`
+-
+-Implementation status:
+-- Recovered Python, Node.js, and Go installation script payloads are restored; exported helpers inline the recovered `$1` version substitution used by `installLanguage`.
+-
+-
+-Non-emitted symbols:
+-- `install_scripts.pythonScript`
+-- `install_scripts.nodeScript`
+-- `install_scripts.goScript`
+-
+-## `internal/envtype/byoc/byoc.go`
+-
+-- `[implemented] func New(data json.RawMessage, logger *slog.Logger) (envtype.EnvironmentType, error)`
+-- `[implemented] func (b *byocEnvironmentType) SetSessionMode(mode config.SessionMode)`
+-- `[implemented] func (b *byocEnvironmentType) SetStartupContext(ctx *config.StartupContext)`
+-- `[implemented] func (b *byocEnvironmentType) SetAuthContext(authCtx *auth.AuthContext)`
+-- `[implemented] func (b *byocEnvironmentType) GetCWD() string`
+-- `[implemented] func (b *byocEnvironmentType) Initialize(ctx context.Context, activityRecorder session.ActivityRecorder) error`
+-- `[implemented] func (b *byocEnvironmentType) extractRepoBranchMapping(ctx context.Context) (map[string]string, error)`
+-- `[implemented] func (b *byocEnvironmentType) handleBranchCheckout(ctx context.Context, activityRecorder session.ActivityRecorder) error`
+-- `[implemented] func (b *byocEnvironmentType) GetClaudeEnvironmentVariables() map[string]string`
+-- `[implemented] func (b *byocEnvironmentType) runScript(ctx context.Context, name string, script string) error`
+-- `[implemented] func (b *byocEnvironmentType) bootstrapClaudeSettings(ctx context.Context) error`
+-- `[implemented] func (b *byocEnvironmentType) setupGitConfig(ctx context.Context)`
+-- `[implemented] func (c *containProvideAuthRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)`
+-- `[implemented] func (b *byocEnvironmentType) CreateLeaseManager(ctx context.Context, sessionID string, environmentID string, apiBaseURL string, sessionIngressToken string, organizationUUID string) *podmonitor.LeaseManager`
+-
+-Implementation status:
+-- Restored BYOC config parsing and validation, session/startup/auth setters, CWD reporting, initialization flow, task setup script execution/skipping by session mode, Claude settings bootstrap, optional git config setup, outcome-to-branch mapping, environment variable construction, authenticated Contain Provide round tripper, and lease-manager creation. Tests cover config validation, setters, branch mapping, environment merge/entrypoint behavior, script success/failure, settings bootstrap preservation, git config skip path, initialization setup-script behavior, auth header injection, and authenticated lease heartbeat creation.
+-
+-Non-emitted symbols:
+-- `byoc.(*byocEnvironmentType).runScript.func1`
+-
+-## `internal/envtype/envtype.go`
+-
+-- `[implemented] func NewEnvTypes() *EnvTypes`
+-- `[implemented] func (e *EnvTypes) Register(envType *Registration)`
+-- `[implemented] func (e *EnvTypes) Create(typeName string, config json.RawMessage, logger *slog.Logger) (EnvironmentType, error)`
+-
+-Implementation status:
+-- Restored environment type registry construction, registration validation/panics, lookup, and factory dispatch. Tests cover initialized registry creation, factory raw-config/logger forwarding, missing type errors, and invalid registration panics.
+-
+-## `internal/envtype/shared/embedded.go`
+-
+-
+-Non-emitted symbols:
+-- `[implemented] shared.DefaultSettingsJSON`
+-- `[implemented] shared.StopHookScript`
+-- `[implemented] shared.BakuSettingsJSON`
+-- `[implemented] shared.BakuStopHookScript`
+-
+-## `internal/gitproxy/handler.go`
+-
+-- `[implemented] func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request)`
+-- `[implemented] func sanitizeError(err error) string`
+-- `[implemented] func sanitizeString(s string) string`
+-- `[implemented] func isValidGitPath(path string) bool`
+-- `[implemented] func (h *handler) forwardRequest(ctx context.Context, w http.ResponseWriter, r *http.Request, org string, repo string, gitPath string) error`
+-
+-Implementation status:
+-- Git proxy HTTP handling is restored. The handler parses recovered `/git/{org}/{repo}.git/{gitPath}` and `/git/{host}/{org}/{repo}.git/{gitPath}` shapes, challenges unauthenticated `info/refs`, validates git service paths, maps repo tokens, forwards to the recovered session ingress `/v1/session_ingress/session/{session}/git_proxy/...` endpoint, rewrites auth with Basic `git:<token>`, applies recovered runner/version and token-backend headers, filters unsafe inbound headers, streams successful responses, and sanitizes error bodies. Tests cover invalid paths, auth challenge, GitHub/GHE forwarding, header filtering, token backend forwarding, response copying, error redaction, and git-path validation.
+-
+-Non-emitted symbols:
+-- `gitproxy.(*handler).forwardRequest.deferwrap1`
+-- `gitproxy.(*server).Start.newHandler.func2`
+-
+-## `internal/gitproxy/manager.go`
+-
+-- `[implemented] func NewManager(config *Config) (Manager, error)`
+-- `[implemented] func (m *manager) Start(ctx context.Context) (string, error)`
+-- `[implemented] func (m *manager) Stop(ctx context.Context) error`
+-- `[implemented] func (m *manager) GetProxyURL(repo string) string`
+-- `[implemented] func (m *manager) IsRunning() bool`
+-
+-Implementation status:
+-- Git proxy manager creation, idempotent start, stop, running state, and recovered `local_proxy@` URL generation are restored. Tests cover nil config validation, start/stop idempotency, localhost base URL creation, GitHub URL shape, and host-qualified GHE URL shape.
+-
+-Non-emitted symbols:
+-- `gitproxy.(*manager).Start.deferwrap1`
+-- `gitproxy.(*manager).Stop.deferwrap1`
+-- `gitproxy.(*manager).GetProxyURL.deferwrap1`
+-- `gitproxy.(*manager).IsRunning.deferwrap1`
+-
+-## `internal/gitproxy/server.go`
+-
+-- `[implemented] func NewServer(config *Config) (Server, error)`
+-- `[implemented] func (s *server) Start(ctx context.Context) error`
+-- `[implemented] func (s *server) Stop(ctx context.Context) error`
+-- `[implemented] func (s *server) Port() int`
+-- `[implemented] func (s *server) BaseURL() string`
+-
+-Implementation status:
+-- Git proxy server validation, localhost listener startup, dynamic port discovery, handler construction, graceful shutdown, and base URL reporting are restored. `Start` now captures the HTTP server before launching the serve goroutine so fast `Stop` calls cannot nil-deref the receiver field. Tests cover required config fields, unsupported token backends, listener start, port/base URL reporting, and repeated stop.
+-
+-Non-emitted symbols:
+-- `gitproxy.(*server).Start.func1`
+-- `gitproxy.(*server).Start.deferwrap1`
+-- `gitproxy.(*server).Stop.deferwrap1`
+-- `gitproxy.(*server).Port.deferwrap1`
+-
+-## `internal/input/secret.go`
+-
+-- `[implemented] func (ws *WorkSecret) UnmarshalJSON(data []uint8) error`
+-- `[implemented] func DecodeWorkSecret(encoded string) (*WorkSecret, error)`
+-- `[implemented] func ParseV1WorkResponse(data []uint8) (*V1WorkResponse, error)`
+-- `[implemented] func (r *V1WorkResponse) GetSessionID() string`
+-- `[implemented] func (r *V1WorkResponse) IsHealthcheck() bool`
+-- `[implemented] func (r *V1WorkResponse) DecodeSecret() (*WorkSecret, error)`
+-
+-Implementation status:
+-- Restored URL-base64 work secret decoding, source dispatch for git repository sources, auth/gateway/code-session fields, secret version validation, V1 work-response validation, session ID access, healthcheck detection, and response-level secret decoding. Tests cover successful full-field decode, malformed/unsupported secrets, source validation, session responses, healthcheck responses, and invalid V1 work data.
+-
+-## `internal/input/v0_parser.go`
+-
+-- `[implemented] func (p *V0Parser) Parse(ctx context.Context, data []uint8) (*ParsedContext, error)`
+-- `[implemented] func (p *V0Parser) parseStartupContext(ctx context.Context, data json.RawMessage) (*config.StartupContext, error)`
+-- `[implemented] func (p *V0Parser) parseEnvironment(ctx context.Context, data json.RawMessage) (*api.GetEnvironmentConfigResponse, error)`
+-- `[implemented] func (p *V0Parser) parseAuth(ctx context.Context, data json.RawMessage) (*auth.AuthContext, error)`
+-- `[implemented] func (p *V0Parser) parseOutcomes(ctx context.Context, startupContext *config.StartupContext) *claude.Outcomes`
+-
+-Implementation status:
+-- Restored the default `task-run --input-format=v0` parser path: top-level stdin JSON parsing, startup context validation and API URL normalization, environment config validation/preservation, optional auth context creation, and recovered git outcome filtering/logging. Tests cover full V0 parse, auth/session propagation, tool fields, outcome filtering, and required environment error paths.
+-
+-## `internal/input/v1_parser.go`
+-
+-- `[implemented] func (p *V1Parser) Parse(ctx context.Context, data []uint8) (*ParsedContext, error)`
+-- `[implemented] func (p *V1Parser) buildHealthcheckResult(ctx context.Context, workResp *V1WorkResponse, secret *WorkSecret, authCtx *auth.AuthContext, parseStartTime time.Time) (*ParsedContext, error)`
+-- `[implemented] func (p *V1Parser) buildSessionResult(ctx context.Context, workResp *V1WorkResponse, secret *WorkSecret, authCtx *auth.AuthContext, parseStartTime time.Time) (*ParsedContext, error)`
+-- `[implemented] func (p *V1Parser) buildStartupContext(secret *WorkSecret, sessionCtx *api.SessionContext) (*config.StartupContext, error)`
+-- `[implemented] func (p *V1Parser) buildEnvironmentResponse(sessionCtx *api.SessionContext) (*api.GetEnvironmentConfigResponse, error)`
+-- `[implemented] func (p *V1Parser) buildAuthContext(secret *WorkSecret, sessionID string) (*auth.AuthContext, error)`
+-- `[implemented] func (p *V1Parser) buildOutcomes(ctx context.Context, sessionCtx *api.SessionContext) *claude.Outcomes`
+-- `[implemented] func normalizeAPIBaseURL(apiBaseURL string) string`
+-
+-Implementation status:
+-- Restored V1 parser orchestration, healthcheck handling, code-session short path, session-context API fetch path, startup context assembly, BYOC environment response construction, auth context creation with secret ingress-token override, API base URL normalization, MCP config decoding, prompt/model propagation, and recovered git outcome filtering. Tests cover healthcheck results, code-session parsing without session-context fetch, session-context HTTP fetch including recovered headers/auth, MCP decoding, environment CWD fallback/session override, and outcome extraction.
+-
+-## `internal/logger/file_logger.go`
+-
+-- `[implemented] func NewFileLoggingHandler(inner slog.Handler, logFile string, minLevel slog.Level) (*FileLoggingHandler, error)`
+-- `[implemented] func (h *FileLoggingHandler) Enabled(ctx context.Context, level slog.Level) bool`
+-- `[implemented] func (h *FileLoggingHandler) Handle(ctx context.Context, record slog.Record) error`
+-- `[implemented] func (h *FileLoggingHandler) WithAttrs(attrs []slog.Attr) slog.Handler`
+-- `[implemented] func (h *FileLoggingHandler) WithGroup(name string) slog.Handler`
+-- `[implemented] func (h *FileLoggingHandler) writeToFile(ctx context.Context, record slog.Record)`
+-- `[implemented] func (h *FileLoggingHandler) Close() error`
+-- `[implemented] func CreateLoggerWithFileOutput(level slog.Level) *slog.Logger`
+-
+-Implementation status:
+-- Restored file logging handler creation with directory setup, inner handler delegation, JSON-line file writes with timestamp/level/message/attrs, shared file/mutex preservation across attrs/groups, close handling, and `/tmp/env-manager.log` logger construction. Tests cover JSON output, inner delegation, enabled checks, wrapped inner errors, attrs/group handler cloning, and logger construction.
+-
+-Non-emitted symbols:
+-- `logger.(*FileLoggingHandler).writeToFile.deferwrap1`
+-- `logger.(*FileLoggingHandler).Close.deferwrap1`
+-
+-## `internal/logger/log_writer.go`
+-
+-- `[implemented] func NewLogWriter(logger *slog.Logger, ctx context.Context, level slog.Level, prefix string, attrs ...slog.Attr) *LogWriter`
+-- `[implemented] func (w *LogWriter) Write(p []uint8) (int, error)`
+-
+-## `internal/logger/multi_handler.go`
+-
+-- `[implemented] func (h *MultiHandler) Enabled(ctx context.Context, level slog.Level) bool`
+-- `[implemented] func (h *MultiHandler) Handle(ctx context.Context, record slog.Record) error`
+-- `[implemented] func (h *MultiHandler) WithAttrs(attrs []slog.Attr) slog.Handler`
+-- `[implemented] func (h *MultiHandler) WithGroup(name string) slog.Handler`
+-- `[implemented] func (f *MinLevelHandler) Enabled(ctx context.Context, level slog.Level) bool`
+-- `[implemented] func (f *MinLevelHandler) Handle(ctx context.Context, r slog.Record) error`
+-- `[implemented] func (f *MinLevelHandler) WithAttrs(attrs []slog.Attr) slog.Handler`
+-- `[implemented] func (f *MinLevelHandler) WithGroup(name string) slog.Handler`
+-
+-Implementation status:
+-- Multi-handler fan-out and minimum-level handler wrapping are implemented, including per-handler `Enabled` checks, nonfatal handler error reporting to stderr, and propagation of attrs/groups.
+-
+-## `internal/manager/manager.go`
+-
+-- `[implemented] func NewManagerWithExecutorAndClaudeConfig(apiClient api.Client, logger *slog.Logger, cfg *config.Session, envTypes *envtype.EnvTypes, executorFactory ClaudeExecutorFactory, sessionMode config.SessionMode, sessionModeExplicitlySet bool, claudeConfig *config.ClaudeConfig, environmentID string, organizationUUID string, processStartTime time.Time, eventPoster session.EventPoster) *Manager`
+-- `[implemented] func (m *Manager) Run(ctx context.Context) error`
+-- `[implemented] func (m *Manager) registerMCPServersAsync(ctx context.Context, wg *sync.WaitGroup, authCtx *auth.AuthContext, workingDir string, activityRecorder session.ActivityRecorder, mcpServers *[]mcp.MCPServer, mcpRegistrations *[]*mcp.MCPServerRegistration, mcpErr *error)`
+-- `[implemented] func (m *Manager) configureEnvironment(ctx context.Context, env envtype.EnvironmentType, authCtx *auth.AuthContext)`
+-- `[implemented] func (m *Manager) configureGitSigning(ctx context.Context)`
+-- `[implemented] func (m *Manager) initializeEnvironmentAsync(ctx context.Context, wg *sync.WaitGroup, env envtype.EnvironmentType, claudeConfig *config.ClaudeConfig, activityRecorder session.ActivityRecorder, envInitErr *error)`
+-- `[implemented] func (m *Manager) applyEnvironmentConfig(ctx context.Context, env envtype.EnvironmentType, claudeConfig *config.ClaudeConfig)`
+-- `[implemented] func (m *Manager) addOfficialPluginMarketplaceAsync(ctx context.Context, wg *sync.WaitGroup, pluginErr *error)`
+-
+-Implementation status:
+-- Manager orchestration is restored and now covered by unit tests. `Run` fetches and creates the environment, defaults implicit BYOC sessions to `resume-cached`, propagates startup/auth/session mode, applies environment variables and working directory to Claude config, runs MCP/plugin/environment setup in parallel, reports diagnostic/activity events, handles setup-only mode, creates the Claude executor, optionally starts the recovered tunnel client when `TUNNEL_ENABLED` is `true`/`1`, treats canceled execution as clean shutdown, and defers tunnel, MCP server, and executor cleanup. Git signing setup and official plugin marketplace installation keep the recovered environment-variable skips.
+-
+-Non-emitted symbols:
+-- `manager.(*Manager).Run.func4`
+-- `manager.(*Manager).Run.func3`
+-- `manager.(*Manager).Run.deferwrap4`
+-- `manager.(*Manager).Run.func2`
+-- `manager.(*Manager).Run.func1`
+-- `manager.(*Manager).Run.gowrap3`
+-- `manager.(*Manager).Run.gowrap2`
+-- `manager.(*Manager).Run.gowrap1`
+-- `manager.(*Manager).registerMCPServersAsync.deferwrap1`
+-- `manager.(*Manager).initializeEnvironmentAsync.deferwrap1`
+-- `manager.(*Manager).addOfficialPluginMarketplaceAsync.deferwrap1`
+-
+-## `internal/manager/mcp.go`
+-
+-- `[implemented] func (m *Manager) registerMCPServers(ctx context.Context, authCtx *auth.AuthContext, workingDir string, activityRecorder session.ActivityRecorder) ([]mcp.MCPServer, []*mcp.MCPServerRegistration, error)`
+-- `[implemented] func (m *Manager) setupMCPServerWithRegistration(ctx context.Context, reg *mcp.MCPServerRegistration, authCtx *auth.AuthContext, workingDir string, activityRecorder session.ActivityRecorder) (mcp.MCPServer, error)`
+-
+-Implementation status:
+-- MCP registration orchestration is restored and covered by direct setup tests: registration discovery, per-server setup, nonfatal setup failure logging/diag event, duration logging, and create/start error wrapping.
+-
+-## `internal/manager/skill_extraction.go`
+-
+-- `[implemented] func extractSkillZips(ctx context.Context, logger *slog.Logger)`
+-- `[implemented] func extractZip(zipPath string, destDir string) error`
+-- `[implemented] func extractZipEntry(file *zip.File, destDir string, totalExtracted *int64) error`
+-- `[implemented] func writeZipEntry(file *zip.File, targetPath string) error`
+-- `[implemented] func sanitizeZipEntryPath(destDir string, entryName string) (string, error)`
+-
+-Implementation status:
+-- Skill zip extraction is implemented for `/mnt/skills` to `/workspace/skills`, including zip discovery, extraction logging, path traversal prevention, symlink rejection, per-file and total extracted-size limits, parent directory creation, file mode preservation, and cleanup when a newly-created destination fails mid-extract.
+-
+-Non-emitted symbols:
+-- `manager.extractZip.func1`
+-- `manager.extractZip.deferwrap1`
+-- `manager.writeZipEntry.deferwrap2`
+-- `manager.writeZipEntry.deferwrap1`
+-
+-## `internal/manager/tunnel_register.go`
+-
+-Implementation status:
+-- Tunnel registration is restored through `init`: the package installs `createTunnelClientFunc`, rewrites API base URLs from `http(s)` to `ws(s)`, creates the action registry, always registers status and snapshot actions, conditionally registers deploy actions for `baku` sessions using Vercel/Antspace auth context, and constructs `tunnel.Client` with the session ID, ingress token, endpoint, logger, and registry.
+-
+-Non-emitted symbols:
+-- `manager.init.0`
+-- `manager.init.0.func1`
+-
+-## `internal/mcp/registry.go`
+-
+-- `[implemented] func RegisterServer(registration *MCPServerRegistration)`
+-- `[implemented] func NewRegistration(name string, description string, configurator MCPServerConfigurator, shouldRegister func(*config.StartupContext, *config.ClaudeConfig) bool, getAdditionalSystemPrompt func() string) *MCPServerRegistration`
+-- `[implemented] func GetMCPRegistrations(startupCtx *config.StartupContext, claudeConfig *config.ClaudeConfig) []*MCPServerRegistration`
+-- `[implemented] func RegisterWithClaude(ctx context.Context, logger *slog.Logger, serverName string, serverConfig *ServerConfig) error`
+-
+-Implementation status:
+-- Registry storage/filtering, `NewRegistration` factory wrapping, allowed-tool name caching, recovered `MCPServerRegistration`/`MCPServer` type shapes, and Claude CLI MCP registration (`list`/`remove`/`add`) are restored and covered by tests using a fake Claude CLI.
+-
+-Non-emitted symbols:
+-- `mcp.RegisterServer.deferwrap1`
+-- `mcp.NewRegistration.func2`
+-- `mcp.NewRegistration.func1`
+-- `mcp.GetMCPRegistrations.deferwrap1`
+-
+-## `internal/mcp/server.go`
+-
+-- `[implemented] func (rw *responseWriter) WriteHeader(code int)`
+-- `[implemented] func (rw *responseWriter) Write(b []uint8) (int, error)`
+-- `[implemented] func (s *BaseServer) GetName() string`
+-- `[implemented] func (s *BaseServer) GetTools() []ToolConfig`
+-- `[implemented] func (s *BaseServer) Start(tools []ToolConfig) (*ServerConfig, error)`
+-- `[implemented] func (s *BaseServer) Stop()`
+-- `[implemented] func (s *BaseServer) ShouldRegisterWithClaude() bool`
+-
+-Implementation status:
+-- `BaseServer.Start` now creates the mark3labs MCP server, registers tools, exposes `/mcp` over a localhost HTTP listener with bearer-token auth, records request status through `responseWriter`, runs the HTTP serve goroutine, and starts the heartbeat monitor. `Stop` performs graceful HTTP shutdown, listener close, and heartbeat channel close. Unit tests cover status tracking, random/debug bearer-token modes, unauthorized rejection, authenticated `tools/list`, authenticated `tools/call`, and idempotent stop.
+-
+-Non-emitted symbols:
+-- `mcp.(*BaseServer).Start.func3`
+-- `mcp.(*BaseServer).Start.func3.deferwrap1`
+-- `mcp.(*BaseServer).Start.func2`
+-- `mcp.(*BaseServer).Start.func1`
+-
+-## `internal/mcp/servers/codesign/registration.go`
+-
+-- `[implemented] func configureServer(baseServer *mcp.BaseServer, authCtx *auth.AuthContext, startupCtx *config.StartupContext, workingDir string, activityRecorder session.ActivityRecorder) (mcp.MCPServer, error)`
+-- `[implemented] func shouldRegister(startupCtx *config.StartupContext, claudeConfig *config.ClaudeConfig) bool`
+-
+-Implementation status:
+-- Code signing registration is restored and side-effect imported by `cmd/task-run`. `configureServer` resolves `SIGNING_SERVER_URL` or `startupCtx.APIBaseURL`, normalizes the URL, and constructs `CodeSignMCPServer`. Tests cover env/default URL selection, missing API base errors, and unconditional registration.
+-
+-Non-emitted symbols:
+-- `codesign.init.func1`
+-
+-## `internal/mcp/servers/codesign/server.go`
+-
+-- `[implemented] func (s *CodeSignMCPServer) GetTools() []mcp.ToolConfig`
+-- `[implemented] func (s *CodeSignMCPServer) handleSignFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error)`
+-- `[implemented] func (s *CodeSignMCPServer) identifySource(ctx context.Context, repoDirectory string) SourceInfo`
+-- `[implemented] func (s *CodeSignMCPServer) Start(tools []mcp.ToolConfig) (*mcp.ServerConfig, error)`
+-- `[implemented] func (s *CodeSignMCPServer) ShouldRegisterWithClaude() bool`
+-
+-Implementation status:
+-- `CodeSignMCPServer` type fields are recovered. `GetTools` exposes the `sign_file` MCP tool with the recovered schema. `handleSignFile` parses tool arguments, enforces absolute file/output paths, reads the target file, signs it, writes the `.sig` output with mode `0600`, and returns MCP text/error results. `identifySource` maps a repo directory back to startup git sources using canonical path matching. `Start` delegates to `BaseServer.Start`, exports `CODESIGN_MCP_PORT`/`CODESIGN_MCP_TOKEN`, writes `/tmp/codesign-mcp-config.json`, and does not register with Claude directly. Tests cover tool schema, source matching, validation errors, and successful file-signing flow against a fake signing server.
+-
+-## `internal/mcp/servers/codesign/sign_operations.go`
+-
+-- `[implemented] func (s *CodeSignMCPServer) executeSign(ctx context.Context, req *SignRequest) (*SignResponse, error)`
+-- `[implemented] func (s *CodeSignMCPServer) signContent(ctx context.Context, content string, sourceInfo SourceInfo, gitObjectFormat string) (string, error)`
+-- `[implemented] func sanitizeSource(source config.Source) interface{}`
+-- `[implemented] func readFileContent(path string) (string, error)`
+-
+-Implementation status:
+-- Code signing operations are restored. `executeSign` marshals `RemoteSignRequest`, selects the code-sessions or session-ingress signing endpoint from `UseCodeSessions`, sets the recovered Anthropic/version/auth headers, calls the remote signing server, validates the JSON response, and returns the signature. `signContent` validates non-empty content, sanitizes source metadata, and wraps signing failures. `sanitizeSource` strips git source auth/url fields before remote submission, and `readFileContent` wraps file open/read errors. Tests cover both recovered endpoint shapes, auth/remote failure cases, source sanitization, file reading, and error wrapping.
+-
+-Non-emitted symbols:
+-- `codesign.(*CodeSignMCPServer).executeSign.deferwrap1`
+-- `codesign.readFileContent.deferwrap1`
+-
+-## `internal/mcp/servers/supabase/client.go`
+-
+-- `[implemented] func (c *Client) ApplyMigration(ctx context.Context, name string, sql string) error`
+-- `[implemented] func (c *Client) RunQuery(ctx context.Context, sql string) (string, error)`
+-- `[implemented] func (c *Client) ListMigrations(ctx context.Context) ([]MigrationResponse, error)`
+-- `[implemented] func (c *Client) GenerateTypes(ctx context.Context) (string, error)`
+-- `[implemented] func (c *Client) doRequest(ctx context.Context, method string, path string, body string) (string, error)`
+-
+-Implementation status:
+-- Supabase API client struct fields and JSON response types are restored. The client methods now marshal migration/query requests, call the recovered Supabase Management API paths, parse migration/type responses, apply bearer auth, cap response reads at 10MB, and surface API error messages. Tests cover recovered paths, methods, headers, request bodies, parsed responses, and API error messages.
+-
+-Non-emitted symbols:
+-- `supabase.(*Client).doRequest.deferwrap1`
+-
+-## `internal/mcp/servers/supabase/functions.go`
+-
+-- `[implemented] func (c *Client) DeployFunction(ctx context.Context, slug string, funcDir string, sharedDir string, trustRoot string) (*DeployFunctionResult, error)`
+-- `[implemented] func collectFunctionFiles(funcDir string, sharedDir string, trustRoot string) ([]functionFile, int64, error)`
+-- `[implemented] func requireDirUnder(path string, resolvedRoot string) error`
+-- `[implemented] func (c *Client) ProjectRef() string`
+-
+-Implementation status:
+-- Supabase Edge Function deployment is restored. `DeployFunction` validates slug shape/length, verifies `index.ts`, collects function and `_shared` files under the trusted project root, enforces recovered 1MiB per-file and 10MiB total source limits, builds the multipart `metadata`/`file` payload, posts to the recovered `/projects/{ref}/functions/deploy?slug={slug}` endpoint with bearer auth, and handles 201/402/429/default responses. Tests cover multipart metadata/files, shared source relpaths, ProjectRef, validation failures, status handling, symlink skipping, and trust-root rejection.
+-
+-Non-emitted symbols:
+-- `supabase.(*Client).DeployFunction.deferwrap1`
+-- `supabase.collectFunctionFiles.collectFunctionFiles.func1.func3`
+-- `supabase.collectFunctionFiles.collectFunctionFiles.func1.func2`
+-
+-## `internal/mcp/servers/supabase/registration.go`
+-
+-- `[implemented] func configureServer(baseServer *mcp.BaseServer, authCtx *auth.AuthContext, startupCtx *config.StartupContext, workingDir string, activityRecorder session.ActivityRecorder) (mcp.MCPServer, error)`
+-- `[implemented] func shouldRegister(startupCtx *config.StartupContext, claudeConfig *config.ClaudeConfig) bool`
+-
+-Implementation status:
+-- Supabase MCP registration and recovered `SupabaseMCPServer`/`Client` type shapes are restored. Registration now honors `SUPABASE_MCP_DISABLED=true`, only enables for `EnvironmentSubType == "baku"`, requires a Supabase PAT, supports `_BAKU_SUPABASE_LAZY`, and creates an eager client when a project ref is already present. `cmd/task-run` side-effect imports this server. Tests cover PAT validation, lazy/eager configuration, auth/session field propagation, and registration filtering.
+-
+-Non-emitted symbols:
+-- `supabase.init.func1`
+-
+-## `internal/mcp/servers/supabase/server.go`
+-
+-- `[implemented] func permanentProvisioningErrBody(err error) string`
+-- `[implemented] func (s *SupabaseMCPServer) getProjectDir() string`
+-- `[implemented] func (s *SupabaseMCPServer) ensureConfigured(ctx context.Context) (*Client, error)`
+-- `[implemented] func (s *SupabaseMCPServer) fetchCredentials(ctx context.Context) (*supabaseCredentials, error)`
+-- `[implemented] func (s *SupabaseMCPServer) writeEnvFiles(creds *supabaseCredentials)`
+-- `[implemented] func (s *SupabaseMCPServer) GetTools() []mcp.ToolConfig`
+-- `[implemented] func (s *SupabaseMCPServer) ShouldRegisterWithClaude() bool`
+-- `[implemented] func (s *SupabaseMCPServer) handleMigrate(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error)`
+-- `[implemented] func (s *SupabaseMCPServer) handleQuery(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error)`
+-- `[implemented] func (s *SupabaseMCPServer) handleListMigrations(ctx context.Context, arg1 mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error)`
+-- `[implemented] func (s *SupabaseMCPServer) handleGenerateTypes(ctx context.Context, arg1 mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error)`
+-- `[implemented] func (s *SupabaseMCPServer) handleDeployFunction(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error)`
+-- `[implemented] func (s *SupabaseMCPServer) triggerProvision(ctx context.Context) (provisionStatus, error)`
+-- `[implemented] func (s *SupabaseMCPServer) handleProvisionDatabase(ctx context.Context, arg1 mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error)`
+-
+-Implementation status:
+-- Supabase credential resolution is restored. `ensureConfigured` caches successful clients, records permanent provisioning failures, supports lazy-mode guidance, initializes the Supabase Management API client, and writes recovered `.env` / `.env.local` files. `fetchCredentials` calls the recovered `/v2/ccr-sessions/{session}/supabase-credentials` endpoint with session ingress auth and handles 204, 500, non-200, decode, and empty-project cases. Tests cover recovered control-plane paths/headers, env-file contents, pending/lazy guidance, permanent-failure caching, and project-dir selection.
+-- Supabase MCP database tools are restored. `GetTools` exposes `migrate`, `query`, `list_migrations`, `generate_types`, `deploy_function`, and lazy-mode `provision_database`; the DB handlers now validate inputs, call the recovered Supabase client, write local migration/type artifacts, format JSON where appropriate, and return MCP text/error results. `provision_database` now triggers on-demand provisioning, handles permanent failures, polls credentials with the recovered timeout/backoff, caches the client via `ensureConfigured`, and writes env files on success. `deploy_function` validates the requested slug/source directory, delegates to `DeployFunction`, logs deployment status, and returns the deployed function URL plus the recovered React invocation hint. Tests cover eager/lazy tool sets, query/list/types/migrate artifact writes, deploy-function URL output, already-provisioned behavior, permanent provisioning failures, and the provisioned-now credential fetch path.
+-
+-Non-emitted symbols:
+-- `supabase.(*SupabaseMCPServer).ensureConfigured.deferwrap1`
+-- `supabase.(*SupabaseMCPServer).fetchCredentials.deferwrap1`
+-- `supabase.(*SupabaseMCPServer).triggerProvision.deferwrap1`
+-
+-## `internal/o11y/diag/cc_log_collector.go`
+-
+-- `[implemented] func newCCLogCollector(ctx context.Context, logFilePath string) (*ccLogCollector, error)`
+-- `[implemented] func (c *ccLogCollector) Drain() []api.DiagLogEntry`
+-- `[implemented] func (c *ccLogCollector) Stop()`
+-- `[implemented] func (c *ccLogCollector) collect(ctx context.Context)`
+-
+-Implementation status:
+-- Claude Code diagnostic log collection is restored. The collector uses the recovered `util.Tailer`, starts from the end of the diagnostic file, parses JSON log lines, normalizes/removes the `timestamp` field when present, tags entries with recovered source value `cc`, caps the in-memory buffer at 5000 entries, and exposes drain/stop semantics matching the recovered `WaitGroup`/tailer lifecycle.
+-
+-Non-emitted symbols:
+-- `diag.newCCLogCollector.gowrap1`
+-- `diag.(*ccLogCollector).Drain.deferwrap1`
+-- `diag.(*ccLogCollector).collect.deferwrap1`
+-
+-## `internal/o11y/diag/diag_logs.go`
+-
+-- `[implemented] func NewDiagService(ctx context.Context, flusher LogFlusher) (*DiagService, context.Context, error)`
+-- `[implemented] func createDiagFile(ctx context.Context, fileNamePrefix string) (*os.File, error)`
+-- `[implemented] func GetClaudeCodeDiagFilePath(ctx context.Context) string`
+-- `[implemented] func (d *DiagService) Shutdown(ctx context.Context) error`
+-- `[implemented] func LogEnvManagerNoPII(ctx context.Context, event string, dataMap map[string]interface{})`
+-- `[implemented] func (d *DiagService) logEnvManagerNoPII(ctx context.Context, event string, dataMap map[string]interface{})`
+-- `[implemented] func (d *DiagService) flushPeriodically(ctx context.Context)`
+-- `[implemented] func (d *DiagService) collectAndMergeLogs(ctx context.Context, pending []api.DiagLogEntry) []api.DiagLogEntry`
+-- `[implemented] func (d *DiagService) drainEnvManagerLogs() []api.DiagLogEntry`
+-- `[implemented] func appendAndCapLogs(ctx context.Context, existing []api.DiagLogEntry, newLogs []api.DiagLogEntry) []api.DiagLogEntry`
+-- `[implemented] func (d *DiagService) flushDiagLogsToRemote(ctx context.Context, pending []api.DiagLogEntry) error`
+-- `[implemented] func LogsEnabled() bool`
+-
+-Implementation status:
+-- Diagnostic logging is restored and wired around the recovered `diag_logs` context key. `NewDiagService` creates `environment-manager-*.diag.log` and `claude-code-*.diag.log`, starts the Claude Code collector, exposes the Claude Code log path through context, and runs the recovered 5-second flush loop. `LogEnvManagerNoPII` records `event`/`source=env_manager`/`data` entries both in memory and as JSONL. Shutdown now marks the service closed, stops the collector, performs a final flush, handles `ErrEndpointNotImplemented` as a clean final shutdown, closes both files, and joins close/flush errors. `LogsEnabled` reads the recovered `ENV_MANAGER_ENABLE_DIAG_LOGS` boolean flag.
+-
+-Non-emitted symbols:
+-- `diag.NewDiagService.gowrap1`
+-- `diag.GetClaudeCodeDiagFilePath.deferwrap1`
+-- `diag.(*DiagService).Shutdown.deferwrap1`
+-- `diag.(*DiagService).logEnvManagerNoPII.deferwrap1`
+-- `diag.(*DiagService).flushPeriodically.deferwrap1`
+-- `diag.(*DiagService).drainEnvManagerLogs.deferwrap1`
+-- `diag.(*DiagService).collectAndMergeLogs.func1`
+-
+-## `internal/o11y/discard_o11y_service.go`
+-
+-- `[implemented] func (d DiscardO11yService) LogHandler() slog.Handler`
+-- `[implemented] func (d DiscardO11yService) Shutdown(arg0 context.Context) error`
+-- `[implemented] func (d DiscardO11yService) Increment(arg0 context.Context, arg1 *O11yMetric, arg2 *map[string]string)`
+-- `[implemented] func (d DiscardO11yService) RecordGauge(arg0 context.Context, arg1 *O11yMetric, arg2 float64, arg3 *map[string]string)`
+-
+-## `internal/o11y/metric_types.go`
+-
+-- `[implemented] func (k *kvTagProvider) Tags() map[string]string`
+-- `[implemented] func ErrorTags(err error) TagProvider`
+-- `[implemented] func mergeTags(tagProvider []TagProvider) map[string]string`
+-
+-## `internal/o11y/metrics.go`
+-
+-- `[implemented] func IncrementEnvManagerEnd(ctx context.Context, mode config.SessionMode, err error)`
+-- `[implemented] func IncrementClaudeCodeEnd(ctx context.Context, err error)`
+-- `[implemented] func IncrementOrchestratorSessionEnd(ctx context.Context, err error)`
+-- `[implemented] func RecordDuration(ctx context.Context, metric *O11yFunctionMetric, duration time.Duration, err error, tagProvider []TagProvider)`
+-
+-Implementation status:
+-- Basic observability metrics are restored: error tags match the recovered `error` / `error_code` shape, tag providers merge in call order, end counters attach recovered tags, and function metrics expand into `.count` and `.latency_ms` instruments.
+-
+-## `internal/o11y/o11y_service.go`
+-
+-- `[implemented] func NewO11yService(ctx context.Context, log *slog.Logger, cfg *O11yConfig) (*O11yServiceImpl, context.Context, error)`
+-- `[implemented] func (o *O11yServiceImpl) LogHandler() slog.Handler`
+-- `[implemented] func GetO11yService(ctx context.Context) O11yService`
+-- `[implemented] func (o *O11yServiceImpl) Shutdown(ctx context.Context) error`
+-- `[implemented] func newResource(ctx context.Context) (interface{}, error)`
+-
+-Non-emitted symbols:
+-- `o11y.NewO11yService.func1`
+-- `o11y.GetO11yService.deferwrap1`
+-
+-Implementation status:
+-- Service/context plumbing is restored with a discard fallback, non-nil log handlers, configured stdout/OTLP metric exporter selection, default resource creation, context cancellation handling during resource creation, and joined shutdown.
+-
+-## `internal/o11y/otel_logging.go`
+-
+-- `[implemented] func initOTelLogger(ctx context.Context, res interface{}, cfg *O11yConfig) (*o11yLoggingProvider, error)`
+-- `[implemented] func (p *o11yLoggingProvider) Shutdown(ctx context.Context) error`
+-
+-## `internal/o11y/otel_metrics.go`
+-
+-- `[implemented] func initOTelMetrics(logger *slog.Logger, res interface{}, exporter interface{}) (*o11yMetricsProvider, error)`
+-- `[implemented] func (s *o11yMetricsProvider) Shutdown(ctx context.Context) error`
+-- `[implemented] func makeOTLPExporter(ctx context.Context, cfg *O11yConfig) (interface{}, error)`
+-- `[implemented] func makeStdoutExporter() (interface{}, error)`
+-- `[implemented] func (s *o11yMetricsProvider) getOrCreateCounter(metric *O11yMetric) (interface{}, error)`
+-- `[implemented] func (s *o11yMetricsProvider) getOrCreateGauge(metric *O11yMetric) (interface{}, error)`
+-- `[implemented] func (s *o11yMetricsProvider) increment(ctx context.Context, counterMetric *O11yMetric, tags *map[string]string)`
+-- `[implemented] func (s *o11yMetricsProvider) recordGauge(ctx context.Context, gaugeMetric *O11yMetric, value float64, tags *map[string]string)`
+-- `[implemented] func (o *O11yServiceImpl) Increment(ctx context.Context, counterMetric *O11yMetric, tags *map[string]string)`
+-- `[implemented] func (o *O11yServiceImpl) RecordGauge(ctx context.Context, gaugeMetric *O11yMetric, value float64, tags *map[string]string)`
+-- `[implemented] func Increment(ctx context.Context, counterMetric *O11yMetric, tagProvider []TagProvider)`
+-- `[implemented] func RecordGauge(ctx context.Context, gaugeMetric *O11yMetric, value float64, tagProvider []TagProvider)`
+-- `[implemented] func RecordFunctionDeferred(ctx context.Context, metric *O11yFunctionMetric, errPtr *error, tagProvider []TagProvider) func()`
+-
+-Implementation status:
+-- Metric wrappers now create/cache OTel API instruments, convert recovered tags to attributes, record counters/gauges, and provide the recovered deferred duration helper. Stdout and OTLP HTTP metric exporters are restored with cumulative temporality selection, endpoint/header configuration, periodic reader wiring, resource attachment, and configured service creation. Tests cover exporter construction, configured service creation, unexpected resource/exporter types, context cancellation during resource creation, instrument caching, tags, wrappers, and deferred duration recording.
+-
+-Non-emitted symbols:
+-- `o11y.(*o11yMetricsProvider).getOrCreateCounter.func1`
+-- `o11y.(*o11yMetricsProvider).getOrCreateGauge.func1`
+-- `o11y.RecordFunctionDeferred.func1`
+-- `o11y.RecordFunctionDeferred.RecordFunction.func2`
+-- `o11y.makeStdoutExporter.func1`
+-- `o11y.makeOTLPExporter.func1`
+-- `embedded.float64Gauge() }]`
+-- `embedded.float64Gauge() }].deferwrap1`
+-- `embedded.int64Counter() }]`
+-- `embedded.int64Counter() }].deferwrap1`
+-- `anthropic.(*anthropicEnvironmentType).Initialize.RecordFunction.func6`
+-- `anthropic.(*anthropicEnvironmentType).Initialize.RecordFunction.func5`
+-- `anthropic.(*anthropicEnvironmentType).Initialize.RecordFunction.func4`
+-- `anthropic.(*anthropicEnvironmentType).Initialize.RecordFunction.func3`
+-- `anthropic.(*anthropicEnvironmentType).Initialize.RecordFunction.func2`
+-- `anthropic.(*anthropicEnvironmentType).Initialize.RecordFunction.func1`
+-
+-## `internal/orchestrator/hooks.go`
+-
+-- `[implemented] func (h *Hook) Execute(ctx context.Context, logger *slog.Logger) error`
+-- `[implemented] func (h *Hook) ExecuteWithStdin(ctx context.Context, logger *slog.Logger, stdinData []uint8) error`
+-
+-Implementation status:
+-- Restored hook command execution, timeout context handling, combined output capture, stdin forwarding, session ID injection from work JSON, optional sandbox runtime wrapping, and sandbox cleanup. Tests cover no-op hooks, success/failure output, stdin preservation, and injected `--session <id>` args.
+-
+-Non-emitted symbols:
+-- `orchestrator.(*Hook).ExecuteWithStdin.func1`
+-
+-## `internal/orchestrator/orchestrator.go`
+-
+-- `[implemented] func NewOrchestrator(config OrchestratorConfig) (*Orchestrator, error)`
+-- `[implemented] func (o *Orchestrator) handleLoopTimeout(ctx context.Context, loopStartTime time.Time) (time.Time, time.Duration)`
+-- `[implemented] func (o *Orchestrator) pollForSession(ctx context.Context, pollTimeout time.Duration, remainingLoopTime time.Duration, consecutiveFailures *int) (json.RawMessage, error)`
+-- `[implemented] func (o *Orchestrator) outputSession(ctx context.Context, sessionJSON json.RawMessage) error`
+-- `[implemented] func (o *Orchestrator) Run(ctx context.Context) error`
+-
+-Implementation status:
+-- The orchestrator main loop now matches the recovered control flow for default timeouts, timeout hooks, poll retries/backoff, queue-empty jitter, stdout session output, execute-hook execution, metrics increments, and context cancellation.
+-
+-## `internal/orchestrator/poll_hook.go`
+-
+-- `[implemented] func NewPollHook(command string, timeout time.Duration, organizationUUID string, environmentID string, workerID string, logger *slog.Logger) *PollHook`
+-- `[implemented] func (p *PollHook) Poll(ctx context.Context) (json.RawMessage, error)`
+-- `[implemented] func (p *PollHook) SleepWithJitter(ctx context.Context) error`
+-
+-Implementation status:
+-- Restored command-based polling with default timeout, JSON stdin context, stdout JSON/null handling, stderr error reporting, invalid JSON validation, and jitter sleep cancellation. Tests cover work JSON return, stdin context fields, empty queue, invalid output, and canceled jitter sleep.
+-
+-## `internal/orchestrator/poller.go`
+-
+-- `[implemented] func NewPollerWithWorkerID(apiBaseURL string, environmentID string, authToken string, workerID string, reclaimOlderThanMs int, logger *slog.Logger) *Poller`
+-- `[implemented] func (p *Poller) Poll(ctx context.Context) (json.RawMessage, error)`
+-- `[implemented] func (p *Poller) SleepWithJitter(ctx context.Context) error`
+-
+-Implementation status:
+-- Restored HTTP work polling with API URL normalization, worker ID fallback/headers, reclaim query parameter, auth/beta/version headers, empty queue handling, non-OK error wrapping with request IDs, response type validation, and jitter cancellation. Tests cover successful poll request shape, empty queue, HTTP errors, unexpected response type, and canceled jitter sleep.
+-
+-Non-emitted symbols:
+-- `orchestrator.(*Poller).Poll.deferwrap1`
+-
+-## `internal/orchestrator/whoami.go`
+-
+-- `[implemented] func NewWhoamiClient(apiBaseURL string, authToken string, logger *slog.Logger) *WhoamiClient`
+-- `[implemented] func (c *WhoamiClient) GetIdentity(ctx context.Context) (*WhoamiResponse, error)`
+-
+-Implementation status:
+-- Restored whoami client construction, API URL normalization, auth/beta/version headers, status/body handling, JSON decode, and response-type validation. Tests cover successful identity fetch plus non-OK status, malformed JSON, and unexpected response type.
+-
+-Non-emitted symbols:
+-- `orchestrator.(*WhoamiClient).GetIdentity.deferwrap1`
+-
+-## `internal/podmonitor/lease_manager.go`
+-
+-- `[implemented] func GetDefaultHealthFilePath() string`
+-- `[implemented] func getClaudeCodeStuckThreshold() time.Duration`
+-- `[implemented] func isPermanentHeartbeatError(err error) bool`
+-- `[implemented] func isPreconditionFailedError(err error) bool`
+-- `[implemented] func (lm *LeaseManager) setGracePeriodAndCancel()`
+-- `[implemented] func (lm *LeaseManager) GetGracePeriod() time.Duration`
+-- `[implemented] func NewLeaseManager(ctx context.Context, sessionID string, environmentID string, organizationUUID string, apiBaseURL string, containProvideClient *http.Client, logger *slog.Logger, interval time.Duration, safetyWindow time.Duration, healthFilePath string) *LeaseManager`
+-- `[implemented] func (lm *LeaseManager) Start() error`
+-- `[implemented] func (lm *LeaseManager) scheduleClaudeCodeStuckCheck()`
+-- `[implemented] func (lm *LeaseManager) timeUntilExpiry() time.Duration`
+-- `[implemented] func (lm *LeaseManager) scheduleLeaseExpiryCheck()`
+-- `[implemented] func (lm *LeaseManager) heartbeatLoop()`
+-- `[implemented] func (lm *LeaseManager) sendHeartbeat() error`
+-- `[implemented] func (lm *LeaseManager) Stop()`
+-- `[implemented] func (lm *LeaseManager) GetLeaseInfo() (time.Time, time.Time, string)`
+-- `[implemented] func (lm *LeaseManager) Context() context.Context`
+-- `[implemented] func (lm *LeaseManager) CallStopAPIForced(ctx context.Context) error`
+-- `[implemented] func (e *stopAPIError) Error() string`
+-- `[implemented] func isRetriableStopError(err error) bool`
+-- `[implemented] func (lm *LeaseManager) callStopAPI(ctx context.Context, force bool) error`
+-- `[implemented] func (lm *LeaseManager) updateHealthFile() error`
+-
+-Implementation status:
+-- Restored lease manager creation, default health-file path selection, stuck-threshold env parsing, heartbeat request/response handling, server heartbeat compare-and-swap query, lease expiry/stuck timers, permanent heartbeat error classification, terminal-state stop behavior, shutdown grace-period calculation, stop API force flag and retry classification, health file writes, and lease info accessors. Tests cover successful heartbeat state/health updates, expected heartbeat propagation, lease-not-extended stop+cancellation, initial heartbeat failure, started loop stop, permanent heartbeat failure stop path, forced stop request shape, non-retriable stop status behavior, heartbeat error classifiers, grace period calculation, and health file writing.
+-
+-Non-emitted symbols:
+-- `podmonitor.(*LeaseManager).setGracePeriodAndCancel.func1`
+-- `podmonitor.(*LeaseManager).GetGracePeriod.deferwrap1`
+-- `podmonitor.(*LeaseManager).Start.gowrap1`
+-- `podmonitor.(*LeaseManager).scheduleClaudeCodeStuckCheck.func1`
+-- `podmonitor.(*LeaseManager).scheduleClaudeCodeStuckCheck.deferwrap1`
+-- `podmonitor.(*LeaseManager).timeUntilExpiry.deferwrap1`
+-- `podmonitor.(*LeaseManager).scheduleLeaseExpiryCheck.func1`
+-- `podmonitor.(*LeaseManager).scheduleLeaseExpiryCheck.deferwrap1`
+-- `podmonitor.(*LeaseManager).heartbeatLoop.deferwrap2`
+-- `podmonitor.(*LeaseManager).heartbeatLoop.func1`
+-- `podmonitor.(*LeaseManager).heartbeatLoop.func1.deferwrap1`
+-- `podmonitor.(*LeaseManager).heartbeatLoop.deferwrap1`
+-- `podmonitor.(*LeaseManager).sendHeartbeat.deferwrap1`
+-- `podmonitor.(*LeaseManager).GetLeaseInfo.deferwrap1`
+-- `podmonitor.(*LeaseManager).callStopAPI.func1`
+-- `podmonitor.(*LeaseManager).callStopAPI.func1.deferwrap1`
+-
+-## `internal/process/process.go`
+-
+-- `[implemented] func Execute(ctx context.Context, logger *slog.Logger, path string, streamer util.OutputStreamer) (*Result, error)`
+-- `[implemented] func streamPipe(ctx context.Context, logger *slog.Logger, pipe io.ReadCloser, streamType util.StreamType, streamer util.OutputStreamer)`
+-
+-Implementation status:
+-- Restored command execution with stdout/stderr pipe streaming, result timing, exit-code capture, and setup validation. Tests cover successful output streaming, non-zero exit handling, validation errors, and stream stop on streamer error.
+-
+-Non-emitted symbols:
+-- `process.init.func1`
+-- `process.Execute.func2`
+-- `process.Execute.func2.deferwrap1`
+-- `process.Execute.func1`
+-- `process.Execute.func1.deferwrap1`
+-- `process.streamPipe.func2`
+-- `process.streamPipe.func1`
+-
+-## `internal/process/script.go`
+-
+-- `[implemented] func ExecuteScript(ctx context.Context, logger *slog.Logger, content string, pattern string, streamer util.OutputStreamer) (*Result, error)`
+-
+-Implementation status:
+-- Restored temporary script creation, write/sync/chmod, execution through `Execute`, and cleanup. Tests cover execution, temp-file cleanup, and validation errors.
+-
+-Non-emitted symbols:
+-- `process.ExecuteScript.func1`
+-
+-## `internal/sandbox/config.go`
+-
+-- `[implemented] func WriteConfigFile(cfg *SRTConfig) (string, error)`
+-- `[implemented] func CleanupConfigFile(path string) error`
+-- `[implemented] func domainMatches(pattern string, required string) bool`
+-- `[implemented] func ValidateConfig(cfg *SRTConfig) error`
+-- `[implemented] func LoadAndValidateConfig(configPath string) (*SRTConfig, error)`
+-
+-Implementation status:
+-- Restored sandbox config JSON writing, safe temp-file cleanup, domain matching, required Anthropic domain validation, and load+validate flow. Tests cover write/load/cleanup, exact and wildcard domain matching, nil/missing-domain validation failures, and read/parse/validation error wrapping.
+-
+-Non-emitted symbols:
+-- `sandbox.WriteConfigFile.deferwrap1`
+-
+-## `internal/sandbox/install.go`
+-
+-- `[implemented] func InstallSandboxRuntime(ctx context.Context, logger *slog.Logger, targetVersion string) error`
+-
+-Implementation status:
+-- Restored sandbox-runtime installation via `npm install -g @anthropic-ai/sandbox-runtime@<version>`, `SRT_BINARY_PATH` lookup, `latest` defaulting, `current` skip mode, and fallback to an existing runtime when upgrades fail. Tests cover the non-installing `current` skip path.
+-
+-## `internal/sandbox/runtime.go`
+-
+-- `[implemented] func NewSandboxRuntimeWithConfig(sessionJSON []uint8, logger *slog.Logger, customConfigPath string, workingDir string) (*SandboxRuntime, error)`
+-- `[implemented] func (s *SandboxRuntime) WrapCommand(command string, args []string) (string, []string)`
+-- `[implemented] func (s *SandboxRuntime) Cleanup() error`
+-
+-Implementation status:
+-- Restored runtime creation with generated default SRT config, custom config validation, `SRT_BINARY_PATH` override, `/tmp/claude` setup, working-directory write allowance, `srt --settings <config> -- <command>` wrapping, owned-config cleanup, and custom-config preservation. Tests cover generated and custom config paths, argument wrapping, invalid custom config rejection, config contents, and cleanup behavior.
+-
+-## `internal/session/noop_activity_recorder.go`
+-
+-- `[implemented] func (n *noopStopper) Stop()`
+-- `[implemented] func (n *NoopActivityRecorder) RecordActivity(arg0 api.LogLevel, arg1 api.LogCategory, arg2 string, arg3 map[string]interface{})`
+-- `[implemented] func (n *NoopActivityRecorder) RecordLongRunningActivity(arg0 api.LogCategory, arg1 string) util.Stopper`
+-- `[implemented] func (n *NoopActivityRecorder) RecordFailureResult(arg0 api.SessionError) error`
+-
+-## `internal/session/session_activity_recorder.go`
+-
+-- `[implemented] func NewActivityRecorder(ctx context.Context, poster EventPoster, logger *slog.Logger, opts *RecorderOptions) *SessionActivityRecorder`
+-- `[implemented] func (l *SessionActivityRecorder) RecordActivity(level api.LogLevel, category api.LogCategory, message string, extra map[string]interface{})`
+-- `[implemented] func (l *SessionActivityRecorder) RecordFailureResult(sessionErr api.SessionError) error`
+-- `[implemented] func (l *SessionActivityRecorder) RecordLongRunningActivity(category api.LogCategory, message string) util.Stopper`
+-
+-Implementation status:
+-- Session activity recording is covered with restored defaults/options, asynchronous environment-manager log events, fatal-result reporting via synthetic assistant/result events, and long-running progress messages through `PeriodicInvoker` plus recovered max-duration auto-stop behavior. The noop recorder returns a no-op stopper and suppresses all event posting.
+-
+-Non-emitted symbols:
+-- `session.(*SessionActivityRecorder).RecordActivity.func1`
+-- `session.(*SessionActivityRecorder).RecordLongRunningActivity.func2`
+-- `session.(*SessionActivityRecorder).RecordLongRunningActivity.func1`
+-
+-## `internal/sources/git.go`
+-
+-- `[implemented] func NewGitHandler(logger *slog.Logger, baseDir string, authContext *auth.AuthContext, sdkBaseURL string, repoBranches map[string]string, activityRecorder session.ActivityRecorder, processMode ProcessMode, shouldValidate bool) *GitHandler`
+-- `[implemented] func (g *GitHandler) CanHandle(sourceType string) bool`
+-- `[implemented] func (g *GitHandler) Process(ctx context.Context, source config.Source) error`
+-- `[implemented] func (g *GitHandler) createSourceAuthProvider(arg0 context.Context, gitInfo config.GitInfo) auth.SourceAuthProvider`
+-- `[implemented] func (g *GitHandler) getAuthenticatedURL(ctx context.Context, gitURL string, authProvider auth.SourceAuthProvider, permission auth.Permission) (string, bool)`
+-- `[implemented] func (g *GitHandler) runGitFetchWithRetry(ctx context.Context, dir string, gitURL string, authenticatedURL string, authProvider auth.SourceAuthProvider, args []string) error`
+-- `[implemented] func (g *GitHandler) ValidateRepositoryAccess(ctx context.Context, gitURL string, authenticatedURL string, authProvider auth.SourceAuthProvider) error`
+-- `[implemented] func (g *GitHandler) runGitCommand(ctx context.Context, dir string, gitURL string, authenticatedURL string, authProvider auth.SourceAuthProvider, envVars []string, args []string) error`
+-- `[implemented] func (g *GitHandler) cloneRepository(ctx context.Context, gitURL string, ref *string, repoPath string, authenticatedURL string, authProvider auth.SourceAuthProvider, repoName string) error`
+-- `[implemented] func (g *GitHandler) runPostCloneHook(ctx context.Context, repoPath string)`
+-- `[implemented] func packSize(repoPath string) (int64, error)`
+-- `[implemented] func (g *GitHandler) isEmptyRepository(ctx context.Context, repoPath string, authenticatedURL string) bool`
+-- `[implemented] func (g *GitHandler) sanitizeURL(urlStr string) string`
+-- `[implemented] func (g *GitHandler) branchExistsOnRemote(ctx context.Context, repoPath string, authenticatedURL string, branch string) bool`
+-- `[implemented] func (g *GitHandler) checkoutBranch(ctx context.Context, repoPath string, targetBranch string, gitURL string, authenticatedURL string, authProvider auth.SourceAuthProvider) error`
+-- `[implemented] func (g *GitHandler) fetchAndCheckoutRemoteBranch(ctx context.Context, repoPath string, targetBranch string, authenticatedURL string, gitURL string, authProvider auth.SourceAuthProvider) error`
+-- `[implemented] func (g *GitHandler) createLocalBranch(ctx context.Context, repoPath string, targetBranch string) error`
+-- `[implemented] func (g *GitHandler) setupBranchFromOutcomes(ctx context.Context, repoPath string, gitURL string, authenticatedURL string, authProvider auth.SourceAuthProvider, gitSource config.GitRepositorySource) error`
+-- `[implemented] func (g *GitHandler) UpdateRemoteURL(ctx context.Context, source config.Source) error`
+-- `[implemented] func (g *GitHandler) SetupGitProxyAfterSourcesProcessed(ctx context.Context, sources []config.Source) error`
+-- `[implemented] func (g *GitHandler) setupLocalGitProxy(ctx context.Context, gitSource config.GitRepositorySource, repoPath string) error`
+-- `[implemented] func classifyGitError(err error) string`
+-
+-Implementation status:
+-- Git source processing is restored. `Process` resolves recovered GitHub/test-file/SSH URLs, supports fresh/resume/allow-prefetched modes, optional access validation, authenticated URL handling, clone/fetch with recovered retry behavior, branch setup from outcome branches, post-clone hook execution, pack-size telemetry, custom remote URL updates, local git proxy setup, URL sanitization, and git error classification. Tests cover real local `file://` fresh clone, outcome branch creation, remote URL updates, auth URL delegation, URL redaction, remote branch detection, pack-size calculation, error classification, and source-manager dispatch.
+-
+-Non-emitted symbols:
+-- `sources.(*GitHandler).Process.deferwrap1`
+-- `sources.(*GitHandler).cloneRepository.func3`
+-- `sources.(*GitHandler).cloneRepository.func2`
+-- `sources.(*GitHandler).cloneRepository.func1`
+-- `sources.(*GitHandler).fetchAndCheckoutRemoteBranch.func1`
+-
+-## `internal/sources/sources.go`
+-
+-- `[implemented] func NewSourceHandlerManager(logger *slog.Logger, baseDir string, authContext *auth.AuthContext, sdkBaseURL string, repoBranches map[string]string, activityRecorder session.ActivityRecorder, processMode ProcessMode, shouldValidate bool) (*SourceHandlerManager, error)`
+-- `[implemented] func (m *SourceHandlerManager) ProcessSources(ctx context.Context, sources []config.Source) error`
+-- `[implemented] func (m *SourceHandlerManager) UpdateRemoteURLs(ctx context.Context, sources []config.Source) error`
+-- `[implemented] func (m *SourceHandlerManager) SetupGitProxyAfterSourcesProcessed(ctx context.Context, sources []config.Source) error`
+-
+-Implementation status:
+-- Source handler manager registration and dispatch are restored. It validates the base directory, installs the Git handler, processes sources by recovered source type, records fatal/non-fatal source failures through the activity recorder, skips unknown handlers, updates git remote URLs via the git handler, and delegates post-processing git proxy setup. Tests cover base-dir validation, handler dispatch, and nil-source errors.
+-
+-## `internal/tunnel/actions/deploy/action.go`
+-
+-- `[implemented] func NewDeployAction(logger *slog.Logger, vercelToken string, vercelTeamID string, antspaceClient *AntspaceClient, defaultTarget string) *DeployAction`
+-- `[implemented] func (d *DeployAction) Name() string`
+-- `[implemented] func (d *DeployAction) Timeout() time.Duration`
+-- `[implemented] func (d *DeployAction) Execute(ctx context.Context, req *actions.ActionRequest, progress actions.ProgressReporter) (*actions.ActionResult, error)`
+-- `[implemented] func (d *DeployAction) executeAntspace(ctx context.Context, params deployRequest, req *actions.ActionRequest, progress actions.ProgressReporter) (*actions.ActionResult, error)`
+-- `[implemented] func getCommitSHA(ctx context.Context, dir string) string`
+-
+-Implementation status:
+-- Deploy local scaffolding is restored. `NewDeployAction` matches the recovered inlined constructor signature and stores logger, Vercel token/team, Antspace client, and default target. `Execute` now recovers the request parsing/default project dir/target dispatch/build/collection/git-SHA/response assembly path, including recovered target and token errors; both Antspace and Vercel targets are wired through their recovered client paths. `getCommitSHA` runs `git rev-parse HEAD` with the recovered working-directory behavior.
+-
+-## `internal/tunnel/actions/deploy/antspace.go`
+-
+-- `[implemented] func NewAntspaceClient(controlPlaneURL string, authToken string, logger *slog.Logger) *AntspaceClient`
+-- `[implemented] func CreateTarball(projectDir string) ([]uint8, int, error)`
+-- `[implemented] func (c *AntspaceClient) Deploy(ctx context.Context, appName string, tarball []uint8, progress actions.ProgressReporter) (*AntspaceDeployResult, error)`
+-- `[implemented] func (c *AntspaceClient) readDeployResponse(req *http.Request, progress actions.ProgressReporter) (*AntspaceDeployResult, error)`
+-
+-Implementation status:
+-- `NewAntspaceClient` restores the recovered constructor fields (`controlPlaneURL`, `authToken`, `httpClient`, `logger`) and the recovered 15-minute HTTP timeout. `CreateTarball` now walks the project, skips symlinks, writes a gzip tarball with directory/file headers, tracks file count, and enforces the recovered 100MiB total payload cap. `Deploy` posts a multipart request to `/deploy` with recovered `app` and `dist` fields, Bearer auth, and `dist.tar.gz`; `readDeployResponse` restores the recovered status/body/JSON error handling and sends the `deployed` progress update.
+-
+-Non-emitted symbols:
+-- `deploy.CreateTarball.func1`
+-- `deploy.(*AntspaceClient).readDeployResponse.deferwrap1`
+-
+-## `internal/tunnel/actions/deploy/vercel.go`
+-
+-- `[implemented] func CollectFiles(dir string) ([]FileEntry, map[string][]uint8, error)`
+-- `[implemented] func (c *VercelClient) CreateDeployment(ctx context.Context, projectName string, files []FileEntry) (*Deployment, []string, error)`
+-- `[implemented] func (c *VercelClient) UploadFile(ctx context.Context, sha string, data []uint8) error`
+-- `[implemented] func (c *VercelClient) WaitForReady(ctx context.Context, deploymentID string, timeout time.Duration) (*Deployment, error)`
+-- `[implemented] func ValidateProjectDir(dir string) error`
+-- `[implemented] func ProjectName(sessionID string) string`
+-
+-Implementation status:
+-- Vercel local helpers are restored. `CollectFiles` walks `dist`, skips directories/symlinks, reads regular file payloads, computes recovered SHA-1 hex hashes, returns Vercel file metadata plus SHA-indexed data, and enforces the recovered 100MiB cap. `CreateDeployment` posts the recovered deployment payload to `/v13/deployments`, handles `missing_files`, and parses deployment JSON. `UploadFile` posts file bytes to `/v2/files` with `x-vercel-digest`. `WaitForReady` polls `/v13/deployments/{id}`, retries rate-limit/server errors, returns on `READY`, and fails on `ERROR`/`CANCELED`. `ValidateProjectDir` cleans paths and accepts only `/home/claude/` descendants. `ProjectName` strips `session_staging_`/`session_`, truncates to 20 bytes, lowercases, replaces non `[a-z0-9-]` runes with `-`, and prefixes `baku-`.
+-
+-Non-emitted symbols:
+-- `deploy.CollectFiles.func1`
+-- `deploy.(*VercelClient).CreateDeployment.deferwrap1`
+-- `deploy.(*VercelClient).UploadFile.deferwrap1`
+-
+-## `internal/tunnel/actions/registry.go`
+-
+-- `[implemented] func (s *sequencedSender) SendHeaders(resp interface{}) error`
+-- `[implemented] func (s *sequencedSender) SendChunk(chunk interface{}) error`
+-- `[implemented] func (s *sequencedSender) SendError(errResp interface{}) error`
+-- `[implemented] func (r *Registry) Register(action Action)`
+-- `[implemented] func (r *Registry) Execute(ctx context.Context, requestID string, path string, body []uint8, sessionID string, sender ResponseSender)`
+-- `[implemented] func (r *Registry) sendJSONResponse(sender ResponseSender, requestID string, statusCode int32, payload interface{})`
+-- `[implemented] func (p *tunnelProgressReporter) SendProgress(update ProgressUpdate) error`
+-
+-Non-emitted symbols:
+-- `actions.(*Registry).Execute.func2`
+-- `actions.(*Registry).Execute.func1`
+-
+-Implementation status:
+-- Restored the recovered registry model: `Action`, `ResponseSender`, `ProgressReporter`, request/result/progress structs, action registration, `/__control/` action-name routing, running-action exclusion, default 5-minute timeout, sequenced HTTP tunnel responses, progress NDJSON chunks, final result/error chunks, JSON fallback responses, and panic conversion into final action errors.
+-
+-## `internal/tunnel/actions/snapshot/action.go`
+-
+-- `[implemented] func NewSnapshotAction(logger *slog.Logger) *SnapshotAction`
+-- `[implemented] func (s *SnapshotAction) Name() string`
+-- `[implemented] func (s *SnapshotAction) Timeout() time.Duration`
+-- `[implemented] func (s *SnapshotAction) Execute(ctx context.Context, req *actions.ActionRequest, arg2 actions.ProgressReporter) (*actions.ActionResult, error)`
+-- `[implemented] func (s *SnapshotAction) readDir(ctx context.Context, dir string, resolvedProject string, startBytes int) ([]fileEntry, int, bool)`
+-- `[implemented] func (s *SnapshotAction) readFileSafe(ctx context.Context, dir string, name string) ([]uint8, bool)`
+-- `[implemented] func (s *SnapshotAction) gitCommitCount(ctx context.Context) int`
+-- `[implemented] func (s *SnapshotAction) gitAppModified(ctx context.Context, commitCount int) bool`
+-
+-Non-emitted symbols:
+-- `snapshot.(*SnapshotAction).readFileSafe.func1`
+-
+-Implementation status:
+-- `Name` and `Timeout` now match recovered constants: `snapshot` and 30 seconds.
+-- `NewSnapshotAction` restores the recovered default paths under `/home/claude/project`.
+-- `Execute` now resolves the project root, snapshots `.baku/drafts` and `.baku/explorations`, reports built-content/git metadata, and marshals the recovered response shape.
+-- `readDir` and `readFileSafe` enforce the recovered 512KB per-file cap, 5MB total cap, symlink/path-escape protections, and recovered snapshot warning events.
+-- `gitCommitCount` and `gitAppModified` restore the recovered `git rev-list --count HEAD` and `git diff --name-only <root>..HEAD -- src/` checks.
+-
+-## `internal/tunnel/actions/status/action.go`
+-
+-- `[implemented] func (s *StatusAction) Name() string`
+-- `[implemented] func (s *StatusAction) Timeout() time.Duration`
+-- `[implemented] func (s *StatusAction) Execute(ctx context.Context, req *actions.ActionRequest, progress actions.ProgressReporter) (*actions.ActionResult, error)`
+-
+-Implementation status:
+-- `Name` and `Timeout` now match recovered constants: `status` and 5 seconds.
+-- `Execute` now parses optional JSON `{ "port": ... }`, defaults to port 3000, validates port range, probes `localhost:%d` over TCP, and returns JSON `{ "listening": bool, "port": int }`.
+-
+-## `gen/proto/anthropic/sessions/tunnel/v1alpha/tunnel.proto`
+-
+-Implementation status:
+-- Restored the tunnel protocol schema from binary protobuf symbols and descriptor strings: `Header`, `TunnelRequest`, `TunnelResponse`, HTTP tunnel messages, and WebSocket tunnel messages.
+-- Generated `tunnel.pb.go` from the recovered `anthropic/sessions/tunnel/v1alpha/tunnel.proto` source path so descriptor names line up with the original binary.
+-- The tunnel package now aliases recovered message types to this generated package and uses `protojson` for tunnel request/response wire data.
+-
+-## `internal/tunnel/client.go`
+-
+-- `[implemented] func NewClient(logger *slog.Logger, statsd interface{}, sessionID string, wsURL string, authToken string, opts []ClientOption) *Client`
+-- `[implemented] func (c *Client) Connect(ctx context.Context) error`
+-- `[implemented] func (c *Client) Run(ctx context.Context) error`
+-- `[implemented] func (c *Client) readLoop(ctx context.Context, conn interface{}) error`
+-- `[implemented] func (c *Client) handleHTTPRequest(ctx context.Context, req interface{})`
+-- `[implemented] func (c *Client) handleHTTPCancel(ctx context.Context, cancel interface{})`
+-- `[implemented] func (c *Client) handleWSOpen(ctx context.Context, req interface{})`
+-- `[implemented] func (c *Client) handleWSMessage(ctx context.Context, msg interface{})`
+-- `[implemented] func (c *Client) handleWSClose(ctx context.Context, closeMsg interface{})`
+-- `[implemented] func (c *Client) pingLoop(ctx context.Context, conn interface{}) error`
+-- `[implemented] func (c *Client) connectWithRetries(ctx context.Context) error`
+-- `[implemented] func (c *Client) closeConnection()`
+-- `[implemented] func (c *Client) ConnectAndRun(ctx context.Context) error`
+-- `[implemented] func addJitter(base time.Duration) time.Duration`
+-- `[implemented] func (c *Client) Close() error`
+-- `[implemented] func (c *Client) sendResponse(resp interface{}) error`
+-- `[implemented] func (s *httpResponseSender) SendHeaders(resp interface{}) error`
+-- `[implemented] func (s *httpResponseSender) SendChunk(chunk interface{}) error`
+-- `[implemented] func (s *httpResponseSender) SendError(err interface{}) error`
+-- `[implemented] func (s *wsResponseSender) SendOpened(resp interface{}) error`
+-- `[implemented] func (s *wsResponseSender) SendMessage(msg interface{}) error`
+-- `[implemented] func (s *wsResponseSender) SendClose(closeMsg interface{}) error`
+-- `[implemented] func (s *wsResponseSender) SendError(err interface{}) error`
+-
+-Implementation status:
+-- Restored client construction with recovered handler fields, redirect policy, response-header timeout, WebSocket handler map, option application, and action registry wiring.
+-- Restored tunnel WebSocket endpoint construction, Authorization/session headers, dial timeout, pong tracking, run/read/ping lifecycle, context-driven close, retry loop with jitter, and reconnect loop.
+-- Restored HTTP/control/WS request dispatch from tunnel messages and response sender wrappers for HTTP headers/chunks/errors plus WS opened/message/close/error envelopes.
+-- Client I/O now uses recovered generated tunnel proto types plus `protojson` instead of hand-written JSON mirror structs.
+-- Tests cover constructor/options, tunnel connect headers and session query, response sender protojson writeback, protojson request dispatch through the read loop, and jitter bounds.
+-
+-Non-emitted symbols:
+-- `tunnel.(*Client).Connect.func1`
+-- `tunnel.(*Client).Connect.deferwrap2`
+-- `tunnel.(*Client).Connect.deferwrap1`
+-- `tunnel.(*Client).Run.func3`
+-- `tunnel.(*Client).Run.func2`
+-- `tunnel.(*Client).Run.func1`
+-- `tunnel.(*Client).readLoop.func3`
+-- `tunnel.(*Client).readLoop.func3.deferwrap1`
+-- `tunnel.(*Client).readLoop.func2`
+-- `tunnel.(*Client).readLoop.func2.deferwrap1`
+-- `tunnel.(*Client).readLoop.func1`
+-- `tunnel.(*Client).readLoop.deferwrap1`
+-- `tunnel.(*Client).pingLoop.func1`
+-- `tunnel.(*Client).pingLoop.deferwrap1`
+-- `tunnel.(*Client).closeConnection.deferwrap1`
+-- `tunnel.(*Client).Close.deferwrap1`
+-- `tunnel.(*Client).sendResponse.deferwrap1`
+-- `manager.init.0.func1.WithActionRegistry.1`
+-
+-## `internal/tunnel/handler.go`
+-
+-- `[implemented] func (h *Handler) HandleRequest(ctx context.Context, req interface{}, sender ResponseSender) error`
+-- `[implemented] func (h *Handler) CancelRequest(requestID string)`
+-
+-Non-emitted symbols:
+-- `tunnel.(*Handler).HandleRequest.deferwrap2`
+-- `tunnel.(*Handler).HandleRequest.deferwrap1`
+-- `tunnel.NewClient.NewHandler.func1`
+-
+-Implementation status:
+-- Restored HTTP tunnel request validation, localhost URL construction, request body/header forwarding, cancellable active request tracking, response header emission, 32KB response chunk streaming with sequence numbers, final chunk emission, response body hashing/logging, and error responses through `HTTPTunnelResponseError`.
+-- Added recovered tunnel message aliases in `internal/tunnel/zz_recovered_types.go`, including recovered HTTP/WS request and response shapes plus the recovered tunnel handler/client struct fields.
+-- Tests cover invalid ports, invalid paths, successful forwarding/streaming, and cancellation through `CancelRequest`.
+-
+-## `internal/tunnel/ws_handler.go`
+-
+-- `[implemented] func (h *WSHandler) OpenTunnel(ctx context.Context, req interface{}, sender WSResponseSender) error`
+-- `[implemented] func (h *WSHandler) SendMessage(ctx context.Context, msg interface{}) error`
+-- `[implemented] func (h *WSHandler) CloseTunnel(ctx context.Context, closeMsg interface{}) error`
+-- `[implemented] func (h *WSHandler) closeTunnelInstance(tunnel *wsTunnel)`
+-- `[implemented] func (h *WSHandler) closeTunnelWithCode(tunnelID string, code int, reason string) error`
+-- `[implemented] func (h *WSHandler) readLoop(ctx context.Context, tunnel *wsTunnel)`
+-- `[implemented] func (h *WSHandler) CloseAll()`
+-
+-Non-emitted symbols:
+-- `tunnel.(*WSHandler).OpenTunnel.gowrap2`
+-- `tunnel.(*WSHandler).OpenTunnel.deferwrap1`
+-- `tunnel.(*WSHandler).SendMessage.deferwrap1`
+-- `tunnel.(*WSHandler).closeTunnelInstance.deferwrap1`
+-- `tunnel.(*WSHandler).closeTunnelWithCode.deferwrap1`
+-- `tunnel.(*WSHandler).readLoop.func2`
+-- `tunnel.(*WSHandler).readLoop.func1`
+-
+-Implementation status:
+-- Restored local WebSocket tunnel opening through `ws://localhost:<port><path>`, request header/subprotocol forwarding, tunnel replacement, opened acknowledgements, outbound message forwarding, close frame writing, per-tunnel cleanup, inbound read loop dispatch, and `CloseAll`.
+-- Tests cover invalid ports plus an end-to-end local WebSocket tunnel with subprotocol negotiation, forwarded outbound text data, inbound binary data, close propagation, and tunnel registry cleanup.
+-
+-## `internal/util/git.go`
+-
+-- `[implemented] func UpdateRemoteTrackingBranch(ctx context.Context, logger *slog.Logger, repoPath string, remoteName string, branchName string, revision string) error`
+-
+-Implementation status:
+-- Remote-tracking branch updates are implemented with `git update-ref`, command output logging on failure, and wrapped errors that name the target ref.
+-
+-## `internal/util/lockfile.go`
+-
+-- `[implemented] func AcquireContainerLock(ctx context.Context, logger *slog.Logger) (func(), error)`
+-- `[implemented] func AcquireLock(ctx context.Context, logger *slog.Logger, sessionID string) (func(), error)`
+-- `[implemented] func getLockPath(sessionID string) string`
+-
+-Non-emitted symbols:
+-- `util.AcquireContainerLock.func1`
+-- `util.AcquireLock.func1`
+-
+-Implementation status:
+-- Recovered lockfile behavior now uses non-blocking `flock` for the container-level singleton lock and per-session lock, preserves the recovered lockfile paths and error/log strings, and releases locks by unlocking, closing, and removing the lockfile.
+-
+-## `internal/util/periodic_invoker.go`
+-
+-- `[implemented] func NewPeriodicInvoker(logger *slog.Logger, interval time.Duration, function func() error) *PeriodicInvoker`
+-- `[implemented] func (p *PeriodicInvoker) Start()`
+-- `[implemented] func (p *PeriodicInvoker) run()`
+-- `[implemented] func (p *PeriodicInvoker) Stop()`
+-- `[implemented] func (p *PeriodicInvoker) IsRunning() bool`
+-
+-Implementation status:
+-- Restored periodic invoker validation, immediate first invocation, ticker loop, error logging while continuing, start/stop state transitions, double-start panic, and idempotent stop behavior. Tests cover constructor panics, start/stop, double start, and continued execution after function errors.
+-
+-Non-emitted symbols:
+-- `util.(*PeriodicInvoker).Start.gowrap2`
+-- `util.(*PeriodicInvoker).Start.deferwrap1`
+-- `util.(*PeriodicInvoker).run.deferwrap2`
+-- `util.(*PeriodicInvoker).run.deferwrap1`
+-- `util.(*PeriodicInvoker).Stop.deferwrap1`
+-- `util.(*PeriodicInvoker).IsRunning.deferwrap1`
+-
+-## `internal/util/retry.go`
+-
+-- `[implemented] func RetryOperation(ctx context.Context, operation func() error, config RetryConfig, logAttrs []interface{}) error`
+-
+-Implementation status:
+-- Restored retry loop with exponential backoff, attempt logging, optional error classifier for non-retriable errors, and last-error return after exhaustion. Tests cover success after retry, non-retriable short-circuit, and exhaustion returning the last error.
+-
+-## `internal/util/tailer.go`
+-
+-- `[implemented] func NewTailer(path string, pollInterval time.Duration) (*Tailer, error)`
+-- `[implemented] func (t *Tailer) Lines() <-chan Line`
+-- `[implemented] func (t *Tailer) Start(ctx context.Context) error`
+-- `[implemented] func (t *Tailer) Stop()`
+-- `[implemented] func (t *Tailer) run(ctx context.Context, file *os.File)`
+-- `[implemented] func (t *Tailer) readLines(file *os.File, buf *[]uint8, discarding *bool) bool`
+-
+-Implementation status:
+-- Restored tailer file validation, default polling interval, start-at-EOF behavior, duplicate-start guard, stop/channel cleanup, newline buffering, partial-line joining, oversized-line discard, read error propagation, and stop-aware line sending. Tests cover missing/default setup, post-start line streaming, partial line joining, duplicate start, and oversized line discard.
+-
+-Non-emitted symbols:
+-- `util.(*Tailer).Start.gowrap1`
+-- `util.(*Tailer).Stop.func1`
+-- `util.(*Tailer).run.deferwrap4`
+-- `util.(*Tailer).run.deferwrap3`
+-- `util.(*Tailer).run.deferwrap2`
+-- `util.(*Tailer).run.deferwrap1`
+-
+-## `main.go`
+-
+-- `[implemented] func main()`
+-
+-Implementation status:
+-- Reconstructed the binary entrypoint: version propagation, `code-sign` executable alias handling, Cobra root command construction, recovered subcommand registration, and process exit on command execution errors.
+diff --git a/index.html b/index.html
+deleted file mode 100644
+index a42bf22..0000000
+--- a/index.html
++++ /dev/null
+@@ -1,499 +0,0 @@
+-<!DOCTYPE html>
+-<html lang="zh-CN">
+-<head>
+-<meta charset="UTF-8">
+-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+-<title>Environment Manager - 架构与实现分析</title>
+-<style>
+-* { margin: 0; padding: 0; box-sizing: border-box; }
+-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; line-height: 1.7; }
+-.container { max-width: 1200px; margin: 0 auto; padding: 0 24px; }
+-header { background: linear-gradient(135deg, #161b22 0%, #0d1117 100%); border-bottom: 1px solid #30363d; padding: 60px 0; }
+-header h1 { font-size: 2.5rem; color: #f0f6fc; margin-bottom: 12px; }
+-header p { font-size: 1.1rem; color: #8b949e; max-width: 700px; }
+-.badge { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; margin-right: 8px; margin-top: 16px; }
+-.badge-go { background: #00add8; color: #fff; }
+-.badge-linux { background: #f5a623; color: #1a1a1a; }
+-.badge-version { background: #238636; color: #fff; }
+-section { padding: 48px 0; border-bottom: 1px solid #21262d; }
+-h2 { font-size: 1.8rem; color: #f0f6fc; margin-bottom: 24px; padding-bottom: 12px; border-bottom: 2px solid #30363d; }
+-h3 { font-size: 1.3rem; color: #58a6ff; margin: 24px 0 12px; }
+-p, li { color: #c9d1d9; margin-bottom: 8px; }
+-ul { padding-left: 24px; }
+-li { margin-bottom: 6px; }
+-.arch-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; margin-top: 20px; }
+-.arch-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; transition: border-color 0.2s; }
+-.arch-card:hover { border-color: #58a6ff; }
+-.arch-card h4 { color: #58a6ff; font-size: 1.1rem; margin-bottom: 8px; }
+-.arch-card .path { font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; color: #8b949e; margin-bottom: 12px; }
+-code { font-family: 'JetBrains Mono', monospace; background: #1c2128; padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; color: #79c0ff; }
+-pre { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; overflow-x: auto; margin: 16px 0; font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; line-height: 1.6; }
+-.flow-diagram { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 24px; margin: 20px 0; overflow-x: auto; font-family: 'JetBrains Mono', monospace; font-size: 0.8rem; line-height: 1.8; color: #8b949e; }
+-.flow-diagram .highlight { color: #58a6ff; }
+-.flow-diagram .success { color: #3fb950; }
+-.flow-diagram .warning { color: #d29922; }
+-.flow-diagram .error { color: #f85149; }
+-.feature-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 16px; }
+-.feature-item { background: #161b22; border-left: 3px solid #58a6ff; padding: 16px; border-radius: 0 6px 6px 0; }
+-.feature-item h5 { color: #f0f6fc; margin-bottom: 6px; }
+-.stats { display: flex; gap: 32px; flex-wrap: wrap; margin: 20px 0; }
+-.stat { text-align: center; }
+-.stat .num { font-size: 2rem; font-weight: 700; color: #58a6ff; }
+-.stat .label { font-size: 0.85rem; color: #8b949e; }
+-table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+-th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid #21262d; }
+-th { color: #f0f6fc; background: #161b22; font-weight: 600; }
+-td { color: #c9d1d9; }
+-td code { font-size: 0.8rem; }
+-.proto-box { background: #1c2128; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin: 12px 0; }
+-footer { padding: 32px 0; text-align: center; color: #484f58; font-size: 0.85rem; }
+-@media (max-width: 768px) { header h1 { font-size: 1.8rem; } .arch-grid { grid-template-columns: 1fr; } .stats { gap: 16px; } }
+-</style>
+-</head>
+-<body>
+-
+-<header>
+-<div class="container">
+-<h1>Environment Manager</h1>
+-<p>Anthropic Claude Code 沙盒环境管理器 - 负责编排 Claude Code 代理会话的完整生命周期，包括环境配置、安全隔离、源码管理和 MCP 服务注册。</p>
+-<span class="badge badge-go">Go 1.25.7</span>
+-<span class="badge badge-linux">Linux amd64</span>
+-<span class="badge badge-version">staging-68f0dff496</span>
+-</div>
+-</header>
+-
+-<div class="container">
+-
+-<section>
+-<h2>项目概览</h2>
+-<div class="stats">
+-<div class="stat"><div class="num">92</div><div class="label">源文件</div></div>
+-<div class="stat"><div class="num">486</div><div class="label">函数/方法</div></div>
+-<div class="stat"><div class="num">6</div><div class="label">子命令</div></div>
+-<div class="stat"><div class="num">27MB</div><div class="label">二进制大小</div></div>
+-</div>
+-<p>Environment Manager 是 Claude Code Web Sandbox (Antspace) 的核心运行时组件。它运行在容器内部，负责：</p>
+-<ul>
+-<li>从 API 轮询工作任务并分发执行</li>
+-<li>配置沙盒隔离环境（网络/文件系统策略）</li>
+-<li>管理 Git 仓库克隆、认证和代理</li>
+-<li>注册并运行 MCP (Model Context Protocol) 服务器</li>
+-<li>通过 WebSocket 隧道连接前端界面</li>
+-<li>监控容器健康状态和租约管理</li>
+-</ul>
+-</section>
+-
+-<section>
+-<h2>系统架构</h2>
+-<div class="flow-diagram">
+-<pre>
+-┌─────────────────────────────────────────────────────────────────────────────┐
+-│                          <span class="highlight">Anthropic Cloud Platform</span>                          │
+-│                                                                             │
+-│  ┌──────────────┐   ┌───────────────────┐   ┌────────────────────────┐     │
+-│  │  Work Queue  │   │  Session Ingress  │   │  Code Sessions API     │     │
+-│  │  /v1/work/*  │   │  /v1/session/*    │   │  WebSocket Tunnel      │     │
+-│  └──────┬───────┘   └────────┬──────────┘   └───────────┬────────────┘     │
+-└─────────┼────────────────────┼───────────────────────────┼──────────────────┘
+-          │                    │                           │
+-          ▼                    ▼                           ▼
+-┌─────────────────────────────────────────────────────────────────────────────┐
+-│                     <span class="highlight">Container (environment-manager)</span>                        │
+-│                                                                             │
+-│  ┌──────────────────────────────────────────────────────────────────────┐   │
+-│  │                        <span class="warning">Orchestrator</span>                                 │   │
+-│  │  Poll → Dispatch → Execute (task-run) → Report                      │   │
+-│  └──────────────────────────────────────┬───────────────────────────────┘   │
+-│                                         │                                   │
+-│  ┌──────────────────────────────────────▼───────────────────────────────┐   │
+-│  │                         <span class="success">Manager (task-run)</span>                           │   │
+-│  │                                                                      │   │
+-│  │  ┌─────────────┐  ┌──────────────┐  ┌─────────────┐  ┌──────────┐  │   │
+-│  │  │ Source Mgr  │  │ Env Type     │  │ MCP Servers │  │ Tunnel   │  │   │
+-│  │  │ (Git clone) │  │ (anthropic/  │  │ (codesign/  │  │ Client   │  │   │
+-│  │  │             │  │  byoc)       │  │  supabase)  │  │ (WS)     │  │   │
+-│  │  └─────────────┘  └──────────────┘  └─────────────┘  └──────────┘  │   │
+-│  │                                                                      │   │
+-│  │  ┌──────────────────────────────────────────────────────────────┐   │   │
+-│  │  │              <span class="highlight">Claude Code Executor</span>                            │   │   │
+-│  │  │  claude --print ... --session-url ... --add-dir ...          │   │   │
+-│  │  └──────────────────────────────────────────────────────────────┘   │   │
+-│  └──────────────────────────────────────────────────────────────────────┘   │
+-│                                                                             │
+-│  ┌────────────────┐  ┌────────────────┐  ┌──────────────────────────────┐  │
+-│  │  Sandbox SRT   │  │  Git Proxy     │  │  Lease Manager (heartbeat)   │  │
+-│  │  (isolation)   │  │  (localhost)   │  │  (pod health + stuck check)  │  │
+-│  └────────────────┘  └────────────────┘  └──────────────────────────────┘  │
+-└─────────────────────────────────────────────────────────────────────────────┘
+-</pre>
+-</div>
+-</section>
+-
+-<section>
+-<h2>命令行接口</h2>
+-<table>
+-<tr><th>命令</th><th>用途</th><th>关键行为</th></tr>
+-<tr><td><code>orchestrator</code></td><td>主循环轮询工作队列</td><td>whoami 身份验证 → poll → dispatch execute hook → 超时管理</td></tr>
+-<tr><td><code>task-run</code></td><td>执行单次会话任务</td><td>stdin 解析 → 环境初始化 → Claude Code 执行 → 结果上报</td></tr>
+-<tr><td><code>poll</code></td><td>单次轮询（调试用）</td><td>获取队列中下一条工作，输出 JSON</td></tr>
+-<tr><td><code>setup</code></td><td>安装依赖</td><td>npm install Claude Code + sandbox-runtime</td></tr>
+-<tr><td><code>code-sign</code></td><td>GPG/SSH 签名代理</td><td>通过 MCP codesign 服务器进行远程签名</td></tr>
+-<tr><td><code>print-sandbox-settings</code></td><td>输出默认沙盒配置</td><td>打印网络/文件系统隔离规则 JSON</td></tr>
+-</table>
+-</section>
+-
+-<section>
+-<h2>核心模块</h2>
+-<div class="arch-grid">
+-
+-<div class="arch-card">
+-<h4>Orchestrator 编排器</h4>
+-<div class="path">internal/orchestrator/</div>
+-<p>主控循环：轮询 API 工作队列，管理超时钩子，分发任务到 execute hook（默认自调用 task-run）。支持 HTTP Poller 和 Shell Poll-Hook 两种模式。</p>
+-</div>
+-
+-<div class="arch-card">
+-<h4>Manager 管理器</h4>
+-<div class="path">internal/manager/</div>
+-<p>task-run 的核心编排：并行初始化环境类型、MCP 服务器、官方插件市场；配置 git 签名；创建 Claude 执行器；可选启动 WebSocket Tunnel。</p>
+-</div>
+-
+-<div class="arch-card">
+-<h4>Environment Types 环境类型</h4>
+-<div class="path">internal/envtype/</div>
+-<p>两种环境：<strong>anthropic</strong>（托管环境，支持语言安装、Baku/Supabase 项目初始化、init 脚本）和 <strong>byoc</strong>（自带容器，支持任务脚本、分支切换、lease 管理）。</p>
+-</div>
+-
+-<div class="arch-card">
+-<h4>Source Handler 源码处理</h4>
+-<div class="path">internal/sources/</div>
+-<p>Git 仓库克隆/拉取，支持 fresh/resume/allow-prefetched 模式，outcome 分支切换，认证 URL 处理，本地 git proxy 设置，retry 和 pack-size 遥测。</p>
+-</div>
+-
+-<div class="arch-card">
+-<h4>Git Proxy 代理</h4>
+-<div class="path">internal/gitproxy/</div>
+-<p>本地 HTTP 服务器，拦截 git 操作并转发到 session ingress 的 <code>/v1/session_ingress/session/{id}/git_proxy/</code> 端点。支持 GitHub 和 GHE。</p>
+-</div>
+-
+-<div class="arch-card">
+-<h4>Tunnel 隧道</h4>
+-<div class="path">internal/tunnel/</div>
+-<p>通过 protobuf WebSocket 连接到 Code Sessions API，转发 HTTP 请求到本地 localhost 端口，支持 WebSocket 子隧道。用于 Baku 项目的实时预览。</p>
+-</div>
+-
+-<div class="arch-card">
+-<h4>MCP Servers</h4>
+-<div class="path">internal/mcp/</div>
+-<p>内置 MCP 服务器注册表。两个实现：<strong>codesign</strong>（远程代码签名）和 <strong>supabase</strong>（数据库迁移、查询、Edge Function 部署、类型生成）。</p>
+-</div>
+-
+-<div class="arch-card">
+-<h4>Sandbox Runtime 沙盒</h4>
+-<div class="path">internal/sandbox/</div>
+-<p>通过 <code>@anthropic-ai/sandbox-runtime</code> npm 包实现进程隔离。配置网络白名单（*.anthropic.com）和文件系统读写策略。</p>
+-</div>
+-
+-<div class="arch-card">
+-<h4>Pod Monitor 容器监控</h4>
+-<div class="path">internal/podmonitor/</div>
+-<p>Lease Manager 定期向 Contain Provide 发送心跳，检测 Claude Code 卡死状态，管理租约过期和优雅退出。</p>
+-</div>
+-
+-<div class="arch-card">
+-<h4>Observability 可观测性</h4>
+-<div class="path">internal/o11y/</div>
+-<p>OpenTelemetry 指标（Counter/Gauge）+ OTLP HTTP 导出器 + 诊断日志收集器 + 环境管理器/Claude Code 双源日志刷新。</p>
+-</div>
+-
+-<div class="arch-card">
+-<h4>Input Parsers 输入解析</h4>
+-<div class="path">internal/input/</div>
+-<p>V0：直接 JSON stdin（startupContext + environment + auth）。V1：work secret base64 解码 → session context API 获取 → 构建完整任务上下文。</p>
+-</div>
+-
+-<div class="arch-card">
+-<h4>Claude Code Executor</h4>
+-<div class="path">internal/claude/</div>
+-<p>构建 claude CLI 参数、环境变量、token 文件描述符传递、MCP 配置写入、session URL 构造、日志捕获、进程生命周期管理。</p>
+-</div>
+-
+-</div>
+-</section>
+-
+-<section>
+-<h2>核心工作流</h2>
+-
+-<h3>1. Orchestrator 主循环</h3>
+-<div class="flow-diagram">
+-<pre>
+-<span class="highlight">启动</span> → whoami 身份验证 → 容器锁获取 → sandbox-runtime 安装
+-  │
+-  ▼
+-<span class="highlight">主循环</span> ─────────────────────────────────────────────────┐
+-  │                                                     │
+-  ├─ 检查 loop_timeout → 触发 timeout_hook             │
+-  │                                                     │
+-  ├─ poll (HTTP/Hook) ──┬── 空队列 → jitter sleep ─────┤
+-  │                     │                               │
+-  │                     └── 获取 work JSON              │
+-  │                         │                           │
+-  │                         ▼                           │
+-  │                    execute_hook (stdin=work_json)    │
+-  │                         │                           │
+-  │                         ├── 成功 → <span class="success">IncrementEnd</span> ────┤
+-  │                         └── 失败 → <span class="error">IncrementEnd</span> ────┤
+-  │                                                     │
+-  └─ SIGTERM/SIGINT → 30s 优雅退出 ────────────────────┘
+-</pre>
+-</div>
+-
+-<h3>2. Task-Run 执行流程</h3>
+-<div class="flow-diagram">
+-<pre>
+-<span class="highlight">stdin</span> ──→ V0/V1 Parser ──→ TaskContext
+-  │
+-  ├─ 会话锁获取 (flock)
+-  ├─ 可选: ACK work (通知 API 已接收)
+-  ├─ 选择后端: SessionIngress / CCR / Noop
+-  ├─ 初始化诊断日志
+-  ├─ 初始化 O11y (OTLP metrics + logging)
+-  │
+-  ▼
+-<span class="highlight">Manager.Run()</span>
+-  │
+-  ├─ 获取环境配置 (GetEnvironmentForSession)
+-  ├─ 创建环境类型实例 (anthropic / byoc)
+-  ├─ 设置 startup/auth/session-mode
+-  ├─ 应用环境变量到 ClaudeConfig
+-  │
+-  ├─ <span class="warning">并行初始化:</span>
+-  │   ├─ 环境初始化 (源码克隆、语言安装、hooks 配置)
+-  │   ├─ MCP 服务器注册 + 启动
+-  │   └─ 官方插件市场安装
+-  │
+-  ├─ setup-only 模式? → 提前返回
+-  │
+-  ├─ 创建 Claude Code Executor
+-  ├─ 可选: 启动 Tunnel Client (WebSocket)
+-  │
+-  ▼
+-<span class="success">Claude Code 执行</span> ──→ 结果上报 ──→ 清理 (tunnel/MCP/executor)
+-</pre>
+-</div>
+-
+-<h3>3. Claude Code 执行器细节</h3>
+-<div class="flow-diagram">
+-<pre>
+-构建参数:
+-  claude --print json \
+-    --session-url wss://... \
+-    --resume-session-url https://... \
+-    --add-dir /workspace/repo1 \
+-    --add-dir /workspace/repo2 \
+-    --output-format streaming-json \
+-    --verbose
+-
+-Token 传递 (fd):
+-  ├─ ANTHROPIC_API_KEY_FD=3       (pipe → token)
+-  ├─ SESSION_INGRESS_TOKEN_FD=4   (pipe → token)
+-  └─ /tmp/session-ingress-token   (file fallback)
+-
+-环境变量:
+-  ├─ ANTHROPIC_BASE_URL, ANTHROPIC_MODEL
+-  ├─ CCR_SESSION_ID, CCR_WORKER_EPOCH
+-  ├─ ENV_MANAGER_VERSION, ENV_MANAGER_SESSION_ID
+-  ├─ CC_DIAG_LOG_FILE (诊断日志路径)
+-  └─ 来自 ClaudeConfig.Env 的覆盖
+-
+-Gateway 参数扩展:
+-  ├─ --allowedTools "tool1,tool2"
+-  ├─ --disallowedTools "..."
+-  ├─ --permission-mode ...
+-  ├─ --append-system-prompt "..."
+-  └─ MCP 配置文件写入 (/tmp/mcp-config-*.json)
+-</pre>
+-</div>
+-</section>
+-
+-<section>
+-<h2>安全隔离</h2>
+-
+-<h3>Sandbox Runtime (SRT)</h3>
+-<div class="feature-list">
+-<div class="feature-item">
+-<h5>网络隔离</h5>
+-<p>默认仅允许 <code>*.anthropic.com</code> 域名出站。通过 domain allowlist 精确控制。</p>
+-</div>
+-<div class="feature-item">
+-<h5>文件系统隔离</h5>
+-<p>拒绝读取敏感路径（~/.ssh, ~/.aws, /etc/shadow）；仅允许写入 /tmp, ~/workspace。</p>
+-</div>
+-<div class="feature-item">
+-<h5>容器单例锁</h5>
+-<p>flock 机制确保每个容器同时只运行一个会话，防止跨会话信息泄露。</p>
+-</div>
+-<div class="feature-item">
+-<h5>Token 安全传递</h5>
+-<p>通过 file descriptor (pipe) 传递 API key，避免在进程参数或环境变量中暴露。</p>
+-</div>
+-</div>
+-
+-<h3>Git 认证</h3>
+-<ul>
+-<li><strong>直接 HTTPS Token:</strong> 通过 URL userinfo 注入 (<code>https://token@github.com/...</code>)</li>
+-<li><strong>Git Proxy JWT:</strong> <code>sk-ant-ccsr-*</code> JWT 通过本地代理中继到 session ingress</li>
+-<li><strong>输出净化:</strong> 自动从 git 输出中移除认证信息</li>
+-</ul>
+-</section>
+-
+-<section>
+-<h2>协议与通信</h2>
+-
+-<h3>Tunnel Protocol (Protobuf)</h3>
+-<div class="proto-box">
+-<pre>
+-// anthropic/sessions/tunnel/v1alpha/tunnel.proto
+-
+-message TunnelRequest {
+-  oneof request {
+-    HTTPTunnelRequest http_request = 1;
+-    HTTPTunnelCancel http_cancel = 2;
+-    WebSocketTunnelOpen ws_open = 3;
+-    WebSocketTunnelMessage ws_message = 4;
+-    WebSocketTunnelClose ws_close = 5;
+-  }
+-}
+-
+-message TunnelResponse {
+-  oneof response {
+-    HTTPTunnelResponseHeaders http_headers = 1;
+-    HTTPTunnelResponseChunk http_chunk = 2;
+-    HTTPTunnelResponseError http_error = 3;
+-    WebSocketTunnelOpened ws_opened = 4;
+-    WebSocketTunnelMessage ws_message = 5;
+-    WebSocketTunnelClose ws_close = 6;
+-    WebSocketTunnelError ws_error = 7;
+-  }
+-}
+-</pre>
+-</div>
+-
+-<h3>Session Ingress API</h3>
+-<table>
+-<tr><th>端点</th><th>用途</th></tr>
+-<tr><td><code>POST /v1/session_ingress/session/{id}/events</code></td><td>上报会话事件（日志、结果、错误）</td></tr>
+-<tr><td><code>POST /v1/session_ingress/session/{id}/forward_diag_logs</code></td><td>转发诊断日志</td></tr>
+-<tr><td><code>GET /v1/session_ingress/session/{id}/git_proxy/...</code></td><td>Git 操作代理</td></tr>
+-<tr><td><code>GET /v2/ccr-sessions/{id}/supabase-credentials</code></td><td>获取 Supabase 凭证</td></tr>
+-</table>
+-
+-<h3>CCR Backend API</h3>
+-<table>
+-<tr><th>端点</th><th>用途</th></tr>
+-<tr><td><code>POST /session/{id}/worker/register</code></td><td>注册 Worker，获取 epoch</td></tr>
+-<tr><td><code>POST /session/{id}/worker/{epoch}/events</code></td><td>上报事件</td></tr>
+-<tr><td><code>POST /session/{id}/worker/{epoch}/diag-logs</code></td><td>刷新诊断日志</td></tr>
+-</table>
+-</section>
+-
+-<section>
+-<h2>MCP 服务器</h2>
+-
+-<h3>Code Signing MCP</h3>
+-<p>提供 <code>sign_file</code> 工具，用于 Git 提交签名。工作流程：读取文件内容 → 附加源码元数据 → 远程签名 → 写入 .sig 文件。</p>
+-
+-<h3>Supabase MCP</h3>
+-<table>
+-<tr><th>工具</th><th>功能</th></tr>
+-<tr><td><code>migrate</code></td><td>应用 SQL 迁移并写入本地文件</td></tr>
+-<tr><td><code>query</code></td><td>执行 SQL 查询</td></tr>
+-<tr><td><code>list_migrations</code></td><td>列出已应用的迁移</td></tr>
+-<tr><td><code>generate_types</code></td><td>从数据库 schema 生成 TypeScript 类型</td></tr>
+-<tr><td><code>deploy_function</code></td><td>部署 Edge Function（多文件 multipart 上传）</td></tr>
+-<tr><td><code>provision_database</code></td><td>按需配置 Supabase 项目（lazy 模式）</td></tr>
+-</table>
+-</section>
+-
+-<section>
+-<h2>Deploy Actions (Tunnel)</h2>
+-<div class="feature-list">
+-<div class="feature-item">
+-<h5>Vercel Deploy</h5>
+-<p>收集 dist/ 文件 → SHA1 哈希 → 创建部署 → 上传缺失文件 → 轮询 READY 状态。项目名从 session ID 派生。</p>
+-</div>
+-<div class="feature-item">
+-<h5>Antspace Deploy</h5>
+-<p>打包项目为 tar.gz → multipart POST 到 /deploy → Bearer 认证 → 100MB 上限。</p>
+-</div>
+-<div class="feature-item">
+-<h5>Snapshot Action</h5>
+-<p>快照 .baku/drafts 和 .baku/explorations 目录，512KB/文件、5MB 总量限制，含 git 元数据。</p>
+-</div>
+-<div class="feature-item">
+-<h5>Status Action</h5>
+-<p>TCP 探测 localhost:port（默认 3000），返回 <code>{"listening": bool, "port": int}</code>。</p>
+-</div>
+-</div>
+-</section>
+-
+-<section>
+-<h2>Anthropic 环境初始化</h2>
+-<div class="flow-diagram">
+-<pre>
+-<span class="highlight">Initialize()</span>
+-  │
+-  ├─ 源码处理 (SourceHandlerManager.ProcessSources)
+-  │   ├─ Git clone / fetch with retry
+-  │   ├─ Branch checkout from outcomes
+-  │   └─ Post-clone hook
+-  │
+-  ├─ 工作目录设置 (MkdirAll + Chdir)
+-  │
+-  ├─ Git Proxy 设置 (SetupGitProxyAfterSourcesProcessed)
+-  │
+-  ├─ Claude 配置引导:
+-  │   ├─ bootstrapHooksInAllDirs (session-start hooks)
+-  │   ├─ bootstrapHooksInAllDirs (stop hooks)
+-  │   └─ bootstrapClaudeSkills (skill markdown)
+-  │
+-  ├─ 语言安装 (并行 goroutines):
+-  │   ├─ Python (uv/pyenv)
+-  │   ├─ Node.js (nvm)
+-  │   └─ Go (go install)
+-  │
+-  ├─ Init Scripts 执行 (config.InitScripts[])
+-  │
+-  ├─ Baku 检测:
+-  │   ├─ initializeBakuProject (模板复制 + git init)
+-  │   └─ writeSupabaseEnvFiles (.env / .env.local)
+-  │
+-  └─ Dev Server 启动 (supervisord)
+-</pre>
+-</div>
+-</section>
+-
+-<section>
+-<h2>逆向工程方法</h2>
+-<p>本项目通过以下技术从 Go ELF 二进制中恢复：</p>
+-<ul>
+-<li><strong>DWARF 符号信息</strong>：恢复函数签名、参数类型、结构体字段</li>
+-<li><strong>Go tool objdump</strong>：反汇编验证控制流和调用链</li>
+-<li><strong>符号表 (nm)</strong>：定位所有导出/内部函数地址</li>
+-<li><strong>字符串常量</strong>：从 rodata 段恢复 API 路径、错误消息、配置键名</li>
+-<li><strong>Protobuf 描述符</strong>：从嵌入的 proto 注册信息恢复 tunnel 协议</li>
+-<li><strong>init 函数分析</strong>：恢复 MCP 服务器注册、tunnel 客户端工厂等副作用代码</li>
+-</ul>
+-<p>所有 486 个函数的反编译实现已通过汇编逐一对比验证，确认逻辑完全一致。</p>
+-</section>
+-
+-</div>
+-
+-<footer>
+-<div class="container">
+-<p>Environment Manager Reverse Engineering Documentation | 从 ELF binary 恢复的完整实现</p>
+-</div>
+-</footer>
+-
+-</body>
+-</html>

@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "baseline": {
-    "go_head": "0706a81d488857f87cf13b68f5c8d2bb54b61834",
-    "go_worktree_diff_sha256": "fa90df15874d704b257f68c16ca0983c24af705e82d980ef3e762d852bae87ca",
+    "go_head": "65e3c65ce3f0f3b69819775d35ac448d9cd1b4fb",
+    "go_worktree_diff_sha256": "d0606591baf87fc0c16ea1d0d8dc7b7934fcd67dcc1d5a619c6e390c799de775",
     "go_version": "1.25.7",
     "rust_version": "1.97.0",
     "target": "aarch64-unknown-linux-gnu"

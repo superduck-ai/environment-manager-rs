@@ -3,8 +3,8 @@
 set -euo pipefail
 
 readonly go_root="${1:-${GO_SOURCE_ROOT:-}}"
-readonly expected_head="0706a81d488857f87cf13b68f5c8d2bb54b61834"
-readonly expected_diff="fa90df15874d704b257f68c16ca0983c24af705e82d980ef3e762d852bae87ca"
+readonly expected_head="65e3c65ce3f0f3b69819775d35ac448d9cd1b4fb"
+readonly expected_diff="d0606591baf87fc0c16ea1d0d8dc7b7934fcd67dcc1d5a619c6e390c799de775"
 readonly rust_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 readonly expected_untracked="${rust_root}/compat/go-untracked-paths.txt"
 readonly expected_build_inputs="${rust_root}/compat/go-untracked-build-inputs.sha256"
@@ -107,7 +107,7 @@ check_file_hash() {
 
 check_file_hash \
   "internal/claude/claude_code_executor.go" \
-  "26a70bad574108d8b3344003b965e8edc79085f2087bf362456c01ca3791628b"
+  "9b8541e81f706e243609cbce69371c8936753f00d089b3ad5cdd4d746d97f7f7"
 check_file_hash \
   "internal/claude/claude_code_executor_test.go" \
   "4ce510a82b4b1c73d31526a30368d3d39a2a55e3e55234237190824fee237e1b"

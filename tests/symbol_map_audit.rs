@@ -7,7 +7,7 @@ use std::{path::PathBuf, process::Command};
 
 /// 验证当前 CSV 与只读 Go 基线和 Rust 工作树重新扫描的结果完全一致。
 ///
-/// 迁移实现已经收口，因此本测试同时要求映射完整以及 Go 顶层测试精确为 278/278；
+/// 迁移实现已经收口，因此本测试同时要求映射完整以及 Go 顶层测试精确为 295/295；
 /// 任何 `pending`/`symbol-missing`、漏掉的测试入口或基线测试数量变化都会失败。
 #[test]
 fn go_rust_symbol_map_is_current() {
@@ -31,7 +31,7 @@ fn go_rust_symbol_map_is_current() {
         .arg("--check")
         .arg("--require-complete")
         .arg("--expected-go-tests")
-        .arg("278")
+        .arg("295")
         .status()
         .expect("Linux ARM64 bootstrap 必须安装 python3");
     assert!(
