@@ -80,7 +80,7 @@ pub(super) struct EnvironmentProxyConfig {
 /// 失败固定返回 `websocket: bad handshake`，同时通过独立的 response 暴露状态。
 /// 这个类型同时保存两部分信息，供主 Tunnel 与本地 WS Tunnel 按各自 Go 格式拼接。
 #[derive(Debug)]
-pub(super) struct GorillaDialFailure {
+pub(crate) struct GorillaDialFailure {
     message: String,
     response_status: Option<String>,
 }
@@ -929,7 +929,7 @@ pub(super) async fn connect_websocket(
 /// 主 Tunnel 与本地 [`WsHandler`](super::WsHandler) 共用这一入口，确保直连、
 /// HTTP CONNECT 和 SOCKS5 三条拨号路径采用相同的 frame/message 限制。配置按值
 /// 移入连接，不保存任何指向 handler 的反向引用。
-pub(super) async fn connect_websocket_with_config(
+pub(crate) async fn connect_websocket_with_config(
     request: WebSocketRequest,
     websocket_config: WebSocketConfig,
 ) -> Result<(LocalWebSocket, WebSocketResponse), GorillaDialFailure> {

@@ -7,7 +7,7 @@ use std::{
         fd::{AsFd as _, AsRawFd as _},
         unix::{fs::PermissionsExt as _, process::CommandExt as _},
     },
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Stdio,
     sync::{Arc, Mutex},
     time::Duration,
@@ -249,113 +249,18 @@ async fn token_descriptors_survive_exec_without_leaking_source_fds() {
     assert_eq!(output.stdout, b"first-token|second-token|third-token");
 }
 
-/// 对应 Go：`TestWriteCCRUpstreamProxyToken`。
-///
-/// 验证 relay token 原子替换、权限收紧和临时文件清理。
-#[test]
-fn test_write_ccr_upstream_proxy_token() {
-    let temp = TempDir::new().unwrap();
-    let directory = temp.path().join("run/ccr");
-    let path = directory.join("session_token");
-    write_ccr_upstream_proxy_token(&path, "first-token").unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    write_ccr_upstream_proxy_token(&path, "replacement-token").unwrap();
-    assert_eq!(fs::read_to_string(&path).unwrap(), "replacement-token");
-    assert_eq!(
-        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    assert_eq!(
-        fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
-        0o700
-    );
-    assert!(fs::read_dir(directory).unwrap().all(|entry| {
-        !entry
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".session_token-")
-    }));
-}
-
-/// 验证递归创建 CCR 目录时，中间目录也使用 Go `MkdirAll(..., 0700)` 的权限。
-///
-/// token 目录可能由调用方覆盖为多级路径；所有新建层级都必须从创建瞬间禁止
-/// group/other 访问，不能先以默认 0755 创建后再只收紧末级目录。
-#[test]
-fn ccr_token_recursive_directories_are_private() {
-    let temp = TempDir::new().unwrap();
-    let first = temp.path().join("private");
-    let second = first.join("nested");
-    let directory = second.join("ccr");
-    let path = directory.join("session_token");
-
-    write_ccr_upstream_proxy_token(&path, "private-token").unwrap();
-
-    for created_directory in [&first, &second, &directory] {
-        assert_eq!(
-            fs::metadata(created_directory)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700,
-            "{} should be private",
-            created_directory.display()
-        );
-    }
-}
-
-/// 验证原子 rename 替换 symlink 本身，而不是跟随链接覆盖外部目标。
-#[test]
-fn ccr_token_atomic_replace_does_not_follow_destination_symlink() {
-    use std::os::unix::fs::symlink;
-
-    let temp = TempDir::new().unwrap();
-    let directory = temp.path().join("run/ccr");
-    fs::create_dir_all(&directory).unwrap();
-    let victim = temp.path().join("victim");
-    fs::write(&victim, "victim-content").unwrap();
-    let path = directory.join("session_token");
-    symlink(&victim, &path).unwrap();
-
-    write_ccr_upstream_proxy_token(&path, "replacement-token").unwrap();
-
-    assert!(
-        !fs::symlink_metadata(&path)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert_eq!(fs::read_to_string(&path).unwrap(), "replacement-token");
-    assert_eq!(fs::read_to_string(victim).unwrap(), "victim-content");
-    assert_eq!(
-        fs::metadata(path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-}
-
-/// 验证空 path/token 在任何文件副作用前失败。
-#[test]
-fn test_write_ccr_upstream_proxy_token_rejects_empty_inputs() {
-    let temp = TempDir::new().unwrap();
-    assert!(write_ccr_upstream_proxy_token(Path::new(""), "token").is_err());
-    assert!(write_ccr_upstream_proxy_token(&temp.path().join("token"), "").is_err());
-}
-
-/// 对应 Go：`TestShouldPrepareCCRUpstreamProxyToken`。
-///
-/// 验证 startup 环境覆盖 config，并且仅 code-session remote proxy 同时开启才写 relay。
+/// 验证 startup 环境覆盖 config，且本地测试模式永不启动 relay。
 #[test]
 fn test_should_prepare_ccr_upstream_proxy_token() {
     let cases = [
-        ("true", "true", true, None, true),
-        ("true", "true", false, None, false),
-        ("false", "true", true, None, false),
-        ("true", "false", true, None, false),
-        ("true", "true", true, Some("false"), false),
+        ("true", "true", true, None, false, true),
+        ("true", "true", true, None, true, false),
+        ("true", "true", false, None, false, false),
+        ("false", "true", true, None, false, false),
+        ("true", "false", true, None, false, false),
+        ("true", "true", true, Some("false"), false, false),
     ];
-    for (remote, proxy, code_session, startup_proxy, expected) in cases {
+    for (remote, proxy, code_session, startup_proxy, local_testing, expected) in cases {
         let mut cfg = empty_config();
         cfg.environment
             .insert("CLAUDE_CODE_REMOTE".to_owned(), remote.to_owned());
@@ -372,11 +277,92 @@ fn test_should_prepare_ccr_upstream_proxy_token() {
         }
         let (executor, _) = make_executor(cfg, startup);
         assert_eq!(
-            executor.should_prepare_ccr_upstream_proxy_token(),
+            executor.should_start_agent_proxy(local_testing),
             expected,
-            "remote={remote} proxy={proxy} code_session={code_session} startup={startup_proxy:?}"
+            "remote={remote} proxy={proxy} code_session={code_session} startup={startup_proxy:?} local={local_testing}"
         );
     }
+}
+
+/// 最终 API base 必须遵守宿主、config、startup 依次覆盖的现有优先级。
+#[test]
+fn agent_proxy_uses_final_api_base_url_priority() {
+    let mut cfg = empty_config();
+    cfg.environment.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "https://config.example.test".to_owned(),
+    );
+    let mut startup = StartupContext {
+        api_base_url: "https://fallback.example.test".to_owned(),
+        ..StartupContext::default()
+    };
+    startup.environment_variables.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "https://startup.example.test".to_owned(),
+    );
+    let (executor, _) = make_executor(cfg, startup);
+    let environment = executor.build_child_environment();
+    let final_value = environment
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "ANTHROPIC_BASE_URL")
+        .map(|(_, value)| value.to_string_lossy());
+    assert_eq!(final_value.as_deref(), Some("https://startup.example.test"));
+}
+
+/// 开启 CCRv2 relay 却没有 ingress token 时必须在 spawn Claude 前失败。
+#[tokio::test]
+async fn enabled_agent_proxy_requires_session_ingress_token() {
+    let mut cfg = empty_config();
+    cfg.environment = [
+        ("CLAUDE_CODE_REMOTE".to_owned(), "true".to_owned()),
+        ("CCR_UPSTREAM_PROXY_ENABLED".to_owned(), "true".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    let startup = StartupContext {
+        api_base_url: "https://api.example.test".to_owned(),
+        use_code_sessions: true,
+        ..StartupContext::default()
+    };
+    let (executor, _) = make_executor(cfg, startup);
+    let error = executor
+        .execute(&CancellationToken::new())
+        .await
+        .expect_err("missing relay token must be fail-closed");
+    assert!(
+        error
+            .to_string()
+            .contains("requires a non-empty session ingress token"),
+        "{error}"
+    );
+}
+
+/// 旧 Claude relay 的 token 必须在启动前被删除。
+#[test]
+fn test_write_ccr_upstream_proxy_token() {
+    let temp = TempDir::new().unwrap();
+    let token = temp.path().join("session_token");
+    fs::write(&token, "old-token").unwrap();
+    let (executor, _) = make_executor(empty_config(), StartupContext::default());
+    executor.remove_stale_agent_proxy_token(&token).unwrap();
+    assert!(!token.exists());
+    executor.remove_stale_agent_proxy_token(&token).unwrap();
+}
+
+/// 旧 token writer 必须保持停用，且不可删除的遗留目标必须 fail-closed。
+#[test]
+fn test_write_ccr_upstream_proxy_token_rejects_empty_inputs() {
+    let temp = TempDir::new().unwrap();
+    let token = temp.path().join("session_token");
+    assert!(write_ccr_upstream_proxy_token(&token, "").is_err());
+    assert!(write_ccr_upstream_proxy_token(&token, "token").is_err());
+    assert!(!token.exists());
+
+    let (executor, _) = make_executor(empty_config(), StartupContext::default());
+    let directory = temp.path().join("directory");
+    fs::create_dir(&directory).unwrap();
+    assert!(executor.remove_stale_agent_proxy_token(&directory).is_err());
 }
 
 /// 对应 Go：`TestBuildArgsFromGatewayConfigMergesAppendSystemPrompt`。

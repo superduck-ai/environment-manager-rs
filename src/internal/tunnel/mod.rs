@@ -16,6 +16,7 @@ mod ws_handler;
 mod ws_handler_test;
 mod zz_recovered_types;
 
+pub(crate) use client::connect_websocket_with_config;
 pub use client::{add_jitter, new_client, with_action_registry};
 pub use handler::{HTTP_TUNNEL_CHUNK_SIZE, new_handler, new_handler_with_timing_for_probe};
 pub use helpers::{
@@ -26,7 +27,8 @@ pub use zz_recovered_types::{
     Client, ClientOption, Handler, TunnelError, WsHandler, WsResponseSender, WsSenderError,
 };
 pub(crate) use zz_recovered_types::{
-    ClientWsResponseSender, HttpResponseSender, LocalWebSocket, LocalWebSocketStream, WsTunnel,
+    ClientWsResponseSender, HttpResponseSender, LocalWebSocket, LocalWebSocketSink,
+    LocalWebSocketStream, WsTunnel,
 };
 
 pub use crate::r#gen::proto::anthropic::sessions::tunnel::v1alpha::{
