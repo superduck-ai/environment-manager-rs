@@ -25,7 +25,6 @@ use tokio_tungstenite::tungstenite::handshake::client::{
 };
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
-use tokio_tungstenite::{client_async_tls_with_config, connect_async_with_config};
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
@@ -924,17 +923,23 @@ pub(super) async fn connect_websocket(
     connect_websocket_with_config(request, gorilla_websocket_config()).await
 }
 
-/// 使用进程级代理快照和调用方提供的 WebSocket 配置建立连接。
+/// 统一的“WebSocket 出站连接器
 ///
-/// 主 Tunnel 与本地 [`WsHandler`](super::WsHandler) 共用这一入口，确保直连、
-/// HTTP CONNECT 和 SOCKS5 三条拨号路径采用相同的 frame/message 限制。配置按值
-/// 移入连接，不保存任何指向 handler 的反向引用。
+/// 1. 读取并缓存 HTTP_PROXY、HTTPS_PROXY、NO_PROXY。
+/// 2. 根据目标 ws:// / wss:// 判断是否需要代理。
+/// 3. 选择建连方式：
+///     不走代理：直接 connect_async_with_config
+///     HTTP 代理：先发送 CONNECT，拿到透明 TCP 流
+///     SOCKS5：先完成 SOCKS5 握手
+///
+/// 4. 在 TCP 流上继续完成 TLS 和 WebSocket 握手。
+/// 5. 应用调用方传入的 WebSocketConfig，比如消息和 frame 大小限制
 pub(crate) async fn connect_websocket_with_config(
-    request: WebSocketRequest,
+    ws_request: WebSocketRequest,
     websocket_config: WebSocketConfig,
 ) -> Result<(LocalWebSocket, WebSocketResponse), GorillaDialFailure> {
     let config = ENVIRONMENT_PROXY_CONFIG.get_or_init(EnvironmentProxyConfig::from_process);
-    connect_websocket_with_proxy_and_websocket_config(request, config, websocket_config).await
+    connect_websocket_with_proxy_and_websocket_config(ws_request, config, websocket_config).await
 }
 
 /// 使用显式代理快照建立 WebSocket，供生产路径与无环境竞态的测试共用。
@@ -950,35 +955,34 @@ pub(super) async fn connect_websocket_with_proxy_config(
         .await
 }
 
-/// 使用显式代理快照和显式 WebSocket 配置建立连接。
+/// 所有 WebSocket 建连方式的最终汇合点：无论直连、HTTP CONNECT 还是 SOCKS5，最终都使用同一份 WebSocketConfig 完成握手。
 ///
-/// 该内部汇合点保证直连、HTTP CONNECT 与 SOCKS5 三条路径使用完全相同的
-/// frame/message 限制和标准 WebSocket 握手规则。配置只会被当前连接持有，
-/// 不会写回进程级代理快照。
 async fn connect_websocket_with_proxy_and_websocket_config(
-    request: WebSocketRequest,
+    ws_request: WebSocketRequest,
     config: &EnvironmentProxyConfig,
     websocket_config: WebSocketConfig,
 ) -> Result<(LocalWebSocket, WebSocketResponse), GorillaDialFailure> {
-    let target = Url::parse(&request.uri().to_string()).map_err(|error| {
-        GorillaDialFailure::from_websocket_error(WebSocketError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            error.to_string(),
-        )))
-    })?;
-    let proxy = proxy_selection_for_websocket_target(&target, config)
+    let target_url = Url::parse(&ws_request.uri().to_string())
+        .map_err(|error| GorillaDialFailure::from_websocket_error(invalid_input(error.to_string())))?;
+    //  选择代理, None 表示直连，Some(proxy) 表示走代理
+    let proxy = proxy_selection_for_websocket_target(&target_url, config)
         .map_err(GorillaDialFailure::from_websocket_error)?;
-    let Some(proxy) = proxy else {
-        return connect_async_with_config(request, Some(websocket_config), false)
-            .await
-            .map_err(GorillaDialFailure::from_websocket_error);
-    };
-    let stream = connect_via_proxy(&proxy, &target)
-        .await
-        .map_err(GorillaDialFailure::from_websocket_error)?;
-    client_async_tls_with_config(request, stream, Some(websocket_config), None)
-        .await
-        .map_err(GorillaDialFailure::from_websocket_error)
+
+    match proxy {
+        None => {
+            tokio_tungstenite::connect_async_with_config(ws_request, Some(websocket_config), false)
+                .await
+                .map_err(GorillaDialFailure::from_websocket_error)
+        }
+        Some(proxy) => {
+            let tcp_stream = connect_via_proxy(&proxy, &target_url)
+                .await
+                .map_err(GorillaDialFailure::from_websocket_error)?;
+            tokio_tungstenite::client_async_tls_with_config(ws_request, tcp_stream, Some(websocket_config), None)
+                .await
+                .map_err(GorillaDialFailure::from_websocket_error)
+        }
+    }
 }
 
 /// 构造 Tunnel 使用的标准 WebSocket 配置。
@@ -1058,10 +1062,20 @@ pub(super) fn proxy_for_websocket_target(
     Ok(proxy_selection_for_websocket_target(target, config)?.map(|proxy| proxy.url))
 }
 
-/// 选择代理并保留解析库无法表达的显式空 password 标志。
+/// 只负责决定 WebSocket 应该直连还是走代理，不负责真正建连。
 ///
-/// 该内部版本是实际拨号路径；仅在测试构建中存在的 `proxy_for_websocket_target` 只返回
-/// URL，而 CONNECT 认证必须使用这里随 URL 一起保存的 `password_set`。
+/// 返回值含义：
+/// - Ok(Some(proxy))：使用这个代理
+/// - Ok(None)：直接连接
+/// - Err(...)：代理配置触发安全错误
+///
+/// 选择规则：
+/// - ws://  → HTTP_PROXY
+/// - wss:// → HTTPS_PROXY
+/// - 其他协议 → 直连
+/// - 代理未配置或配置无效 → 直连
+/// - localhost / loopback / 命中 NO_PROXY → 直连
+/// - 否则 → 返回代理配置
 fn proxy_selection_for_websocket_target(
     target: &Url,
     config: &EnvironmentProxyConfig,
@@ -1281,6 +1295,11 @@ fn cidr_contains(entry: &str, target: IpAddr) -> bool {
         }
         _ => false,
     }
+}
+
+/// 构造 InvalidInput 类型的 WebSocket 错误。
+fn invalid_input(message: impl Into<String>) -> WebSocketError {
+    WebSocketError::Io(io::Error::new(io::ErrorKind::InvalidInput, message.into()))
 }
 
 /// 生成 CONNECT request 使用的带端口 authority，IPv6 保留方括号。

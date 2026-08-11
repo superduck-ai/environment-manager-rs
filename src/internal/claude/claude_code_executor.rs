@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl},
-    unistd::pipe2,
+    unistd::{close, pipe2},
 };
 use tokio::{
     fs::{File, OpenOptions},
@@ -1240,6 +1240,8 @@ pub(super) fn install_token_descriptors(
         .iter()
         .map(|descriptor| (descriptor.source.as_raw_fd(), descriptor.target))
         .collect::<Vec<_>>();
+    // nix 0.30 的任意目标 `dup2` API 要求构造 `OwnedFd`，但 3/4/5 在此可能尚未打开，
+    // 伪造所有权反而会破坏 IO safety，因此仅这里保留原始 `dup2`。
     // SAFETY: closure 只调用 async-signal-safe 的 `dup2` 与 errno 读取；source FD
     // 在 `spawn` 返回前由 `descriptors` 保持存活，且都复制到 64 以上，不会被目标
     // 3/4/5 的顺序映射覆盖。dup2 会清除目标 CLOEXEC，使其按约定穿过 exec。
@@ -1503,13 +1505,7 @@ async fn append_log(logger: &Logger, log_file: &Arc<Mutex<File>>, bytes: &[u8]) 
 /// 调用方必须先通过 `into_raw_fd` 取得唯一所有权；函数无重试，因为 Linux 上
 /// close 返回 EINTR 后 FD 状态不确定，重试可能误关已被其他线程复用的描述符。
 fn close_owned_fd(raw_fd: i32) -> io::Result<()> {
-    // SAFETY: raw_fd 来自本模块刚消费的 OwnedFd/std::fs::File，调用期间没有其他
-    // owning handle；只调用一次 close，并把所有权在此终止。
-    if unsafe { libc::close(raw_fd) } == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    close(raw_fd).map_err(io::Error::from)
 }
 
 /// 生成日志 header 使用的本地毫秒时间戳。

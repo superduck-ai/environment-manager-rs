@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
@@ -557,10 +561,8 @@ async fn cancellation_kills_only_direct_child_with_sigkill() {
     assert_eq!(result.exit_code, -1);
     assert_eq!(result.error, Some(ProcessExitError::ExitCode(-1)));
     assert!(!signal_marker.exists());
-    // SAFETY: signal 0 只检查测试脚本记录的 PID 是否仍存在，不向进程发送信号。
-    assert_eq!(unsafe { libc::kill(grandchild_pid, 0) }, 0);
-    // SAFETY: PID 来自当前测试创建的孙进程；SIGKILL 仅用于避免 fixture 泄漏。
-    let _cleanup_result = unsafe { libc::kill(grandchild_pid, libc::SIGKILL) };
+    assert_eq!(kill(Pid::from_raw(grandchild_pid), None::<Signal>), Ok(()));
+    let _cleanup_result = kill(Pid::from_raw(grandchild_pid), Signal::SIGKILL);
 }
 
 /// 验证 direct child 被取消后，只要孙进程仍持有 stdout/stderr，Execute 就等待 EOF。
@@ -629,8 +631,7 @@ async fn cancellation_waits_for_descendant_that_holds_pipes() {
         Some("Z"),
         "Go Execute 在 pipe reader 完成前不调用 Wait，因此 direct child 应暂为 zombie"
     );
-    // SAFETY: PID 来自本测试刚创建的 sleep；SIGKILL 释放其继承的 stdout/stderr。
-    assert_eq!(unsafe { libc::kill(descendant_pid, libc::SIGKILL) }, 0);
+    assert_eq!(kill(Pid::from_raw(descendant_pid), Signal::SIGKILL), Ok(()));
     let result = tokio::time::timeout(Duration::from_secs(5), execution)
         .await
         .unwrap()

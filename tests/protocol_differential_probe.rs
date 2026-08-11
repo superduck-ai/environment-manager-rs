@@ -7,7 +7,6 @@
 use std::{
     collections::BTreeMap,
     io::Write as _,
-    os::fd::AsRawFd as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -45,6 +44,7 @@ use environment_manager::{
     },
 };
 use flate2::{Compression, write::GzEncoder};
+use nix::sys::socket::{setsockopt, sockopt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, json};
 use tokio::{
@@ -1416,23 +1416,8 @@ async fn capture_connection_reset_before_headers() -> ProtocolTunnelHttpCase {
             l_onoff: 1,
             l_linger: 0,
         };
-        // SAFETY: `stream.as_raw_fd()` 在本作用域内保持有效；指针指向已初始化的
-        // `libc::linger`，长度与目标类型完全一致。调用仅设置 Linux socket 选项。
-        let result = unsafe {
-            libc::setsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_LINGER,
-                std::ptr::from_ref(&linger).cast(),
-                std::mem::size_of::<libc::linger>() as libc::socklen_t,
-            )
-        };
-        assert_eq!(
-            result,
-            0,
-            "设置 SO_LINGER 失败: {}",
-            std::io::Error::last_os_error()
-        );
+        setsockopt(&stream, sockopt::Linger, &linger)
+            .unwrap_or_else(|error| panic!("设置 SO_LINGER 失败: {error}"));
         drop(stream);
     });
 

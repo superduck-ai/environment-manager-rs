@@ -7,6 +7,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use nix::sys::stat::{Mode, umask};
 use serde_json::json;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
@@ -617,8 +618,7 @@ fn test_permanent_provisioning_err_body() {
 #[test]
 fn test_supabase_directories_use_0755_under_zero_umask() {
     if let Some(path) = std::env::var_os(ZERO_UMASK_CHILD_DIRECTORY) {
-        // SAFETY: 该精确测试独占子进程，修改 umask 后只创建目标目录并立即退出。
-        unsafe { libc::umask(0) };
+        umask(Mode::empty());
         create_dir_all_0755(&std::path::PathBuf::from(path).join("first/second"))
             .expect("以 Go mode 创建 Supabase 目录树");
         return;

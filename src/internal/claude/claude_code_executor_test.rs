@@ -13,7 +13,11 @@ use std::{
     time::Duration,
 };
 
-use nix::fcntl::{FcntlArg, fcntl};
+use nix::{
+    fcntl::{FcntlArg, fcntl},
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use tempfile::TempDir;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -225,6 +229,7 @@ async fn token_descriptors_survive_exec_without_leaking_source_fds() {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // 与生产映射一样，nix 0.30 的任意目标 `dup2` 需要 `OwnedFd`，不适用于这些原始目标槽。
     // SAFETY: closure 在 fork 后、exec 前只调用 async-signal-safe 的 dup2；FD 0 已由
     // Command 配成 /dev/null。先占据 3/4 是测试夹具，随后生产映射必须覆盖它们。
     unsafe {
@@ -567,10 +572,8 @@ async fn cancellation_does_not_kill_process_group() {
         .unwrap()
         .unwrap_err();
     assert_eq!(error.to_string(), "claude code stopped: context canceled");
-    // SAFETY: signal 0 只探测子进程 PID 是否存在，不会修改目标进程状态。
-    assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
-    // SAFETY: PID 来自本测试子进程创建的文件，SIGKILL 只用于测试结束清理。
-    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(kill(Pid::from_raw(pid), None::<Signal>), Ok(()));
+    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
 }
 
 /// 验证 Claude direct child 被取消后，继承 stdio 的孙进程会延迟 Execute 返回。
@@ -616,8 +619,7 @@ async fn claude_cancellation_waits_for_descendant_pipe_eof() {
             .is_err(),
         "继承 pipe 的孙进程存活时 Claude Execute 不应返回"
     );
-    // SAFETY: PID 来自本测试创建的 sleep；SIGKILL 只释放 fixture 继承的 pipe。
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    assert_eq!(kill(Pid::from_raw(pid), Signal::SIGKILL), Ok(()));
     let error = tokio::time::timeout(Duration::from_secs(5), execution)
         .await
         .unwrap()

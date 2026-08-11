@@ -18,7 +18,12 @@ use std::{
     time::Duration,
 };
 
-use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+use nix::{
+    errno::Errno,
+    fcntl::{FcntlArg, FdFlag, fcntl},
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use tempfile::TempDir;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -103,8 +108,7 @@ impl Drop for PidCleanup {
     /// case panic 时仍尽力终止 pipe holder，避免 canonical 门禁泄漏后台进程。
     fn drop(&mut self) {
         if let Some(pid) = self.0.take() {
-            // SAFETY: PID 来自本 probe 的原子 PID 文件；SIGKILL 只用于 fixture 清理。
-            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
         }
     }
 }
@@ -592,18 +596,16 @@ fn process_state(pid: i32) -> Option<String> {
 
 /// 用 signal 0 判断 PID 是否存在；zombie 仍返回 true。
 fn process_exists(pid: i32) -> bool {
-    // SAFETY: signal 0 不改变目标状态，只查询当前用户可见性。
-    let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    matches!(
+        kill(Pid::from_raw(pid), None::<Signal>),
+        Ok(()) | Err(Errno::EPERM)
+    )
 }
 
 /// SIGKILL 当前 probe 创建的 descendant；ESRCH 视为已经清理。
 fn kill_pid(pid: i32) {
-    // SAFETY: PID 由本 probe 刚写出的 holder PID 文件提供，不来自外部输入。
-    let result = unsafe { libc::kill(pid, libc::SIGKILL) };
-    if result != 0 {
-        let error = io::Error::last_os_error();
-        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+    if let Err(error) = kill(Pid::from_raw(pid), Signal::SIGKILL) {
+        assert_eq!(error, Errno::ESRCH);
     }
 }
 

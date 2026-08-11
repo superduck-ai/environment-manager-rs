@@ -14,6 +14,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures_util::{SinkExt as _, StreamExt as _};
 use http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use httparse::{EMPTY_HEADER, Request, Status};
+use nix::sys::prctl::set_dumpable;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
@@ -38,6 +40,7 @@ const CA_CERT_PATH: &str = "/v1/code/upstreamproxy/ca-cert";
 const WEBSOCKET_PATH: &str = "/v1/code/upstreamproxy/ws";
 const CA_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECT_HEADER_BYTES: usize = 8 * 1024;
+const MAX_CONNECT_HEADERS: usize = 64;
 const MAX_CHUNK_BYTES: usize = 512 * 1024;
 const MAX_ENCODED_CHUNK_BYTES: usize = MAX_CHUNK_BYTES + 4;
 const TCP_BUFFER_BYTES: usize = 32 * 1024;
@@ -82,8 +85,24 @@ struct RelayConfig {
     proxy_authorization: String,
 }
 
+impl RelayConfig {
+    /// 构造上游代理 WebSocket 握手请求（含认证与协议头）。
+    fn build_websocket_request(&self) -> Result<http::Request<()>> {
+        let mut request = self
+            .websocket_url
+            .as_str()
+            .into_client_request()
+            .context("failed to build upstream proxy WebSocket request")?;
+        let headers = request.headers_mut();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/proto"));
+        headers.insert(AUTHORIZATION, self.websocket_authorization.clone());
+        Ok(request)
+    }
+}
+
 struct ConnectRequest {
-    line: String,
+    // CONNECT example.com:443 HTTP/1.1
+    first_line: String,
     trailing: Vec<u8>,
 }
 
@@ -155,12 +174,11 @@ impl AgentProxy {
             websocket_authorization,
             proxy_authorization,
         });
-        let listener = bind_local_listener(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
-        let port = listener
-            .local_addr()
-            .context("failed to read local upstream proxy relay address")?
-            .port();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let port = listener.local_addr()?.port();
         let environment = proxy_environment(port, &paths.ca_bundle, host)?;
+
         let cancellation = CancellationToken::new();
         let listener_cancellation = cancellation.clone();
         let (failure_sender, failure) = oneshot::channel();
@@ -220,12 +238,10 @@ fn agent_proxy_start_error(error: impl std::fmt::Display) -> ClaudeError {
 
 /// 尽力禁止同 UID 进程通过 ptrace 读取父进程中的会话 token。
 fn set_non_dumpable() {
-    // SAFETY: 仅调用 Linux PR_SET_DUMPABLE，后续参数都是固定标量且不涉及指针。
-    let result = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-    if result != 0 {
+    if let Err(error) = set_dumpable(false) {
         eprintln!(
             "[upstreamproxy] prctl(PR_SET_DUMPABLE, 0) failed: {}",
-            io::Error::last_os_error()
+            io::Error::from(error)
         );
     }
 }
@@ -242,43 +258,28 @@ async fn download_ca_bundle_with_timeout(
     output: &Path,
     timeout: Duration,
 ) -> Result<()> {
-    let endpoint = base_url
-        .join(CA_CERT_PATH)
-        .context("failed to build upstream proxy CA URL")?;
-    let client = reqwest::Client::builder()
+    let endpoint = base_url.join(CA_CERT_PATH)?;
+    let ccr_ca = reqwest::Client::builder()
         .timeout(timeout)
-        .build()
-        .context("failed to create upstream proxy CA client")?;
-    let response = client
+        .build()?
         .get(endpoint)
         .send()
-        .await
-        .context("failed to download upstream proxy CA")?
-        .error_for_status()
-        .context("upstream proxy CA endpoint returned an error")?;
-    let ccr_ca = response
+        .await?
         .bytes()
-        .await
-        .context("failed to read upstream proxy CA response")?;
-    if ccr_ca.iter().all(u8::is_ascii_whitespace) {
-        bail!("upstream proxy CA response is empty");
-    }
-    let system_ca = tokio::fs::read(system_ca)
-        .await
-        .context("failed to read system CA bundle")?;
+        .await?;
+
+    let system_ca = tokio::fs::read(system_ca).await?;
+
     let directory = output
         .parent()
         .ok_or_else(|| anyhow!("upstream proxy CA bundle path has no parent"))?;
-    tokio::fs::create_dir_all(directory)
-        .await
-        .context("failed to create upstream proxy CA directory")?;
+    tokio::fs::create_dir_all(directory).await?;
+
     let mut bundle = Vec::with_capacity(system_ca.len() + ccr_ca.len() + 1);
     bundle.extend_from_slice(&system_ca);
     bundle.push(b'\n');
     bundle.extend_from_slice(&ccr_ca);
-    tokio::fs::write(output, bundle)
-        .await
-        .context("failed to write upstream proxy CA bundle")?;
+    tokio::fs::write(output, bundle).await?;
     Ok(())
 }
 
@@ -329,16 +330,14 @@ async fn run_listener(
                 connections.shutdown().await;
                 return Ok(());
             }
+            _ = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
                 let (socket, _) = accepted.context("local relay accept failed")?;
-                let config = Arc::clone(&config);
+                let config = config.clone();
                 let cancellation = cancellation.clone();
                 connections.spawn(async move {
                     let _ = handle_connection(socket, &config, &cancellation).await;
                 });
-            }
-            completed = connections.join_next(), if !connections.is_empty() => {
-                let _ = completed;
             }
         }
     }
@@ -350,20 +349,16 @@ async fn handle_connection(
     config: &RelayConfig,
     cancellation: &CancellationToken,
 ) -> Result<()> {
+    // CONNECT example.com:443 HTTP/1.1
+    // Host: example.com:443
+    // Proxy-Authorization: xx
+    // 核心流程： 只解析 CONNECT 行，不解析原始 CONNECT 的 Host、User-Agent 等 header。除了请求行，其余原始 header 都被忽略。
+    // WebSocket 建立后，它会重新构造一个 CONNECT 请求，只保留原始 CONNECT 行并注入 Proxy-Authorization
     let Some(request) = read_connect_request(&mut socket, cancellation).await? else {
         return Ok(());
     };
-    let mut websocket_request = config
-        .websocket_url
-        .as_str()
-        .into_client_request()
-        .context("failed to build upstream proxy WebSocket request")?;
-    websocket_request
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static("application/proto"));
-    websocket_request
-        .headers_mut()
-        .insert(AUTHORIZATION, config.websocket_authorization.clone());
+    // websocket_url: wss://api.example.com/v1/code/upstreamproxy/ws
+    let websocket_request = config.build_websocket_request()?;
     let websocket_config = WebSocketConfig::default()
         .max_message_size(Some(MAX_ENCODED_CHUNK_BYTES))
         .max_frame_size(Some(MAX_ENCODED_CHUNK_BYTES));
@@ -380,9 +375,13 @@ async fn handle_connection(
         }
     };
     let (mut websocket_writer, mut websocket_reader) = websocket.split();
+
+    // 送给服务端的首个 WebSocket chunk 是：
+    // CONNECT api.example.com:443 HTTP/1.1
+    // Proxy-Authorization: Basic ...
     let connect_head = format!(
         "{}\r\nProxy-Authorization: {}\r\n\r\n",
-        request.line, config.proxy_authorization
+        request.first_line, config.proxy_authorization
     );
     if let Err(error) = send_chunked(&mut websocket_writer, connect_head.as_bytes()).await {
         write_bad_gateway(&mut socket).await;
@@ -479,33 +478,36 @@ async fn read_connect_request(
 
 /// 解析已累计的 CONNECT header，并保留 header 后的尾随字节。
 fn parse_connect_request(buffer: &[u8]) -> ConnectParse {
-    let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
-        return if buffer.len() > MAX_CONNECT_HEADER_BYTES {
-            ConnectParse::Reject(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-        } else {
-            ConnectParse::Incomplete
-        };
+    const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\r\n";
+    const METHOD_NOT_ALLOWED: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\r\n";
+
+    let mut headers = [EMPTY_HEADER; MAX_CONNECT_HEADERS];
+    let mut request = Request::new(&mut headers);
+    let header_end = match request.parse(buffer) {
+        Ok(Status::Partial) if buffer.len() <= MAX_CONNECT_HEADER_BYTES => {
+            return ConnectParse::Incomplete;
+        }
+        Ok(Status::Complete(header_end)) if header_end <= MAX_CONNECT_HEADER_BYTES => header_end,
+        Ok(_) | Err(_) => return ConnectParse::Reject(BAD_REQUEST),
     };
-    if header_end + 4 > MAX_CONNECT_HEADER_BYTES {
-        return ConnectParse::Reject(b"HTTP/1.1 400 Bad Request\r\n\r\n");
-    }
-    let head = String::from_utf8_lossy(&buffer[..header_end]);
-    let first_line = head.split("\r\n").next().unwrap_or_default();
-    let mut fields = first_line.split_ascii_whitespace();
-    let valid = fields
-        .next()
+
+    let valid = request
+        .method
         .is_some_and(|method| method.eq_ignore_ascii_case("CONNECT"))
-        && fields.next().is_some_and(|target| !target.is_empty())
-        && fields.next().is_some_and(|version| {
-            version.eq_ignore_ascii_case("HTTP/1.0") || version.eq_ignore_ascii_case("HTTP/1.1")
-        })
-        && fields.next().is_none();
+        && request.path.is_some_and(|target| !target.is_empty())
+        && matches!(request.version, Some(0) | Some(1));
     if !valid {
-        return ConnectParse::Reject(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n");
+        return ConnectParse::Reject(METHOD_NOT_ALLOWED);
     }
+
+    let first_line = buffer[..header_end]
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let first_line = first_line.strip_suffix(b"\r").unwrap_or(first_line);
     ConnectParse::Request(ConnectRequest {
-        line: first_line.to_owned(),
-        trailing: buffer[header_end + 4..].to_vec(),
+        first_line: String::from_utf8_lossy(first_line).into_owned(),
+        trailing: buffer[header_end..].to_vec(),
     })
 }
 
@@ -619,7 +621,7 @@ mod tests {
             b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\nhello",
         ) {
             ConnectParse::Request(request) => {
-                assert_eq!(request.line, "CONNECT example.com:443 HTTP/1.1");
+                assert_eq!(request.first_line, "CONNECT example.com:443 HTTP/1.1");
                 assert_eq!(request.trailing, b"hello");
             }
             _ => panic!("CONNECT request should parse"),
@@ -627,6 +629,10 @@ mod tests {
         assert!(matches!(
             parse_connect_request(b"GET https://example.com HTTP/1.1\r\n\r\n"),
             ConnectParse::Reject(response) if response.starts_with(b"HTTP/1.1 405")
+        ));
+        assert!(matches!(
+            parse_connect_request(b"CONNECT example.com:443 HTTP/1.1\r\ninvalid-header\r\n\r\n"),
+            ConnectParse::Reject(response) if response.starts_with(b"HTTP/1.1 400")
         ));
         let oversized = vec![b'a'; MAX_CONNECT_HEADER_BYTES + 1];
         assert!(matches!(
