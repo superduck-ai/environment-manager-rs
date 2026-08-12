@@ -16,7 +16,7 @@ use std::{
     os::{
         fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd},
         unix::{
-            fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _},
+            fs::{DirBuilderExt as _, OpenOptionsExt as _},
             process::CommandExt as _,
         },
     },
@@ -30,7 +30,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl},
-    unistd::pipe2,
+    unistd::{close, pipe2},
 };
 use tokio::{
     fs::{File, OpenOptions},
@@ -63,43 +63,12 @@ use super::{
 
 const CLAUDE_CODE_LOG_PATH: &str = "/tmp/claude-code.log";
 const DEFAULT_API_BASE_URL: &str = "api.anthropic.com";
-const DEFAULT_CCR_UPSTREAM_PROXY_TOKEN_PATH: &str = "/run/ccr/session_token";
 const DEFAULT_MCP_CONFIG_PATH: &str = "/tmp/mcp-config.json";
 const SESSION_INGRESS_TOKEN_PATH: &str = "/home/claude/.claude/remote/.session_ingress_token";
 const CCR_UPSTREAM_PROXY_ENABLED_ENVIRONMENT_KEY: &str = "CCR_UPSTREAM_PROXY_ENABLED";
 const CLAUDE_CODE_REMOTE_ENVIRONMENT_KEY: &str = "CLAUDE_CODE_REMOTE";
 const STREAM_BUFFER_SIZE: usize = 32 * 1024;
 const SAFE_TOKEN_FD_FLOOR: i32 = 64;
-
-/// 保存一个应在当前 `execute` 返回时删除的敏感临时文件。
-struct SensitiveFileGuard {
-    path: PathBuf,
-    logger: Logger,
-}
-
-impl SensitiveFileGuard {
-    /// 创建只负责异常兜底删除的 guard；文件应已由调用方成功写入。
-    fn new(path: impl Into<PathBuf>, logger: Logger) -> Self {
-        Self {
-            path: path.into(),
-            logger,
-        }
-    }
-}
-
-impl Drop for SensitiveFileGuard {
-    /// 幂等删除 token；Claude relay 已主动 unlink 时 `NotFound` 被视为成功。
-    fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.path)
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            self.logger.warn(
-                "Failed to remove CCR upstream proxy token file",
-                claude_attrs!("error" => error.to_string(), "path" => self.path.display().to_string()),
-            );
-        }
-    }
-}
 
 /// 父进程持有的 token pipe 读端及其 child 目标 FD。
 pub(super) struct TokenDescriptor {
@@ -259,65 +228,15 @@ fn is_truthy_environment_value(value: &str) -> bool {
     )
 }
 
-/// 原子写入 CCR upstream proxy token，并将目录/文件权限收紧为 0700/0600。
-pub(super) fn write_ccr_upstream_proxy_token(path: &Path, token: &str) -> Result<(), ClaudeError> {
-    if path.as_os_str().is_empty() {
-        return Err(ClaudeError::message(
-            "CCR upstream proxy token path is empty",
-        ));
-    }
-    if token.is_empty() {
-        return Err(ClaudeError::message("CCR upstream proxy token is empty"));
-    }
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut directory_builder = std::fs::DirBuilder::new();
-    directory_builder.recursive(true).mode(0o700);
-    directory_builder.create(directory).map_err(|error| {
-        ClaudeError::message(format!(
-            "failed to create CCR upstream proxy token directory: {error}"
-        ))
-    })?;
-    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).map_err(
-        |error| {
-            ClaudeError::message(format!(
-                "failed to secure CCR upstream proxy token directory: {error}"
-            ))
-        },
-    )?;
-
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".session_token-")
-        .tempfile_in(directory)
-        .map_err(|error| {
-            ClaudeError::message(format!(
-                "failed to create temporary CCR upstream proxy token file: {error}"
-            ))
-        })?;
-    temporary
-        .as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| {
-            ClaudeError::message(format!(
-                "failed to secure temporary CCR upstream proxy token file: {error}"
-            ))
-        })?;
-    temporary.write_all(token.as_bytes()).map_err(|error| {
-        ClaudeError::message(format!(
-            "failed to write temporary CCR upstream proxy token file: {error}"
-        ))
-    })?;
-    temporary.flush().map_err(|error| {
-        ClaudeError::message(format!(
-            "failed to close temporary CCR upstream proxy token file: {error}"
-        ))
-    })?;
-    temporary.persist(path).map_err(|error| {
-        ClaudeError::message(format!(
-            "failed to install CCR upstream proxy token file: {}",
-            error.error
-        ))
-    })?;
-    Ok(())
+/// 旧 token 文件交接已停用；测试入口固定返回错误以防行为被意外恢复。
+#[cfg(test)]
+pub(super) fn write_ccr_upstream_proxy_token(
+    _path: &Path,
+    _token: &str,
+) -> Result<(), ClaudeError> {
+    Err(ClaudeError::message(
+        "CCR upstream proxy token handoff is no longer supported",
+    ))
 }
 
 /// 创建 token pipe、写入一行 token，并安排为 child 的下一个 ExtraFiles FD。
@@ -400,7 +319,7 @@ impl ClaudeCodeExecutor {
         value
     }
 
-    /// 判断当前会话是否必须准备固定路径的 CCRv2 relay token。
+    /// 判断远程 code session 是否配置了 CCRv2 relay。
     pub(super) fn should_prepare_ccr_upstream_proxy_token(&self) -> bool {
         self.startup_context.use_code_sessions
             && is_truthy_environment_value(
@@ -409,6 +328,11 @@ impl ClaudeCodeExecutor {
             && is_truthy_environment_value(
                 &self.effective_environment_value(CCR_UPSTREAM_PROXY_ENABLED_ENVIRONMENT_KEY),
             )
+    }
+
+    /// 判断当前会话是否由 environment-manager 启动 CCRv2 relay。
+    pub(super) fn should_start_agent_proxy(&self, local_testing_mode: bool) -> bool {
+        !local_testing_mode && self.should_prepare_ccr_upstream_proxy_token()
     }
 
     /// 合并 sandbox gateway 参数、本地追加 prompt，并按需写出 gateway MCP 文件。
@@ -634,8 +558,13 @@ impl ClaudeCodeExecutor {
         }
         let mut environment = self.build_child_environment();
         let mut descriptors = Vec::new();
-        let relay_token_guard =
-            self.prepare_authentication(local_testing_mode, &mut environment, &mut descriptors)?;
+        self.prepare_authentication(local_testing_mode, &mut environment, &mut descriptors)?;
+        let mut agent_proxy = self
+            .start_agent_proxy(local_testing_mode, &environment)
+            .await?;
+        if let Some(proxy) = agent_proxy.as_ref() {
+            environment.extend(proxy.environment().iter().cloned());
+        }
 
         // Go `exec.CommandContext` 在构造 Cmd 时立即执行 LookPath，但把错误保存到
         // `Cmd.Err`，直到后续 `Run` 才返回。这里同样先解析并继续完成日志/tailer
@@ -691,8 +620,12 @@ impl ClaudeCodeExecutor {
                 command_lookup_error,
                 local_testing_mode,
                 Arc::clone(&log_file),
+                agent_proxy.as_mut(),
             )
             .await;
+        if let Some(proxy) = agent_proxy.take() {
+            proxy.shutdown().await;
+        }
         stop_cc_log_tailer(active_tailer).await;
         let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
         if let Some(observability) = self.observability.as_deref() {
@@ -709,10 +642,8 @@ impl ClaudeCodeExecutor {
             .finish_execution(cancellation, &log_file, run, duration_ms)
             .await;
 
-        // Go defer 的逆序是：关闭日志文件、删除 relay token、关闭 token read FD。
-        // 这里显式保持同一顺序；三个动作各自只告警，不覆盖 child 的主返回结果。
+        // 日志与 token read FD 的清理只告警，不覆盖 child 的主返回结果。
         close_claude_log(&self.logger, log_file).await;
-        drop(relay_token_guard);
         drop(descriptors);
         result
     }
@@ -761,7 +692,7 @@ impl ClaudeCodeExecutor {
     }
 
     /// 按 Go append 顺序构造 child 环境，后层键覆盖前层键。
-    fn build_child_environment(&self) -> Vec<(OsString, OsString)> {
+    pub(super) fn build_child_environment(&self) -> Vec<(OsString, OsString)> {
         let mut environment = filter_init_only_from_environ(std::env::vars_os());
         let mut has_anthropic_base_url = false;
         if let Some(cfg) = self.cfg.as_ref() {
@@ -831,17 +762,16 @@ impl ClaudeCodeExecutor {
         environment
     }
 
-    /// 准备 session/OAuth/API token FD 与兼容 token 文件。
+    /// 准备 session/OAuth/API token FD 与 Bash 兼容 token 文件。
     fn prepare_authentication(
         &self,
         local_testing_mode: bool,
         environment: &mut Vec<(OsString, OsString)>,
         descriptors: &mut Vec<TokenDescriptor>,
-    ) -> Result<Option<SensitiveFileGuard>, ClaudeError> {
+    ) -> Result<(), ClaudeError> {
         let Some(auth) = self.auth_context.as_ref() else {
-            return Ok(None);
+            return Ok(());
         };
-        let mut relay_guard = None;
         let session_token = auth.get_session_ingress_token();
         if !session_token.is_empty() && !local_testing_mode {
             let fd = add_token_via_file_descriptor(
@@ -880,19 +810,6 @@ impl ClaudeCodeExecutor {
                     }
                 }
             }
-            if self.should_prepare_ccr_upstream_proxy_token() {
-                let path = Path::new(DEFAULT_CCR_UPSTREAM_PROXY_TOKEN_PATH);
-                write_ccr_upstream_proxy_token(path, session_token).map_err(|error| {
-                    ClaudeError::message(format!(
-                        "failed to prepare CCR upstream proxy token: {error}"
-                    ))
-                })?;
-                self.logger.info(
-                    "Prepared session ingress token for CCR upstream proxy relay",
-                    claude_attrs!("path" => DEFAULT_CCR_UPSTREAM_PROXY_TOKEN_PATH),
-                );
-                relay_guard = Some(SensitiveFileGuard::new(path, self.logger.clone()));
-            }
         }
 
         if !auth.get_anthropic_oauth_token().is_empty() {
@@ -918,10 +835,70 @@ impl ClaudeCodeExecutor {
                 OsString::from(fd.to_string()),
             ));
         }
-        Ok(relay_guard)
+        Ok(())
+    }
+
+    /// 使用最终 child 环境中的 API base 和 session ingress token 启动本地 relay。
+    async fn start_agent_proxy(
+        &self,
+        local_testing_mode: bool,
+        environment: &[(OsString, OsString)],
+    ) -> Result<Option<super::agent_proxy::AgentProxyHandle>, ClaudeError> {
+        if !self.should_start_agent_proxy(local_testing_mode) {
+            return Ok(None);
+        }
+        self.remove_stale_agent_proxy_token(Path::new(super::agent_proxy::STALE_RELAY_TOKEN_PATH))?;
+        let token = self
+            .auth_context
+            .as_ref()
+            .map(AuthContext::get_session_ingress_token)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                ClaudeError::message(
+                    "CCR upstream proxy requires a non-empty session ingress token",
+                )
+            })?;
+        let api_base_url = environment
+            .iter()
+            .rev()
+            .find(|(key, _)| key == OsStr::new("ANTHROPIC_BASE_URL"))
+            .and_then(|(_, value)| value.to_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ClaudeError::message("CCR upstream proxy requires ANTHROPIC_BASE_URL")
+            })?;
+        let proxy = super::agent_proxy::AgentProxy::start(super::agent_proxy::AgentProxyConfig {
+            api_base_url: api_base_url.to_owned(),
+            session_id: self.session_id.clone(),
+            token: token.to_owned(),
+        })
+        .await?;
+        self.logger.info(
+            "Prepared session ingress token for CCR upstream proxy relay",
+            claude_attrs!("path" => "environment-manager memory"),
+        );
+        Ok(Some(proxy))
+    }
+
+    /// 删除旧 Claude relay 遗留的固定 token；非 NotFound 错误按 fail-closed 返回。
+    pub(super) fn remove_stale_agent_proxy_token(&self, path: &Path) -> Result<(), ClaudeError> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => {
+                self.logger.warn(
+                    "Failed to remove CCR upstream proxy token file",
+                    claude_attrs!("error" => error.to_string(), "path" => path.display().to_string()),
+                );
+                Err(ClaudeError::message(format!(
+                    "failed to remove stale CCR upstream proxy token: {error}"
+                )))
+            }
+        }
     }
 
     /// spawn child、写 stdin、并发复制两个 stream，并只等待 direct child。
+    #[allow(clippy::too_many_arguments)]
     async fn run_child(
         &self,
         cancellation: &CancellationToken,
@@ -930,6 +907,7 @@ impl ClaudeCodeExecutor {
         command_lookup_error: Option<Vec<u8>>,
         local_testing_mode: bool,
         log_file: Arc<Mutex<File>>,
+        agent_proxy: Option<&mut super::agent_proxy::AgentProxyHandle>,
     ) -> ExecutionRun {
         if let Some(error) = command_lookup_error {
             return ExecutionRun {
@@ -990,11 +968,19 @@ impl ClaudeCodeExecutor {
             verbose,
             Some(log_writer),
         ));
+        let proxy_failure = super::agent_proxy::wait_for_agent_proxy_failure(agent_proxy);
+        tokio::pin!(proxy_failure);
+        let mut forced_error = None;
         let status = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
                 // 有意只 kill direct child；孙进程持有 pipe 时 reader 可能继续等待，
                 // 这正是 Go CommandContext 的兼容行为，不能擅自切换 process group。
+                let _direct_child_kill = child.start_kill();
+                child.wait().await
+            }
+            error = &mut proxy_failure => {
+                forced_error = Some(error.into_bytes());
                 let _direct_child_kill = child.start_kill();
                 child.wait().await
             }
@@ -1018,6 +1004,14 @@ impl ClaudeCodeExecutor {
             }
         };
         let process_exit_code = exit_code(&status);
+        if let Some(error) = forced_error {
+            return ExecutionRun {
+                error: Some(error),
+                exit_code: process_exit_code,
+                stdout,
+                stderr,
+            };
+        }
         match status {
             Ok(status) if status.success() && stream_error.is_none() => ExecutionRun {
                 error: None,
@@ -1202,17 +1196,18 @@ impl ClaudeCodeExecutor {
         let _ = stdout.write_all(format!("{separator}\n").as_bytes()).await;
     }
 
-    /// 幂等删除 session token 与按条件存在的 relay token。
+    /// 幂等删除 Bash 使用的 session ingress token。
     async fn destroy_inner(&self) -> Result<(), ClaudeError> {
         self.logger.info(
             "Destroying ClaudeCodeExecutor",
             claude_attrs!("session_id" => &self.session_id),
         );
         remove_token_file(&self.logger, Path::new(SESSION_INGRESS_TOKEN_PATH), false);
-        if self.should_prepare_ccr_upstream_proxy_token() {
+        let local_testing_mode = self.cfg.as_ref().is_some_and(|cfg| cfg.local_testing_mode);
+        if self.should_start_agent_proxy(local_testing_mode) {
             remove_token_file(
                 &self.logger,
-                Path::new(DEFAULT_CCR_UPSTREAM_PROXY_TOKEN_PATH),
+                Path::new(super::agent_proxy::STALE_RELAY_TOKEN_PATH),
                 true,
             );
         }
@@ -1245,6 +1240,8 @@ pub(super) fn install_token_descriptors(
         .iter()
         .map(|descriptor| (descriptor.source.as_raw_fd(), descriptor.target))
         .collect::<Vec<_>>();
+    // nix 0.30 的任意目标 `dup2` API 要求构造 `OwnedFd`，但 3/4/5 在此可能尚未打开，
+    // 伪造所有权反而会破坏 IO safety，因此仅这里保留原始 `dup2`。
     // SAFETY: closure 只调用 async-signal-safe 的 `dup2` 与 errno 读取；source FD
     // 在 `spawn` 返回前由 `descriptors` 保持存活，且都复制到 64 以上，不会被目标
     // 3/4/5 的顺序映射覆盖。dup2 会清除目标 CLOEXEC，使其按约定穿过 exec。
@@ -1508,13 +1505,7 @@ async fn append_log(logger: &Logger, log_file: &Arc<Mutex<File>>, bytes: &[u8]) 
 /// 调用方必须先通过 `into_raw_fd` 取得唯一所有权；函数无重试，因为 Linux 上
 /// close 返回 EINTR 后 FD 状态不确定，重试可能误关已被其他线程复用的描述符。
 fn close_owned_fd(raw_fd: i32) -> io::Result<()> {
-    // SAFETY: raw_fd 来自本模块刚消费的 OwnedFd/std::fs::File，调用期间没有其他
-    // owning handle；只调用一次 close，并把所有权在此终止。
-    if unsafe { libc::close(raw_fd) } == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    close(raw_fd).map_err(io::Error::from)
 }
 
 /// 生成日志 header 使用的本地毫秒时间戳。

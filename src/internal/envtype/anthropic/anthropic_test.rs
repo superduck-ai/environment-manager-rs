@@ -15,6 +15,10 @@ use std::{
 };
 
 use async_trait::async_trait;
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::{
@@ -603,11 +607,8 @@ async fn cancellation_kills_only_direct_script_child() {
         .await
         .unwrap()
         .unwrap();
-    // SAFETY: kill(pid, 0) 只探测测试刚创建的进程；随后 SIGKILL 清理该孙进程。
-    unsafe {
-        assert_eq!(libc::kill(pid, 0), 0);
-        libc::kill(pid, libc::SIGKILL);
-    }
+    assert_eq!(kill(Pid::from_raw(pid), None::<Signal>), Ok(()));
+    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
 }
 
 /// 验证 exit status 前缀解析以及不匹配时的默认值。

@@ -25,7 +25,6 @@ use tokio_tungstenite::tungstenite::handshake::client::{
 };
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
-use tokio_tungstenite::{client_async_tls_with_config, connect_async_with_config};
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
@@ -60,6 +59,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// 代理 CONNECT 响应 header 的最大尺寸，防止错误代理无界占用内存。
 const MAX_PROXY_RESPONSE_HEADER: usize = 64 * 1024;
+/// `httparse` 需要调用方提供 header 槽位；代理握手不使用这些字段，只需设置合理上限。
+const MAX_PROXY_RESPONSE_HEADERS: usize = 128;
 
 /// Go `http.ProxyFromEnvironment` 第一次使用时捕获的进程级代理配置。
 static ENVIRONMENT_PROXY_CONFIG: OnceLock<EnvironmentProxyConfig> = OnceLock::new();
@@ -80,7 +81,7 @@ pub(super) struct EnvironmentProxyConfig {
 /// 失败固定返回 `websocket: bad handshake`，同时通过独立的 response 暴露状态。
 /// 这个类型同时保存两部分信息，供主 Tunnel 与本地 WS Tunnel 按各自 Go 格式拼接。
 #[derive(Debug)]
-pub(super) struct GorillaDialFailure {
+pub(crate) struct GorillaDialFailure {
     message: String,
     response_status: Option<String>,
 }
@@ -924,17 +925,23 @@ pub(super) async fn connect_websocket(
     connect_websocket_with_config(request, gorilla_websocket_config()).await
 }
 
-/// 使用进程级代理快照和调用方提供的 WebSocket 配置建立连接。
+/// 统一的“WebSocket 出站连接器
 ///
-/// 主 Tunnel 与本地 [`WsHandler`](super::WsHandler) 共用这一入口，确保直连、
-/// HTTP CONNECT 和 SOCKS5 三条拨号路径采用相同的 frame/message 限制。配置按值
-/// 移入连接，不保存任何指向 handler 的反向引用。
-pub(super) async fn connect_websocket_with_config(
-    request: WebSocketRequest,
+/// 1. 读取并缓存 HTTP_PROXY、HTTPS_PROXY、NO_PROXY。
+/// 2. 根据目标 ws:// / wss:// 判断是否需要代理。
+/// 3. 选择建连方式：
+///     不走代理：直接 connect_async_with_config
+///     HTTP 代理：先发送 CONNECT，拿到透明 TCP 流
+///     SOCKS5：先完成 SOCKS5 握手
+///
+/// 4. 在 TCP 流上继续完成 TLS 和 WebSocket 握手。
+/// 5. 应用调用方传入的 WebSocketConfig，比如消息和 frame 大小限制
+pub(crate) async fn connect_websocket_with_config(
+    ws_request: WebSocketRequest,
     websocket_config: WebSocketConfig,
 ) -> Result<(LocalWebSocket, WebSocketResponse), GorillaDialFailure> {
     let config = ENVIRONMENT_PROXY_CONFIG.get_or_init(EnvironmentProxyConfig::from_process);
-    connect_websocket_with_proxy_and_websocket_config(request, config, websocket_config).await
+    connect_websocket_with_proxy_and_websocket_config(ws_request, config, websocket_config).await
 }
 
 /// 使用显式代理快照建立 WebSocket，供生产路径与无环境竞态的测试共用。
@@ -950,35 +957,40 @@ pub(super) async fn connect_websocket_with_proxy_config(
         .await
 }
 
-/// 使用显式代理快照和显式 WebSocket 配置建立连接。
+/// 所有 WebSocket 建连方式的最终汇合点：无论直连、HTTP CONNECT 还是 SOCKS5，最终都使用同一份 WebSocketConfig 完成握手。
 ///
-/// 该内部汇合点保证直连、HTTP CONNECT 与 SOCKS5 三条路径使用完全相同的
-/// frame/message 限制和标准 WebSocket 握手规则。配置只会被当前连接持有，
-/// 不会写回进程级代理快照。
 async fn connect_websocket_with_proxy_and_websocket_config(
-    request: WebSocketRequest,
+    ws_request: WebSocketRequest,
     config: &EnvironmentProxyConfig,
     websocket_config: WebSocketConfig,
 ) -> Result<(LocalWebSocket, WebSocketResponse), GorillaDialFailure> {
-    let target = Url::parse(&request.uri().to_string()).map_err(|error| {
-        GorillaDialFailure::from_websocket_error(WebSocketError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            error.to_string(),
-        )))
+    let target_url = Url::parse(&ws_request.uri().to_string()).map_err(|error| {
+        GorillaDialFailure::from_websocket_error(invalid_input(error.to_string()))
     })?;
-    let proxy = proxy_selection_for_websocket_target(&target, config)
+    //  选择代理, None 表示直连，Some(proxy) 表示走代理
+    let proxy = proxy_selection_for_websocket_target(&target_url, config)
         .map_err(GorillaDialFailure::from_websocket_error)?;
-    let Some(proxy) = proxy else {
-        return connect_async_with_config(request, Some(websocket_config), false)
+
+    match proxy {
+        None => {
+            tokio_tungstenite::connect_async_with_config(ws_request, Some(websocket_config), false)
+                .await
+                .map_err(GorillaDialFailure::from_websocket_error)
+        }
+        Some(proxy) => {
+            let tcp_stream = connect_via_proxy(&proxy, &target_url)
+                .await
+                .map_err(GorillaDialFailure::from_websocket_error)?;
+            tokio_tungstenite::client_async_tls_with_config(
+                ws_request,
+                tcp_stream,
+                Some(websocket_config),
+                None,
+            )
             .await
-            .map_err(GorillaDialFailure::from_websocket_error);
-    };
-    let stream = connect_via_proxy(&proxy, &target)
-        .await
-        .map_err(GorillaDialFailure::from_websocket_error)?;
-    client_async_tls_with_config(request, stream, Some(websocket_config), None)
-        .await
-        .map_err(GorillaDialFailure::from_websocket_error)
+            .map_err(GorillaDialFailure::from_websocket_error)
+        }
+    }
 }
 
 /// 构造 Tunnel 使用的标准 WebSocket 配置。
@@ -1058,10 +1070,20 @@ pub(super) fn proxy_for_websocket_target(
     Ok(proxy_selection_for_websocket_target(target, config)?.map(|proxy| proxy.url))
 }
 
-/// 选择代理并保留解析库无法表达的显式空 password 标志。
+/// 只负责决定 WebSocket 应该直连还是走代理，不负责真正建连。
 ///
-/// 该内部版本是实际拨号路径；仅在测试构建中存在的 `proxy_for_websocket_target` 只返回
-/// URL，而 CONNECT 认证必须使用这里随 URL 一起保存的 `password_set`。
+/// 返回值含义：
+/// - Ok(Some(proxy))：使用这个代理
+/// - Ok(None)：直接连接
+/// - Err(...)：代理配置触发安全错误
+///
+/// 选择规则：
+/// - ws://  → HTTP_PROXY
+/// - wss:// → HTTPS_PROXY
+/// - 其他协议 → 直连
+/// - 代理未配置或配置无效 → 直连
+/// - localhost / loopback / 命中 NO_PROXY → 直连
+/// - 否则 → 返回代理配置
 fn proxy_selection_for_websocket_target(
     target: &Url,
     config: &EnvironmentProxyConfig,
@@ -1283,6 +1305,11 @@ fn cidr_contains(entry: &str, target: IpAddr) -> bool {
     }
 }
 
+/// 构造 InvalidInput 类型的 WebSocket 错误。
+fn invalid_input(message: impl Into<String>) -> WebSocketError {
+    WebSocketError::Io(io::Error::new(io::ErrorKind::InvalidInput, message.into()))
+}
+
 /// 生成 CONNECT request 使用的带端口 authority，IPv6 保留方括号。
 fn websocket_target_authority(target: &Url) -> Result<String, WebSocketError> {
     let host = target.host().ok_or_else(|| {
@@ -1341,8 +1368,6 @@ async fn connect_via_http_proxy(
         .await
         .map_err(WebSocketError::Io)?;
 
-    // `http.Request.Write` 会在 Host 后自动写这一 UA；代理或差分
-    // probe 可观测到 CONNECT 原始字节，顺序不能省略。
     let mut connect_request = format!(
         "CONNECT {target_authority} HTTP/1.1\r\nHost: {target_authority}\r\nUser-Agent: Go-http-client/1.1\r\n"
     );
@@ -1362,27 +1387,13 @@ async fn connect_via_http_proxy(
         .await
         .map_err(WebSocketError::Io)?;
 
-    let response_header = read_proxy_response_header(&mut stream).await?;
-    let status_line = response_header
-        .split(|byte| *byte == b'\n')
-        .next()
-        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-        .ok_or_else(|| WebSocketError::Io(io::Error::other("malformed proxy response")))?;
-    let status_line = std::str::from_utf8(status_line)
-        .map_err(|_| WebSocketError::Io(io::Error::other("malformed proxy response")))?;
-    let mut fields = status_line.splitn(3, ' ');
-    let _http_version = fields.next();
-    let status_code = fields
-        .next()
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| WebSocketError::Io(io::Error::other("malformed proxy response")))?;
-    let reason = fields.next().unwrap_or_default();
+    let (status_code, reason) = read_proxy_response(&mut stream).await?;
     if status_code != 200 {
         // Gorilla 对非 200 返回 `resp.Status` 中第一个空格后的 reason。
         let message = if reason.is_empty() {
             status_code.to_string()
         } else {
-            reason.to_owned()
+            reason
         };
         return Err(WebSocketError::Io(io::Error::other(message)));
     }
@@ -1655,26 +1666,79 @@ async fn read_socks5_connect_response(
     Ok(())
 }
 
-/// 读取到完整 `\r\n\r\n`，并限制代理响应 header 的内存使用。
-async fn read_proxy_response_header(stream: &mut TcpStream) -> Result<Vec<u8>, WebSocketError> {
-    let mut header = Vec::with_capacity(1024);
-    let mut byte = [0_u8; 1];
-    while header.len() < MAX_PROXY_RESPONSE_HEADER {
-        let read = stream.read(&mut byte).await.map_err(WebSocketError::Io)?;
+/// 批量读取并解析代理响应，同时避免消费 header 后的隧道数据。
+pub(super) async fn read_proxy_response(
+    stream: &mut TcpStream,
+) -> Result<(u16, String), WebSocketError> {
+    const READ_CHUNK_SIZE: usize = 4096;
+
+    let mut response_bytes = Vec::with_capacity(1024);
+    let mut peek_buf = [0_u8; READ_CHUNK_SIZE];
+    while response_bytes.len() < MAX_PROXY_RESPONSE_HEADER {
+        let remaining = MAX_PROXY_RESPONSE_HEADER - response_bytes.len();
+        let read = stream
+            .peek(&mut peek_buf[..remaining.min(READ_CHUNK_SIZE)])
+            .await
+            .map_err(WebSocketError::Io)?;
         if read == 0 {
             return Err(WebSocketError::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "unexpected EOF reading proxy response",
             )));
         }
-        header.push(byte[0]);
-        if header.ends_with(b"\r\n\r\n") {
-            return Ok(header);
+
+        // previous_len: 本轮 peek 之前，已经累计并消费的响应 header 字节数
+        let previous_len = response_bytes.len();
+        response_bytes.extend_from_slice(&peek_buf[..read]);
+        let parsed = {
+            let mut headers = [httparse::EMPTY_HEADER; MAX_PROXY_RESPONSE_HEADERS];
+            let mut response = httparse::Response::new(&mut headers);
+            match response.parse(&response_bytes) {
+                Ok(httparse::Status::Complete(header_end)) => Some((
+                    header_end,
+                    response.code.ok_or_else(malformed_proxy_response)?,
+                    response.reason.unwrap_or_default().to_owned(),
+                )),
+                Ok(httparse::Status::Partial) => None,
+                Err(_) => return Err(malformed_proxy_response()),
+            }
+        };
+        match parsed {
+            // None 消费本次全部 peek 数据，继续循环。
+            None => {
+                stream
+                    .read_exact(&mut peek_buf[..read])
+                    .await
+                    .map_err(WebSocketError::Io)?;
+            }
+            // 只消费到 header 边界，保留本次 peek 到的隧道数据。
+            Some((header_end, status_code, reason)) => {
+                // 第一轮：已经累计 100 字节
+                // 第二轮：peek 到 60 字节
+                // previous_len = 100;
+                // response_bytes.len() = 160;
+                // 假设 httparse 发现完整 header 结束于累计 buffer 的第 130 字节：
+                // 那么当前这一轮只应从 socket 消费：
+                //
+                // let consume = header_end - previous_len;
+                // 130 - 100 = 30
+                let consume = header_end - previous_len;
+                // 只消费当前轮中的 header 部分: 30
+                stream
+                    .read_exact(&mut peek_buf[..consume])
+                    .await
+                    .map_err(WebSocketError::Io)?;
+                return Ok((status_code, reason));
+            }
         }
     }
     Err(WebSocketError::Io(io::Error::other(
         "proxy response header too large",
     )))
+}
+
+fn malformed_proxy_response() -> WebSocketError {
+    WebSocketError::Io(io::Error::other("malformed proxy response"))
 }
 
 /// 对 proxy URL user-info 执行 percent decode；`+` 在 URL user-info 中保持原字节。

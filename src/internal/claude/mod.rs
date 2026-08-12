@@ -4,6 +4,7 @@
 //! `exec.CommandContext`。所有取消路径只终止直接子进程，不创建或清理进程组；
 //! token 仍通过从 3 开始的继承文件描述符传递，避免进入 argv 或普通环境变量。
 
+mod agent_proxy;
 mod claude_code_executor;
 mod config_helpers;
 mod init;

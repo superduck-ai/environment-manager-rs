@@ -25,7 +25,7 @@ use url::Url;
 use super::actions::{ResponseSender, new_registry};
 use super::client::{
     EnvironmentProxyConfig, PingWriteFailure, connect_websocket_with_proxy_config,
-    gorilla_websocket_config, ping_write_failure, proxy_for_websocket_target,
+    gorilla_websocket_config, ping_write_failure, proxy_for_websocket_target, read_proxy_response,
     read_tunnel_data_message, should_offer_socks5_auth, socks5_proxy_port,
 };
 use super::{
@@ -667,6 +667,59 @@ async fn test_websocket_proxy_connect_and_non_200_reason() {
     );
     assert!(connect_request.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
     proxy.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_proxy_response_does_not_consume_tunnel_bytes() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: test\r\n\r\ntunnel")
+            .await
+            .unwrap();
+    });
+
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let (status_code, reason) = read_proxy_response(&mut stream).await.unwrap();
+    assert_eq!(status_code, 200);
+    assert_eq!(reason, "Connection Established");
+
+    let mut trailing = [0_u8; 6];
+    stream.read_exact(&mut trailing).await.unwrap();
+    assert_eq!(&trailing, b"tunnel");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_proxy_response_split_across_segments() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        // 先写不含终止空行的不完整 header，迫使客户端走 Partial 路径
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: test\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // 再补完剩余 header + 终止空行 + 隧道字节
+        stream
+            .write_all(b"X-Custom: v\r\n\r\ntunnel")
+            .await
+            .unwrap();
+    });
+
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let (status_code, reason) = read_proxy_response(&mut stream).await.unwrap();
+    assert_eq!(status_code, 200);
+    assert_eq!(reason, "Connection Established");
+
+    let mut trailing = [0_u8; 6];
+    stream.read_exact(&mut trailing).await.unwrap();
+    assert_eq!(&trailing, b"tunnel");
+    server.await.unwrap();
 }
 
 /// 启动一次性 HTTP proxy，返回 Rust 发送的完整 CONNECT header。
