@@ -1,4 +1,4 @@
-//! Anthropic 环境的恢复数据类型与稳定错误载体。
+//! Anthropic 环境的数据类型与稳定错误载体。
 //!
 //! 对应 Go：`internal/envtype/anthropic/anthropic.go` 与同目录配置声明。该文件集中
 //! 保存 JSON DTO、环境生命周期字段及错误包装，供 `anthropic.rs` 的副作用实现使用；

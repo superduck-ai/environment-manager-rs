@@ -55,7 +55,7 @@ use super::{
     Outcomes,
     config_helpers::get_claude_path,
     session_urls::build_session_urls,
-    zz_recovered_types::{
+    types::{
         ClaudeCodeExecutor, ClaudeError, ClaudeObservability, Executor, McpServerRegistration,
         claude_attrs, format_exit_status,
     },
@@ -679,8 +679,7 @@ impl ClaudeCodeExecutor {
                 );
                 None
             }
-            // 分支书写顺序有意与 Go 源码的两个同文案 slog 点一致：错误分支在前、
-            // 成功分支在后，使静态 occurrence 映射与实际 runtime source 同时正确。
+            // 错误分支和成功分支保留各自的 Rust 日志调用位置。
             Ok(directory) => {
                 self.logger.info(
                     "Claude Code will run in current directory (no working_dir configured)",
@@ -1059,8 +1058,7 @@ impl ClaudeCodeExecutor {
                     claude_attrs!("duration_ms" => duration_ms),
                 );
                 if self.cfg.as_ref().is_some_and(|cfg| cfg.print_code_logs) {
-                    // 三个终止分支在 Go 中是三个独立 slog source。这里有意不抽成
-                    // helper，确保取消分支仍解析到 Go Execute 的第一处 sync 日志。
+                    // 三个终止分支保留独立调用点，便于区分各自的 sync 失败。
                     if let Err(error) = log_file.lock().await.sync_all().await {
                         self.logger.warn(
                             "Failed to sync log file before printing",
@@ -1122,7 +1120,7 @@ impl ClaudeCodeExecutor {
                 );
             }
             if self.cfg.as_ref().is_some_and(|cfg| cfg.print_code_logs) {
-                // 对应 Go 的普通失败分支；独立调用点也是 source 兼容协议的一部分。
+                // 对应普通失败分支，并保留独立的 Rust 调用位置。
                 if let Err(error) = log_file.lock().await.sync_all().await {
                     self.logger.warn(
                         "Failed to sync log file before printing",
@@ -1366,8 +1364,8 @@ async fn write_command_file(logger: &Logger, command: &str, args: &[String]) {
         Err(error) => Err(error),
     };
     if let Err(error) = result {
-        // Go 的 `os.WriteFile` 只有一个错误返回点；open/write 两阶段必须汇合到同一
-        // Logger callsite，否则同一个 Go source 会被两个 Rust consumer 消费。
+        // open/write 两阶段必须汇合到同一 Logger callsite，避免重复
+        // 记录同一次文件写入失败。
         logger.warn(
             "Failed to write claude command to file",
             claude_attrs!("error" => error.to_string()),

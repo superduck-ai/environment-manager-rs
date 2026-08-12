@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::internal::logger::Logger;
 
-use super::zz_recovered_types::{AuthConfig, AuthContext, deserialize_string_or_null};
+use super::types::{AuthConfig, AuthContext, deserialize_string_or_null};
 
 /// 认证配置解析失败。
 #[derive(Debug, Error)]

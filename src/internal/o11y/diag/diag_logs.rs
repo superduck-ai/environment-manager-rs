@@ -13,7 +13,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::internal::api::{DiagLogEntry, SessionBackend};
-use crate::internal::logger::{LogAttributes, Logger, default_slog_logger};
+use crate::internal::logger::{LogAttributes, Logger, default_logger};
 
 use super::{
     DiagContext, DiagError, DiagFile, DiagService, DiagState, LogFlusher, SessionBackendLogFlusher,
@@ -31,13 +31,13 @@ pub async fn new_diag_service(
     cancellation: CancellationToken,
     flusher: Arc<dyn LogFlusher>,
 ) -> Result<(Arc<DiagService>, DiagContext), DiagError> {
-    new_diag_service_with_logger(cancellation, flusher, default_slog_logger().clone()).await
+    new_diag_service_with_logger(cancellation, flusher, default_logger().clone()).await
 }
 
 /// 对应 Go：`diag.NewDiagService`，并允许 Rust 测试注入可观测 logger。
 ///
-/// 生产入口总是传入 `slog.Default()` 兼容 logger；单独保留此内部入口，是为了验证每个
-/// Go 日志调用点的消息、级别和属性顺序，而不修改进程级 stderr。两份临时文件创建、
+/// 生产入口总是传入进程级 tracing logger；单独保留此内部入口，是为了
+/// 测试消息、级别和属性顺序，而不写入进程级日志。两份临时文件创建、
 /// collector 启动和 flusher task 启动仍严格按 Go 顺序执行；任一步失败时，已经创建的
 /// `File` 会被 drop/close，但 `keep()` 后的路径与 Go `os.CreateTemp` 一样不会删除。
 ///

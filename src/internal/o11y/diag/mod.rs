@@ -6,22 +6,20 @@
 
 mod cc_log_collector;
 mod diag_logs;
-mod zz_recovered_types;
+mod types;
 
 pub use diag_logs::{
     get_claude_code_diag_file_path, log_env_manager_no_pii, logs_enabled, new_diag_service,
     new_diag_service_with_backend,
 };
-pub use zz_recovered_types::{
-    DiagContext, DiagError, DiagService, LogFlusher, SessionBackendLogFlusher,
-};
+pub use types::{DiagContext, DiagError, DiagService, LogFlusher, SessionBackendLogFlusher};
 
 // 这些名称只用于 `diag` 自身的兄弟模块及其测试。保持为父模块私有导入，既允许
 // 子模块通过 `super` 访问，也不会把子模块中 `pub(super)` 的实现细节错误地扩大
 // 到 `o11y`，从而触发 Rust 的“重导出可见性高于原条目”错误。
 use cc_log_collector::{CcLogCollector, new_cc_log_collector};
 use diag_logs::append_and_cap_logs;
-use zz_recovered_types::{DiagFile, DiagState};
+use types::{DiagFile, DiagState};
 
 #[cfg(test)]
 mod diag_logs_test;

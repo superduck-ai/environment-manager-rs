@@ -104,7 +104,7 @@ pub(super) struct DiagState {
 
 /// 诊断日志服务的共享运行状态。
 pub struct DiagService {
-    /// 对应 Go 包级 `slog.Default()`；构造时固定下来，供后台任务和同步记录路径共享。
+    /// 构造时固定的 tracing logger，供后台任务和同步记录路径共享。
     pub(super) logger: Logger,
     pub(super) state: Mutex<DiagState>,
     pub(super) cc_collector: Option<Arc<CcLogCollector>>,

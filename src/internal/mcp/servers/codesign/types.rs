@@ -1,4 +1,4 @@
-//! code-sign server 的恢复类型。
+//! code-sign server 的数据类型。
 //!
 //! wire 字段严格区分本地 [`SignRequest::content`] 与远端
 //! [`RemoteSignRequest::contents`]；source 只携带签名 API 所需的仓库标识，绝不复制

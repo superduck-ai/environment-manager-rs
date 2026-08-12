@@ -44,7 +44,7 @@ use crate::internal::{
 use super::{
     AnthropicEnvironmentType, AnthropicError, Config, Language, RunScriptError, decode_config,
     install_scripts,
-    zz_recovered_types::{HookConfig, ScopedActivityRecorder, SharedScopedRecorder, boxed},
+    types::{HookConfig, ScopedActivityRecorder, SharedScopedRecorder, boxed},
 };
 
 /// Baku 镜像内置 Vite 模板目录。
@@ -108,10 +108,9 @@ pub static REGISTRATION: LazyLock<Registration> = LazyLock::new(|| Registration 
 
 /// 对应 Go：`internal/envtype/anthropic/anthropic.go` 中的 `New`。
 ///
-/// 从后端 JSON 创建 Anthropic 环境，并保存 manager 传入的 logger。Go 接受 nil
-/// logger 并在方法入口回退到 `slog.Default()`；Rust 的生产 Factory 总能拿到 manager
-/// logger，因此通过非 Optional 类型在构造期消除 nil 分支。测试若不关心日志，必须
-/// 显式传入 discard logger，避免误用没有 subscriber 的 tracing。
+/// 从后端 JSON 创建 Anthropic 环境，并保存 manager 传入的 logger。Rust 的
+/// 生产 Factory 总能拿到 manager logger，因此通过非 Optional 类型在构造期
+/// 消除 nil 分支。测试若不关心日志，应显式传入 discard logger。
 ///
 /// # 参数
 /// - `data`：Anthropic 环境原始 JSON；函数只在解码期间借用。
@@ -602,8 +601,8 @@ impl AnthropicEnvironmentType {
         cancellation: &CancellationToken,
     ) -> Result<(), AnthropicError> {
         let languages = self.config_ref().languages.clone();
-        // 该日志与 Initialize 外层日志同文案、同属性，必须保持第二个
-        // 独立 runtime caller 才能对应 Go installLanguages 内的 source line。
+        // 该日志与 Initialize 外层日志同文案、同属性，保留第二个独立
+        // runtime caller 以区分 installLanguages 阶段。
         self.logger.info(
             "Installing languages",
             attributes([("language_count", json!(languages.len()))]),

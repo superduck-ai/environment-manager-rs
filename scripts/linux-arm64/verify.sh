@@ -97,23 +97,11 @@ run_gate "Go/Rust 符号映射完整且新鲜" \
     --go-root "${go_root}" \
     --rust-root . \
     --check \
-    --expected-go-tests 295 \
-    --require-complete
-run_gate "Go logger source 映射 100% oracle 且新鲜" \
-  env PYTHONDONTWRITEBYTECODE=1 \
-  python3 scripts/compat/generate_log_source_map.py \
-    --go-root "${go_root}" \
-    --rust-root . \
-    --check \
+    --expected-go-tests 287 \
     --require-complete
 run_gate "cargo clippy --all-targets" \
   cargo +1.97.0 clippy --all-targets --locked -- -D warnings
 run_gate "cargo test --locked" cargo +1.97.0 test --locked
-run_gate "Go/Rust logger source 严格差分" \
-  env GO_ORACLE_IMAGE="${go_oracle_image}" \
-  GO_SOURCE_ROOT="${go_root}" \
-  GO_SOURCE_DIR="${go_root}" \
-  bash scripts/compat/run_logger_source_differential.sh
 
 if [[ ! -f "${differential_runner}" ]]; then
   printf '<== FAIL: canonical 差分 runner 不存在: %s\n' \

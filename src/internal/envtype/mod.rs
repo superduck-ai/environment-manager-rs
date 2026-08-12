@@ -9,10 +9,10 @@ pub mod byoc;
 #[allow(clippy::module_inception)]
 pub mod envtype;
 pub mod shared;
-pub mod zz_recovered_types;
+pub mod types;
 
 pub use envtype::{EnvTypeError, new_env_types};
-pub use zz_recovered_types::{
+pub use types::{
     EnvTypes, EnvironmentType, Factory, LeaseManagerHandle, LeaseManagerProvider, Registration,
 };
 

@@ -8,7 +8,7 @@
 use std::{collections::HashMap, fmt, io, sync::Arc};
 
 use crate::internal::{
-    logger::{LogAttributes, LogLevel, Logger, default_slog_logger},
+    logger::{LogAttributes, LogLevel, Logger, default_logger},
     util::{claude_code_version, go_path_escape, version},
 };
 use axum::{body::Body, response::Response};
@@ -88,12 +88,12 @@ impl Handler {
         http_client: reqwest::Client,
         repo_tokens: HashMap<String, String>,
     ) -> Self {
-        // Go server 在创建 handler 前已经把 nil logger 替换为 slog.Default。测试会
-        // 直接构造 Handler，因此这里也独立执行同一替换，保证两条入口行为一致。
+        // 测试会直接构造 Handler，因此这里也在边界解析默认
+        // tracing logger，保证两条入口行为一致。
         let logger = config
             .logger
             .clone()
-            .unwrap_or_else(|| default_slog_logger().clone());
+            .unwrap_or_else(|| default_logger().clone());
         Self {
             config,
             http_client,

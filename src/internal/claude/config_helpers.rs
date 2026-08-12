@@ -5,7 +5,7 @@
 
 use crate::internal::{config::ClaudeConfig, logger::Logger};
 
-use super::zz_recovered_types::claude_attrs;
+use super::types::claude_attrs;
 
 /// 选择 Claude 可执行文件路径并记录非默认来源。
 #[must_use]

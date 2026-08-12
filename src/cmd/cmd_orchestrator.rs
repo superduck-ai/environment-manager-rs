@@ -19,7 +19,7 @@ use super::error::CliError;
 use super::utils::{
     LogLevel, bool_value, flag_arg, logger_level, parse_go_duration, parse_log_level,
 };
-use crate::internal::logger::{LogAttributes, Logger, create_logger_with_file_output};
+use crate::internal::logger::{LogAttributes, Logger, create_logger};
 use crate::internal::orchestrator::{
     CommandOutcome, Hook, OrchestratorConfig, OrchestratorError, OrchestratorResult,
     PollerInterface, SandboxAdapter, SandboxRequest, log_command_wrapped_with_sandbox,
@@ -361,7 +361,7 @@ pub async fn run_orchestrator(
     arguments: &OrchestratorArgs,
     executable: &std::ffi::OsStr,
 ) -> Result<(), String> {
-    let logger = create_logger_with_file_output(logger_level(arguments.log_level));
+    let logger = create_logger(logger_level(arguments.log_level));
     logger.info(
         "orchestrator configured",
         orchestrator_configured_attributes(arguments),

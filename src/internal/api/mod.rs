@@ -11,8 +11,8 @@ mod retry;
 mod session_ingress_backend;
 mod session_ingress_client;
 mod session_ingress_types;
+mod types;
 mod work_client;
-mod zz_recovered_types;
 
 pub use ccr_backend::CCRBackend;
 pub use client::{ApiError, ClientOptions, HttpClient};
@@ -29,8 +29,8 @@ pub use session_ingress_types::{
     new_env_manager_log_event, new_env_manager_log_event_data, new_result_event,
     new_synthetic_assistant_message,
 };
+pub use types::*;
 pub use work_client::WorkClient;
-pub use zz_recovered_types::*;
 
 #[cfg(test)]
 #[path = "client_test.rs"]

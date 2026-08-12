@@ -1,6 +1,6 @@
 //! podmonitor 的共享状态、wire DTO 与可判定错误类型。
 //!
-//! 文件名对应 Go `zz_recovered_types.go`。与 Go 把所有字段直接放进一个结构体不同，
+//! 类型源自 Go `zz_recovered_types.go`。与 Go 把所有字段直接放进一个结构体不同，
 //! Rust 用 `Arc<LeaseManagerInner>` 共享只读配置，用 `RwLock<LeaseState>` 保护短时状态，
 //! 并让网络请求和定时等待永远不持有锁。
 

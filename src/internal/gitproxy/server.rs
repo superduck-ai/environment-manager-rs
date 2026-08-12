@@ -18,7 +18,7 @@ use axum::Router;
 use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, LogLevel, Logger, default_slog_logger};
+use crate::internal::logger::{LogAttributes, LogLevel, Logger, default_logger};
 
 use super::{
     Config, GitProxyError, GitProxyResult, Server, SharedServer,
@@ -45,12 +45,12 @@ impl ServerImpl {
     /// 使用已验证配置创建尚未监听的 server。
     fn new(config: Config) -> Self {
         let bound_port = config.port;
-        // 对应 Go `NewServer` 对 nil Logger 的 `slog.Default()` 替换。server、serve
-        // goroutine 与 handler 都因此共享同一个具体 logger，日志不会分流到 tracing。
+        // 在构造边界解析默认 logger，让 server、serve task 和 handler
+        // 共享同一个 tracing 接收端。
         let logger = config
             .logger
             .clone()
-            .unwrap_or_else(|| default_slog_logger().clone());
+            .unwrap_or_else(|| default_logger().clone());
         Self {
             config: Arc::new(config),
             logger,
@@ -59,7 +59,7 @@ impl ServerImpl {
         }
     }
 
-    /// 记录 server 生命周期事件，并保留调用处用于 Go source 映射。
+    /// 记录 server 生命周期事件。
     ///
     /// # 参数
     /// - `level`：Go 调用点对应的日志级别。
@@ -67,7 +67,7 @@ impl ServerImpl {
     /// - `attributes`：保持 Go 参数顺序和 JSON 标量类型的属性。
     ///
     /// # 副作用
-    /// 调用结构化 logger；logger handler 错误按 `slog` 语义被吞掉。
+    /// 调用结构化 logger；日志接收端错误不会改变 server 结果。
     #[track_caller]
     fn log(&self, level: LogLevel, message: &str, attributes: LogAttributes) {
         self.logger.log(level, message, attributes);

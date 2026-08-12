@@ -28,7 +28,7 @@ use super::orchestrator::orchestrator_configured_attributes;
 use super::setup::{
     check_npm_available, install_sandbox_runtime, load_service_key, run_api_healthcheck,
 };
-use super::zz_recovered_types::RetryConfig;
+use super::types::RetryConfig;
 use super::*;
 use crate::internal::orchestrator::default_orchestrator_logger;
 

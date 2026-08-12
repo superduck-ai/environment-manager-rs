@@ -11,7 +11,7 @@ mod init;
 mod install;
 mod outcomes;
 mod session_urls;
-mod zz_recovered_types;
+mod types;
 
 pub use claude_code_executor::new_claude_code_executor;
 pub use config_helpers::get_claude_path;
@@ -21,7 +21,7 @@ pub use install::{
 };
 pub use outcomes::Outcomes;
 pub use session_urls::build_session_urls;
-pub use zz_recovered_types::{
+pub use types::{
     ClaudeCodeExecutor, ClaudeError, ClaudeObservability, Executor, McpServerRegistration,
 };
 

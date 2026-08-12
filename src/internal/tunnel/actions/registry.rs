@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use crate::r#gen::proto::anthropic::sessions::tunnel::v1alpha::{
     Header, HttpTunnelResponseChunk, HttpTunnelResponseError, HttpTunnelResponseHeaders,
 };
-use crate::internal::logger::{LogAttributes, Logger, default_slog_logger};
+use crate::internal::logger::{LogAttributes, Logger, default_logger};
 
 use super::{
     Action, ActionError, ActionRequest, ActionResult, ProgressReporter, ProgressUpdate, Registry,
@@ -33,8 +33,7 @@ pub const DEFAULT_ACTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// 对应 Go：`actions.NewRegistry`。
 ///
-/// 创建空 action 表和运行集合。logger 为 `None` 时回退到进程默认 logger，严格保持
-/// Go `(*Registry).log` 返回 `slog.Default()` 的可观察行为。
+/// 创建空 action 表和运行集合。logger 为 `None` 时使用进程级 tracing logger。
 #[must_use]
 pub fn new_registry(logger: Option<Logger>) -> Registry {
     Registry {
@@ -337,11 +336,11 @@ impl Registry {
             .await;
     }
 
-    /// 返回 registry 配置的 logger；无 logger 时严格回退到 Go 的 `slog.Default()`。
+    /// 返回 registry 配置的 logger；未配置时使用进程级 tracing logger。
     fn log(&self) -> &Logger {
         match self.logger.as_ref() {
             Some(logger) => logger,
-            None => default_slog_logger(),
+            None => default_logger(),
         }
     }
 }

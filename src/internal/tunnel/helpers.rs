@@ -8,7 +8,7 @@ use std::io;
 use http::header::{HOST, HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 
-use crate::internal::logger::{Logger, default_slog_logger};
+use crate::internal::logger::{Logger, default_logger};
 
 use super::{Client, Handler, Header, TunnelError, WsHandler};
 
@@ -68,30 +68,30 @@ where
     Ok(output)
 }
 
-/// 返回 tunnel client 配置的 logger；未注入时回退到 Go `slog.Default()`。
+/// 返回 tunnel client 配置的 logger；未注入时使用进程级 tracing logger。
 #[must_use]
 pub(crate) fn client_logger(client: &Client) -> &Logger {
     match client.logger.as_ref() {
         Some(logger) => logger,
-        None => default_slog_logger(),
+        None => default_logger(),
     }
 }
 
-/// 返回 HTTP handler 配置的 logger；未注入时回退到 Go `slog.Default()`。
+/// 返回 HTTP handler 配置的 logger；未注入时使用进程级 tracing logger。
 #[must_use]
 pub(crate) fn handler_logger(handler: &Handler) -> &Logger {
     match handler.logger.as_ref() {
         Some(logger) => logger,
-        None => default_slog_logger(),
+        None => default_logger(),
     }
 }
 
-/// 返回 WebSocket handler 配置的 logger；未注入时回退到 Go `slog.Default()`。
+/// 返回 WebSocket handler 配置的 logger；未注入时使用进程级 tracing logger。
 #[must_use]
 pub(crate) fn ws_logger(handler: &WsHandler) -> &Logger {
     match handler.logger.as_ref() {
         Some(logger) => logger,
-        None => default_slog_logger(),
+        None => default_logger(),
     }
 }
 

@@ -174,7 +174,7 @@ pub struct HttpClient {
     pub(crate) http_client: reqwest::Client,
     /// 默认重试配置。
     pub(crate) retry_config: RetryConfig,
-    /// 对应 Go `HttpClient.logger`，所有重试事件必须进入同一个 `slog` 兼容 handler。
+    /// 所有重试事件共享的 logger。
     pub(crate) logger: Option<Logger>,
     /// 已验证的默认 header。
     default_headers: HeaderMap,
@@ -215,8 +215,8 @@ impl HttpClient {
 
     /// 对应 Go `NewHttpClientWithOptions`，创建带 30 秒连接超时的连接池。
     ///
-    /// `logger` 与返回 client 绑定，确保 `RetryableHTTPDo` 的 attempt/backoff 日志使用
-    /// 调用链原有 handler、绑定属性与 Go source 映射，而不是无订阅者的全局 tracing。
+    /// `logger` 与返回 client 绑定，确保 `RetryableHTTPDo` 的 attempt/backoff 日志
+    /// 使用调用链原有接收端和绑定属性。
     pub fn with_options(
         base_url: &str,
         logger: Option<Logger>,
@@ -265,7 +265,7 @@ impl HttpClient {
     /// # 参数
     /// - `base_url`：后端 API 根地址，保持原 scheme/path，仅移除全部尾随斜杠。
     /// - `http_client`：所有权转入返回值的已配置 Reqwest client；clone 仍共享连接池。
-    /// - `logger`：沿用上层 Go `slog.Logger` 的兼容 facade；测试可传 `None` 静默。
+    /// - `logger`：沿用上层结构化 logger；测试可传 `None` 静默。
     /// - `retry_config`：通用 JSON API 的可选重试参数；为空时采用默认值。
     ///
     /// # 兼容性

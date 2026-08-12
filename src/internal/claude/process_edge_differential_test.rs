@@ -37,7 +37,7 @@ use crate::internal::{
 
 use super::{
     claude_code_executor::{add_token_via_file_descriptor, install_token_descriptors},
-    zz_recovered_types::run_combined_command,
+    types::run_combined_command,
 };
 
 /// 为 process-edge probe 创建显式丢弃日志的具体 Logger。

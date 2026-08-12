@@ -6,11 +6,11 @@
 
 pub mod noop_activity_recorder;
 pub mod session_activity_recorder;
-pub mod zz_recovered_types;
+pub mod types;
 
 pub use noop_activity_recorder::NoopStopper;
 pub use session_activity_recorder::new_activity_recorder;
-pub use zz_recovered_types::{
+pub use types::{
     ActivityRecorder, ActivityRecorderError, EventPoster, LongRunningActivityState,
     NoopActivityRecorder, RecorderOptions, SessionActivityRecorder,
 };

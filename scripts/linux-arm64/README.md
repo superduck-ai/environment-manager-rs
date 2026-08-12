@@ -28,8 +28,7 @@ scripts/linux-arm64/verify.sh
 
 脚本同步源码到 `/home/arthur/environment-manager` 后，依次检查 Ubuntu 24.04 ARM64、
 Rust 1.97.0、原生 GNU host triple、不可变 Go 基线、格式、中文注释、rustdoc 链接、
-Cargo.lock 禁止依赖、完整符号映射、100% Go logger source oracle 映射、Clippy、全部
-Rust 测试、logger source 严格 transcript，以及 Go/Rust 协议差分。
+Cargo.lock 禁止依赖、完整符号映射、Clippy、全部 Rust 测试以及 Go/Rust 协议差分。
 
 `verify-cargo-dependencies.sh` 使用 Python `tomllib` 解析 Cargo 实际 lockfile，而不是
 扫描 Cargo.toml 文本。它拒绝 `tonic`/`tonic-*`、`git2`/`libgit2-sys`、
@@ -48,26 +47,10 @@ HTTP API、V0/V1 input、MCP Streamable HTTP 以及 Tunnel HTTP/WebSocket ProtoJ
 请求/响应原文不会在被测实现中归一化；input 的不可预测解析耗时保留原始整数，
 仅由比较器按 manifest 中唯一审核规则验证后处理。
 
-logger source 使用独立的 `scripts/compat/run_logger_source_differential.sh`。它将 catalog
-probe 复制到容器临时目录，并从固定 Go 1.25.7 `-trimpath` ARM64 ELF 提取生产 slog
-调用表达式内的 PC；随后由同一个 ELF 用 `runtime.CallersFrames` 解析
-`function/file/line`。对于 canonical CLI 已证明候选 PC 不等于真实 `slog.Record.PC` 的
-多行调用，生成器只接受 `compat/go-log-source-canonical-overrides.tsv` 中钉住 probe
-旧值、canonical 新值和证据用例的逐项覆盖，再重建 `compat/go-log-source-oracle.tsv`。
-函数、文件、调用表达式范围或 probe 原值漂移都会失败。probe 只通过不可达环境变量
-分支保留原程序链接器会裁掉的 `UpdateRemoteURLs` 调用点，不执行该业务路径，也不修改
-只读 Go 工作树。脚本逐字节核对仓库 oracle，再运行 Go/Rust `LogWriter` 完整行与截断
-行 probe。该 transcript 不包含 time；`function`、`file`、`line` 从不归一化。
+日志使用 Rust `tracing` 输出到 stderr 和 `/tmp/env-manager.log`，不再生成或校验 Go
+`slog` source oracle。协议差分仍比较明确列入 transcript 的业务日志级别、消息和属性。
 
-`compat/go-rust-log-sources.tsv` 的发布规则是双向且 fail-closed：每个 Rust `Logger`
-调用必须解析成一个 `mapped-oracle` 规则，同时 683 个 Go 生产 slog 调用点中的每一个
-必须恰好由一个 Rust runtime callsite 消费。未消费、被多个 Rust callsite 消费、source
-identity 冲突、无 Go 对应的 runtime 规则、动态消息以及 Rust-only 事件都会阻断门禁。
-生产源码中的 `tracing::{trace,debug,info,warn,error}!` 由独立扫描器全部标记为
-`tracing-event-not-source-compatible`，不能冒充带精确 Go caller 的 `Logger` 事件；runtime
-loader 对未映射调用输出显式 sentinel，也不会退回 Rust caller。
-
-## Go 基线和两种 oracle 构建
+## Go 基线和 oracle 构建
 
 `verify-go-baseline.sh` 除 HEAD、tracked diff 和关键文件 SHA 外，还读取：
 
@@ -91,11 +74,8 @@ scripts/linux-arm64/build-go-oracle.sh \
 静态 AArch64 ELF、没有 `INTERP` 和动态 `NEEDED`，并在 Ubuntu ARM64 宿主执行一次
 限时 `--help` 烟测；release 对即将提升的最终路径再独立复核一次。
 
-logger source 差分仍由 `scripts/compat/build_go_oracle.sh` 构建行为 oracle。它为了测试依赖
-只读与复用缓存，使用 `CGO_ENABLED=1`、`-mod=readonly`、不剥离符号，并默认注入
-测试版本 `0.1.0`。因此这个二进制只用于对比外部行为，不承诺与正式 rollback
-逐字节相同，也不会被 release 保存。协议差分另外用 `go test -overlay` 注入 probe；
-overlay 不进入 Go 工作树，也不属于 rollback 定义。
+协议差分用 `go test -overlay` 注入 probe；overlay 不进入 Go 工作树，也不属于 rollback
+定义。
 
 ## 构建 staging 候选
 
@@ -109,9 +89,7 @@ scripts/linux-arm64/build-release-artifact.sh
 同文件系统目录 rename 一次性发布四件套。它在 allowlist 中的
 AlmaLinux 9 ARM64 镜像内使用 Rust 1.97.0 构建，然后用 `file`/`readelf` 验证
 AArch64 GNU ELF、动态加载器、libc、无 OpenSSL 依赖及最高 `GLIBC_2.34`。
-即使不先运行 `verify.sh`，候选脚本也会重新检查只读 Go 基线，并执行 logger source
-映射的 `--check --require-complete`；因此单独调用 preflight 不能把静态近似映射装进
-候选产物。
+即使不先运行 `verify.sh`，候选脚本也会重新检查只读 Go 基线和 Cargo 依赖。
 
 候选目录包含四份互相绑定的证据：
 

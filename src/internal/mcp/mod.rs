@@ -9,13 +9,13 @@ mod registry;
 mod rmcp_adapter;
 mod server;
 pub mod servers;
-mod zz_recovered_types;
+mod types;
 
 pub use registry::{
     get_mcp_registrations, new_registration, register_server, register_with_claude,
 };
 pub use server::{MCP_ENDPOINT_PATH, dispatch_json_rpc};
-pub use zz_recovered_types::{
+pub use types::{
     BaseServer, CallToolParams, CallToolRequest, CallToolResult, MCPServer, MCPServerConfigurator,
     MCPServerFactory, MCPServerRegistration, McpError, McpResult, ServerConfig, ShouldRegister,
     TextContent, Tool, ToolConfig, ToolHandler, new_tool_result_error, new_tool_result_text,

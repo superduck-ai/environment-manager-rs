@@ -22,7 +22,7 @@ use crate::internal::{
     mcp::{
         CallToolRequest, CallToolResult, MCPServer, McpError, McpResult, ServerConfig, Tool,
         ToolConfig, ToolHandler, new_tool_result_error, new_tool_result_text,
-        zz_recovered_types::log_attributes,
+        types::log_attributes,
     },
     util::go_path_escape,
 };

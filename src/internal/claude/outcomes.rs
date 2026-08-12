@@ -5,15 +5,14 @@
 //! `nil map` 与 `NewOutcomes` 创建的非 nil 空 map 之间的差异；写入和导出则依靠
 //! Rust 所有权或显式克隆，维持 Go `append([]string(nil), branches...)` 的隔离语义。
 //!
-//! 与 Go 的结构差异仅在于 Rust 不允许安全代码调用 nil `*Outcomes` 或 nil
-//! `*slog.Logger`。`validate()` 仍明确使用进程级 `slog.Default()` 兼容 logger，避免
-//! 把这两个可观察日志点路由到应用 tracing subscriber。
+//! Rust 不允许安全代码调用 nil `*Outcomes`；`validate()` 使用进程级
+//! tracing logger，显式注入的路径则便于测试捕获。
 
 use std::{collections::HashMap, fmt};
 
-use crate::internal::logger::{Logger, default_slog_logger};
+use crate::internal::logger::{Logger, default_logger};
 
-use super::zz_recovered_types::claude_attrs;
+use super::types::claude_attrs;
 
 /// 一个 session 允许写入的仓库及其目标分支。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -137,7 +136,7 @@ impl Outcomes {
 
     /// 对应 Go：`(*Outcomes).Validate`。
     ///
-    /// 使用进程级 `slog.Default()` 兼容 logger 验证当前集合。多分支仓库只保留第一
+    /// 使用进程级 tracing logger 验证当前集合。多分支仓库只保留第一
     /// 项，空分支列表原样保留；原集合不会被修改。
     ///
     /// # 返回
@@ -148,7 +147,7 @@ impl Outcomes {
     /// 默认 logger 的 INFO 门槛会像 Go 一样过滤 DEBUG 记录。
     #[must_use]
     pub fn validate(&self) -> Self {
-        self.validate_with_logger(default_slog_logger())
+        self.validate_with_logger(default_logger())
     }
 
     /// 对应 Go：`(*Outcomes).ValidateWithLogger`。

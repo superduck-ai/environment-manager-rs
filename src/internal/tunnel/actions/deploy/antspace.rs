@@ -16,13 +16,11 @@ use tar::{Builder as TarBuilder, Header};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
-use crate::internal::logger::{LogAttributes, Logger, default_slog_logger};
+use crate::internal::logger::{LogAttributes, Logger, default_logger};
 use crate::internal::tunnel::actions::{ActionError, ProgressUpdate};
 
+use super::types::{AntspaceClient, AntspaceDeployResult, AntspaceResponse, OptionalProgress};
 use super::vercel::MAX_DEPLOYMENT_BYTES;
-use super::zz_recovered_types::{
-    AntspaceClient, AntspaceDeployResult, AntspaceResponse, OptionalProgress,
-};
 
 /// Antspace 整次 HTTP 请求的固定超时，对应 Go 的十五分钟 `http.Client.Timeout`。
 const ANTSPACE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -268,11 +266,11 @@ impl AntspaceClient {
         }))
     }
 
-    /// 返回 Antspace client 配置的 logger；缺省时严格复刻 Go 的 `slog.Default()`。
+    /// 返回 Antspace client 配置的 logger；缺省时使用进程级 tracing logger。
     fn log(&self) -> &Logger {
         match self.logger.as_ref() {
             Some(logger) => logger,
-            None => default_slog_logger(),
+            None => default_logger(),
         }
     }
 }

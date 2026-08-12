@@ -28,7 +28,7 @@ use super::task_run::{
     load_context_from_bytes, run_task_run_manager, task_run_claude_path, validate_api_base_url,
     wrap_claude_code_availability_error,
 };
-use super::zz_recovered_types::{StdinConfigClient, TaskContext};
+use super::types::{StdinConfigClient, TaskContext};
 
 use super::*;
 

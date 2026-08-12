@@ -4,10 +4,10 @@
 //! 服务是否已经监听。
 
 mod action;
-mod zz_recovered_types;
+mod types;
 
 pub use action::{STATUS_TIMEOUT, new_status_action};
-pub use zz_recovered_types::StatusAction;
+pub use types::StatusAction;
 
 #[cfg(test)]
 mod action_test;

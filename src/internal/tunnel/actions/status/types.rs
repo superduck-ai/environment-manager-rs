@@ -1,4 +1,4 @@
-//! 对应 Go `internal/tunnel/actions/status/zz_recovered_types.go` 的恢复类型。
+//! Status action 的数据结构。
 //!
 //! 类型字段顺序与 JSON rename 保持 Go 行为；执行逻辑仍在 `action.rs`，从而让类型
 //! 对照文件只描述状态，不复制网络探测流程。

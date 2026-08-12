@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     claude_code_executor::filter_init_only_from_environ,
     config_helpers::get_claude_path,
-    zz_recovered_types::{
+    types::{
         ClaudeError, ClaudeObservability, claude_attrs, go_utf8_error_view, run_combined_command,
     },
 };

@@ -7,11 +7,11 @@
 mod handler;
 mod manager;
 mod server;
-mod zz_recovered_types;
+mod types;
 
 pub use manager::new_manager;
 pub use server::new_server;
-pub use zz_recovered_types::{
+pub use types::{
     Config, GitProxyError, GitProxyResult, Manager, RepoAuth, Server, SharedManager, SharedServer,
 };
 

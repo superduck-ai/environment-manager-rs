@@ -6,11 +6,11 @@
 #[path = "config.rs"]
 mod implementation;
 pub mod session_mode;
-pub mod zz_recovered_types;
+pub mod types;
 
 pub use implementation::{ConfigError, default_claude_config};
 pub use session_mode::{SessionMode, SessionModeParseError, parse_session_mode};
-pub use zz_recovered_types::{
+pub use types::{
     BaseSource, ClaudeConfig, GitInfo, GitOutcomeInfo, GitRepositorySource, McpConfig,
     McpConfigFile, McpServerConfig, McpServerConfigTool, OutcomeField, PermissionPolicy, Session,
     Source, StartupContext,

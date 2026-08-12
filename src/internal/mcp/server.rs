@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use crate::internal::logger::{LogLevel, Logger};
 
 use super::rmcp_adapter;
-use super::zz_recovered_types::{
+use super::types::{
     BaseServer, CallToolRequest, MCPServer, McpError, McpResult, ServerConfig, ServerRuntime,
     ToolConfig, log_attributes,
 };
@@ -678,8 +678,7 @@ impl axum::serve::Listener for McpTimeoutListener {
             match self.inner.accept().await {
                 Ok((stream, address)) => return (McpTimeoutStream::new(stream), address),
                 Err(_) => {
-                    // Go `http.Server.Serve` 对临时 accept 错误内部退避；它不通过业务
-                    // slog logger 发事件，因此这里也只退避，避免产生 Rust-only source。
+                    // 临时 accept 错误只做内部退避，避免额外产生业务日志。
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }

@@ -24,7 +24,7 @@ use crate::internal::{
     util::{OutputStreamer, StreamType},
 };
 
-use super::zz_recovered_types::{
+use super::types::{
     ProcessError, ProcessExitError, ProcessResult, go_errno_text, go_spawn_error,
     resolve_go_command,
 };
@@ -43,7 +43,7 @@ const STREAM_BUFFER_SIZE: usize = 32 * 1024;
 /// # 参数
 /// - `cancellation`：上层 context 的取消令牌，只终止 direct child。
 /// - `logger`：manager 注入的具体 session logger；克隆后分别交给 stdout/stderr
-///   reader，保留 Go `*slog.Logger` 的同一 handler。
+///   reader，共享同一个 tracing 接收端。
 /// - `path`：不带参数的 executable 名称或路径，允许 Unix 非 UTF-8 字节。
 /// - `streamer`：每次管道读取后同步调用的输出处理器；错误会停止对应 reader。
 ///
@@ -289,7 +289,7 @@ fn close_owned_pipe(pipe: OwnedFd) -> io::Result<()> {
     })
 }
 
-/// 按调用顺序构造 slog 兼容属性，避免日志迁移时遗漏或重排字段。
+/// 按调用顺序构造结构化日志属性。
 pub(super) fn attributes<const N: usize>(pairs: [(&str, Value); N]) -> LogAttributes {
     pairs
         .into_iter()

@@ -1,6 +1,6 @@
 //! MCP 迁移边界的数据类型与异步接口。
 //!
-//! 文件名对应 Go `zz_recovered_types.go`。JSON 类型使用 `serde(flatten)` 保存未知
+//! 类型源自 Go `zz_recovered_types.go`。JSON 类型使用 `serde(flatten)` 保存未知
 //! 字段，避免代理或新协议版本经过本服务时被旧结构无意裁剪；运行期资源使用 Arc、
 //! Tokio cancellation token 与显式 async trait，替代 Go interface、goroutine 和 channel。
 

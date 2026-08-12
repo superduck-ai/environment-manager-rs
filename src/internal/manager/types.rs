@@ -1,6 +1,6 @@
-//! Manager 生命周期编排所需的恢复类型与窄适配边界。
+//! Manager 生命周期编排所需的类型与窄适配边界。
 //!
-//! 本文件机械对应 Go `internal/manager/zz_recovered_types.go`。Rust 版本把同步
+//! 这些声明对应 Go `internal/manager/zz_recovered_types.go`。Rust 版本把同步
 //! function/interface 改为可共享闭包和 async trait；API 附加上下文、o11y 诊断及
 //! environment lease 的动态能力通过局部 adapter 暴露，避免 manager 反向依赖具体实现。
 

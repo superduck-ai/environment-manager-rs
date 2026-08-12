@@ -1,4 +1,4 @@
-//! 对应 Go `internal/orchestrator/zz_recovered_types.go` 的类型声明。
+//! Orchestrator 的共享类型声明。
 //!
 //! 恢复出的 Go 文件把协议 DTO、轮询 trait 和 orchestrator 配置集中在一起；Rust
 //! 版本保留同一文件边界，并用 `Arc<dyn Trait>` 表达可共享接口、用
@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, Logger, default_slog_logger};
+use crate::internal::logger::{LogAttributes, Logger, default_logger};
 
 /// 与 Go `json.RawMessage` 对应的原始 JSON 字节。
 pub type RawMessage = Vec<u8>;
@@ -210,7 +210,7 @@ pub struct OrchestratorConfig {
     pub loop_timeout: Duration,
     /// 连续 poll 失败上限；0 表示无限重试。
     pub max_poll_failures: i64,
-    /// 可选结构化 logger；缺省使用 Go 进程级 `slog.Default()` 兼容实现。
+    /// 可选结构化 logger；缺省使用进程级 Rust tracing logger。
     pub logger: Option<Logger>,
     /// 可选 o11y adapter。
     pub observer: Option<Arc<dyn OrchestratorObserver>>,
@@ -340,20 +340,16 @@ pub struct WhoamiResponse {
     pub environment_id: String,
 }
 
-/// 对应 Go：orchestrator 构造函数中缺省使用 `slog.Default()` 的分支。
+/// 返回 orchestrator 的进程级默认 logger。
 ///
 /// # 返回
-/// 返回 Go legacy 默认 logger 的轻量克隆；克隆共享同一个加锁的 stderr writer，
-/// 因而并发日志仍按完整行原子写出。
+/// 返回 Rust tracing logger 的轻量克隆。
 ///
 /// # 副作用
-/// 第一次调用会惰性初始化进程级默认 logger，之后的 INFO 及以上记录会写到 stderr。
-///
-/// # 兼容性
-/// 不能退回 `tracing`：Go 基线在调用方没有传 logger 时使用标准库
-/// `slog.Default()`，其时间、级别和属性文本格式属于可观察的命令行行为。
+/// 第一次调用会惰性初始化进程级 subscriber，之后的 INFO 及以上
+/// 记录会写到 stderr 和默认日志文件。
 pub fn default_orchestrator_logger() -> Logger {
-    default_slog_logger().clone()
+    default_logger().clone()
 }
 
 /// 创建有序结构化日志属性。

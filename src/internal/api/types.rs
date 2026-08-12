@@ -1,4 +1,4 @@
-//! 对应 Go `internal/api/zz_recovered_types.go` 的协议类型。
+//! API 协议类型。
 //!
 //! 原 Go 文件由 DWARF 恢复；这里保留 JSON 字段和零值语义，并用 `Option` 明确表示
 //! `omitempty`。动态事件内容使用 `serde_json::Value`，以免枚举封闭后丢弃后端新增字段。

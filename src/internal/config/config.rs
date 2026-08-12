@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use super::zz_recovered_types::{
+use super::types::{
     BaseSource, ClaudeConfig, GitRepositorySource, McpServerConfig, Session, Source, StartupContext,
 };
 

@@ -13,7 +13,7 @@ use opentelemetry_sdk::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, Logger, default_slog_logger};
+use crate::internal::logger::{LogAttributes, Logger, default_logger};
 
 use super::{
     CachedInstrument, KvTagProvider, MetricTags, MetricsExporter, O11yConfig, O11yContext,
@@ -43,9 +43,9 @@ pub(crate) fn init_otel_metrics(
     resource: Option<Resource>,
     exporter: Option<MetricsExporter>,
 ) -> Result<O11yMetricsProvider, O11yError> {
-    // Go 在该函数入口把 nil logger 替换成 slog.Default；必须在 provider 构造时只做
-    // 一次解析，不能在故障分支中改用 tracing，否则输出格式和最低级别都会改变。
-    let logger = logger.unwrap_or_else(|| default_slog_logger().clone());
+    // 在 provider 构造边界一次性解析默认 logger，使后续故障记录共享
+    // 同一个 tracing 接收端。
+    let logger = logger.unwrap_or_else(|| default_logger().clone());
     let mut builder = SdkMeterProvider::builder();
     if let Some(resource) = resource {
         builder = builder.with_resource(resource);

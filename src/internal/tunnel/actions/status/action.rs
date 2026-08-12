@@ -10,12 +10,12 @@ use async_trait::async_trait;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, Logger, default_slog_logger};
+use crate::internal::logger::{LogAttributes, Logger, default_logger};
 use crate::internal::tunnel::actions::{
     Action, ActionError, ActionRequest, ActionResult, ProgressReporter,
 };
 
-use super::zz_recovered_types::{StatusAction, StatusRequest, StatusResult};
+use super::types::{StatusAction, StatusRequest, StatusResult};
 
 /// 对应 Go `(*StatusAction).Timeout`：端口探测 action 最多运行五秒。
 pub const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -62,7 +62,7 @@ impl Action for StatusAction {
         };
 
         let mut attributes = LogAttributes::new();
-        // 属性顺序必须与 Go 的 slog 参数顺序一致；默认 stderr handler 会原样保留该顺序。
+        // 按业务参数顺序组装结构化属性。
         attributes.insert(
             "session_id".to_owned(),
             serde_json::Value::String(request.session_id),
@@ -75,7 +75,7 @@ impl Action for StatusAction {
         attributes.insert("listening".to_owned(), serde_json::Value::Bool(listening));
         let logger = match self.logger.as_ref() {
             Some(logger) => logger,
-            None => default_slog_logger(),
+            None => default_logger(),
         };
         logger.info("status_check", attributes);
 

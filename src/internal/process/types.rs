@@ -1,6 +1,6 @@
 //! 进程执行结果与错误类型。
 //!
-//! 本文件机械对应 Go `internal/process/zz_recovered_types.go`。Go 恢复类型名为
+//! 这些声明对应 Go `internal/process/zz_recovered_types.go`。Go 恢复类型名为
 //! `Result`；Rust 同时保留该精确名称和迁移早期使用的 `ProcessResult` 别名，避免与
 //! 标准库 `Result<T, E>` 混淆时仍可逐项对照。
 

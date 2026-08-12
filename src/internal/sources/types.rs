@@ -1,4 +1,4 @@
-//! `internal/sources` 的恢复类型与跨子系统适配边界。
+//! `internal/sources` 的共享类型与跨子系统适配边界。
 //!
 //! Go 版本依赖 interface、可空 interface 和具体 `gitproxy.Manager`。Rust
 //! 版本分别使用 trait object、[`SourceSlot`] 与显式 proxy factory 表达这些语义；

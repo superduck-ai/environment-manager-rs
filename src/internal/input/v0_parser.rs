@@ -18,10 +18,8 @@ use crate::internal::auth::{
 use crate::internal::config::{ConfigError, StartupContext};
 use crate::internal::logger::{LogAttributes, Logger};
 
+use super::types::{EnvironmentConfigResponse, InputParser, Outcomes, ParsedContext, V0Parser};
 use super::v1_parser::normalize_api_base_url;
-use super::zz_recovered_types::{
-    EnvironmentConfigResponse, InputParser, Outcomes, ParsedContext, V0Parser,
-};
 
 /// V0 stdin 解析失败。
 #[derive(Debug, Error)]

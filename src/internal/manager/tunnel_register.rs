@@ -21,7 +21,7 @@ use crate::internal::{
     },
 };
 
-use super::zz_recovered_types::{CreateTunnelClientFunc, Manager, ManagerError, TunnelClient};
+use super::types::{CreateTunnelClientFunc, Manager, ManagerError, TunnelClient};
 
 /// 创建 Manager 构造函数安装的默认 tunnel factory。
 ///

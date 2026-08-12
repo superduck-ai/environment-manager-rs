@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::internal::{
     config::Source,
-    mcp::{McpError, McpResult, zz_recovered_types::log_attributes},
+    mcp::{McpError, McpResult, types::log_attributes},
     util::{claude_code_version, version},
 };
 

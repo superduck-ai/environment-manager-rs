@@ -59,7 +59,27 @@ REMOVED_COBRA_COMPATIBILITY = {
         "cmd/utils.go",
         "markRequiredFlags",
     ): "Cobra required-flag annotations were removed; Clap arguments declare requiredness directly",
+    (
+        "cmd/cmd_provision_packages.go",
+        "commandExitError.Error",
+    ): "Cobra commandExitError compatibility was removed with positional-argument emulation",
+    (
+        "cmd/cmd_provision_packages.go",
+        "commandExitError.Unwrap",
+    ): "Cobra commandExitError compatibility was removed with positional-argument emulation",
+    (
+        "cmd/cmd_provision_packages.go",
+        "ExitCode",
+    ): "Cobra commandExitError compatibility was removed with positional-argument emulation",
 }
+RUST_NATIVE_LOGGING_FILES = frozenset(
+    {
+        "internal/logger/file_logger.go",
+        "internal/logger/file_logger_test.go",
+        "internal/logger/multi_handler.go",
+        "internal/logger/multi_handler_test.go",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -120,10 +140,12 @@ def receiver_type(receiver: str | None) -> str | None:
 
 
 def expected_rust_path(relative: Path) -> Path:
-    """返回旧布局下的机械期望路径；实际命中路径由符号索引决定。"""
+    """返回 Rust 约定下的期望路径；实际命中路径由符号索引决定。"""
 
     if relative == Path("main.go"):
         return Path("src/main.rs")
+    if relative.name == "zz_recovered_types.go":
+        relative = relative.with_name("types.go")
     return Path("src") / relative.with_suffix(".rs")
 
 
@@ -675,6 +697,7 @@ def collect(go_root: Path, rust_root: Path) -> list[list[str]]:
 
     for source_path in go_files(go_root):
         relative = source_path.relative_to(go_root)
+        rust_native_logging = relative.as_posix() in RUST_NATIVE_LOGGING_FILES
         expected = expected_rust_path(relative)
         source = source_path.read_text(encoding="utf-8")
         is_generated = generated_proto(relative, source)
@@ -692,6 +715,22 @@ def collect(go_root: Path, rust_root: Path) -> list[list[str]]:
             go_symbol = f"{receiver + '.' if receiver else ''}{name}"
             kind = "test" if name.startswith("Test") else ("method" if receiver else "function")
             go_location = f"{relative.as_posix()}:{line_number}"
+
+            if rust_native_logging:
+                symbol_rows.append(
+                    [
+                        go_location,
+                        kind,
+                        go_symbol,
+                        expected.as_posix(),
+                        "",
+                        "",
+                        "",
+                        "rust-native-logging",
+                        "Go slog file handler compatibility was replaced by Rust tracing",
+                    ]
+                )
+                continue
 
             if is_generated:
                 status = "generated-exempt" if expected in rust_paths else "generated-wrapper-missing"
@@ -743,7 +782,11 @@ def collect(go_root: Path, rust_root: Path) -> list[list[str]]:
                 )
             )
 
-        if is_generated:
+        if rust_native_logging:
+            file_status = "rust-native-logging"
+            actual_path = "src/internal/logger/tracing_logger.rs"
+            detail = "Go slog file output was replaced by Rust tracing"
+        elif is_generated:
             file_status = "generated-wrapper" if expected in rust_paths else "generated-wrapper-missing"
             actual_path = expected.as_posix() if expected in rust_paths else ""
             detail = "checked-in wrapper includes prost/pbjson output from OUT_DIR"
@@ -850,7 +893,11 @@ def main() -> int:
             print(f"stale symbol map: regenerate {target}", file=sys.stderr)
             return 1
         if arguments.expected_go_tests is not None:
-            go_tests = [row for row in rows if row[1] == "test"]
+            go_tests = [
+                row
+                for row in rows
+                if row[1] == "test" and row[7] != "rust-native-logging"
+            ]
             migrated_tests = [row for row in go_tests if row[7] == "migrated"]
             print(
                 "Go test scenarios: "

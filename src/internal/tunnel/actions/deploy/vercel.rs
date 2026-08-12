@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 
 use crate::internal::{tunnel::actions::ActionError, util::format_go_duration};
 
-use super::zz_recovered_types::{Deployment, FileEntry, VercelClient, VercelErrorResponse};
+use super::types::{Deployment, FileEntry, VercelClient, VercelErrorResponse};
 
 /// 对应 Go `maxDeploymentBytes`：单次部署所有普通文件合计最多 100 MiB。
 pub const MAX_DEPLOYMENT_BYTES: usize = 100 * 1024 * 1024;

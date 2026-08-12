@@ -33,13 +33,13 @@ use crate::internal::{
     api::LogCategory,
     auth::{AuthContext, Permission, SourceAuthProvider, new_github_source_auth_provider},
     config::{GitInfo, GitRepositorySource},
-    logger::{LogAttributes, LogLevel, Logger, default_slog_logger},
+    logger::{LogAttributes, LogLevel, Logger, default_logger},
     session::ActivityRecorder,
     util::{Stopper, update_remote_tracking_branch},
 };
 
 use super::gitproxy_adapter::ProductionGitProxyFactory;
-use super::zz_recovered_types::SharedAuthProvider;
+use super::types::SharedAuthProvider;
 
 const GIT_HTTP_PROXY_AUTH_CONFIG: &str = "http.proxyAuthMethod=basic";
 
@@ -429,7 +429,7 @@ impl GitHandler<'_> {
         Some(Arc::new(new_github_source_auth_provider(
             self.logger
                 .clone()
-                .unwrap_or_else(|| default_slog_logger().clone()),
+                .unwrap_or_else(|| default_logger().clone()),
             auth.token.clone(),
         )))
     }
@@ -1206,7 +1206,7 @@ impl GitHandler<'_> {
         };
         if let Some(error) = pack_error {
             // Go 只有一个 `result.err != nil` 日志调用点；即便 Tokio worker 自身异常，
-            // 也汇入同一调用点，避免 source 映射凭 Rust 分支凭空增加一条记录。
+            // 也汇入同一调用点，避免 Rust 分支凭空增加一条记录。
             self.log(
                 LogLevel::Warn,
                 "Failed to calculate repo size",
@@ -1619,7 +1619,7 @@ impl GitHandler<'_> {
     ) -> SourcesResult<()> {
         let logger = match self.logger.as_ref() {
             Some(logger) => logger,
-            None => default_slog_logger(),
+            None => default_logger(),
         };
         let starting_attributes = log_attributes!("target_branch" => target_branch);
         logger.info(
@@ -2019,10 +2019,8 @@ impl GitHandler<'_> {
         Ok(())
     }
 
-    /// 统一把 Git handler 日志写入显式 logger；未注入时退回 Go `slog.Default()`。
-    ///
-    /// `track_caller` 让 [`Logger`] 看到每个具体业务调用表达式，而不是这个转发方法；
-    /// 这样 source 映射仍能逐项对应 77 个 Go `slog` 调用点。
+    /// 统一把 Git handler 日志写入显式 logger；未注入时使用进程级
+    /// tracing logger。`track_caller` 保留具体 Rust 业务调用位置。
     #[track_caller]
     fn log(&self, level: LogLevel, message: impl Into<String>, attributes: LogAttributes) {
         log_with_logger(self.logger.as_ref(), level, message, attributes);
@@ -2520,11 +2518,11 @@ fn unix_nanos_mod(modulus: u64) -> u64 {
         .map_or(0, |duration| u64::from(duration.subsec_nanos()) % modulus)
 }
 
-/// 把包内日志写入显式 logger；未注入时使用进程级 Go `slog.Default()` 兼容实例。
+/// 把包内日志写入显式 logger；未注入时使用进程级 tracing logger。
 ///
 /// # 参数
 /// - `logger`：调用方注入的 logger；`None` 只用于旧调用点与测试。
-/// - `level`：不得重映射的 Go slog 级别。
+/// - `level`：事件级别。
 /// - `message`：静态或动态生成的 Go 原始消息。
 /// - `attributes`：已经按 Go 参数顺序插入的结构化属性。
 ///
@@ -2539,7 +2537,7 @@ fn log_with_logger(
 ) {
     let logger = match logger {
         Some(logger) => logger,
-        None => default_slog_logger(),
+        None => default_logger(),
     };
     logger.log(level, message, attributes);
 }

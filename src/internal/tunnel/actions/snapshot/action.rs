@@ -17,12 +17,12 @@ use async_trait::async_trait;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, Logger, default_slog_logger};
+use crate::internal::logger::{LogAttributes, Logger, default_logger};
 use crate::internal::tunnel::actions::{
     Action, ActionError, ActionRequest, ActionResult, ProgressReporter,
 };
 
-use super::zz_recovered_types::{FileEntry, SnapshotAction, SnapshotResponse};
+use super::types::{FileEntry, SnapshotAction, SnapshotResponse};
 
 /// 对应 Go `snapshotTimeout`：快照 action 最多运行三十秒。
 pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -442,11 +442,11 @@ impl SnapshotAction {
         }
     }
 
-    /// 返回快照 action 配置的 logger；缺省时严格回退到 Go 的 `slog.Default()`。
+    /// 返回快照 action 配置的 logger；缺省时使用进程级 tracing logger。
     fn log(&self) -> &Logger {
         match self.logger.as_ref() {
             Some(logger) => logger,
-            None => default_slog_logger(),
+            None => default_logger(),
         }
     }
 }

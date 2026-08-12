@@ -1,6 +1,6 @@
-//! Git proxy 的恢复类型、异步接口与稳定错误边界。
+//! Git proxy 的数据类型、异步接口与稳定错误边界。
 //!
-//! 本文件机械对应 Go `zz_recovered_types.go`：配置和仓库认证字段保持同名的
+//! 这些声明对应 Go `zz_recovered_types.go`：配置和仓库认证字段保持同名的
 //! snake_case 映射，`context.Context` 映射为 `CancellationToken`，同步接口则改为
 //! 可在线程间共享的异步 trait。认证 token 的 `Debug` 实现始终脱敏，避免诊断日志
 //! 偶然暴露仓库凭据。
@@ -71,7 +71,7 @@ pub struct Config {
     pub port: i64,
     /// 空字符串使用默认 token 后端，`tvs` 显式选择 TVS。
     pub token_backend: String,
-    /// 可选结构化 logger；缺省时与 Go 一样在构造器中捕获 `slog.Default()`。
+    /// 可选结构化 logger；缺省时在构造器中捕获进程级 tracing logger。
     pub logger: Option<Logger>,
 }
 

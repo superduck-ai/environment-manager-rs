@@ -6,14 +6,14 @@
 mod config;
 mod install;
 mod runtime;
-mod zz_recovered_types;
+mod types;
 
 pub use config::{
     ConfigError, cleanup_config_file, load_and_validate_config, validate_config, write_config_file,
 };
 pub use install::{SandboxInstallError, install_sandbox_runtime};
 pub use runtime::{SandboxRuntimeError, default_config, new_sandbox_runtime_with_config};
-pub use zz_recovered_types::{FilesystemConfig, NetworkConfig, SandboxRuntime, SrtConfig};
+pub use types::{FilesystemConfig, NetworkConfig, SandboxRuntime, SrtConfig};
 
 #[cfg(test)]
 mod sandbox_test;

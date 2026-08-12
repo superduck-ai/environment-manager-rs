@@ -39,7 +39,7 @@ use crate::internal::tunnel::{
     LocalWebSocketSink, LocalWebSocketStream, connect_websocket_with_config,
 };
 
-use super::zz_recovered_types::ClaudeError;
+use super::types::ClaudeError;
 
 pub(super) const STALE_RELAY_TOKEN_PATH: &str = "/run/ccr/session_token";
 const SYSTEM_CA_BUNDLE_PATH: &str = "/etc/ssl/certs/ca-certificates.crt";
@@ -280,8 +280,12 @@ async fn download_ca_bundle_with_timeout(
         .get(endpoint)
         .send()
         .await?
+        .error_for_status()?
         .bytes()
         .await?;
+    if ccr_ca.iter().all(u8::is_ascii_whitespace) {
+        bail!("upstream proxy CA certificate is empty");
+    }
 
     let system_ca = tokio::fs::read(system_ca).await?;
 
@@ -373,6 +377,7 @@ async fn handle_connection(
     .await
 }
 
+/// 使用可注入握手超时处理一条 CONNECT 连接，供生产默认值和边界测试共用。
 async fn handle_connection_with_handshake_timeout(
     mut client_stream: TcpStream,
     config: &RelayConfig,

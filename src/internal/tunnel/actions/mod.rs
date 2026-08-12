@@ -4,14 +4,14 @@
 //! 有界超时和取消令牌执行，并把进度及最终结果编码成与 Go 一致的 NDJSON 分片。
 
 mod registry;
-mod zz_recovered_types;
+mod types;
 
 pub mod deploy;
 pub mod snapshot;
 pub mod status;
 
 pub use registry::{DEFAULT_ACTION_TIMEOUT, new_registry};
-pub use zz_recovered_types::{
+pub use types::{
     Action, ActionError, ActionRequest, ActionResult, ProgressReporter, ProgressUpdate, Registry,
     ResponseSender,
 };

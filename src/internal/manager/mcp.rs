@@ -16,9 +16,7 @@ use crate::internal::{
     session::ActivityRecorder,
 };
 
-use super::zz_recovered_types::{
-    Manager, ManagerError, McpRegistrationBatch, working_directory_path,
-};
+use super::types::{Manager, ManagerError, McpRegistrationBatch, working_directory_path};
 
 impl Manager {
     /// 选择当前会话启用的 registrations，并依次创建、启动和注册 MCP servers。

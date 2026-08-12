@@ -56,8 +56,8 @@ impl EnvTypes {
     /// 对应 Go：`internal/envtype/envtype.go` 中的 `EnvTypes.Create`。
     ///
     /// 使用命中的工厂原样传递 JSON 字节和 manager logger，并创建环境实例。
-    /// logger 的 handler、固定属性和 source 映射上下文都会随 clone 保留；这里不创建
-    /// tracing fallback，确保环境初始化日志进入与 manager 相同的输出链。
+    /// logger 的接收端和固定属性都会随 clone 保留，确保环境初始化日志
+    /// 进入与 manager 相同的 tracing 输出链。
     ///
     /// # 参数
     /// - `type_name`：配置声明的稳定环境类型名称。

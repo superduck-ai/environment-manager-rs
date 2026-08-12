@@ -4,10 +4,10 @@
 //! 文件类型、symlink、单文件和总读取量。
 
 mod action;
-mod zz_recovered_types;
+mod types;
 
 pub use action::{SNAPSHOT_TIMEOUT, new_snapshot_action};
-pub use zz_recovered_types::SnapshotAction;
+pub use types::SnapshotAction;
 
 #[cfg(test)]
 mod action_test;
