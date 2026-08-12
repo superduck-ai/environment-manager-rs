@@ -190,7 +190,7 @@ impl AgentProxy {
             proxy_authorization,
         });
 
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let listener = bind_local_listener(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
         let port = listener.local_addr()?.port();
         let environment = proxy_environment(port, &paths.ca_bundle, host)?;
 
