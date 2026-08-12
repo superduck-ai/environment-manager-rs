@@ -705,7 +705,10 @@ async fn test_proxy_response_split_across_segments() {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         // 再补完剩余 header + 终止空行 + 隧道字节
-        stream.write_all(b"X-Custom: v\r\n\r\ntunnel").await.unwrap();
+        stream
+            .write_all(b"X-Custom: v\r\n\r\ntunnel")
+            .await
+            .unwrap();
     });
 
     let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();

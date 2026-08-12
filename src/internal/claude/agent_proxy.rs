@@ -33,6 +33,8 @@ use tokio_tungstenite::tungstenite::{
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use prost::Message as ProstMessage;
+
 use crate::internal::tunnel::{
     LocalWebSocketSink, LocalWebSocketStream, connect_websocket_with_config,
 };
@@ -44,6 +46,7 @@ const SYSTEM_CA_BUNDLE_PATH: &str = "/etc/ssl/certs/ca-certificates.crt";
 const CA_CERT_PATH: &str = "/v1/code/upstreamproxy/ca-cert";
 const WEBSOCKET_PATH: &str = "/v1/code/upstreamproxy/ws";
 const CA_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
+const WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CONNECT_HEADER_BYTES: usize = 8 * 1024;
 const MAX_CONNECT_HEADERS: usize = 64;
 const MAX_CHUNK_BYTES: usize = 512 * 1024;
@@ -53,6 +56,14 @@ const TCP_BUFFER_BYTES: usize = 32 * 1024;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// CCRv2 CONNECT-over-WebSocket 私有 wire message；不属于公共 Tunnel API。
+#[derive(Clone, PartialEq, prost::Message)]
+struct UpstreamProxyChunk {
+    /// `optional` 让空 payload 仍编码为稳定的 `0a 00` keepalive。
+    #[prost(bytes = "vec", optional, tag = "1")]
+    data: Option<Vec<u8>>,
+}
 
 const NO_PROXY_LIST: &str = concat!(
     "localhost,127.0.0.1,::1,169.254.0.0/16,10.0.0.0/8,172.16.0.0/12,",
@@ -106,8 +117,7 @@ impl RelayConfig {
 }
 
 struct ConnectRequest {
-    // CONNECT example.com:443 HTTP/1.1
-    first_line: String,
+    target: String,
     trailing: Vec<u8>,
 }
 
@@ -350,9 +360,24 @@ async fn run_listener(
 
 /// 把一条本地 CONNECT 流量双向转发到 CCR WebSocket。
 async fn handle_connection(
+    client_stream: TcpStream,
+    config: &RelayConfig,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    handle_connection_with_handshake_timeout(
+        client_stream,
+        config,
+        cancellation,
+        WEBSOCKET_HANDSHAKE_TIMEOUT,
+    )
+    .await
+}
+
+async fn handle_connection_with_handshake_timeout(
     mut client_stream: TcpStream,
     config: &RelayConfig,
     cancellation: &CancellationToken,
+    handshake_timeout: Duration,
 ) -> Result<()> {
     // CONNECT example.com:443 HTTP/1.1
     // Host: example.com:443
@@ -367,16 +392,24 @@ async fn handle_connection(
     let websocket_config = WebSocketConfig::default()
         .max_message_size(Some(MAX_ENCODED_CHUNK_BYTES))
         .max_frame_size(Some(MAX_ENCODED_CHUNK_BYTES));
-    let (websocket, _) = match tokio::select! {
+    let handshake = tokio::select! {
         () = cancellation.cancelled() => return Ok(()),
-        result = connect_websocket_with_config(websocket_request, websocket_config) => result,
-    } {
-        Ok(connection) => connection,
-        Err(error) => {
+        result = tokio::time::timeout(
+            handshake_timeout,
+            connect_websocket_with_config(websocket_request, websocket_config),
+        ) => result,
+    };
+    let (websocket, _) = match handshake {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(error)) => {
             write_bad_gateway(&mut client_stream).await;
             return Err(anyhow!(
                 "upstream proxy WebSocket handshake failed: {error}"
             ));
+        }
+        Err(_) => {
+            write_bad_gateway(&mut client_stream).await;
+            return Err(anyhow!("upstream proxy WebSocket handshake timed out"));
         }
     };
     let (mut websocket_writer, websocket_reader) = websocket.split();
@@ -385,8 +418,8 @@ async fn handle_connection(
     // CONNECT api.example.com:443 HTTP/1.1
     // Proxy-Authorization: Basic ...
     let connect_head = format!(
-        "{}\r\nProxy-Authorization: {}\r\n\r\n",
-        request.first_line, config.proxy_authorization
+        "CONNECT {} HTTP/1.1\r\nProxy-Authorization: {}\r\n\r\n",
+        request.target, config.proxy_authorization
     );
     if let Err(error) = send_chunked(&mut websocket_writer, connect_head.as_bytes()).await {
         write_bad_gateway(&mut client_stream).await;
@@ -460,7 +493,7 @@ async fn relay_websocket_to_tcp(
                 if !payload.is_empty() {
                     established = true;
                     client_writer
-                        .write_all(payload)
+                        .write_all(&payload)
                         .await
                         .context("failed to write local CONNECT socket")?;
                 }
@@ -536,13 +569,8 @@ fn parse_connect_request(buffer: &[u8]) -> ConnectParse {
         return ConnectParse::Reject(METHOD_NOT_ALLOWED);
     }
 
-    let first_line = buffer[..header_end]
-        .split(|byte| *byte == b'\n')
-        .next()
-        .unwrap_or_default();
-    let first_line = first_line.strip_suffix(b"\r").unwrap_or(first_line);
     ConnectParse::Request(ConnectRequest {
-        first_line: String::from_utf8_lossy(first_line).into_owned(),
+        target: request.path.unwrap().to_owned(),
         trailing: buffer[header_end..].to_vec(),
     })
 }
@@ -558,52 +586,31 @@ async fn send_chunked(writer: &mut LocalWebSocketSink, data: &[u8]) -> Result<()
     Ok(())
 }
 
-/// 手工编码只有 bytes 字段的 UpstreamProxyChunk protobuf 消息。
+/// 用 prost 编码只有 bytes 字段的 UpstreamProxyChunk protobuf 消息。
 fn encode_chunk(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() > MAX_CHUNK_BYTES {
         bail!("upstream proxy chunk exceeds {MAX_CHUNK_BYTES} bytes");
     }
-    let mut length = data.len();
-    let mut encoded = Vec::with_capacity(data.len() + 4);
-    encoded.push(0x0a);
-    while length > 0x7f {
-        encoded.push(((length & 0x7f) as u8) | 0x80);
-        length >>= 7;
-    }
-    encoded.push(length as u8);
-    encoded.extend_from_slice(data);
-    Ok(encoded)
+    let msg = UpstreamProxyChunk {
+        data: Some(data.to_vec()),
+    };
+    Ok(msg.encode_to_vec())
 }
 
-/// 解码 UpstreamProxyChunk 的 bytes 字段并拒绝畸形或超限长度。
-fn decode_chunk(encoded: &[u8]) -> Result<&[u8]> {
+/// 用 prost 解码 UpstreamProxyChunk 的 bytes 字段并拒绝畸形或超限长度。
+fn decode_chunk(encoded: &[u8]) -> Result<Vec<u8>> {
     if encoded.is_empty() {
-        return Ok(&[]);
+        return Ok(Vec::new());
     }
-    if encoded[0] != 0x0a {
-        bail!("upstream proxy chunk has an invalid protobuf tag");
+    let chunk =
+        UpstreamProxyChunk::decode(encoded).context("upstream proxy chunk has invalid protobuf")?;
+    let data = chunk
+        .data
+        .ok_or_else(|| anyhow!("upstream proxy chunk is missing data"))?;
+    if data.len() > MAX_CHUNK_BYTES {
+        bail!("upstream proxy chunk exceeds {MAX_CHUNK_BYTES} bytes");
     }
-    let mut length = 0_usize;
-    let mut shift = 0_u32;
-    let mut cursor = 1;
-    loop {
-        let byte = *encoded
-            .get(cursor)
-            .ok_or_else(|| anyhow!("upstream proxy chunk has a truncated protobuf length"))?;
-        cursor += 1;
-        length |= usize::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-        if shift > 28 {
-            bail!("upstream proxy chunk has an invalid protobuf length");
-        }
-    }
-    if length > MAX_CHUNK_BYTES || cursor + length > encoded.len() {
-        bail!("upstream proxy chunk has an invalid data length");
-    }
-    Ok(&encoded[cursor..cursor + length])
+    Ok(data)
 }
 
 /// 在隧道建立前向本地 CONNECT 客户端返回固定 502。
@@ -659,7 +666,7 @@ mod tests {
             b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\nhello",
         ) {
             ConnectParse::Request(request) => {
-                assert_eq!(request.first_line, "CONNECT example.com:443 HTTP/1.1");
+                assert_eq!(request.target, "example.com:443");
                 assert_eq!(request.trailing, b"hello");
             }
             _ => panic!("CONNECT request should parse"),
@@ -900,7 +907,7 @@ mod tests {
         let relay_task = tokio::spawn(run_listener(listener, relay_config, cancellation.clone()));
         let mut client = TcpStream::connect(relay_address).await.unwrap();
         client
-            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\nclient-data")
+            .write_all(b"CONNECT example.com:443 HTTP/1.0\r\nHost: example.com\r\n\r\nclient-data")
             .await
             .unwrap();
         let expected = b"HTTP/1.1 200 Connection Established\r\n\r\nserver-data";
@@ -942,5 +949,55 @@ mod tests {
 
         cancellation.cancel();
         relay_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_timeout_returns_502() {
+        let websocket_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let websocket_address = websocket_listener.local_addr().unwrap();
+        let websocket_server = tokio::spawn(async move {
+            let (_socket, _) = websocket_listener.accept().await.unwrap();
+            pending::<()>().await;
+        });
+        let relay_config = RelayConfig {
+            websocket_url: Url::parse(&format!("ws://{websocket_address}{WEBSOCKET_PATH}"))
+                .unwrap(),
+            websocket_authorization: HeaderValue::from_static("Bearer token-456"),
+            proxy_authorization: "Basic unused".to_owned(),
+        };
+        let relay_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        let cancellation = CancellationToken::new();
+        let relay_task = tokio::spawn(async move {
+            let (client_stream, _) = relay_listener.accept().await.unwrap();
+            handle_connection_with_handshake_timeout(
+                client_stream,
+                &relay_config,
+                &cancellation,
+                Duration::from_millis(20),
+            )
+            .await
+        });
+
+        let mut client = TcpStream::connect(relay_address).await.unwrap();
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        assert!(
+            relay_task
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("handshake timed out")
+        );
+        websocket_server.abort();
     }
 }

@@ -964,8 +964,9 @@ async fn connect_websocket_with_proxy_and_websocket_config(
     config: &EnvironmentProxyConfig,
     websocket_config: WebSocketConfig,
 ) -> Result<(LocalWebSocket, WebSocketResponse), GorillaDialFailure> {
-    let target_url = Url::parse(&ws_request.uri().to_string())
-        .map_err(|error| GorillaDialFailure::from_websocket_error(invalid_input(error.to_string())))?;
+    let target_url = Url::parse(&ws_request.uri().to_string()).map_err(|error| {
+        GorillaDialFailure::from_websocket_error(invalid_input(error.to_string()))
+    })?;
     //  选择代理, None 表示直连，Some(proxy) 表示走代理
     let proxy = proxy_selection_for_websocket_target(&target_url, config)
         .map_err(GorillaDialFailure::from_websocket_error)?;
@@ -980,9 +981,14 @@ async fn connect_websocket_with_proxy_and_websocket_config(
             let tcp_stream = connect_via_proxy(&proxy, &target_url)
                 .await
                 .map_err(GorillaDialFailure::from_websocket_error)?;
-            tokio_tungstenite::client_async_tls_with_config(ws_request, tcp_stream, Some(websocket_config), None)
-                .await
-                .map_err(GorillaDialFailure::from_websocket_error)
+            tokio_tungstenite::client_async_tls_with_config(
+                ws_request,
+                tcp_stream,
+                Some(websocket_config),
+                None,
+            )
+            .await
+            .map_err(GorillaDialFailure::from_websocket_error)
         }
     }
 }
@@ -1675,7 +1681,10 @@ pub(super) async fn read_proxy_response(
             .await
             .map_err(WebSocketError::Io)?;
         if read == 0 {
-            return Err(WebSocketError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected EOF reading proxy response")));
+            return Err(WebSocketError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "unexpected EOF reading proxy response",
+            )));
         }
 
         // previous_len: 本轮 peek 之前，已经累计并消费的响应 header 字节数
@@ -1723,7 +1732,9 @@ pub(super) async fn read_proxy_response(
             }
         }
     }
-    Err(WebSocketError::Io(io::Error::other("proxy response header too large")))
+    Err(WebSocketError::Io(io::Error::other(
+        "proxy response header too large",
+    )))
 }
 
 fn malformed_proxy_response() -> WebSocketError {
