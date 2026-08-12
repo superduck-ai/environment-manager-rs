@@ -171,7 +171,7 @@ async fn start_server(router: Router) -> (i32, JoinHandle<()>) {
 
 #[tokio::test]
 async fn test_open_tunnel_rejects_invalid_port() {
-    let handler = new_ws_handler(None);
+    let handler = new_ws_handler();
     let sender = Arc::new(RecordingWsSender::default());
     handler
         .open_tunnel(
@@ -197,7 +197,7 @@ async fn test_open_tunnel_rejects_invalid_port() {
 async fn test_open_tunnel_formats_bad_handshake_like_gorilla() {
     let router = Router::new().fallback(|| async { axum::http::StatusCode::FORBIDDEN });
     let (port, server) = start_server(router).await;
-    let handler = new_ws_handler(None);
+    let handler = new_ws_handler();
     let sender = Arc::new(RecordingWsSender::default());
 
     handler
@@ -234,7 +234,7 @@ async fn test_local_websocket_abnormal_eof_is_reported_as_close_1006() {
         // 绕过 WebSocket close handshake 直接 drop TCP，复制本地进程崩溃/退出。
         drop(socket.into_inner());
     });
-    let handler = new_ws_handler(None);
+    let handler = new_ws_handler();
     let sender = Arc::new(RecordingWsSender::default());
 
     handler
@@ -275,7 +275,7 @@ async fn test_local_websocket_invalid_utf8_text_reports_protocol_error() {
         let _ = release_rx.await;
         raw.shutdown().await.unwrap();
     });
-    let handler = new_ws_handler(None);
+    let handler = new_ws_handler();
     let sender = Arc::new(RecordingWsSender::default());
     let cancellation = CancellationToken::new();
 
@@ -319,7 +319,7 @@ async fn test_local_websocket_fragmented_invalid_utf8_reports_protocol_error() {
             .unwrap();
         raw.shutdown().await.unwrap();
     });
-    let handler = new_ws_handler(None);
+    let handler = new_ws_handler();
     let sender = Arc::new(RecordingWsSender::default());
 
     handler
@@ -371,7 +371,7 @@ async fn test_replacing_local_websocket_does_not_wait_or_send_close_frame() {
         new_message_tx.send(message).unwrap();
     });
 
-    let handler = new_ws_handler(None);
+    let handler = new_ws_handler();
     handler
         .open_tunnel(
             CancellationToken::new(),
@@ -464,7 +464,7 @@ async fn test_timed_out_local_websocket_is_removed_and_socket_discarded() {
         closed_tx.send(closed).unwrap();
     });
 
-    let handler = new_ws_handler(None);
+    let handler = new_ws_handler();
     let sender = Arc::new(RecordingWsSender::default());
     handler
         .open_tunnel(
@@ -588,7 +588,7 @@ async fn test_open_tunnel_send_message_and_close() {
     );
     let (port, server) = start_server(router).await;
 
-    let handler = new_ws_handler(None);
+    let handler = new_ws_handler();
     let sender = Arc::new(RecordingWsSender::default());
     handler
         .open_tunnel(

@@ -1,6 +1,6 @@
 //! 配置子系统的数据声明。
 //!
-//! 类型源自 Go 的 `zz_recovered_types.go`。与 Go interface 不同，源码类型
+//! Session 配置与源码类型。与旧 interface 不同，源码类型
 //! 使用封闭 enum 表达，因此未知 source 会在反序列化阶段被明确拒绝。
 
 use std::collections::HashMap;

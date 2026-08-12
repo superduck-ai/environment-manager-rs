@@ -16,15 +16,13 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use nix::unistd::close;
-use serde_json::json;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::{logger::Logger, util::OutputStreamer};
+use crate::internal::util::OutputStreamer;
 
 use super::{
     ProcessError, ProcessResult, execute,
-    process::attributes,
     types::{go_errno_text, go_utf8_error_view},
 };
 
@@ -62,7 +60,6 @@ pub enum ScriptError {
 struct TemporaryScript {
     file: Option<File>,
     path: PathBuf,
-    logger: Logger,
 }
 
 impl Drop for TemporaryScript {
@@ -76,10 +73,7 @@ impl Drop for TemporaryScript {
         if let Err(error) = std::fs::remove_file(&self.path) {
             let path_text = go_utf8_error_view(self.path.as_os_str().as_bytes());
             let removal_error = format!("remove {}: {}", path_text, go_errno_text(&error));
-            self.logger.warn(
-                "Failed to remove temp script file",
-                attributes([("path", json!(path_text)), ("error", json!(removal_error))]),
-            );
+            tracing::warn!("path" = ?(path_text), "error" = ?(removal_error), "{}", "Failed to remove temp script file");
         }
     }
 }
@@ -94,7 +88,6 @@ impl Drop for TemporaryScript {
 ///
 /// # 参数
 /// - `cancellation`：上层 context 的取消令牌，仅传给 direct child 执行阶段。
-/// - `logger`：manager 注入的具体 session logger；同时用于执行输出与删除失败日志。
 /// - `content`：完整脚本字节的 UTF-8 表示；空字符串在创建文件前拒绝。
 /// - `pattern`：传给临时文件命名器的 Go `CreateTemp` 兼容 pattern。
 /// - `streamer`：接收脚本 stdout/stderr chunk 的同步回调。
@@ -108,7 +101,6 @@ impl Drop for TemporaryScript {
 /// 创建 direct child，最后删除文件；删除失败只写 Go 同名 warning，不覆盖原返回值。
 pub async fn execute_script(
     cancellation: &CancellationToken,
-    logger: Logger,
     content: &str,
     pattern: &str,
     streamer: OutputStreamer,
@@ -133,7 +125,6 @@ pub async fn execute_script(
     let mut temporary_script = TemporaryScript {
         file: Some(file),
         path,
-        logger: logger.clone(),
     };
     temporary_script
         .file
@@ -161,7 +152,7 @@ pub async fn execute_script(
 
     // 保留 Go 实现中的短暂延迟，规避部分 overlay/container 文件系统的可执行可见性延迟。
     tokio::time::sleep(Duration::from_millis(10)).await;
-    let result = execute(cancellation, logger, &script_path, streamer).await;
+    let result = execute(cancellation, &script_path, streamer).await;
     // 显式 drop 保证删除与其 warning 在函数返回前完成，而不是依赖局部变量隐式顺序。
     drop(temporary_script);
     result.map_err(ScriptError::from)

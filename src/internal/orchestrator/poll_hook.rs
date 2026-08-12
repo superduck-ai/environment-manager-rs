@@ -7,17 +7,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rand::Rng;
-use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::{
     OrchestratorError, OrchestratorResult, PollHook, PollHookContext, PollerInterface, RawMessage,
-    log_attributes, run_command_capture,
+    run_command_capture,
 };
-use crate::internal::{
-    logger::Logger,
-    util::{format_go_duration, go_duration_nanoseconds},
-};
+use crate::internal::util::{duration_nanoseconds, format_go_duration};
 
 /// 对应 Go `NewPollHook`，创建命令型 poller。
 ///
@@ -28,13 +24,8 @@ pub fn new_poll_hook(
     organization_uuid: impl Into<String>,
     environment_id: impl Into<String>,
     worker_id: impl Into<String>,
-    logger: Logger,
 ) -> PollHook {
     let command = command.into();
-    let logger = logger.with_attrs(log_attributes([
-        ("component", json!("poll_hook")),
-        ("command", json!(command)),
-    ]));
     PollHook {
         command,
         args: Vec::new(),
@@ -48,7 +39,6 @@ pub fn new_poll_hook(
             environment_id: environment_id.into(),
             worker_id: worker_id.into(),
         },
-        logger,
     }
 }
 
@@ -67,7 +57,7 @@ impl PollHook {
             ));
         }
 
-        self.logger.debug("executing poll hook", Default::default());
+        tracing::debug!("{}", "executing poll hook");
         let stdin_data = serde_json::to_vec(&self.stdin_context).map_err(|error| {
             OrchestratorError::message(format!(
                 "failed to serialize poll hook stdin context: {error}"
@@ -84,14 +74,7 @@ impl PollHook {
 
         if let Some(error) = outcome.error {
             let stderr = String::from_utf8_lossy(&outcome.stderr).into_owned();
-            self.logger.error(
-                "poll hook execution failed",
-                log_attributes([
-                    ("duration", json!(go_duration_nanoseconds(outcome.duration))),
-                    ("stderr", json!(stderr)),
-                    ("error", json!(error)),
-                ]),
-            );
+            tracing::error!("duration" = ?(duration_nanoseconds(outcome.duration)), "stderr" = ?(stderr), "error" = ?(error), "{}", "poll hook execution failed");
             return Err(OrchestratorError::message(format!(
                 "poll hook failed after {}: {error} (stderr: {stderr})",
                 format_go_duration(outcome.duration)
@@ -101,31 +84,18 @@ impl PollHook {
         let output = String::from_utf8_lossy(&outcome.stdout);
         let output = output.trim();
         if output.is_empty() || output == "null" {
-            self.logger.debug(
-                "poll hook returned empty queue",
-                log_attributes([("duration", json!(go_duration_nanoseconds(outcome.duration)))]),
-            );
+            tracing::debug!("duration" = ?(duration_nanoseconds(outcome.duration)), "{}", "poll hook returned empty queue");
             return Ok(None);
         }
 
         if let Err(error) = serde_json::from_str::<serde_json::Value>(output) {
-            self.logger.error(
-                "poll hook returned invalid JSON",
-                log_attributes([
-                    ("duration", json!(go_duration_nanoseconds(outcome.duration))),
-                    ("output", json!(output)),
-                    ("error", json!(error.to_string())),
-                ]),
-            );
+            tracing::error!("duration" = ?(duration_nanoseconds(outcome.duration)), "output" = ?(output), "error" = ?(error.to_string()), "{}", "poll hook returned invalid JSON");
             return Err(OrchestratorError::message(format!(
                 "poll hook returned invalid JSON: {error}"
             )));
         }
 
-        self.logger.info(
-            "poll hook returned work",
-            log_attributes([("duration", json!(go_duration_nanoseconds(outcome.duration)))]),
-        );
+        tracing::info!("duration" = ?(duration_nanoseconds(outcome.duration)), "{}", "poll hook returned work");
         Ok(Some(output.as_bytes().to_vec()))
     }
 
@@ -142,13 +112,7 @@ impl PollHook {
             rng.random_range(1_u64..=3)
         };
         let sleep_duration = Duration::from_secs(seconds);
-        self.logger.debug(
-            "sleeping with jitter after empty queue",
-            log_attributes([(
-                "sleep_duration",
-                json!(go_duration_nanoseconds(sleep_duration)),
-            )]),
-        );
+        tracing::debug!("sleep_duration" = ?(duration_nanoseconds(sleep_duration)), "{}", "sleeping with jitter after empty queue");
 
         tokio::select! {
             biased;

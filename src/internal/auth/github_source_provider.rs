@@ -5,8 +5,6 @@
 
 use url::{Position, Url};
 
-use crate::internal::logger::{LogAttributes, Logger};
-
 use super::types::{
     AuthContext, GitHubAuthType, GitHubSourceAuthProvider, Permission, SourceAuthProvider,
 };
@@ -18,11 +16,8 @@ const GIT_PROXY_JWT_PREFIX: &str = "sk-ant-ccsr-";
 /// `sk-ant-ccsr-` 前缀被视为 git proxy JWT，其余 token 使用普通 GitHub token
 /// 语义。空 token 仍会创建 provider，但认证尝试会返回 `false`。
 #[must_use]
-pub fn new_github_source_auth_provider(
-    logger: Logger,
-    token: impl Into<String>,
-) -> GitHubSourceAuthProvider {
-    GitHubSourceAuthProvider::new(logger, token)
+pub fn new_github_source_auth_provider(token: impl Into<String>) -> GitHubSourceAuthProvider {
+    GitHubSourceAuthProvider::new(token)
 }
 
 impl GitHubSourceAuthProvider {
@@ -31,22 +26,18 @@ impl GitHubSourceAuthProvider {
     /// 这是 Go `NewGitHubSourceAuthProvider` 的现代关联构造器；普通 token 与 git
     /// proxy JWT 的判定仍只依赖固定前缀，空 token 也保留为可构造状态。
     #[must_use]
-    pub fn new(logger: Logger, token: impl Into<String>) -> Self {
+    pub fn new(token: impl Into<String>) -> Self {
         let token = token.into();
         let auth_type = if token.starts_with(GIT_PROXY_JWT_PREFIX) {
-            logger.info(
-                "GitHub source auth provider initialized with git proxy JWT",
-                LogAttributes::new(),
+            tracing::info!(
+                "{}",
+                "GitHub source auth provider initialized with git proxy JWT"
             );
             GitHubAuthType::GitProxyJwt
         } else {
             GitHubAuthType::Token
         };
-        Self {
-            auth_type,
-            token,
-            logger,
-        }
+        Self { auth_type, token }
     }
 
     /// 返回构造时识别出的认证类型，主要供策略选择和兼容性测试使用。
@@ -69,23 +60,14 @@ impl SourceAuthProvider for GitHubSourceAuthProvider {
         permission: &Permission,
     ) -> (String, bool) {
         if source_url.starts_with("git@") || source_url.starts_with("ssh://") {
-            self.logger.debug(
-                "SSH URL detected, cannot use token authentication",
-                log_attributes([("url", serde_json::json!(source_url))]),
-            );
+            tracing::debug!("url" = ?(source_url), "{}", "SSH URL detected, cannot use token authentication");
             return (source_url.to_owned(), false);
         }
 
         let mut parsed_url = match Url::parse(source_url) {
             Ok(parsed_url) => parsed_url,
             Err(error) => {
-                self.logger.warn(
-                    "Failed to parse GitHub URL",
-                    log_attributes([
-                        ("url", serde_json::json!(source_url)),
-                        ("error", serde_json::json!(error.to_string())),
-                    ]),
-                );
+                tracing::warn!("url" = ?(source_url), "error" = ?(error.to_string()), "{}", "Failed to parse GitHub URL");
                 return (source_url.to_owned(), false);
             }
         };
@@ -110,14 +92,10 @@ impl SourceAuthProvider for GitHubSourceAuthProvider {
             }
             GitHubAuthType::GitProxyJwt => {
                 if self.token.is_empty() {
-                    self.logger
-                        .warn("No git proxy JWT available", LogAttributes::new());
+                    tracing::warn!("No git proxy JWT available");
                     return (source_url.to_owned(), false);
                 }
-                self.logger.info(
-                    "Using git proxy authentication",
-                    log_attributes([("url", serde_json::json!(source_url))]),
-                );
+                tracing::info!("url" = ?(source_url), "{}", "Using git proxy authentication");
                 if parsed_url.set_username("unused").is_err()
                     || parsed_url.set_password(Some(&self.token)).is_err()
                 {
@@ -131,21 +109,10 @@ impl SourceAuthProvider for GitHubSourceAuthProvider {
             return (source_url.to_owned(), false);
         }
         let authenticated_url = format_authenticated_url(parsed_url, source_url);
-        self.logger.debug(
-            "GitHub authentication applied",
-            log_attributes([
-                ("url", serde_json::json!(source_url)),
-                (
-                    "auth_type",
-                    serde_json::json!(match self.auth_type {
+        tracing::debug!("url" = ?(source_url), "auth_type" = ?(match self.auth_type {
                         GitHubAuthType::Token => 0,
                         GitHubAuthType::GitProxyJwt => 1,
-                    }),
-                ),
-                ("permission", serde_json::json!(&permission.0)),
-                ("success", serde_json::json!(true)),
-            ]),
-        );
+                    }), "permission" = ?(&permission.0), "success" = ?(true), "{}", "GitHub authentication applied");
         (authenticated_url, true)
     }
 
@@ -164,14 +131,6 @@ impl SourceAuthProvider for GitHubSourceAuthProvider {
         }
         sanitized
     }
-}
-
-/// 按 Go slog 参数顺序构造 GitHub URL 认证日志属性。
-fn log_attributes<const N: usize>(entries: [(&str, serde_json::Value); N]) -> LogAttributes {
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }
 
 /// 输出注入凭据后的 URL，同时撤销 WHATWG parser 自动补出的根路径 `/`。

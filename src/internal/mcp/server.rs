@@ -31,12 +31,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Instant, Sleep};
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogLevel, Logger};
-
 use super::rmcp_adapter;
 use super::types::{
     BaseServer, CallToolRequest, MCPServer, McpError, McpResult, ServerConfig, ServerRuntime,
-    ToolConfig, log_attributes,
+    ToolConfig,
 };
 
 /// MCP Streamable HTTP 的固定 endpoint。
@@ -717,7 +715,6 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, McpT
 
 #[derive(Clone)]
 struct RpcServerState {
-    logger: Logger,
     name: String,
     version: String,
     port: u16,
@@ -943,22 +940,12 @@ async fn handle_http(
     let user_agent = request
         .headers()
         .get(header::USER_AGENT)
-        // Go 的 Header.Get 返回原始字节组成的 string；slog/JSON 在遇到非法 UTF-8
-        // 时以替换字符编码。不能使用 `HeaderValue::to_str` 后回退为空串，否则诊断值
+        // 非法 UTF-8 以替换字符记录。不能使用 `HeaderValue::to_str` 后回退为空串，
+        // 否则诊断值
         // 会在包含 obs-text 的合法 HTTP/1 请求上与 Go 不同。
         .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
         .unwrap_or_default();
-    state.logger.info(
-        "Incoming MCP request",
-        log_attributes([
-            ("server_name", json!(&state.name)),
-            ("method", json!(&method)),
-            ("path", json!(&path)),
-            ("remote_addr", json!(&remote_address)),
-            ("user_agent", json!(&user_agent)),
-            ("port", json!(state.port)),
-        ]),
-    );
+    tracing::info!("server_name" = ?(&state.name), "method" = ?(&method), "path" = ?(&path), "remote_addr" = ?(&remote_address), "user_agent" = ?(&user_agent), "port" = ?(state.port), "{}", "Incoming MCP request");
 
     let expected = format!("Bearer {}", state.bearer_token);
     let authorized = request
@@ -967,24 +954,11 @@ async fn handle_http(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value == expected);
     if !authorized {
-        state.logger.warn(
-            "Unauthorized MCP request",
-            log_attributes([
-                ("remote_addr", json!(&remote_address)),
-                ("user_agent", json!(&user_agent)),
-            ]),
-        );
+        tracing::warn!("remote_addr" = ?(&remote_address), "user_agent" = ?(&user_agent), "{}", "Unauthorized MCP request");
         return text_response(StatusCode::UNAUTHORIZED, "Unauthorized\n");
     }
 
-    state.logger.debug(
-        "Authorized MCP request",
-        log_attributes([
-            ("server_name", json!(&state.name)),
-            ("method", json!(&method)),
-            ("path", json!(&path)),
-        ]),
-    );
+    tracing::debug!("server_name" = ?(&state.name), "method" = ?(&method), "path" = ?(&path), "{}", "Authorized MCP request");
 
     let response = if request.uri().path() != MCP_ENDPOINT_PATH {
         text_response(StatusCode::NOT_FOUND, "404 page not found\n")
@@ -1012,36 +986,15 @@ async fn handle_http(
     let status_code = response.status().as_u16();
     let duration_ms = started.elapsed().as_millis();
     match status_code {
-        500.. => state.logger.error(
-            "MCP request completed",
-            log_attributes([
-                ("server_name", json!(&state.name)),
-                ("status_code", json!(status_code)),
-                ("duration_ms", json!(duration_ms)),
-                ("method", json!(&method)),
-                ("path", json!(&path)),
-            ]),
-        ),
-        400..=499 => state.logger.warn(
-            "MCP request completed",
-            log_attributes([
-                ("server_name", json!(&state.name)),
-                ("status_code", json!(status_code)),
-                ("duration_ms", json!(duration_ms)),
-                ("method", json!(&method)),
-                ("path", json!(&path)),
-            ]),
-        ),
-        _ => state.logger.info(
-            "MCP request completed",
-            log_attributes([
-                ("server_name", json!(&state.name)),
-                ("status_code", json!(status_code)),
-                ("duration_ms", json!(duration_ms)),
-                ("method", json!(&method)),
-                ("path", json!(&path)),
-            ]),
-        ),
+        500.. => {
+            tracing::error!("server_name" = ?(&state.name), "status_code" = ?(status_code), "duration_ms" = ?(duration_ms), "method" = ?(&method), "path" = ?(&path), "{}", "MCP request completed")
+        }
+        400..=499 => {
+            tracing::warn!("server_name" = ?(&state.name), "status_code" = ?(status_code), "duration_ms" = ?(duration_ms), "method" = ?(&method), "path" = ?(&path), "{}", "MCP request completed")
+        }
+        _ => {
+            tracing::info!("server_name" = ?(&state.name), "status_code" = ?(status_code), "duration_ms" = ?(duration_ms), "method" = ?(&method), "path" = ?(&path), "{}", "MCP request completed")
+        }
     }
     response
 }
@@ -1149,15 +1102,7 @@ impl MCPServer for BaseServer {
         // 调试 token 是显式 opt-in；正常路径每次启动都从 OS CSPRNG 读取 32 字节。
         let bearer_token = if self.debug_hardcoded_token {
             let token = self.bearer_token();
-            self.logger.warn(
-                "Using hardcoded bearer token for debugging",
-                log_attributes([
-                    ("server_name", json!(&self.name)),
-                    ("bearer_token", json!(&token)),
-                    ("warning", json!("this is insecure")),
-                    ("only_for", json!("local_debugging")),
-                ]),
-            );
+            tracing::warn!("server_name" = ?(&self.name), "bearer_token" = ?(&token), "warning" = ?("this is insecure"), "only_for" = ?("local_debugging"), "{}", "Using hardcoded bearer token for debugging");
             token
         } else {
             let mut bytes = [0_u8; 32];
@@ -1167,27 +1112,17 @@ impl MCPServer for BaseServer {
                     McpError::message(format!("failed to generate bearer token: {error}"))
                 })?;
             let token = URL_SAFE.encode(bytes);
-            self.logger
-                .info("Generated secure random bearer token", log_attributes([]));
+            tracing::info!("Generated secure random bearer token");
             token
         };
         self.set_bearer_token(bearer_token.clone());
 
         let requested_address = "127.0.0.1:0";
-        self.logger.info(
-            "Creating TCP listener",
-            log_attributes([("address", json!(requested_address))]),
-        );
+        tracing::info!("address" = ?(requested_address), "{}", "Creating TCP listener");
         let listener = match TcpListener::bind(requested_address).await {
             Ok(listener) => listener,
             Err(error) => {
-                self.logger.error(
-                    "Failed to create TCP listener",
-                    log_attributes([
-                        ("address", json!(requested_address)),
-                        ("error", json!(error.to_string())),
-                    ]),
-                );
+                tracing::error!("address" = ?(requested_address), "error" = ?(error.to_string()), "{}", "Failed to create TCP listener");
                 return Err(McpError::message(format!(
                     "Failed to create listener: {error}"
                 )));
@@ -1203,17 +1138,10 @@ impl MCPServer for BaseServer {
             .port
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = port;
-        self.logger.info(
-            "TCP listener created successfully",
-            log_attributes([
-                ("address", json!(listener_address.to_string())),
-                ("port", json!(port)),
-            ]),
-        );
+        tracing::info!("address" = ?(listener_address.to_string()), "port" = ?(port), "{}", "TCP listener created successfully");
 
         let server_cancellation = CancellationToken::new();
         let state = Arc::new(RpcServerState {
-            logger: self.logger.clone(),
             name: self.name.clone(),
             version: self.version.clone(),
             port,
@@ -1224,7 +1152,6 @@ impl MCPServer for BaseServer {
         let router = Router::new().fallback(any(handle_http)).with_state(state);
         let serve_shutdown = server_cancellation.clone();
         let server_name = self.name.clone();
-        let logger = self.logger.clone();
         let server_address = listener_address.to_string();
         // `net.OpError.Addr` 以 `any` 进入 Go JSONHandler 时会按 `net.TCPAddr`
         // 的导出字段编码，而不是调用 String；保留同样的嵌套值形状和字段顺序。
@@ -1234,13 +1161,7 @@ impl MCPServer for BaseServer {
             "Zone": "",
         });
         let server_task = tokio::spawn(async move {
-            logger.info(
-                "MCP HTTP server starting to serve",
-                log_attributes([
-                    ("address", json!(&server_address)),
-                    ("server_name", json!(&server_name)),
-                ]),
-            );
+            tracing::info!("address" = ?(&server_address), "server_name" = ?(&server_name), "{}", "MCP HTTP server starting to serve");
             let result = axum::serve(
                 McpTimeoutListener::new(listener),
                 router.into_make_service_with_connect_info::<McpConnectInfo>(),
@@ -1248,10 +1169,9 @@ impl MCPServer for BaseServer {
             .with_graceful_shutdown(serve_shutdown.cancelled_owned())
             .await;
             match result {
-                Ok(()) => logger.info(
-                    "MCP HTTP server stopped cleanly",
-                    log_attributes([("server_name", json!(&server_name))]),
-                ),
+                Ok(()) => {
+                    tracing::info!("server_name" = ?(&server_name), "{}", "MCP HTTP server stopped cleanly")
+                }
                 Err(error) if error.raw_os_error().is_some() => {
                     let timeout = error.kind() == io::ErrorKind::TimedOut;
                     let temporary = matches!(
@@ -1260,25 +1180,11 @@ impl MCPServer for BaseServer {
                             | io::ErrorKind::Interrupted
                             | io::ErrorKind::WouldBlock
                     );
-                    logger.error(
-                        "MCP HTTP server error",
-                        log_attributes([
-                            ("error", json!(error.to_string())),
-                            ("server_name", json!(&server_name)),
-                            ("network", json!("tcp")),
-                            ("address", server_log_address.clone()),
-                            ("temporary", json!(temporary)),
-                            ("timeout", json!(timeout)),
-                        ]),
-                    );
+                    tracing::error!("error" = ?(error.to_string()), "server_name" = ?(&server_name), "network" = ?("tcp"), "address" = ?(server_log_address.clone()), "temporary" = ?(temporary), "timeout" = ?(timeout), "{}", "MCP HTTP server error");
                 }
-                Err(error) => logger.error(
-                    "MCP HTTP server error",
-                    log_attributes([
-                        ("error", json!(error.to_string())),
-                        ("server_name", json!(&server_name)),
-                    ]),
-                ),
+                Err(error) => {
+                    tracing::error!("error" = ?(error.to_string()), "server_name" = ?(&server_name), "{}", "MCP HTTP server error")
+                }
             }
         });
 
@@ -1286,7 +1192,6 @@ impl MCPServer for BaseServer {
         // heartbeat channel。使用独立 token，避免一个广播取消把日志阶段顺序颠倒。
         let heartbeat_cancellation = CancellationToken::new();
         let heartbeat_shutdown = heartbeat_cancellation.clone();
-        let heartbeat_logger = self.logger.clone();
         let heartbeat_name = self.name.clone();
         let heartbeat_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -1295,23 +1200,11 @@ impl MCPServer for BaseServer {
             loop {
                 tokio::select! {
                     _ = heartbeat_shutdown.cancelled() => {
-                        heartbeat_logger.info(
-                            "MCP heartbeat monitor stopping",
-                            log_attributes([("server_name", json!(&heartbeat_name))]),
-                        );
+                        tracing::info!("server_name" = ?(&heartbeat_name), "{}", "MCP heartbeat monitor stopping");
                         break;
                     },
                     _ = interval.tick() => {
-                        heartbeat_logger.log(
-                            LogLevel::Debug,
-                            "MCP server heartbeat",
-                            log_attributes([
-                                ("server_name", json!(&heartbeat_name)),
-                                ("port", json!(port)),
-                                ("status", json!("running")),
-                                ("healthy", json!(true)),
-                            ]),
-                        );
+                        tracing::debug!("server_name" = ?(&heartbeat_name), "port" = ?(port), "status" = ?("running"), "healthy" = ?(true), "{}", "MCP server heartbeat");
                     }
                 }
             }
@@ -1331,14 +1224,7 @@ impl MCPServer for BaseServer {
             old_runtime.heartbeat_task.abort();
         }
 
-        self.logger.info(
-            "MCP server started",
-            log_attributes([
-                ("server_name", json!(&self.name)),
-                ("port", json!(port)),
-                ("version", json!(&self.version)),
-            ]),
-        );
+        tracing::info!("server_name" = ?(&self.name), "port" = ?(port), "version" = ?(&self.version), "{}", "MCP server started");
 
         Ok(ServerConfig { port, bearer_token })
     }
@@ -1357,13 +1243,7 @@ impl MCPServer for BaseServer {
                 .await
                 .is_err()
             {
-                self.logger.warn(
-                    "Failed to stop MCP server",
-                    log_attributes([
-                        ("server_name", json!(&self.name)),
-                        ("error", json!("context deadline exceeded")),
-                    ]),
-                );
+                tracing::warn!("server_name" = ?(&self.name), "error" = ?("context deadline exceeded"), "{}", "Failed to stop MCP server");
                 server_task.abort();
             }
             listener_address = Some(runtime.listener_address);
@@ -1375,28 +1255,16 @@ impl MCPServer for BaseServer {
         if let Some(listener_address) = listener_address {
             // Go 先调用 `http.Server.Shutdown`（它关闭 listener），随后再次显式 Close；
             // 第二次 close 固定返回 use-of-closed-network-connection，并被记录为 warning。
-            self.logger.warn(
-                "Failed to close MCP server listener",
-                log_attributes([
-                    ("server_name", json!(&self.name)),
-                    (
-                        "error",
-                        json!(format!(
+            tracing::warn!("server_name" = ?(&self.name), "error" = ?(format!(
                             "close tcp {listener_address}: use of closed network connection"
-                        )),
-                    ),
-                ]),
-            );
+                        )), "{}", "Failed to close MCP server listener");
         }
         if let Some((heartbeat_cancellation, _)) = heartbeat_runtime.as_ref() {
             heartbeat_cancellation.cancel();
             // Go 在关闭 channel 后不等待 goroutine；先记录 stopped，再在函数返回前
             // 回收 Tokio task，既保留日志阶段顺序，也不把后台任务泄漏给测试运行时。
         }
-        self.logger.info(
-            "MCP server stopped",
-            log_attributes([("server_name", json!(&self.name))]),
-        );
+        tracing::info!("server_name" = ?(&self.name), "{}", "MCP server stopped");
         if let Some((_, mut heartbeat_task)) = heartbeat_runtime
             && tokio::time::timeout(Duration::from_secs(5), &mut heartbeat_task)
                 .await

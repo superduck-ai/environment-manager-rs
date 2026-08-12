@@ -43,9 +43,9 @@ paths="$(mktemp)"
 trap 'rm -f "${temporary}" "${paths}"' EXIT
 
 # `.git` 不会同步到权威验证目录；target/dist 是派生产物；IDE 元数据、macOS
-# Finder 文件、Python 字节码缓存和同步 marker 也不参与构建。Python 比较器会按
-# 解释器小版本生成不同的 `__pycache__`，若纳入清单会把同一源码误判成漂移。除
-# 这些明确派生项外，所有普通文件与符号链接都进入清单，使代码、测试、fixture、
+# Finder 文件、Python 字节码缓存和同步 marker 也不参与构建。`__pycache__` 会按
+# 解释器小版本生成不同内容，若纳入清单会把同一源码误判成漂移。除这些明确
+# 派生项外，所有普通文件与符号链接都进入清单，使代码、测试、fixture、
 # 门禁脚本或配置发生变化时都必须重建候选并重新做 staging E2E。
 (
   cd "${root}"

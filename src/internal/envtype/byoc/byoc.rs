@@ -1,8 +1,7 @@
 //! BYOC 环境的配置校验、初始化和外部适配逻辑。
 //!
 //! 对应 Go：`internal/envtype/byoc/byoc.go`。本模块负责按 Go 顺序完成工作目录、
-//! Claude 设置、Git 全局配置、setup 脚本、缓存分支和 Git proxy 初始化，并把
-//! manager 注入的同一个 [`Logger`] 继续传给 sources、HTTP client 与 podmonitor。
+//! Claude 设置、Git 全局配置、setup 脚本、缓存分支和 Git proxy 初始化。
 //! Rust 额外保留可注入的 processor/factory trait 以隔离测试；生产构造始终安装
 //! 真实适配器，不改变 Go 的日志、网络和子进程副作用边界。
 
@@ -16,7 +15,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use nix::{fcntl::OFlag, unistd::pipe2};
-use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -32,7 +30,6 @@ use crate::internal::config::{SessionMode, StartupContext};
 use crate::internal::envtype::{
     EnvironmentType, LeaseManagerHandle, LeaseManagerProvider, Registration,
 };
-use crate::internal::logger::{LogAttributes, LogLevel, Logger};
 use crate::internal::podmonitor::{self, get_default_health_file_path};
 use crate::internal::process::{execute_script, go_spawn_error, resolve_go_command};
 use crate::internal::session::ActivityRecorder;
@@ -50,8 +47,8 @@ pub const MAX_TASK_SETUP_SCRIPT_BYTES: usize = 1024 * 1024;
 /// BYOC 在环境类型注册表中的静态元数据。
 pub static REGISTRATION: LazyLock<Registration> = LazyLock::new(|| Registration {
     type_name: "byoc".to_owned(),
-    factory: Some(Arc::new(|data, logger| {
-        new(data, logger)
+    factory: Some(Arc::new(|data| {
+        new(data)
             .map(|environment| Box::new(environment) as Box<dyn EnvironmentType>)
             .map_err(|error| Box::new(error) as BoxError)
     })),
@@ -75,8 +72,7 @@ impl LeaseManagerFactory for PodmonitorLeaseManagerFactory {
     /// runner 版本和 beta header；转换过程中不得重建连接池，否则这些 wire 行为会丢失。
     ///
     /// # 参数
-    /// - `request`：包含已认证 transport、租约标识、取消令牌、时间参数和 session
-    ///   logger 的完整请求；transport 与 logger 的所有权转入返回的 manager。
+    /// - `request`：包含已认证 transport、租约标识、取消令牌和时间参数的完整请求。
     ///
     /// # 返回
     /// 成功时返回可异步启动/停止的 podmonitor 句柄；当前生产适配过程本身不失败，
@@ -84,18 +80,14 @@ impl LeaseManagerFactory for PodmonitorLeaseManagerFactory {
     ///
     /// # 副作用
     /// 本函数只组装共享连接池和状态机，不立即发起 heartbeat；网络请求在 `start`
-    /// 后发生。HTTP 重试日志与 lease 状态日志共享同一个 logger handler。
+    /// 后发生。
     fn create(
         &self,
         request: LeaseManagerRequest,
     ) -> Result<Arc<dyn LeaseManagerHandle>, BoxError> {
-        // HttpClient 的 retry 日志和 podmonitor 的 lease 状态日志必须共享同一 handler；
-        // 先 clone 给 client，再把原句柄移入 lease manager，固定属性和 source 上下文
-        // 都会保留，且不会创建第二套日志目的地。
         let api_client = HttpClient::from_reqwest_client(
             &request.api_base_url,
             request.transport.client(),
-            Some(request.logger.clone()),
             None,
         );
         Ok(Arc::new(podmonitor::new_lease_manager(
@@ -104,7 +96,6 @@ impl LeaseManagerFactory for PodmonitorLeaseManagerFactory {
             request.environment_id,
             request.organization_uuid,
             api_client,
-            Some(request.logger),
             request.heartbeat_interval,
             request.safety_window,
             get_default_health_file_path(),
@@ -134,9 +125,7 @@ impl LeaseManagerHandle for podmonitor::LeaseManager {
 
 /// 对应 Go：`internal/envtype/byoc/byoc.go` 中的 `New`。
 ///
-/// 从原始 JSON 创建 BYOC 环境、保存 manager logger，并在产生任何副作用前完成
-/// 配置校验。Rust 的 Factory 契约要求传入具体 `Logger`，测试也必须
-/// 显式使用 discard handler，因此生产调用一定进入已初始化的 tracing 输出链。
+/// 从原始 JSON 创建 BYOC 环境，并在产生任何副作用前完成配置校验。
 ///
 /// CWD 除了必须是绝对路径，还必须与词法归一化结果逐字节相同。
 /// 因而 `..`、`.`、重复分隔符和非根目录的尾随分隔符都会被拒绝，
@@ -144,13 +133,11 @@ impl LeaseManagerHandle for podmonitor::LeaseManager {
 ///
 /// # 参数
 /// - `data`：后端返回的 BYOC JSON，函数只在反序列化期间借用。
-/// - `logger`：本次 session 的结构化 logger，所有权保存到环境并继续传给 sources、
-///   HTTP client 与 podmonitor。
 ///
 /// # 返回
 /// 配置合法时返回已接好生产 adapter 的环境；JSON、类型、CWD 或脚本大小不合法时
 /// 返回与 Go 文本一致的 `ByocError`。本函数不访问文件、网络或子进程。
-pub fn new(data: &[u8], logger: Logger) -> Result<ByocEnvironmentType, ByocError> {
+pub fn new(data: &[u8]) -> Result<ByocEnvironmentType, ByocError> {
     let config: ByocConfig = serde_json::from_slice(data)?;
     if config.environment_type != "byoc" {
         return Err(ByocError::InvalidEnvironmentType {
@@ -168,7 +155,6 @@ pub fn new(data: &[u8], logger: Logger) -> Result<ByocEnvironmentType, ByocError
 
     Ok(ByocEnvironmentType {
         config,
-        logger,
         session_mode: SessionMode::New,
         startup_context: None,
         auth_context: None,
@@ -257,24 +243,16 @@ impl ByocEnvironmentType {
         activity_recorder: Option<&(dyn ActivityRecorder + Send + Sync)>,
     ) -> Result<(), ByocError> {
         ensure_not_cancelled(cancellation)?;
-        self.logger.info(
-            "Initializing BYOC environment",
-            attributes([
-                ("cwd", json!(self.config.cwd)),
-                ("environment_type", json!(self.config.environment_type)),
-                (
-                    "has_task_setup_script",
-                    json!(!self.config.task_setup_script.is_empty()),
-                ),
-                ("session_mode", json!(self.session_mode.as_str())),
-            ]),
+        tracing::info!(
+            cwd = %self.config.cwd,
+            environment_type = %self.config.environment_type,
+            has_task_setup_script = !self.config.task_setup_script.is_empty(),
+            session_mode = %self.session_mode.as_str(),
+            "Initializing BYOC environment"
         );
 
         if !self.config.cwd.is_empty() {
-            self.logger.info(
-                "Setting working directory",
-                attributes([("cwd", json!(self.config.cwd))]),
-            );
+            tracing::info!(cwd = %self.config.cwd, "Setting working directory");
             ensure_not_cancelled(cancellation)?;
             create_dir_all_with_mode(PathBuf::from(&self.config.cwd), 0o755)
                 .await
@@ -290,17 +268,11 @@ impl ByocEnvironmentType {
                     source,
                 }
             })?;
-            self.logger.info(
-                "Working directory set successfully",
-                attributes([("cwd", json!(self.config.cwd))]),
-            );
+            tracing::info!(cwd = %self.config.cwd, "Working directory set successfully");
         }
 
         if let Err(error) = self.bootstrap_claude_settings(cancellation).await {
-            self.logger.warn(
-                "Failed to bootstrap Claude settings",
-                attributes([("error", json!(error.to_string()))]),
-            );
+            tracing::warn!(error = %error, "Failed to bootstrap Claude settings");
         }
         ensure_not_cancelled(cancellation)?;
         self.setup_git_config(cancellation).await?;
@@ -308,8 +280,7 @@ impl ByocEnvironmentType {
         let should_run_setup =
             matches!(self.session_mode, SessionMode::New | SessionMode::SetupOnly);
         if !self.config.task_setup_script.is_empty() && should_run_setup {
-            self.logger
-                .info("Running task setup script", LogAttributes::new());
+            tracing::info!("Running task setup script");
             ensure_not_cancelled(cancellation)?;
             if let Err(error) = self
                 .run_script(cancellation, "task_setup", &self.config.task_setup_script)
@@ -318,10 +289,7 @@ impl ByocEnvironmentType {
                 return Err(ByocError::TaskSetup(Box::new(error)));
             }
         } else if !self.config.task_setup_script.is_empty() {
-            self.logger.info(
-                "Fast resume: Skipping task setup script",
-                LogAttributes::new(),
-            );
+            tracing::info!("Fast resume: Skipping task setup script");
         }
 
         let has_sources = self
@@ -333,18 +301,12 @@ impl ByocEnvironmentType {
             .as_ref()
             .is_some_and(|context| !context.outcomes.is_empty());
         if self.session_mode == SessionMode::ResumeCached && has_sources && has_outcomes {
-            self.logger.info(
-                "Attempting to checkout target branches for BYOC environment",
-                LogAttributes::new(),
-            );
+            tracing::info!("Attempting to checkout target branches for BYOC environment");
             if let Err(error) = self
                 .handle_branch_checkout(cancellation, activity_recorder)
                 .await
             {
-                self.logger.error(
-                    "Failed to checkout branches",
-                    attributes([("error", json!(error.to_string()))]),
-                );
+                tracing::error!(error = %error, "Failed to checkout branches");
                 return Err(ByocError::BranchCheckout(Box::new(error)));
             }
         }
@@ -354,39 +316,26 @@ impl ByocEnvironmentType {
                 .setup_git_proxy_after_sources_processed(cancellation, activity_recorder)
                 .await
             {
-                Ok(()) => self.logger.info(
-                    "Git proxy setup completed",
-                    attributes([(
-                        "source_count",
-                        json!(
-                            self.startup_context
-                                .as_ref()
-                                .map_or(0, |context| context.sources.len())
-                        ),
-                    )]),
+                Ok(()) => tracing::info!(
+                    source_count = self
+                        .startup_context
+                        .as_ref()
+                        .map_or(0, |context| context.sources.len()),
+                    "Git proxy setup completed"
                 ),
                 Err(SourceProcessorError::CreateManager(error)) => {
-                    self.logger.warn(
-                        "Failed to create source manager for git proxy setup",
-                        attributes([("error", json!(error.to_string()))]),
-                    );
+                    tracing::warn!(error = %error, "Failed to create source manager for git proxy setup");
                 }
                 Err(
                     SourceProcessorError::ProcessSources(error)
                     | SourceProcessorError::SetupGitProxy(error),
                 ) => {
-                    self.logger.warn(
-                        "Failed to setup git proxy",
-                        attributes([("error", json!(error.to_string()))]),
-                    );
+                    tracing::warn!(error = %error, "Failed to setup git proxy");
                 }
             }
         }
         // Go 把 proxy 阶段（包括其中观察到的取消）视为 best effort，之后直接成功返回。
-        self.logger.info(
-            "BYOC environment initialization completed",
-            LogAttributes::new(),
-        );
+        tracing::info!("BYOC environment initialization completed");
         Ok(())
     }
 
@@ -415,13 +364,7 @@ impl ByocEnvironmentType {
             }
             let branch = outcome.git_info.branches[0].clone();
             mapping.insert(outcome.git_info.repo.clone(), branch.clone());
-            self.logger.debug(
-                "Mapped repository to branch for checkout",
-                attributes([
-                    ("repo", json!(outcome.git_info.repo)),
-                    ("branch", json!(branch)),
-                ]),
-            );
+            tracing::debug!(repo = %outcome.git_info.repo, branch = %branch, "Mapped repository to branch for checkout");
         }
         Ok(mapping)
     }
@@ -436,21 +379,15 @@ impl ByocEnvironmentType {
         cancellation: &CancellationToken,
         activity_recorder: Option<&(dyn ActivityRecorder + Send + Sync)>,
     ) -> Result<(), ByocError> {
-        self.logger.info(
-            "Extracting repository-branch mapping from outcomes",
-            LogAttributes::new(),
-        );
+        tracing::info!("Extracting repository-branch mapping from outcomes");
         let repo_branches = self.extract_repo_branch_mapping(cancellation)?;
         if repo_branches.is_empty() {
-            self.logger.info(
-                "No specific branches requested for checkout",
-                LogAttributes::new(),
-            );
+            tracing::info!("No specific branches requested for checkout");
             return Ok(());
         }
-        self.logger.info(
-            "Found branches to checkout",
-            attributes([("branch_count", json!(repo_branches.len()))]),
+        tracing::info!(
+            branch_count = repo_branches.len(),
+            "Found branches to checkout"
         );
         let processor = &self.source_processor;
         let context = self.startup_context.as_ref();
@@ -466,7 +403,6 @@ impl ByocEnvironmentType {
                 .unwrap_or_default(),
             mode: SourceProcessMode::AllowPrefetched,
             should_validate: true,
-            logger: self.logger.clone(),
         };
         let count = request.repo_branches.len();
         let repository_label = if count == 1 {
@@ -503,10 +439,7 @@ impl ByocEnvironmentType {
             }
         }
         ensure_not_cancelled(cancellation)?;
-        self.logger.info(
-            "Branches checked out successfully",
-            attributes([("branch_count", json!(count))]),
-        );
+        tracing::info!(branch_count = count, "Branches checked out successfully");
         if let Some(recorder) = activity_recorder {
             recorder.record_activity(
                 ApiLogLevel::Info,
@@ -558,44 +491,28 @@ impl ByocEnvironmentType {
         script: &str,
     ) -> Result<(), ByocError> {
         ensure_not_cancelled(cancellation)?;
-        self.logger.info(
-            "Executing script",
-            attributes([
-                ("name", json!(name)),
-                ("script_length", json!(script.len())),
-            ]),
-        );
+        tracing::info!(name = %name, script_length = script.len(), "Executing script");
         let content = if script.starts_with("#!") {
             script.to_owned()
         } else {
             format!("#!/bin/bash\nset -e\n{script}")
         };
         let script_name = name.to_owned();
-        let logger = self.logger.clone();
         let streamer = output_streamer(move |stream, data| {
-            logger.log(
-                LogLevel::Debug,
-                "Script output",
-                attributes([
-                    ("script_name", json!(script_name)),
-                    ("stream", json!(stream.to_string())),
-                    ("data", json!(String::from_utf8_lossy(data))),
-                ]),
+            tracing::debug!(
+                script_name = %script_name,
+                stream = %stream,
+                data = %String::from_utf8_lossy(data),
+                "Script output"
             );
             Ok::<(), std::io::Error>(())
         });
-        let result = execute_script(
-            cancellation,
-            self.logger.clone(),
-            &content,
-            &format!("{name}-*.sh"),
-            streamer,
-        )
-        .await
-        .map_err(|source| ByocError::ExecuteScript {
-            name: name.to_owned(),
-            source,
-        })?;
+        let result = execute_script(cancellation, &content, &format!("{name}-*.sh"), streamer)
+            .await
+            .map_err(|source| ByocError::ExecuteScript {
+                name: name.to_owned(),
+                source,
+            })?;
         if cancellation.is_cancelled() {
             return Err(ByocError::Cancelled);
         }
@@ -605,13 +522,11 @@ impl ByocEnvironmentType {
                 source,
             });
         }
-        self.logger.info(
-            "Script completed successfully",
-            attributes([
-                ("name", json!(name)),
-                ("exit_code", json!(result.exit_code)),
-                ("duration_ms", json!(result.duration.as_millis())),
-            ]),
+        tracing::info!(
+            name = %name,
+            exit_code = result.exit_code,
+            duration_ms = result.duration.as_millis(),
+            "Script completed successfully"
         );
         Ok(())
     }
@@ -642,17 +557,11 @@ impl ByocEnvironmentType {
         // 存在/缺失场景的日志顺序可被外部观察，因此不能简化成逐个检查后写入。
         let settings_exists = tokio::fs::metadata(&settings_path).await.is_ok();
         if settings_exists {
-            self.logger.info(
-                "Claude settings file already exists",
-                attributes([("path", json!(settings_path))]),
-            );
+            tracing::info!(path = %settings_path.display(), "Claude settings file already exists");
         }
         let stop_hook_exists = tokio::fs::metadata(&stop_hook_path).await.is_ok();
         if stop_hook_exists {
-            self.logger.info(
-                "Stop hook script already exists",
-                attributes([("path", json!(stop_hook_path))]),
-            );
+            tracing::info!(path = %stop_hook_path.display(), "Stop hook script already exists");
         }
 
         if !settings_exists
@@ -665,10 +574,7 @@ impl ByocEnvironmentType {
             )
             .await?
         {
-            self.logger.info(
-                "Successfully created Claude settings file",
-                attributes([("path", json!(settings_path))]),
-            );
+            tracing::info!(path = %settings_path.display(), "Successfully created Claude settings file");
         }
         if !stop_hook_exists
             && write_if_missing(
@@ -680,10 +586,7 @@ impl ByocEnvironmentType {
             )
             .await?
         {
-            self.logger.info(
-                "Successfully created stop hook script",
-                attributes([("path", json!(stop_hook_path))]),
-            );
+            tracing::info!(path = %stop_hook_path.display(), "Successfully created stop hook script");
         }
         ensure_not_cancelled(cancellation)
     }
@@ -698,16 +601,10 @@ impl ByocEnvironmentType {
         cancellation: &CancellationToken,
     ) -> Result<(), ByocError> {
         if env::var("SKIP_GIT_CONFIG").as_deref() == Ok("true") {
-            self.logger.info(
-                "Skipping git configuration (SKIP_GIT_CONFIG=true)",
-                LogAttributes::new(),
-            );
+            tracing::info!("Skipping git configuration (SKIP_GIT_CONFIG=true)");
             return Ok(());
         }
-        self.logger.info(
-            "Setting up git configuration for BYOC environment",
-            LogAttributes::new(),
-        );
+        tracing::info!("Setting up git configuration for BYOC environment");
         let configs = [
             ("user.name", "Claude"),
             ("user.email", "noreply@anthropic.com"),
@@ -719,19 +616,12 @@ impl ByocEnvironmentType {
         for (key, value) in configs {
             ensure_not_cancelled(cancellation)?;
             match run_git_config(cancellation, key, value).await {
-                Ok(()) => self.logger.debug(
-                    "Set git config",
-                    attributes([("key", json!(key)), ("value", json!(value))]),
-                ),
-                Err(failure) => self.logger.warn(
-                    "Failed to set git config",
-                    attributes([
-                        ("key", json!(key)),
-                        ("value", json!(value)),
-                        ("error", json!(failure.error.to_string())),
-                        ("output", json!(failure.output)),
-                    ]),
-                ),
+                Ok(()) => {
+                    tracing::debug!(key = %key, value = %value, "Set git config")
+                }
+                Err(failure) => {
+                    tracing::warn!(key = %key, value = %value, error = %failure.error, output = %failure.output, "Failed to set git config")
+                }
             }
         }
 
@@ -739,10 +629,7 @@ impl ByocEnvironmentType {
         let home = env::var_os("HOME").unwrap_or_default();
         let ssh_dir = PathBuf::from(home).join(".ssh");
         if let Err(error) = create_dir_all_with_mode(ssh_dir.clone(), 0o700).await {
-            self.logger.warn(
-                "Failed to create .ssh directory",
-                attributes([("error", json!(error.to_string()))]),
-            );
+            tracing::warn!(error = %error, "Failed to create .ssh directory");
             return Ok(());
         }
 
@@ -755,35 +642,25 @@ impl ByocEnvironmentType {
         {
             Ok(file) => {
                 drop(file);
-                self.logger.debug(
-                    "Created empty signing key file",
-                    attributes([("path", json!(signing_key))]),
-                );
+                tracing::debug!(path = %signing_key.display(), "Created empty signing key file");
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => self.logger.warn(
-                "Failed to create signing key file",
-                attributes([("error", json!(error.to_string()))]),
-            ),
+            Err(error) => {
+                tracing::warn!(error = %error, "Failed to create signing key file")
+            }
         }
         ensure_not_cancelled(cancellation)?;
         let key_value = signing_key.to_string_lossy();
         match run_git_config(cancellation, "user.signingkey", &key_value).await {
-            Ok(()) => self.logger.debug(
-                "Set git signing key",
-                attributes([("path", json!(signing_key))]),
-            ),
-            Err(failure) => self.logger.warn(
-                "Failed to set git signing key config",
-                attributes([
-                    ("error", json!(failure.error.to_string())),
-                    ("output", json!(failure.output)),
-                ]),
-            ),
+            Ok(()) => {
+                tracing::debug!(path = %signing_key.display(), "Set git signing key")
+            }
+            Err(failure) => {
+                tracing::warn!(error = %failure.error, output = %failure.output, "Failed to set git signing key config")
+            }
         }
         ensure_not_cancelled(cancellation)?;
-        self.logger
-            .info("Git configuration setup completed", LogAttributes::new());
+        tracing::info!("Git configuration setup completed");
         Ok(())
     }
 
@@ -807,7 +684,6 @@ impl ByocEnvironmentType {
                 .unwrap_or_default(),
             mode: SourceProcessMode::Fresh,
             should_validate: false,
-            logger: self.logger.clone(),
         };
         tokio::select! {
             biased;
@@ -844,13 +720,7 @@ impl ByocEnvironmentType {
             session_ingress_token.to_owned(),
             organization_uuid.to_owned(),
         )?;
-        self.logger.info(
-            "Creating LeaseManager for BYOC environment",
-            attributes([
-                ("session_id", json!(session_id)),
-                ("environment_id", json!(environment_id)),
-            ]),
-        );
+        tracing::info!(session_id = %session_id, environment_id = %environment_id, "Creating LeaseManager for BYOC environment");
         factory
             .create(LeaseManagerRequest {
                 cancellation: cancellation.clone(),
@@ -861,7 +731,6 @@ impl ByocEnvironmentType {
                 transport,
                 heartbeat_interval: Duration::from_secs(30),
                 safety_window: Duration::from_secs(30),
-                logger: self.logger.clone(),
             })
             .map_err(ByocError::LeaseManagerFactory)
     }
@@ -1093,14 +962,6 @@ fn go_exit_status(status: ExitStatus) -> String {
         Some(signal) => format!("signal: {signal}"),
         None => "exit status 1".to_owned(),
     }
-}
-
-/// 按调用方给出的顺序构造 slog 兼容 JSON 属性。
-fn attributes<const N: usize>(pairs: [(&str, Value); N]) -> LogAttributes {
-    pairs
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }
 
 /// 在 blocking 池中按 Go `MkdirAll(path, mode)` 语义创建目录。

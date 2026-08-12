@@ -18,7 +18,6 @@ use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, Logger, default_logger};
 use crate::internal::tunnel::actions::{
     Action, ActionError, ActionRequest, ActionResult, ProgressReporter, ProgressUpdate,
 };
@@ -62,14 +61,12 @@ pub(super) struct CommandFailure {
 /// 同一个 action 同时持有 Vercel 与 Antspace 配置。
 #[must_use]
 pub fn new_deploy_action(
-    logger: Option<Logger>,
     vercel_token: impl Into<String>,
     vercel_team_id: impl Into<String>,
     antspace_client: Option<super::AntspaceClient>,
     default_target: impl Into<String>,
 ) -> DeployAction {
     DeployAction {
-        logger,
         vercel_token: vercel_token.into(),
         vercel_team_id: vercel_team_id.into(),
         antspace_client,
@@ -126,28 +123,7 @@ impl Action for DeployAction {
         let started = Instant::now();
         let vercel_client = VercelClient::new(&self.vercel_token, &self.vercel_team_id);
         let project_name = project_name(&request.session_id);
-        let logger = self.log();
-        logger.info(
-            "deploy_start",
-            collect_log_attributes([
-                (
-                    "target",
-                    serde_json::Value::String(parameters.deploy_target.clone()),
-                ),
-                (
-                    "project_name",
-                    serde_json::Value::String(project_name.clone()),
-                ),
-                (
-                    "project_dir",
-                    serde_json::Value::String(parameters.project_dir.clone()),
-                ),
-                (
-                    "session_id",
-                    serde_json::Value::String(request.session_id.clone()),
-                ),
-            ]),
-        );
+        tracing::info!("target" = ?(parameters.deploy_target.clone()), "project_name" = ?(project_name.clone()), "project_dir" = ?(parameters.project_dir.clone()), "session_id" = ?(request.session_id.clone()), "{}", "deploy_start");
 
         // 六个阶段各自保留 warning 调用，使业务阶段与 Rust 调用位置
         // 均可直接辨识。
@@ -161,11 +137,7 @@ impl Action for DeployAction {
         )
         .await
         {
-            let logger = self.log();
-            logger.warn(
-                "deploy_progress_failed",
-                collect_log_attributes([("error", serde_json::Value::String(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "deploy_progress_failed");
         }
         let build_started = Instant::now();
         if let Err(mut failure) =
@@ -176,17 +148,7 @@ impl Action for DeployAction {
                     .output
                     .split_off(failure.output.len() - BUILD_ERROR_OUTPUT_LIMIT);
             }
-            let logger = self.log();
-            logger.error(
-                "deploy_build_failed",
-                collect_log_attributes([
-                    (
-                        "duration_ms",
-                        serde_json::Value::from(build_started.elapsed().as_millis() as u64),
-                    ),
-                    ("error", serde_json::Value::String(failure.error.clone())),
-                ]),
-            );
+            tracing::error!("duration_ms" = ?(build_started.elapsed().as_millis() as u64), "error" = ?(failure.error.clone()), "{}", "deploy_build_failed");
             return Err(format!(
                 "build failed: {}\n{}",
                 failure.error,
@@ -194,14 +156,7 @@ impl Action for DeployAction {
             )
             .into());
         }
-        let logger = self.log();
-        logger.info(
-            "deploy_build_completed",
-            collect_log_attributes([(
-                "duration_ms",
-                serde_json::Value::from(build_started.elapsed().as_millis() as u64),
-            )]),
-        );
+        tracing::info!("duration_ms" = ?(build_started.elapsed().as_millis() as u64), "{}", "deploy_build_completed");
 
         if let Err(error) = send_progress(
             Some(progress.as_ref()),
@@ -213,11 +168,7 @@ impl Action for DeployAction {
         )
         .await
         {
-            let logger = self.log();
-            logger.warn(
-                "deploy_progress_failed",
-                collect_log_attributes([("error", serde_json::Value::String(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "deploy_progress_failed");
         }
         let distribution_directory = Path::new(&parameters.project_dir).join("dist");
         let collect_path = distribution_directory.clone();
@@ -252,11 +203,7 @@ impl Action for DeployAction {
         )
         .await
         {
-            let logger = self.log();
-            logger.warn(
-                "deploy_progress_failed",
-                collect_log_attributes([("error", serde_json::Value::String(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "deploy_progress_failed");
         }
 
         let (mut deployment, missing_files) = vercel_client
@@ -304,11 +251,7 @@ impl Action for DeployAction {
         )
         .await
         {
-            let logger = self.log();
-            logger.warn(
-                "deploy_progress_failed",
-                collect_log_attributes([("error", serde_json::Value::String(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "deploy_progress_failed");
         }
         let deployment = deployment.expect("deployment was checked before polling");
         let deployment = vercel_client
@@ -334,29 +277,7 @@ impl Action for DeployAction {
         };
         let body = serde_json::to_vec(&response)
             .map_err(|error| format!("failed to marshal deploy response: {error}"))?;
-
-        let logger = self.log();
-        logger.info(
-            "deploy_success",
-            collect_log_attributes([
-                ("url", serde_json::Value::String(response.url.clone())),
-                (
-                    "deploy_id",
-                    serde_json::Value::String(response.deploy_id.clone()),
-                ),
-                ("project_name", serde_json::Value::String(project_name)),
-                (
-                    "duration_ms",
-                    serde_json::Value::from(started.elapsed().as_millis() as u64),
-                ),
-                ("files_uploaded", serde_json::Value::from(files_uploaded)),
-                (
-                    "files_cached",
-                    serde_json::Value::from(response.files_cached),
-                ),
-                ("session_id", serde_json::Value::String(request.session_id)),
-            ]),
-        );
+        tracing::info!("url" = ?(response.url.clone()), "deploy_id" = ?(response.deploy_id.clone()), "project_name" = ?(project_name), "duration_ms" = ?(started.elapsed().as_millis() as u64), "files_uploaded" = ?(files_uploaded), "files_cached" = ?(response.files_cached), "session_id" = ?(request.session_id), "{}", "deploy_success");
         Ok(ActionResult {
             status_code: 200,
             body,
@@ -401,11 +322,7 @@ impl DeployAction {
         )
         .await
         {
-            let logger = self.log();
-            logger.warn(
-                "deploy_progress_failed",
-                collect_log_attributes([("error", serde_json::Value::String(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "deploy_progress_failed");
         }
 
         let project_directory = PathBuf::from(&parameters.project_dir);
@@ -423,11 +340,7 @@ impl DeployAction {
         )
         .await
         {
-            let logger = self.log();
-            logger.warn(
-                "deploy_progress_failed",
-                collect_log_attributes([("error", serde_json::Value::String(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "deploy_progress_failed");
         }
 
         let result = client
@@ -452,14 +365,6 @@ impl DeployAction {
             status_code: 200,
             body,
         })
-    }
-
-    /// 返回 action 配置的 logger；缺省时使用进程级 tracing logger。
-    fn log(&self) -> &Logger {
-        match self.logger.as_ref() {
-            Some(logger) => logger,
-            None => default_logger(),
-        }
     }
 }
 
@@ -644,16 +549,4 @@ fn format_exit_status(status: ExitStatus) -> String {
         Some(signal) => format!("signal: {signal}"),
         None => status.to_string(),
     }
-}
-
-/// 按调用顺序收集任意日志属性迭代器。
-fn collect_log_attributes<I, K>(attributes: I) -> LogAttributes
-where
-    I: IntoIterator<Item = (K, serde_json::Value)>,
-    K: Into<String>,
-{
-    attributes
-        .into_iter()
-        .map(|(key, value)| (key.into(), value))
-        .collect()
 }

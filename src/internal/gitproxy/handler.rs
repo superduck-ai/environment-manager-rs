@@ -7,10 +7,7 @@
 
 use std::{collections::HashMap, fmt, io, sync::Arc};
 
-use crate::internal::{
-    logger::{LogAttributes, LogLevel, Logger, default_logger},
-    util::{claude_code_version, go_path_escape, version},
-};
+use crate::internal::util::{claude_code_version, go_path_escape, version};
 use axum::{body::Body, response::Response};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
@@ -74,7 +71,6 @@ impl From<GitProxyError> for ForwardRequestFailure {
 pub(super) struct Handler {
     config: Arc<Config>,
     http_client: reqwest::Client,
-    logger: Logger,
     repo_tokens: Arc<HashMap<String, String>>,
 }
 
@@ -88,16 +84,9 @@ impl Handler {
         http_client: reqwest::Client,
         repo_tokens: HashMap<String, String>,
     ) -> Self {
-        // 测试会直接构造 Handler，因此这里也在边界解析默认
-        // tracing logger，保证两条入口行为一致。
-        let logger = config
-            .logger
-            .clone()
-            .unwrap_or_else(|| default_logger().clone());
         Self {
             config,
             http_client,
-            logger,
             repo_tokens: Arc::new(repo_tokens),
         }
     }
@@ -111,11 +100,7 @@ impl Handler {
         let method = request.method().as_str().to_owned();
         let path = percent_decode_path(request.uri().path());
         if !path.starts_with("/git/") {
-            self.log(
-                LogLevel::Warn,
-                "Invalid path format - missing components",
-                log_attributes([("path", serde_json::Value::String(path.clone()))]),
-            );
+            tracing::warn!("path" = ?(path.clone()), "{}", "Invalid path format - missing components");
             return http_error(StatusCode::BAD_REQUEST, "Invalid path format");
         }
 
@@ -126,11 +111,7 @@ impl Handler {
         let parsed = if first_segment.contains('.') {
             let parts = local_path.splitn(4, '/').collect::<Vec<_>>();
             if parts.len() < 4 {
-                self.log(
-                    LogLevel::Warn,
-                    "Invalid GHE path format - missing components",
-                    log_attributes([("path", serde_json::Value::String(path.clone()))]),
-                );
+                tracing::warn!("path" = ?(path.clone()), "{}", "Invalid GHE path format - missing components");
                 return http_error(StatusCode::BAD_REQUEST, "Invalid path format");
             }
             (
@@ -141,11 +122,7 @@ impl Handler {
         } else {
             let parts = local_path.splitn(3, '/').collect::<Vec<_>>();
             if parts.len() < 3 {
-                self.log(
-                    LogLevel::Warn,
-                    "Invalid path format - missing components",
-                    log_attributes([("path", serde_json::Value::String(path.clone()))]),
-                );
+                tracing::warn!("path" = ?(path.clone()), "{}", "Invalid path format - missing components");
                 return http_error(StatusCode::BAD_REQUEST, "Invalid path format");
             }
             (
@@ -160,28 +137,10 @@ impl Handler {
             .headers()
             .get(AUTHORIZATION)
             .is_some_and(|value| !value.as_bytes().is_empty());
-        self.log(
-            LogLevel::Info,
-            "Received git request",
-            log_attributes([
-                ("method", serde_json::Value::String(method)),
-                ("path", serde_json::Value::String(path)),
-                ("org", serde_json::Value::String(org.clone())),
-                ("repo", serde_json::Value::String(repo.clone())),
-                ("git_path", serde_json::Value::String(git_path.clone())),
-                ("has_auth", serde_json::Value::Bool(has_auth)),
-            ]),
-        );
+        tracing::info!("method" = ?(method), "path" = ?(path), "org" = ?(org.clone()), "repo" = ?(repo.clone()), "git_path" = ?(git_path.clone()), "has_auth" = ?(serde_json::Value::Bool(has_auth)), "{}", "Received git request");
 
         if git_path == "info/refs" && !has_auth {
-            self.log(
-                LogLevel::Info,
-                "Challenging unauthenticated info/refs request",
-                log_attributes([
-                    ("org", serde_json::Value::String(org.clone())),
-                    ("repo", serde_json::Value::String(repo.clone())),
-                ]),
-            );
+            tracing::info!("org" = ?(org.clone()), "repo" = ?(repo.clone()), "{}", "Challenging unauthenticated info/refs request");
             let mut response = Response::new(Body::empty());
             *response.status_mut() = StatusCode::UNAUTHORIZED;
             response.headers_mut().insert(
@@ -195,16 +154,7 @@ impl Handler {
             Ok(response) => response,
             Err(failure) => {
                 let sanitized = sanitize_error(Some(&failure.error));
-                self.log(
-                    LogLevel::Error,
-                    "Failed to proxy git request",
-                    log_attributes([
-                        ("error", serde_json::Value::String(sanitized.clone())),
-                        ("org", serde_json::Value::String(org)),
-                        ("repo", serde_json::Value::String(repo)),
-                        ("git_path", serde_json::Value::String(git_path)),
-                    ]),
-                );
+                tracing::error!("error" = ?(sanitized.clone()), "org" = ?(org), "repo" = ?(repo), "git_path" = ?(git_path), "{}", "Failed to proxy git request");
                 failure.response.unwrap_or_else(|| {
                     http_error(
                         StatusCode::BAD_GATEWAY,
@@ -228,15 +178,7 @@ impl Handler {
         git_path: &str,
     ) -> Result<Response, ForwardRequestFailure> {
         if !is_valid_git_path(git_path) {
-            self.log(
-                LogLevel::Warn,
-                "Invalid git path detected",
-                log_attributes([
-                    ("git_path", serde_json::Value::String(git_path.to_owned())),
-                    ("org", serde_json::Value::String(org.to_owned())),
-                    ("repo", serde_json::Value::String(repo.to_owned())),
-                ]),
-            );
+            tracing::warn!("git_path" = ?(git_path.to_owned()), "org" = ?(org.to_owned()), "repo" = ?(repo.to_owned()), "{}", "Invalid git path detected");
             return Err(GitProxyError::message("invalid git path").into());
         }
 
@@ -248,11 +190,7 @@ impl Handler {
         {
             Some(auth_token) => auth_token,
             None => {
-                self.log(
-                    LogLevel::Warn,
-                    "No auth token configured for repository",
-                    log_attributes([("repo", serde_json::Value::String(repo_key.clone()))]),
-                );
+                tracing::warn!("repo" = ?(repo_key.clone()), "{}", "No auth token configured for repository");
                 return Err(GitProxyError::message("repository not authorized").into());
             }
         };
@@ -271,18 +209,7 @@ impl Handler {
             upstream_url.push('?');
             upstream_url.push_str(query);
         }
-        self.log(
-            LogLevel::Info,
-            "Forwarding request to session ingress proxy",
-            log_attributes([
-                (
-                    "upstream_url",
-                    serde_json::Value::String(sanitize_string(&upstream_url)),
-                ),
-                ("repo", serde_json::Value::String(repo_key.clone())),
-                ("git_path", serde_json::Value::String(git_path.to_owned())),
-            ]),
-        );
+        tracing::info!("upstream_url" = ?(sanitize_string(&upstream_url)), "repo" = ?(repo_key.clone()), "git_path" = ?(git_path.to_owned()), "{}", "Forwarding request to session ingress proxy");
 
         let mut headers = filtered_request_headers(parts.headers);
         let basic_auth = format!("Basic {}", STANDARD.encode(format!("git:{auth_token}")));
@@ -326,14 +253,7 @@ impl Handler {
                 GitProxyError::message(format!("failed to create upstream request: {error}"))
             })?;
 
-        self.log(
-            LogLevel::Info,
-            "Sending authenticated request to upstream",
-            log_attributes([
-                ("repo", serde_json::Value::String(repo_key.clone())),
-                ("method", serde_json::Value::String(method)),
-            ]),
-        );
+        tracing::info!("repo" = ?(repo_key.clone()), "method" = ?(method), "{}", "Sending authenticated request to upstream");
         let upstream_response =
             self.http_client
                 .execute(upstream_request)
@@ -343,39 +263,19 @@ impl Handler {
                 })?;
         let status = upstream_response.status();
         let response_headers = upstream_response.headers().clone();
-        self.log(
-            LogLevel::Info,
-            "Received response from upstream",
-            log_attributes([
-                ("repo", serde_json::Value::String(repo_key.clone())),
-                (
-                    "status",
-                    serde_json::Value::from(i64::from(status.as_u16())),
-                ),
-            ]),
-        );
+        tracing::info!("repo" = ?(repo_key.clone()), "status" = ?(i64::from(status.as_u16())), "{}", "Received response from upstream");
 
         let response_body = if status >= StatusCode::BAD_REQUEST {
             // Go 在写出上游 status/header 后才读取错误体；读取失败不能再改写成 502。
             match upstream_response.bytes().await {
                 Ok(bytes) => logged_sanitized_body(
                     sanitize_string(&String::from_utf8_lossy(&bytes)),
-                    self.logger.clone(),
                     repo_key.clone(),
                     status,
                 ),
                 Err(error) => {
                     let sanitized = sanitize_error(Some(&error));
-                    self.log(
-                        LogLevel::Error,
-                        "Error reading error response body",
-                        log_attributes([
-                            // 后续还要把同一脱敏文本写入已提交状态码的响应体；日志
-                            // handler 拥有自己的 JSON 值，因此这里只复制一次字符串。
-                            ("error", serde_json::Value::String(sanitized.clone())),
-                            ("repo", serde_json::Value::String(repo_key)),
-                        ]),
-                    );
+                    tracing::error!(error = %sanitized, repo = %repo_key, "Error reading error response body");
                     // Go 此时已经执行 `WriteHeader(resp.StatusCode)`。如果上游没有
                     // Content-Type，外层 `http.Error` 的状态修改会被忽略，但错误文本
                     // 仍会追加到 body；已有 Content-Type 时外层不会再写任何内容。
@@ -399,7 +299,7 @@ impl Handler {
                 }
             }
         } else {
-            logged_streaming_body(upstream_response, self.logger.clone(), repo_key, status)
+            logged_streaming_body(upstream_response, repo_key, status)
         };
 
         let mut response = Response::new(response_body);
@@ -407,34 +307,6 @@ impl Handler {
         *response.headers_mut() = response_headers;
         Ok(response)
     }
-
-    /// 向构造时已具体化的 logger 记录结构化事件。
-    ///
-    /// # 参数
-    /// - `level`：对应 Go `InfoContext`、`WarnContext` 或 `ErrorContext` 的级别。
-    /// - `message`：与 Go 调用点逐字相同的消息。
-    /// - `attributes`：保持 Go 参数顺序和原始标量类型的属性。
-    ///
-    /// # 副作用
-    /// 调用 logger handler；写日志失败不会改变 HTTP 响应。
-    #[track_caller]
-    fn log(&self, level: LogLevel, message: &str, attributes: LogAttributes) {
-        self.logger.log(level, message, attributes);
-    }
-}
-
-/// 把一组按 Go 调用顺序给出的键值转换为保序日志属性。
-///
-/// # 参数
-/// - `attributes`：固定长度的键值数组；值必须已经完成脱敏并保留原始 JSON 类型。
-///
-/// # 返回
-/// 返回启用了 `preserve_order` 的 `LogAttributes`，供 logger 原样编码。
-fn log_attributes<const N: usize>(attributes: [(&str, serde_json::Value); N]) -> LogAttributes {
-    attributes
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }
 
 /// 响应体复制路径，用于区分 Go 中两个独立的 `io.WriteString`/`io.Copy` 错误日志。
@@ -451,7 +323,6 @@ enum ResponseWriteMode {
 /// guard 跟随 body stream 生命周期，从而在正常 EOF 或客户端提前断开时补回同一组
 /// 可观察日志。`completed` 防止显式错误之后的 Drop 再写一条重复事件。
 struct ResponseWriteGuard {
-    logger: Logger,
     repo: String,
     status: StatusCode,
     bytes_written: i64,
@@ -463,13 +334,11 @@ impl ResponseWriteGuard {
     /// 创建尚未写出任何字节的响应日志 guard。
     ///
     /// # 参数
-    /// - `logger`：与当前 handler 相同的具体 logger。
     /// - `repo`：`org/repo` 仓库键。
     /// - `status`：上游返回的 HTTP 状态。
     /// - `mode`：错误响应的脱敏写入或成功响应的流式复制路径。
-    fn new(logger: Logger, repo: String, status: StatusCode, mode: ResponseWriteMode) -> Self {
+    fn new(repo: String, status: StatusCode, mode: ResponseWriteMode) -> Self {
         Self {
-            logger,
             repo,
             status,
             bytes_written: 0,
@@ -494,18 +363,7 @@ impl ResponseWriteGuard {
     /// 兜底；日志写入失败不会影响已经发送的 HTTP 响应。
     fn finish(&mut self) {
         self.completed = true;
-        self.logger.log(
-            LogLevel::Info,
-            "Successfully proxied request",
-            log_attributes([
-                ("repo", serde_json::Value::String(self.repo.clone())),
-                (
-                    "status",
-                    serde_json::Value::from(i64::from(self.status.as_u16())),
-                ),
-                ("bytes_written", serde_json::Value::from(self.bytes_written)),
-            ]),
-        );
+        tracing::info!("repo" = ?(self.repo.clone()), "status" = ?(i64::from(self.status.as_u16())), "bytes_written" = ?(self.bytes_written), "{}", "Successfully proxied request");
     }
 
     /// 对应 Go 的响应体写入失败分支，并按写入模式选择精确消息。
@@ -517,19 +375,12 @@ impl ResponseWriteGuard {
     /// 记录 `error`、`repo` 两个有序属性；调用后 guard 不会在 Drop 时重复记录。
     fn fail(&mut self, error: String) {
         self.completed = true;
-        let attributes = log_attributes([
-            ("error", serde_json::Value::String(error)),
-            ("repo", serde_json::Value::String(self.repo.clone())),
-        ]);
         match self.mode {
-            ResponseWriteMode::Sanitized => self.logger.log(
-                LogLevel::Error,
-                "Error writing sanitized response body",
-                attributes,
-            ),
+            ResponseWriteMode::Sanitized => {
+                tracing::error!(error = %error, repo = %self.repo, "Error writing sanitized response body")
+            }
             ResponseWriteMode::Streaming => {
-                self.logger
-                    .log(LogLevel::Error, "Error streaming response body", attributes)
+                tracing::error!(error = %error, repo = %self.repo, "Error streaming response body")
             }
         }
     }
@@ -551,15 +402,14 @@ impl Drop for ResponseWriteGuard {
 ///
 /// # 参数
 /// - `body`：脱敏后的 UTF-8 错误体。
-/// - `logger`：当前 handler logger。
 /// - `repo`：`org/repo` 仓库键。
 /// - `status`：上游 HTTP 状态。
 ///
 /// # 返回
 /// 返回只产生一个数据块的 body；正常 EOF 记录成功字节数，提前丢弃记录 Go 的
 /// `Error writing sanitized response body` 分支。
-fn logged_sanitized_body(body: String, logger: Logger, repo: String, status: StatusCode) -> Body {
-    let mut guard = ResponseWriteGuard::new(logger, repo, status, ResponseWriteMode::Sanitized);
+fn logged_sanitized_body(body: String, repo: String, status: StatusCode) -> Body {
+    let mut guard = ResponseWriteGuard::new(repo, status, ResponseWriteMode::Sanitized);
     if body.is_empty() {
         guard.finish();
         return Body::empty();
@@ -586,21 +436,15 @@ fn logged_sanitized_body(body: String, logger: Logger, repo: String, status: Sta
 ///
 /// # 参数
 /// - `response`：尚未消费响应体的上游响应。
-/// - `logger`：当前 handler logger。
 /// - `repo`：`org/repo` 仓库键。
 /// - `status`：上游 HTTP 状态。
 ///
 /// # 返回
 /// 返回保持 backpressure 的流式 body；上游读取错误原样传给 Hyper，并记录 Go 的
 /// `Error streaming response body`，正常 EOF 则记录成功事件。
-fn logged_streaming_body(
-    response: reqwest::Response,
-    logger: Logger,
-    repo: String,
-    status: StatusCode,
-) -> Body {
+fn logged_streaming_body(response: reqwest::Response, repo: String, status: StatusCode) -> Body {
     let upstream = Box::pin(response.bytes_stream());
-    let guard = ResponseWriteGuard::new(logger, repo, status, ResponseWriteMode::Streaming);
+    let guard = ResponseWriteGuard::new(repo, status, ResponseWriteMode::Streaming);
     let stream = futures_util::stream::unfold(Some((upstream, guard)), |state| async move {
         let (mut upstream, mut guard) = state?;
         match upstream.as_mut().next().await {

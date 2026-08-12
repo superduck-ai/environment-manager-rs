@@ -19,9 +19,7 @@ use wiremock::{
 use crate::internal::{
     auth::{AuthConfig, AuthContext, new_auth_context_with_session_id},
     config::StartupContext,
-    logger::Logger,
     mcp::{BaseServer, CallToolParams, CallToolRequest, CallToolResult},
-    o11y::{DiscardO11yService, O11yService},
     session::NoopActivityRecorder,
 };
 
@@ -100,11 +98,6 @@ fn new_supabase_auth_context(
     )
 }
 
-/// 对应 Go `supabaseTestLogger`；测试不观察日志，但显式传递 discard logger。
-fn supabase_test_logger() -> Logger {
-    Logger::new(DiscardO11yService.log_handler())
-}
-
 /// 对应 Go `mcpResultContains`，搜索实际 MCP 文本内容。
 fn mcp_result_contains(result: &CallToolResult, want: &str) -> bool {
     result
@@ -150,7 +143,7 @@ async fn test_configure_server_and_should_register() {
     let auth =
         new_supabase_auth_context("session-123", "pat-token", "project-ref", "ingress-token");
     let server = configure_server(
-        Arc::new(BaseServer::new(supabase_test_logger(), "supabase", "0.0.1")),
+        Arc::new(BaseServer::new("supabase", "0.0.1")),
         Some(auth),
         Some(Arc::new(StartupContext {
             api_base_url: "api.example.test".to_owned(),
@@ -178,7 +171,7 @@ async fn test_configure_server_and_should_register() {
     drop(state);
 
     let without_project = configure_server(
-        Arc::new(BaseServer::new(supabase_test_logger(), "supabase", "0.0.1")),
+        Arc::new(BaseServer::new("supabase", "0.0.1")),
         Some(new_supabase_auth_context(
             "session-123",
             "pat-token",
@@ -194,7 +187,7 @@ async fn test_configure_server_and_should_register() {
     assert!(without_project.state.read().await.client.is_none());
 
     let error = configure_server(
-        Arc::new(BaseServer::new(supabase_test_logger(), "supabase", "0.0.1")),
+        Arc::new(BaseServer::new("supabase", "0.0.1")),
         Some(new_supabase_auth_context(
             "session-123",
             "",
@@ -238,7 +231,7 @@ async fn test_ensure_configured_fetches_credentials_and_writes_env_files() {
         .mount(&control)
         .await;
     let server = SupabaseMCPServer::new(
-        Arc::new(BaseServer::new(supabase_test_logger(), "supabase", "0.0.1")),
+        Arc::new(BaseServer::new("supabase", "0.0.1")),
         None,
         "pat-token",
         working_directory.path().to_path_buf(),
@@ -275,7 +268,7 @@ async fn test_ensure_configured_pending_and_permanent_failures() {
         .mount(&pending)
         .await;
     let non_lazy = SupabaseMCPServer::new(
-        Arc::new(BaseServer::new(supabase_test_logger(), "supabase", "0.0.1")),
+        Arc::new(BaseServer::new("supabase", "0.0.1")),
         None,
         "pat-token",
         tempdir().unwrap().path().to_path_buf(),
@@ -298,7 +291,7 @@ async fn test_ensure_configured_pending_and_permanent_failures() {
         .mount(&lazy_pending)
         .await;
     let lazy = SupabaseMCPServer::new(
-        Arc::new(BaseServer::new(supabase_test_logger(), "supabase", "0.0.1")),
+        Arc::new(BaseServer::new("supabase", "0.0.1")),
         None,
         "pat-token",
         tempdir().unwrap().path().to_path_buf(),
@@ -321,7 +314,7 @@ async fn test_ensure_configured_pending_and_permanent_failures() {
         .mount(&permanent)
         .await;
     let failed = SupabaseMCPServer::new(
-        Arc::new(BaseServer::new(supabase_test_logger(), "supabase", "0.0.1")),
+        Arc::new(BaseServer::new("supabase", "0.0.1")),
         None,
         "pat-token",
         tempdir().unwrap().path().to_path_buf(),
@@ -398,7 +391,7 @@ async fn test_supabase_tool_handlers_use_configured_client() {
             .with_http_clients(http.clone(), http),
     );
     let eager = Arc::new(SupabaseMCPServer::new(
-        Arc::new(BaseServer::new(supabase_test_logger(), "supabase", "0.0.1")),
+        Arc::new(BaseServer::new("supabase", "0.0.1")),
         Some(Arc::clone(&client)),
         "pat-token",
         working_directory.path().to_path_buf(),
@@ -411,7 +404,7 @@ async fn test_supabase_tool_handlers_use_configured_client() {
     assert_eq!(tools.len(), 5, "tools={:?}", tool_names(&tools));
     assert!(eager.should_register_with_claude());
     let lazy = Arc::new(SupabaseMCPServer::new(
-        Arc::new(BaseServer::new(supabase_test_logger(), "supabase", "0.0.1")),
+        Arc::new(BaseServer::new("supabase", "0.0.1")),
         Some(Arc::clone(&client)),
         "pat-token",
         working_directory.path().to_path_buf(),
@@ -501,7 +494,7 @@ async fn test_handle_deploy_function_and_provision_database() {
             .with_http_clients(reqwest::Client::new(), reqwest::Client::new()),
     );
     let server = SupabaseMCPServer::new(
-        Arc::new(BaseServer::new(supabase_test_logger(), "supabase", "0.0.1")),
+        Arc::new(BaseServer::new("supabase", "0.0.1")),
         Some(client),
         "pat-token",
         working_directory.path().to_path_buf(),
@@ -570,7 +563,7 @@ async fn test_handle_provision_database_fetches_credentials_when_already_provisi
         .mount(&control)
         .await;
     let server = SupabaseMCPServer::new(
-        Arc::new(BaseServer::new(supabase_test_logger(), "supabase", "0.0.1")),
+        Arc::new(BaseServer::new("supabase", "0.0.1")),
         None,
         "pat-token",
         working_directory.path().to_path_buf(),

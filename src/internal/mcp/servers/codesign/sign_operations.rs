@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::internal::{
     config::Source,
-    mcp::{McpError, McpResult, types::log_attributes},
+    mcp::{McpError, McpResult},
     util::{claude_code_version, version},
 };
 
@@ -31,15 +31,7 @@ impl CodeSignMCPServer {
         cancellation: &CancellationToken,
         request: &SignRequest,
     ) -> McpResult<SignResponse> {
-        self.base_server.logger.info(
-            "Executing sign operation via remote server",
-            log_attributes([
-                ("content_length", json!(request.content.len())),
-                ("has_source", json!(request.source.is_some())),
-                ("signing_server_url", json!(&self.signing_server_url)),
-                ("working_dir", json!(self.working_dir.to_string_lossy())),
-            ]),
-        );
+        tracing::info!("content_length" = ?(request.content.len()), "has_source" = ?(request.source.is_some()), "signing_server_url" = ?(&self.signing_server_url), "working_dir" = ?(self.working_dir.to_string_lossy()), "{}", "Executing sign operation via remote server");
         let session_id = self
             .auth_context
             .as_deref()
@@ -112,10 +104,7 @@ impl CodeSignMCPServer {
         let response = match response {
             Ok(response) => response,
             Err(error) => {
-                self.base_server.logger.error(
-                    "Failed to call remote signing server",
-                    log_attributes([("error", json!(&error)), ("url", json!(&endpoint))]),
-                );
+                tracing::error!("error" = ?(&error), "url" = ?(&endpoint), "{}", "Failed to call remote signing server");
                 return Err(McpError::message(format!(
                     "failed to call signing server: {error}"
                 )));
@@ -131,16 +120,7 @@ impl CodeSignMCPServer {
             })?,
         };
         if status != reqwest::StatusCode::OK {
-            self.base_server.logger.error(
-                "Remote signing server returned error",
-                log_attributes([
-                    ("status_code", json!(status.as_u16())),
-                    (
-                        "response_body",
-                        json!(String::from_utf8_lossy(&response_body)),
-                    ),
-                ]),
-            );
+            tracing::error!("status_code" = ?(status.as_u16()), "response_body" = ?(String::from_utf8_lossy(&response_body)), "{}", "Remote signing server returned error");
             return Err(McpError::message(format!(
                 "signing server returned status {}: {}",
                 status.as_u16(),
@@ -151,16 +131,7 @@ impl CodeSignMCPServer {
         let remote_response: RemoteSignResponse = match serde_json::from_slice(&response_body) {
             Ok(response) => response,
             Err(error) => {
-                self.base_server.logger.error(
-                    "Failed to parse signing server response",
-                    log_attributes([
-                        ("error", json!(error.to_string())),
-                        (
-                            "response_body",
-                            json!(String::from_utf8_lossy(&response_body)),
-                        ),
-                    ]),
-                );
+                tracing::error!("error" = ?(error.to_string()), "response_body" = ?(String::from_utf8_lossy(&response_body)), "{}", "Failed to parse signing server response");
                 return Err(McpError::message(format!(
                     "failed to parse response: {error}"
                 )));
@@ -169,10 +140,7 @@ impl CodeSignMCPServer {
         if remote_response.signature.is_empty() {
             return Err(McpError::message("no signature returned from server"));
         }
-        self.base_server.logger.info(
-            "Successfully received signature from remote server",
-            log_attributes([("signature_length", json!(remote_response.signature.len()))]),
-        );
+        tracing::info!("signature_length" = ?(remote_response.signature.len()), "{}", "Successfully received signature from remote server");
         Ok(SignResponse {
             signature: remote_response.signature,
         })
@@ -187,14 +155,7 @@ impl CodeSignMCPServer {
         git_object_format: String,
     ) -> McpResult<String> {
         let source_type = source_info.source.as_ref().map_or("", Source::get_type);
-        self.base_server.logger.info(
-            "Signing content for source",
-            log_attributes([
-                ("source_name", json!(&source_info.name)),
-                ("source_type", json!(source_type)),
-                ("content_length", json!(content.len())),
-            ]),
-        );
+        tracing::info!("source_name" = ?(&source_info.name), "source_type" = ?(source_type), "content_length" = ?(content.len()), "{}", "Signing content for source");
         if content.is_empty() {
             return Err(McpError::message(ERR_EMPTY_CONTENT));
         }

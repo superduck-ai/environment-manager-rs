@@ -27,7 +27,6 @@ use crate::internal::{
         EnvTypes, EnvironmentType, Factory, LeaseManagerHandle, LeaseManagerProvider, Registration,
         new_env_types,
     },
-    logger::{LogAttributes, LogHandler, LogHandlerError, LogLevel, LogRecord, Logger},
     mcp::{MCPServer, MCPServerRegistration, McpError, McpResult, ServerConfig, ToolConfig},
     session::{ActivityRecorder, NoopActivityRecorder},
     util::BoxError,
@@ -39,36 +38,6 @@ use super::{
     new_manager_with_executor_and_claude_config,
     types::{ClaudeExecutorFactory, EnvironmentLeaseAdapter},
 };
-
-/// 丢弃全部测试日志的 handler。
-struct DiscardHandler;
-
-impl LogHandler for DiscardHandler {
-    /// 测试 logger 接受所有级别，以覆盖业务侧属性构造。
-    fn enabled(&self, _level: LogLevel) -> bool {
-        true
-    }
-
-    /// 丢弃记录并报告成功。
-    fn handle(&self, _record: &LogRecord) -> Result<(), LogHandlerError> {
-        Ok(())
-    }
-
-    /// 返回同样丢弃记录的派生 handler。
-    fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        Arc::new(Self)
-    }
-
-    /// 返回同样丢弃记录的 group handler。
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(Self)
-    }
-}
-
-/// 对应 Go：`newTestLogger`；创建无输出测试 logger。
-fn new_test_logger() -> Logger {
-    Logger::new(Arc::new(DiscardHandler))
-}
 
 /// Fake environment 的跨 factory 可观察状态。
 #[derive(Default)]
@@ -418,7 +387,7 @@ fn fake_environment(initialization_error: Option<&str>) -> FakeEnvironment {
 fn new_env_types_for_test(type_name: &str, environment: FakeEnvironment) -> Arc<EnvTypes> {
     let mut env_types = new_env_types();
     let factory_environment = environment;
-    let factory: Factory = Arc::new(move |_raw_config, _logger| {
+    let factory: Factory = Arc::new(move |_raw_config| {
         Ok(Box::new(factory_environment.clone()) as Box<dyn EnvironmentType>)
     });
     env_types.register(Registration {
@@ -466,8 +435,7 @@ fn new_manager_for_test_with_error_bytes(
     let factory_call = Arc::new(Mutex::new(FactoryCall::default()));
     let captured_call = Arc::clone(&factory_call);
     let executor_factory: ClaudeExecutorFactory = Arc::new(
-        move |_logger,
-              configuration,
+        move |configuration,
               session_id,
               startup_context,
               auth_context,
@@ -510,7 +478,6 @@ fn new_manager_for_test_with_error_bytes(
     });
     let manager = new_manager_with_executor_and_claude_config(
         api_client,
-        new_test_logger(),
         Some(session),
         new_env_types_for_test(environment_type, environment),
         executor_factory,
@@ -929,7 +896,7 @@ async fn test_setup_mcp_server_with_registration() {
     let registration = Arc::new(MCPServerRegistration {
         name: "codesign".to_owned(),
         description: "Code signing".to_owned(),
-        factory: Arc::new(move |_, _, _, _, _, _| {
+        factory: Arc::new(move |_, _, _, _, _| {
             let server = Arc::clone(&factory_server);
             Box::pin(async move { Ok(server) })
         }),
@@ -962,7 +929,7 @@ async fn test_setup_mcp_server_with_registration_wraps_factory_error() {
     let registration = Arc::new(MCPServerRegistration {
         name: "broken".to_owned(),
         description: "Broken".to_owned(),
-        factory: Arc::new(move |_, _, _, _, _, _| {
+        factory: Arc::new(move |_, _, _, _, _| {
             Box::pin(async move { Err(McpError::message("boom")) })
         }),
         should_register: Arc::new(|_, _| true),

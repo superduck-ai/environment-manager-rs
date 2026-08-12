@@ -22,7 +22,6 @@ use crate::internal::{
     mcp::{
         CallToolRequest, CallToolResult, MCPServer, McpError, McpResult, ServerConfig, Tool,
         ToolConfig, ToolHandler, new_tool_result_error, new_tool_result_text,
-        types::log_attributes,
     },
 };
 
@@ -89,20 +88,14 @@ impl CodeSignMCPServer {
 
         let file_path_ref = Path::new(&file_path);
         if !file_path_ref.is_absolute() {
-            self.base_server.logger.error(
-                "File path must be absolute",
-                log_attributes([("file_path", json!(&file_path))]),
-            );
+            tracing::error!("file_path" = ?(&file_path), "{}", "File path must be absolute");
             return Ok(new_tool_result_error(format!(
                 "Error: File path must be absolute, got: {file_path}"
             )));
         }
         let output_path_ref = Path::new(&output_path);
         if !output_path_ref.is_absolute() {
-            self.base_server.logger.error(
-                "Output path must be absolute",
-                log_attributes([("output_path", json!(&output_path))]),
-            );
+            tracing::error!("output_path" = ?(&output_path), "{}", "Output path must be absolute");
             return Ok(new_tool_result_error(format!(
                 "Error: Output path must be absolute, got: {output_path}"
             )));
@@ -113,27 +106,11 @@ impl CodeSignMCPServer {
             .source
             .as_ref()
             .map_or("", crate::internal::config::Source::get_type);
-        self.base_server.logger.info(
-            "Handling sign file request",
-            log_attributes([
-                ("file_path", json!(&file_path)),
-                ("output_path", json!(&output_path)),
-                ("repo_directory", json!(&repo_directory)),
-                ("source_name", json!(&source_info.name)),
-                ("source_type", json!(source_type)),
-                ("git_object_format", json!(&git_object_format)),
-            ]),
-        );
+        tracing::info!("file_path" = ?(&file_path), "output_path" = ?(&output_path), "repo_directory" = ?(&repo_directory), "source_name" = ?(&source_info.name), "source_type" = ?(source_type), "git_object_format" = ?(&git_object_format), "{}", "Handling sign file request");
         let content = match read_file_content(file_path_ref).await {
             Ok(content) => content,
             Err(error) => {
-                self.base_server.logger.error(
-                    "Failed to read file",
-                    log_attributes([
-                        ("error", json!(error.to_string())),
-                        ("file_path", json!(&file_path)),
-                    ]),
-                );
+                tracing::error!("error" = ?(error.to_string()), "file_path" = ?(&file_path), "{}", "Failed to read file");
                 return Ok(new_tool_result_error(format!(
                     "Error: Cannot read file {file_path}: {error}"
                 )));
@@ -145,10 +122,7 @@ impl CodeSignMCPServer {
         {
             Ok(signature) => signature,
             Err(error) => {
-                self.base_server.logger.error(
-                    "Signing failed",
-                    log_attributes([("error", json!(error.to_string()))]),
-                );
+                tracing::error!("error" = ?(error.to_string()), "{}", "Signing failed");
                 return Ok(new_tool_result_error(format!("Signing failed: {error}")));
             }
         };
@@ -171,13 +145,7 @@ impl CodeSignMCPServer {
         }
         .await;
         if let Err(error) = write_result {
-            self.base_server.logger.error(
-                "Failed to write signature",
-                log_attributes([
-                    ("error", json!(error.to_string())),
-                    ("output_path", json!(&output_path)),
-                ]),
-            );
+            tracing::error!("error" = ?(error.to_string()), "output_path" = ?(&output_path), "{}", "Failed to write signature");
             return Ok(new_tool_result_error(format!(
                 "Failed to write signature to {output_path}: {error}"
             )));
@@ -191,10 +159,7 @@ impl CodeSignMCPServer {
     #[must_use]
     pub fn identify_source(&self, repo_directory: &str) -> SourceInfo {
         if repo_directory.is_empty() {
-            self.base_server.logger.debug(
-                "No repo directory provided, cannot identify source",
-                log_attributes([]),
-            );
+            tracing::debug!("{}", "No repo directory provided, cannot identify source");
             return SourceInfo {
                 name: "unknown".to_owned(),
                 source: None,
@@ -207,10 +172,7 @@ impl CodeSignMCPServer {
             .as_deref()
             .filter(|context| !context.sources.is_empty())
         else {
-            self.base_server.logger.debug(
-                "No startup context or sources available for mapping",
-                log_attributes([("repo_directory", json!(repo_directory))]),
-            );
+            tracing::debug!("repo_directory" = ?(repo_directory), "{}", "No startup context or sources available for mapping");
             return SourceInfo {
                 name: "unknown".to_owned(),
                 source: None,
@@ -233,38 +195,26 @@ impl CodeSignMCPServer {
                 ),
                 source: Some(source.clone()),
             };
-            let attributes = || {
-                log_attributes([
-                    ("repo_directory", json!(repo_directory)),
-                    (
-                        "canonical_repo_directory",
-                        json!(canonical_repo.to_string_lossy()),
-                    ),
-                    (
-                        "source_directory",
-                        json!(source_directory.to_string_lossy()),
-                    ),
-                    (
-                        "canonical_source_directory",
-                        json!(canonical_source.to_string_lossy()),
-                    ),
-                ])
-            };
             if exact_match {
-                self.base_server
-                    .logger
-                    .info("Identified exact source match", attributes());
+                tracing::info!(
+                    repo_directory,
+                    canonical_repo_directory = %canonical_repo.display(),
+                    source_directory = %source_directory.display(),
+                    canonical_source_directory = %canonical_source.display(),
+                    "Identified exact source match"
+                );
             } else {
-                self.base_server
-                    .logger
-                    .info("Identified source (subdirectory)", attributes());
+                tracing::info!(
+                    repo_directory,
+                    canonical_repo_directory = %canonical_repo.display(),
+                    source_directory = %source_directory.display(),
+                    canonical_source_directory = %canonical_source.display(),
+                    "Identified source (subdirectory)"
+                );
             }
             return source_info;
         }
-        self.base_server.logger.warn(
-            "Could not identify source for repo directory",
-            log_attributes([("repo_directory", json!(repo_directory))]),
-        );
+        tracing::warn!("repo_directory" = ?(repo_directory), "{}", "Could not identify source for repo directory");
         SourceInfo {
             name: "unknown".to_owned(),
             source: None,
@@ -305,20 +255,10 @@ impl CodeSignMCPServer {
                 file.write_all(&data)
             })();
             if let Err(error) = write_result {
-                self.base_server.logger.warn(
-                    "Failed to write codesign MCP config",
-                    log_attributes([
-                        ("config_path", json!(CONFIG_PATH)),
-                        ("error", json!(error.to_string())),
-                        ("server_name", json!(&self.base_server.name)),
-                    ]),
-                );
+                tracing::warn!("config_path" = ?(CONFIG_PATH), "error" = ?(error.to_string()), "server_name" = ?(&self.base_server.name), "{}", "Failed to write codesign MCP config");
             }
         }
-        self.base_server.logger.info(
-            "Code signing MCP server started",
-            log_attributes([("port", json!(config.port))]),
-        );
+        tracing::info!("port" = ?(config.port), "{}", "Code signing MCP server started");
         Ok(config)
     }
 

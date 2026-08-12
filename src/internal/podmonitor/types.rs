@@ -1,6 +1,6 @@
 //! podmonitor 的共享状态、wire DTO 与可判定错误类型。
 //!
-//! 类型源自 Go `zz_recovered_types.go`。与 Go 把所有字段直接放进一个结构体不同，
+//! 与旧实现把所有字段直接放进一个结构体不同，
 //! Rust 用 `Arc<LeaseManagerInner>` 共享只读配置，用 `RwLock<LeaseState>` 保护短时状态，
 //! 并让网络请求和定时等待永远不持有锁。
 
@@ -16,8 +16,6 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::internal::api::HttpClient;
-use crate::internal::logger::Logger;
-
 /// 服务端尚未返回过 heartbeat 标识时发送的 CAS sentinel。
 pub(super) const NO_SERVER_HEARTBEAT: &str = "NO_HEARTBEAT";
 
@@ -259,8 +257,6 @@ pub(super) struct LeaseManagerInner {
     pub(super) organization_uuid: String,
     /// 复用现有 API 连接池和规范化 base URL。
     pub(super) api_client: HttpClient,
-    /// 构造阶段已经完成 nil 回退的兼容 logger。
-    pub(super) logger: Logger,
     /// 成功 heartbeat 后更新的健康文件路径；空路径禁用。
     pub(super) health_file_path: PathBuf,
     /// Claude Code 卡死阈值。
@@ -290,7 +286,7 @@ pub struct LeaseManager {
 }
 
 impl std::fmt::Debug for LeaseManager {
-    /// 只打印非敏感 ID、取消和任务状态，不展开 HTTP 连接池或 logger。
+    /// 只打印非敏感 ID、取消和任务状态，不展开 HTTP 连接池。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LeaseManager")

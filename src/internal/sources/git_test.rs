@@ -22,7 +22,6 @@ use crate::internal::{
     api::{LogCategory, LogLevel, SessionError},
     auth::{AuthContext, Permission, SourceAuthProvider, new_auth_context_with_session_id},
     config::{BaseSource, GitInfo, GitRepositorySource},
-    logger::Logger,
     session::{ActivityRecorder, ActivityRecorderError, NoopActivityRecorder, NoopStopper},
     util::Stopper,
 };
@@ -70,7 +69,6 @@ async fn git_activity_guard_future_drop_requests_stop() {
 #[test]
 fn git_handler_has_production_proxy_factory_by_default() {
     let handler = new_git_handler(
-        None,
         "/tmp/sources-proxy-default",
         None,
         "https://api.example.test",
@@ -96,7 +94,6 @@ async fn test_git_handler_process_fresh_clones_local_repository() {
     let base_dir = TempDir::new().expect("base temp dir should be created");
     let source = git_test_source(&bare_repo, Some("main"));
     let handler = new_git_handler(
-        sources_test_logger(),
         base_dir.path(),
         None,
         "",
@@ -134,7 +131,6 @@ async fn test_git_handler_process_creates_outcome_branch() {
     let mut repo_branches = HashMap::new();
     repo_branches.insert(bare_repo.display().to_string(), "task-branch".to_owned());
     let handler = new_git_handler(
-        sources_test_logger(),
         base_dir.path(),
         None,
         "",
@@ -188,7 +184,6 @@ async fn test_git_handler_update_remote_url() {
         },
     };
     let handler = new_git_handler(
-        sources_test_logger(),
         base_dir.path(),
         None,
         "",
@@ -222,7 +217,6 @@ fn test_git_handler_authentication_helpers() {
     );
     let provider = FakeSourceAuthProvider::new("https://token@example.test/repo.git", true);
     let handler = new_git_handler(
-        sources_test_logger(),
         TempDir::new().expect("temp dir should be created").path(),
         Some(auth_context),
         "",
@@ -247,7 +241,6 @@ fn test_git_handler_authentication_helpers() {
     drop(observed);
 
     let no_context_handler = new_git_handler(
-        sources_test_logger(),
         TempDir::new().expect("temp dir should be created").path(),
         None,
         "",
@@ -282,7 +275,6 @@ async fn test_git_handler_branch_helpers() {
     let (_root, bare_repo, _) = create_bare_git_repo();
     let repo_path = TempDir::new().expect("temp dir should be created");
     let handler = new_git_handler(
-        sources_test_logger(),
         TempDir::new().expect("temp dir should be created").path(),
         None,
         "",
@@ -336,7 +328,6 @@ fn test_pack_size_and_classify_git_error() {
 #[tokio::test]
 async fn test_source_handler_manager_dispatches_handlers() {
     let empty_error = new_source_handler_manager(
-        sources_test_logger(),
         PathBuf::new(),
         None,
         "",
@@ -351,7 +342,6 @@ async fn test_source_handler_manager_dispatches_handlers() {
 
     let base = TempDir::new().expect("temp dir should be created");
     let mut manager = new_source_handler_manager(
-        sources_test_logger(),
         base.path(),
         None,
         "",
@@ -404,7 +394,6 @@ async fn source_handler_manager_preserves_scoped_trait_object_lifetimes() {
     });
     let base = TempDir::new().expect("temp dir should be created");
     let mut manager = new_source_handler_manager(
-        sources_test_logger(),
         base.path(),
         None,
         "",
@@ -515,14 +504,6 @@ fn git_output(dir: &Path, args: &[&str]) -> String {
 /// 把测试路径借为命令参数；fixture 路径由 tempfile 保证为 UTF-8 可表示。
 fn path_text(path: &Path) -> &str {
     path.to_str().expect("fixture path should be valid UTF-8")
-}
-
-/// 对应 Go：`sourcesTestLogger`。
-///
-/// Rust source API 用 `Option<Logger>` 表示可丢弃 logger；`None` 是 Go 测试中
-/// discard handler 的直接结构等价，不会创建文件或向 stderr 写入。
-fn sources_test_logger() -> Option<Logger> {
-    None
 }
 
 /// fake provider 记录最后一次认证调用，便于验证 permission 和 source URL。

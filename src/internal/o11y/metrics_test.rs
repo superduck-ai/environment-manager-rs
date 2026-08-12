@@ -5,14 +5,13 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::{config::SessionMode, logger::LogHandler};
+use crate::internal::config::SessionMode;
 
 use super::{
     CLAUDE_CODE_END_COUNTER, ENV_MANAGER_END_COUNTER, ENV_MANAGER_START_COUNTER,
     GIT_CHECKOUT_METRIC, KvTagProvider, MetricTags, O11yContext, O11yError, O11yFunctionMetric,
-    O11yMetric, O11yService, ORCHESTRATOR_POLL_DURATION_METRIC,
-    discard_o11y_service::DiscardLogHandler, increment_claude_code_end, increment_env_manager_end,
-    increment_env_manager_start, record_duration,
+    O11yMetric, O11yService, ORCHESTRATOR_POLL_DURATION_METRIC, increment_claude_code_end,
+    increment_env_manager_end, increment_env_manager_start, record_duration,
 };
 
 /// 一次被测试替身捕获的 counter 写入。
@@ -39,11 +38,6 @@ pub(super) struct RecordingO11yService {
 
 #[async_trait]
 impl O11yService for RecordingO11yService {
-    /// 测试 logger 不需要任何输出。
-    fn log_handler(&self) -> Arc<dyn LogHandler> {
-        Arc::new(DiscardLogHandler)
-    }
-
     /// 测试替身没有后台资源。
     async fn shutdown(&self, _cancellation: &CancellationToken) -> Result<(), O11yError> {
         Ok(())
@@ -153,7 +147,7 @@ fn test_increment_env_manager_start() {
 
 /// 验证从 DWARF 恢复的代表性指标名称与单位。
 #[test]
-fn test_recovered_metric_definitions() {
+fn test_metric_definitions() {
     assert_eq!(GIT_CHECKOUT_METRIC.name, "git.checkout");
     assert_eq!(
         ORCHESTRATOR_POLL_DURATION_METRIC.name,

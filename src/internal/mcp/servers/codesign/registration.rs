@@ -8,14 +8,12 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use serde_json::json;
-
 use crate::internal::{
     auth::AuthContext,
     config::{ClaudeConfig, StartupContext},
     mcp::{
         BaseServer, MCPServer, MCPServerConfigurator, MCPServerRegistration, McpError, McpResult,
-        new_registration, types::log_attributes,
+        new_registration,
     },
     session::ActivityRecorder,
 };
@@ -63,10 +61,7 @@ pub async fn configure_server(
 ) -> McpResult<Arc<CodeSignMCPServer>> {
     let signing_server_url = match std::env::var("SIGNING_SERVER_URL") {
         Ok(value) if !value.is_empty() => {
-            base_server.logger.info(
-                "Using signing server URL from environment",
-                log_attributes([("url", json!(&value))]),
-            );
+            tracing::info!("url" = ?(&value), "{}", "Using signing server URL from environment");
             value
         }
         _ => {
@@ -86,10 +81,7 @@ pub async fn configure_server(
                     format!("http://{api_base_url}")
                 };
             let value = value.trim_end_matches('/').to_owned();
-            base_server.logger.info(
-                "Using API base URL for code signing",
-                log_attributes([("url", json!(&value))]),
-            );
+            tracing::info!("url" = ?(&value), "{}", "Using API base URL for code signing");
             value
         }
     };

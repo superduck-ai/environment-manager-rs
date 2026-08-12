@@ -8,19 +8,14 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use serde_json::{Value, json};
 
-use crate::internal::auth::AuthConfig;
-use crate::internal::logger::{
-    LogAttributes, LogHandler, LogHandlerError, LogLevel, LogRecord, Logger,
-};
-
 use super::*;
+use crate::internal::auth::AuthConfig;
 
 /// 对应 Go：`TestWorkSecretUnmarshalAndDecode`。
 ///
 /// 验证 work secret 的 URL-safe Base64、source、auth 和全部 gateway 字段。
 #[test]
 fn test_work_secret_unmarshal_and_decode() {
-    let _logger = input_test_logger();
     let encoded = encoded_work_secret(json!({
         "version": 1,
         "session_ingress_token": "ingress-token",
@@ -59,7 +54,6 @@ fn test_work_secret_unmarshal_and_decode() {
 /// 验证空值、Base64、JSON、版本和 source 类型错误都被折叠成 Go 兼容错误。
 #[test]
 fn test_decode_work_secret_reports_errors() {
-    let _logger = input_test_logger();
     assert_eq!(
         decode_work_secret("").unwrap_err().to_string(),
         "secret is empty"
@@ -163,7 +157,6 @@ fn test_work_secret_explicit_null_values_match_go_encoding_json() {
 /// 验证 session/healthcheck 两个合法联合体分支，并逐项检查 envelope 校验顺序。
 #[test]
 fn test_parse_v1_work_response_validation() {
-    let _logger = input_test_logger();
     let session = parse_v1_work_response(
         br#"{"id":"work-1","type":"work","environment_id":"env-1","data":{"type":"session","id":"session-1"},"secret":"abc"}"#,
     )
@@ -206,7 +199,6 @@ fn test_parse_v1_work_response_validation() {
 /// 验证 code-session secret 不调用 session-context provider，并使用 cwd 回退值。
 #[tokio::test]
 async fn test_v1_parser_parses_code_sessions_secret_without_fetching_session_context() {
-    let _logger = input_test_logger();
     let secret = encoded_work_secret(json!({
         "version": 1,
         "session_ingress_token": "ingress-token",
@@ -282,7 +274,6 @@ impl SessionContextProvider for FixtureProvider {
 /// 验证旧 V1 工作流通过 provider 获取 context，并合并 prompt、MCP 和 outcomes。
 #[tokio::test]
 async fn test_v1_parser_fetches_session_context_and_builds_result() {
-    let _logger = input_test_logger();
     let observed = Arc::new(Mutex::new(Vec::new()));
     let provider = FixtureProvider {
         context: SessionContext {
@@ -389,7 +380,6 @@ async fn test_v1_parser_preserves_explicit_null_session_fields() {
 /// 验证 healthcheck 只构建最小 startup/auth 元数据。
 #[tokio::test]
 async fn test_v1_parser_builds_healthcheck_result() {
-    let _logger = input_test_logger();
     let secret = encoded_work_secret(json!({
         "version": 1,
         "session_ingress_token": "ingress-token",
@@ -418,8 +408,7 @@ async fn test_v1_parser_builds_healthcheck_result() {
 
 /// 验证 V0 startup、environment、auth 和单分支 outcomes。
 #[test]
-fn test_v0_parser_parses_recovered_input() {
-    let _logger = input_test_logger();
+fn test_v0_parser_parses_input() {
     let input = json!({
         "startup_context": {
             "api_base_url": "api.example.test",
@@ -461,40 +450,9 @@ fn test_v0_parser_parses_recovered_input() {
     );
 }
 
-#[derive(Clone, Default)]
-struct RecordingLogHandler {
-    records: Arc<Mutex<Vec<LogRecord>>>,
-}
-
-impl LogHandler for RecordingLogHandler {
-    fn enabled(&self, _level: LogLevel) -> bool {
-        true
-    }
-
-    fn handle(&self, record: &LogRecord) -> Result<(), LogHandlerError> {
-        self.records.lock().unwrap().push(record.clone());
-        Ok(())
-    }
-
-    fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-}
-
-fn recording_logger() -> (Logger, Arc<Mutex<Vec<LogRecord>>>) {
-    let handler = RecordingLogHandler::default();
-    let records = Arc::clone(&handler.records);
-    (Logger::new(Arc::new(handler)), records)
-}
-
 /// 验证缺失 startup context 只在 CLI 专用入口转换为错误。
 ///
-/// 普通 `parse` 和带 logger 的生产 parser 入口仍提供差分 probe 依赖的 panic payload；
-/// CLI 入口必须返回 sentinel，并且只记录崩溃前已经发生的 parsing 日志。
+/// 普通 `parse` 保留 panic payload，CLI 入口把它转换为 sentinel。
 #[test]
 fn v0_missing_startup_context_preserves_parser_panic_and_cli_sentinel() {
     let parser = V0Parser {
@@ -504,23 +462,10 @@ fn v0_missing_startup_context_preserves_parser_panic_and_cli_sentinel() {
 
     assert_nil_dereference_panic(catch_unwind(AssertUnwindSafe(|| parser.parse(payload))));
 
-    let (ordinary_logger, _) = recording_logger();
-    assert_nil_dereference_panic(catch_unwind(AssertUnwindSafe(|| {
-        parser.parse_with_logger(payload, &ordinary_logger)
-    })));
-
-    let (cli_logger, records) = recording_logger();
     let error = parser
-        .parse_with_logger_for_cli(payload, &cli_logger)
+        .parse_for_cli(payload)
         .expect_err("CLI 入口必须把 nil dereference 转换为专用 sentinel");
     assert!(matches!(error, V0ParseError::StartupContextRequired));
-    let messages = records
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|record| record.message.clone())
-        .collect::<Vec<_>>();
-    assert_eq!(messages, ["Parsing V0 input format"]);
 }
 
 /// 断言 parser panic payload 保持 Go runtime nil dereference 文本。
@@ -539,101 +484,9 @@ fn assert_nil_dereference_panic<T>(outcome: std::thread::Result<T>) {
     );
 }
 
-/// 验证 V0 parser 与 auth provider 的生产日志阶段、级别和属性顺序。
-#[test]
-fn v0_parser_emits_go_compatible_stage_logs() {
-    let (logger, records) = recording_logger();
-    let input = json!({
-        "startup_context": {
-            "api_base_url": "api.example.test",
-            "claude_code_args": {"model": "claude-test"},
-            "outcomes": [{
-                "type": "git_repository",
-                "git_info": {"repo": "anthropic/demo", "branches": ["task-branch"]}
-            }]
-        },
-        "environment": {"environment_type": "byoc", "cwd": "/workspace"},
-        "auth": [{"type": "anthropic_api", "token": "secret-not-logged"}]
-    });
-    V0Parser {
-        session_id: "session-1".into(),
-    }
-    .parse_with_logger(&must_json(&input), &logger)
-    .expect("V0 fixture 应完成生产日志解析");
-
-    let records = records.lock().unwrap();
-    let messages = records
-        .iter()
-        .map(|record| record.message.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        messages,
-        [
-            "Parsing V0 input format",
-            "Parsed startup context from V0 input",
-            "Received pre-computed args from sandbox-gateway",
-            "Parsed environment from V0 input",
-            "Configured Anthropic API token",
-            "Parsed auth from V0 input",
-            "Parsed outcomes from V0 input",
-            "Repository outcome",
-            "Completed parsing V0 input",
-        ]
-    );
-    assert_eq!(
-        records[4]
-            .attributes
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["auth_type"]
-    );
-    assert!(records.iter().all(|record| {
-        !record
-            .attributes
-            .values()
-            .any(|value| value.as_str() == Some("secret-not-logged"))
-    }));
-}
-
-/// 验证 V1 对 explicit null outcomes 记录零计数，而 missing 字段不记录该阶段。
-#[tokio::test]
-async fn v1_parser_logs_raw_message_presence_like_go() {
-    let secret = encoded_work_secret(json!({
-        "version": 1,
-        "api_base_url": "api.example.test"
-    }));
-    let work = v1_work_response_json("work-1", "env-1", "session", "session-1", &secret);
-
-    for (outcomes, expects_log) in [(Some(Value::Null), true), (None, false)] {
-        let (logger, records) = recording_logger();
-        let parser = V1Parser::new(
-            "/workspace",
-            FixtureProvider {
-                context: SessionContext {
-                    outcomes,
-                    ..SessionContext::default()
-                },
-                observed: Arc::new(Mutex::new(Vec::new())),
-            },
-        );
-        parser
-            .parse_with_logger(&work, &logger)
-            .await
-            .expect("V1 null/missing fixture 应成功解析");
-        let has_outcomes_log = records
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|record| record.message == "Parsed outcomes from V1 session context");
-        assert_eq!(has_outcomes_log, expects_log);
-    }
-}
-
 /// 验证 V0 environment 必填字段以及缺失 startup context 的安全错误。
 #[test]
 fn test_v0_parser_reports_environment_errors() {
-    let _logger = input_test_logger();
     let parser = V0Parser {
         session_id: "session-1".into(),
     };
@@ -703,14 +556,6 @@ fn v1_work_response_json(
 /// 对应 Go：`mustJSON`，让所有 fixture 通过相同的 Serde wire 编码路径。
 fn must_json(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).expect("测试 JSON 必须能够序列化")
-}
-
-/// 对应 Go：`inputTestLogger`。
-///
-/// 返回丢弃 dispatch 以保留 Go fixture 的符号映射；普通领域测试走无日志 `parse`
-/// 入口，生产日志由上面的记录型 handler 测试覆盖。
-fn input_test_logger() -> tracing::Dispatch {
-    tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default())
 }
 
 /// 静态断言 AuthConfig 仍能以 wire `type` 字段往返序列化。

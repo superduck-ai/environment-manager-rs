@@ -34,5 +34,5 @@ mod claude_code_executor_test;
 mod install_outcomes_test;
 
 #[cfg(test)]
-#[path = "process_edge_differential_test.rs"]
-mod process_edge_differential_test;
+#[path = "process_edge_test.rs"]
+mod process_edge_test;

@@ -7,8 +7,6 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::Logger;
-
 use super::{
     ApiError, DiagLogEntry, HttpClient, HttpSessionIngressClient, OtlpEndpoints, SessionBackend,
     SessionEvent,
@@ -28,12 +26,11 @@ impl SessionIngressBackend {
         api_base_url: &str,
         auth_token: impl Into<String>,
         session_id: impl Into<String>,
-        logger: Option<Logger>,
     ) -> Result<Self, ApiError> {
         let auth_token = auth_token.into();
         let session_id = session_id.into();
-        let http_client = HttpClient::new(api_base_url, logger.clone(), None)?;
-        let client = HttpSessionIngressClient::new(http_client, auth_token.clone(), logger, false);
+        let http_client = HttpClient::new(api_base_url, None)?;
+        let client = HttpSessionIngressClient::new(http_client, auth_token.clone(), false);
         Ok(Self {
             client,
             session_id,

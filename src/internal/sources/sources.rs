@@ -5,19 +5,13 @@
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
-use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::{
     ProcessMode, SourceHandler, SourceHandlerManager, SourceSlot, SourcesError, SourcesResult,
     new_git_handler,
 };
-use crate::internal::{
-    api::SourceProcessingError,
-    auth::AuthContext,
-    logger::{LogAttributes, LogLevel, Logger, default_logger},
-    session::ActivityRecorder,
-};
+use crate::internal::{api::SourceProcessingError, auth::AuthContext, session::ActivityRecorder};
 
 /// 对应 Go `NewSourceHandlerManager`，校验 base directory 并注册默认 Git handler。
 ///
@@ -26,7 +20,6 @@ use crate::internal::{
 /// 与动态 handler 容器，保证任何一个对象都不能逃出 activity recorder 的有效期。
 #[allow(clippy::too_many_arguments)]
 pub fn new_source_handler_manager<'recorder>(
-    logger: Option<Logger>,
     base_dir: impl Into<PathBuf>,
     auth_context: Option<Arc<AuthContext>>,
     sdk_base_url: impl Into<String>,
@@ -41,7 +34,6 @@ pub fn new_source_handler_manager<'recorder>(
     }
 
     let git_handler = new_git_handler(
-        logger.clone(),
         base_dir.clone(),
         auth_context,
         sdk_base_url,
@@ -54,7 +46,6 @@ pub fn new_source_handler_manager<'recorder>(
     // 那会再次迫使局部 recorder 做不安全生命周期擦除。
     let git_handler: Arc<dyn SourceHandler + 'recorder> = Arc::new(git_handler);
     Ok(SourceHandlerManager {
-        logger,
         handlers: vec![git_handler],
         base_dir,
         activity_recorder,
@@ -86,19 +77,11 @@ impl<'recorder> SourceHandlerManager<'recorder> {
         S: SourceSlot,
     {
         if sources.is_empty() {
-            self.log(
-                LogLevel::Debug,
-                "No sources to process",
-                LogAttributes::new(),
-            );
+            tracing::debug!("{}", "No sources to process");
             return Ok(());
         }
 
-        self.log(
-            LogLevel::Debug,
-            "Starting to process sources",
-            log_attributes([("num_sources", json!(sources.len()))]),
-        );
+        tracing::debug!("num_sources" = ?(sources.len()), "{}", "Starting to process sources");
         let started = Instant::now();
         let mut processed_count = 0_usize;
 
@@ -107,15 +90,7 @@ impl<'recorder> SourceHandlerManager<'recorder> {
                 return Err(SourcesError::message(format!("source[{index}] is nil")));
             };
             let source_type = source.get_type();
-            self.log(
-                LogLevel::Debug,
-                "Processing source",
-                log_attributes([
-                    ("source_index", json!(index + 1)),
-                    ("total_count", json!(sources.len())),
-                    ("source_type", json!(source_type)),
-                ]),
-            );
+            tracing::debug!("source_index" = ?(index + 1), "total_count" = ?(sources.len()), "source_type" = ?(source_type), "{}", "Processing source");
 
             let Some(handler) = self.find_handler(source_type) else {
                 if let Some(recorder) = &self.activity_recorder {
@@ -125,11 +100,7 @@ impl<'recorder> SourceHandlerManager<'recorder> {
                     };
                     let _ = recorder.record_failure_result(&error).await;
                 }
-                self.log(
-                    LogLevel::Warn,
-                    "No handler found for source type, skipping",
-                    log_attributes([("source_type", json!(source_type))]),
-                );
+                tracing::warn!("source_type" = ?(source_type), "{}", "No handler found for source type, skipping");
                 continue;
             };
 
@@ -141,40 +112,17 @@ impl<'recorder> SourceHandlerManager<'recorder> {
                     };
                     let _ = recorder.record_failure_result(&source_error).await;
                 }
-                self.log(
-                    LogLevel::Error,
-                    "Failed to process source",
-                    log_attributes([
-                        ("source_type", json!(source_type)),
-                        ("error", json!(error.to_string())),
-                    ]),
-                );
+                tracing::error!("source_type" = ?(source_type), "error" = ?(error.to_string()), "{}", "Failed to process source");
                 return Err(SourcesError::message(format!(
                     "failed to process source type {source_type}: {error}"
                 )));
             }
 
             processed_count += 1;
-            self.log(
-                LogLevel::Debug,
-                "Source processed successfully",
-                log_attributes([
-                    ("source_type", json!(source_type)),
-                    ("source_index", json!(index + 1)),
-                    ("total_count", json!(sources.len())),
-                ]),
-            );
+            tracing::debug!("source_type" = ?(source_type), "source_index" = ?(index + 1), "total_count" = ?(sources.len()), "{}", "Source processed successfully");
         }
 
-        self.log(
-            LogLevel::Debug,
-            "Completed processing all sources",
-            log_attributes([
-                ("duration_ms", json!(started.elapsed().as_millis())),
-                ("total_count", json!(sources.len())),
-                ("processed_count", json!(processed_count)),
-            ]),
-        );
+        tracing::debug!("duration_ms" = ?(started.elapsed().as_millis()), "total_count" = ?(sources.len()), "processed_count" = ?(processed_count), "{}", "Completed processing all sources");
         Ok(())
     }
 
@@ -191,30 +139,18 @@ impl<'recorder> SourceHandlerManager<'recorder> {
         S: SourceSlot,
     {
         if sources.is_empty() {
-            self.log(
-                LogLevel::Debug,
-                "No sources to update",
-                LogAttributes::new(),
-            );
+            tracing::debug!("{}", "No sources to update");
             return Ok(());
         }
 
-        self.log(
-            LogLevel::Debug,
-            "Updating git remote URLs for existing repositories",
-            log_attributes([("num_sources", json!(sources.len()))]),
-        );
+        tracing::debug!("num_sources" = ?(sources.len()), "{}", "Updating git remote URLs for existing repositories");
 
         let Some(updater) = self
             .handlers
             .iter()
             .find_map(|handler| handler.as_git_remote_updater())
         else {
-            self.log(
-                LogLevel::Warn,
-                "No git handler found for updating remote URL",
-                LogAttributes::new(),
-            );
+            tracing::warn!("{}", "No git handler found for updating remote URL");
             return Ok(());
         };
 
@@ -226,14 +162,7 @@ impl<'recorder> SourceHandlerManager<'recorder> {
                 continue;
             }
             if let Err(error) = updater.update_remote_url(cancellation, source).await {
-                self.log(
-                    LogLevel::Warn,
-                    "Failed to update remote URL, continuing",
-                    log_attributes([
-                        ("source_type", json!(source.get_type())),
-                        ("error", json!(error.to_string())),
-                    ]),
-                );
+                tracing::warn!("source_type" = ?(source.get_type()), "error" = ?(error.to_string()), "{}", "Failed to update remote URL, continuing");
             }
         }
         Ok(())
@@ -260,11 +189,7 @@ impl<'recorder> SourceHandlerManager<'recorder> {
             .iter()
             .find_map(|handler| handler.as_git_handler())
         else {
-            self.log(
-                LogLevel::Debug,
-                "No git handler found for proxy setup",
-                LogAttributes::new(),
-            );
+            tracing::debug!("{}", "No git handler found for proxy setup");
             return Ok(());
         };
 
@@ -284,17 +209,6 @@ impl<'recorder> SourceHandlerManager<'recorder> {
             .find(|handler| handler.can_handle(source_type))
     }
 
-    /// 把一条 source manager 记录写入注入 logger，并保留 Go 属性顺序。
-    ///
-    /// 测试构造器允许 `None`；该分支使用进程级 tracing logger。
-    fn log(&self, level: LogLevel, message: &str, attributes: LogAttributes) {
-        let logger = match self.logger.as_ref() {
-            Some(logger) => logger,
-            None => default_logger(),
-        };
-        logger.log(level, message, attributes);
-    }
-
     /// 返回构造时保存的 base directory，供上层 adapter 无损复用 manager 配置。
     #[must_use]
     pub fn base_dir(&self) -> &std::path::Path {
@@ -306,14 +220,4 @@ impl<'recorder> SourceHandlerManager<'recorder> {
     pub fn should_validate(&self) -> bool {
         self.should_validate
     }
-}
-
-/// 创建保持 Go `slog` 参数顺序的 source manager 日志属性。
-fn log_attributes(
-    entries: impl IntoIterator<Item = (impl Into<String>, serde_json::Value)>,
-) -> LogAttributes {
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.into(), value))
-        .collect()
 }

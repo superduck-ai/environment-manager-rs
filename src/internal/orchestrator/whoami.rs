@@ -7,16 +7,14 @@ use std::time::Duration;
 
 use reqwest::header::AUTHORIZATION;
 use serde::Deserialize;
-use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::{OrchestratorError, OrchestratorResult, WhoamiClient, WhoamiResponse, log_attributes};
+use super::{OrchestratorError, OrchestratorResult, WhoamiClient, WhoamiResponse};
 use crate::{
     internal::api::{
         GoRequestErrorContext, mark_go_transport_response, prepare_go_transport_request,
         read_go_response_body,
     },
-    internal::logger::Logger,
     internal::util::{claude_code_version, version},
 };
 
@@ -40,7 +38,6 @@ struct GoWhoamiResponse {
 pub fn new_whoami_client(
     api_base_url: impl Into<String>,
     auth_token: impl Into<String>,
-    logger: Logger,
 ) -> WhoamiClient {
     let mut api_base_url = api_base_url.into();
     if !api_base_url.starts_with("http://") && !api_base_url.starts_with("https://") {
@@ -54,7 +51,6 @@ pub fn new_whoami_client(
         http_client: reqwest::Client::builder()
             .build()
             .expect("Go-compatible Whoami HTTP client configuration is valid"),
-        logger: logger.with_attrs(log_attributes([("component", json!("whoami_client"))])),
     }
 }
 
@@ -68,10 +64,7 @@ impl WhoamiClient {
         cancellation: &CancellationToken,
     ) -> OrchestratorResult<WhoamiResponse> {
         let url = format!("{}/v1/environments/whoami", self.api_base_url);
-        self.logger.info(
-            "calling whoami endpoint",
-            log_attributes([("url", json!(url))]),
-        );
+        tracing::info!("url" = ?(url), "{}", "calling whoami endpoint");
 
         let mut request = self
             .http_client
@@ -145,13 +138,7 @@ impl WhoamiClient {
             )));
         }
 
-        self.logger.info(
-            "whoami response received",
-            log_attributes([
-                ("organization_uuid", json!(response.organization_uuid)),
-                ("environment_id", json!(response.environment_id)),
-            ]),
-        );
+        tracing::info!("organization_uuid" = ?(response.organization_uuid), "environment_id" = ?(response.environment_id), "{}", "whoami response received");
         Ok(response)
     }
 }

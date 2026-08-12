@@ -6,12 +6,10 @@
 
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
-use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::internal::{
     auth::AuthContext,
-    logger::LogAttributes,
     mcp::{self, MCPServer, MCPServerRegistration},
     session::ActivityRecorder,
 };
@@ -38,10 +36,7 @@ impl Manager {
         let registrations =
             mcp::get_mcp_registrations(startup_context, self.claude_config.as_ref());
 
-        self.logger.info(
-            "Starting MCP server registrations",
-            attributes([("server_count", json!(registrations.len()))]),
-        );
+        tracing::info!("server_count" = ?(registrations.len()), "{}", "Starting MCP server registrations");
 
         let mut servers = Vec::new();
         for registration in &registrations {
@@ -58,25 +53,12 @@ impl Manager {
                 Ok(server) => servers.push(server),
                 Err(error) => {
                     self.log_diag("mcp_server_setup_failed_nonfatal", BTreeMap::new());
-                    self.logger.warn(
-                        "Failed to setup MCP server",
-                        attributes([
-                            ("server_name", json!(&registration.name)),
-                            ("error", json!(error.to_string())),
-                        ]),
-                    );
+                    tracing::warn!("server_name" = ?(&registration.name), "error" = ?(error.to_string()), "{}", "Failed to setup MCP server");
                 }
             }
         }
 
-        self.logger.info(
-            "Completed MCP server registrations",
-            attributes([
-                ("duration_ms", json!(duration_milliseconds(started))),
-                ("registered_count", json!(servers.len())),
-                ("attempted_count", json!(registrations.len())),
-            ]),
-        );
+        tracing::info!("duration_ms" = ?(duration_milliseconds(started)), "registered_count" = ?(servers.len()), "attempted_count" = ?(registrations.len()), "{}", "Completed MCP server registrations");
         McpRegistrationBatch {
             servers,
             registrations,
@@ -93,13 +75,7 @@ impl Manager {
         activity_recorder: Arc<dyn ActivityRecorder>,
     ) -> Result<Arc<dyn MCPServer>, ManagerError> {
         let started = Instant::now();
-        self.logger.info(
-            "Starting MCP server setup",
-            attributes([
-                ("server_name", json!(&registration.name)),
-                ("description", json!(&registration.description)),
-            ]),
-        );
+        tracing::info!("server_name" = ?(&registration.name), "description" = ?(&registration.description), "{}", "Starting MCP server setup");
 
         let startup_context = self
             .session_config
@@ -108,7 +84,6 @@ impl Manager {
             .map(Arc::new);
         let result = (registration.factory)(
             cancellation.clone(),
-            self.logger.clone(),
             Some(Arc::new(auth_context.clone())),
             working_directory_path(working_directory),
             startup_context,
@@ -119,14 +94,7 @@ impl Manager {
         let server = match result {
             Ok(server) => server,
             Err(error) => {
-                self.logger.warn(
-                    "Failed to create and start MCP server",
-                    attributes([
-                        ("server_name", json!(&registration.name)),
-                        ("duration_ms", json!(duration_ms)),
-                        ("error", json!(error.to_string())),
-                    ]),
-                );
+                tracing::warn!("server_name" = ?(&registration.name), "duration_ms" = ?(duration_ms), "error" = ?(error.to_string()), "{}", "Failed to create and start MCP server");
                 return Err(ManagerError::message(format!(
                     "failed to create and start {} MCP server: {error}",
                     registration.name
@@ -134,24 +102,9 @@ impl Manager {
             }
         };
 
-        self.logger.info(
-            "Successfully setup MCP server",
-            attributes([
-                ("server_name", json!(&registration.name)),
-                ("description", json!(&registration.description)),
-                ("duration_ms", json!(duration_ms)),
-            ]),
-        );
+        tracing::info!("server_name" = ?(&registration.name), "description" = ?(&registration.description), "duration_ms" = ?(duration_ms), "{}", "Successfully setup MCP server");
         Ok(server)
     }
-}
-
-/// 把成对字段收集为 logger 使用的稳定排序属性。
-fn attributes<const N: usize>(entries: [(&str, Value); N]) -> LogAttributes {
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }
 
 /// 将单调时钟耗时饱和转换为日志协议使用的有符号毫秒数。

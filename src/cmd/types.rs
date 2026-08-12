@@ -11,7 +11,6 @@ use serde_json::Value;
 
 use crate::internal::{
     api::GetEnvironmentConfigResponse, auth::AuthContext, claude::Outcomes, config::StartupContext,
-    logger::Logger,
 };
 
 /// stdin v0/v1 解析后交给 `task-run` 主流程的统一上下文。
@@ -49,8 +48,6 @@ pub(super) struct StdinConfigClient {
     pub(super) auth_context: Option<AuthContext>,
     /// 已校验 outcomes。
     pub(super) outcomes: Option<Outcomes>,
-    /// 记录“使用 stdin 配置”事件的应用 logger。
-    pub(super) logger: Logger,
 }
 
 /// 本地 code-sign MCP HTTP server 的连接配置。

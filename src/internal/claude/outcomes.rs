@@ -5,14 +5,9 @@
 //! `nil map` 与 `NewOutcomes` 创建的非 nil 空 map 之间的差异；写入和导出则依靠
 //! Rust 所有权或显式克隆，维持 Go `append([]string(nil), branches...)` 的隔离语义。
 //!
-//! Rust 不允许安全代码调用 nil `*Outcomes`；`validate()` 使用进程级
-//! tracing logger，显式注入的路径则便于测试捕获。
+//! Rust 不允许安全代码调用 nil `*Outcomes`；`validate()` 直接写 tracing 事件。
 
 use std::{collections::HashMap, fmt};
-
-use crate::internal::logger::{Logger, default_logger};
-
-use super::types::claude_attrs;
 
 /// 一个 session 允许写入的仓库及其目标分支。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -136,39 +131,18 @@ impl Outcomes {
 
     /// 对应 Go：`(*Outcomes).Validate`。
     ///
-    /// 使用进程级 tracing logger 验证当前集合。多分支仓库只保留第一
-    /// 项，空分支列表原样保留；原集合不会被修改。
+    /// 验证当前集合。多分支仓库只保留第一项，空分支列表原样保留；原集合不会被修改。
     ///
     /// # 返回
     /// 返回已经初始化的新集合，内容为验证和截断后的深拷贝。
     ///
     /// # 副作用
-    /// 遇到空分支或多分支仓库时，分别尝试写出 Go 对应的 DEBUG 或 WARN 日志。
-    /// 默认 logger 的 INFO 门槛会像 Go 一样过滤 DEBUG 记录。
-    #[must_use]
-    pub fn validate(&self) -> Self {
-        self.validate_with_logger(default_logger())
-    }
-
-    /// 对应 Go：`(*Outcomes).ValidateWithLogger`。
-    ///
-    /// 使用调用方提供的 logger 验证 outcome。空分支列表仍保留对应仓库；多分支
-    /// 列表记录完整兼容告警后仅保留第一项；单分支列表直接复制。
-    ///
-    /// # 参数
-    /// - `logger`：接收验证日志的 concrete logger；Rust 引用不允许 Go 的 nil logger。
-    ///
-    /// # 返回
-    /// 返回已经初始化的新集合；任何分支 `Vec` 都不会与原集合共享可变存储。
-    ///
-    /// # 副作用
-    /// 空分支仓库写 DEBUG，属性依次为 `repository`；多分支仓库写 WARN，属性严格
-    /// 依次为 `repository`、`branch_used`、`branches_ignored`。
+    /// 遇到空分支或多分支仓库时，分别写出 DEBUG 或 WARN tracing 事件。
     ///
     /// # 兼容性
     /// 遍历顺序沿用 hash map 的非确定顺序，不额外排序；这与 Go map 遍历一致。
     #[must_use]
-    pub fn validate_with_logger(&self, logger: &Logger) -> Self {
+    pub fn validate(&self) -> Self {
         let mut validated = Self::new();
         let Some(repositories) = self.repositories.as_ref() else {
             return validated;
@@ -176,23 +150,13 @@ impl Outcomes {
 
         for (repository, branches) in repositories {
             if branches.is_empty() {
-                logger.debug(
-                    "Repository has no branches specified, preserving empty list",
-                    claude_attrs!("repository" => repository),
-                );
+                tracing::debug!("repository" = ?(repository), "{}", "Repository has no branches specified, preserving empty list");
                 validated.add(repository.clone(), Vec::new());
                 continue;
             }
 
             if branches.len() > 1 {
-                logger.warn(
-                    "Repository has multiple branches, using only the first one",
-                    claude_attrs!(
-                        "repository" => repository,
-                        "branch_used" => &branches[0],
-                        "branches_ignored" => &branches[1..],
-                    ),
-                );
+                tracing::warn!("repository" = ?(repository), "branch_used" = ?(&branches[0]), "branches_ignored" = ?(&branches[1..]), "{}", "Repository has multiple branches, using only the first one");
             }
             validated.add(repository.clone(), vec![branches[0].clone()]);
         }

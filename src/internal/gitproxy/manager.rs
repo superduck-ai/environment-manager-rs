@@ -13,8 +13,6 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, LogLevel, Logger, default_logger};
-
 use super::{
     Config, GitProxyError, GitProxyResult, Manager, SharedManager, SharedServer, new_server,
 };
@@ -23,7 +21,6 @@ use super::{
 pub(super) struct ManagerImpl {
     server: SharedServer,
     config: Arc<Config>,
-    logger: Logger,
     operation: Mutex<()>,
     running: AtomicBool,
 }
@@ -31,33 +28,12 @@ pub(super) struct ManagerImpl {
 impl ManagerImpl {
     /// 使用已创建的 server 与同一份逻辑配置构造未启动 manager。
     fn new(server: SharedServer, config: Config) -> Self {
-        // 在构造边界解析默认 logger，避免后续每条日志重复选择
-        // tracing 接收端。
-        let logger = config
-            .logger
-            .clone()
-            .unwrap_or_else(|| default_logger().clone());
         Self {
             server,
             config: Arc::new(config),
-            logger,
             operation: Mutex::new(()),
             running: AtomicBool::new(false),
         }
-    }
-
-    /// 写入 manager 生命周期日志。
-    ///
-    /// # 参数
-    /// - `level`：与 Go `slog` 调用相同的日志级别。
-    /// - `message`：与 Go 源码逐字一致的静态消息。
-    /// - `attributes`：按 Go 参数出现顺序构造的结构化属性。
-    ///
-    /// # 副作用
-    /// 调用配置 logger；日志接收端错误不会改变 manager 操作的返回结果。
-    #[track_caller]
-    fn log(&self, level: LogLevel, message: &str, attributes: LogAttributes) {
-        self.logger.log(level, message, attributes);
     }
 }
 
@@ -81,11 +57,7 @@ impl Manager for ManagerImpl {
             return Ok(self.server.base_url());
         }
 
-        self.log(
-            LogLevel::Info,
-            "Starting git proxy manager",
-            LogAttributes::new(),
-        );
+        tracing::info!("{}", "Starting git proxy manager");
         self.server
             .start(cancellation)
             .await
@@ -93,16 +65,11 @@ impl Manager for ManagerImpl {
         self.running.store(true, Ordering::Release);
 
         let base_url = self.server.base_url();
-        let mut attributes = LogAttributes::new();
-        attributes.insert(
-            "base_url".to_owned(),
-            serde_json::Value::String(base_url.clone()),
+        tracing::info!(
+            base_url,
+            port = self.server.port(),
+            "Git proxy manager started"
         );
-        attributes.insert(
-            "port".to_owned(),
-            serde_json::Value::from(self.server.port()),
-        );
-        self.log(LogLevel::Info, "Git proxy manager started", attributes);
         Ok(base_url)
     }
 
@@ -113,21 +80,13 @@ impl Manager for ManagerImpl {
             return Ok(());
         }
 
-        self.log(
-            LogLevel::Info,
-            "Stopping git proxy manager",
-            LogAttributes::new(),
-        );
+        tracing::info!("{}", "Stopping git proxy manager");
         self.server
             .stop(cancellation)
             .await
             .map_err(|error| GitProxyError::message(format!("failed to stop server: {error}")))?;
         self.running.store(false, Ordering::Release);
-        self.log(
-            LogLevel::Info,
-            "Git proxy manager stopped",
-            LogAttributes::new(),
-        );
+        tracing::info!("{}", "Git proxy manager stopped");
         Ok(())
     }
 

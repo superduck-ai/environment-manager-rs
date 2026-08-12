@@ -13,8 +13,6 @@ use opentelemetry_sdk::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, Logger, default_logger};
-
 use super::{
     CachedInstrument, KvTagProvider, MetricTags, MetricsExporter, O11yConfig, O11yContext,
     O11yError, O11yFunctionMetric, O11yMetric, O11yMetricsProvider, SharedMetricError, TagProvider,
@@ -39,13 +37,9 @@ pub(crate) const fn cumulative_temporality_selector(
 /// 对应 Go `initOTelMetrics`；OTel 缩写按 Rust 单词命名，provider、resource 与
 /// exporter 的组装行为仍集中在此唯一入口。
 pub(crate) fn init_otel_metrics(
-    logger: Option<Logger>,
     resource: Option<Resource>,
     exporter: Option<MetricsExporter>,
 ) -> Result<O11yMetricsProvider, O11yError> {
-    // 在 provider 构造边界一次性解析默认 logger，使后续故障记录共享
-    // 同一个 tracing 接收端。
-    let logger = logger.unwrap_or_else(|| default_logger().clone());
     let mut builder = SdkMeterProvider::builder();
     if let Some(resource) = resource {
         builder = builder.with_resource(resource);
@@ -58,7 +52,6 @@ pub(crate) fn init_otel_metrics(
     let meter = meter_provider.meter(METER_SCOPE);
 
     Ok(O11yMetricsProvider {
-        logger,
         meter_provider: Some(meter_provider),
         instrument_cache: std::sync::Mutex::new(HashMap::new()),
         meter: std::sync::Mutex::new(Some(meter)),
@@ -213,12 +206,7 @@ impl O11yMetricsProvider {
             Ok(counter) => counter,
             Err(error) => {
                 let metric_name = metric.map_or("", |metric| metric.name.as_ref());
-                let mut attributes = LogAttributes::new();
-                // Go 的 slog 属性输出顺序是调用顺序；`metric` 必须位于 `error` 前。
-                attributes.insert("metric".to_owned(), serde_json::json!(metric_name));
-                attributes.insert("error".to_owned(), serde_json::json!(error.to_string()));
-                self.logger
-                    .error("Failed to get or create counter", attributes);
+                tracing::error!(metric = metric_name, error = %error, "Failed to get or create counter");
                 return;
             }
         };
@@ -231,7 +219,7 @@ impl O11yMetricsProvider {
     ///
     /// 缺少 metric 时静默返回；instrument 创建或 cache 类型错误按 `metric`、`error`
     /// 顺序写 ERROR 并吞掉错误；成功时记录调用方给出的 `f64`。该路径不重试，也不会
-    /// 因 logger 或 exporter 状态改变调用方的返回结果。
+    /// 因 tracing subscriber 或 exporter 状态改变调用方的返回结果。
     pub(crate) fn record_gauge(
         &self,
         metric: Option<&O11yMetric>,
@@ -242,12 +230,7 @@ impl O11yMetricsProvider {
             Ok(gauge) => gauge,
             Err(error) => {
                 let metric_name = metric.map_or("", |metric| metric.name.as_ref());
-                let mut attributes = LogAttributes::new();
-                // 保留 Go `ErrorContext` 的 `metric`、`error` 传参顺序。
-                attributes.insert("metric".to_owned(), serde_json::json!(metric_name));
-                attributes.insert("error".to_owned(), serde_json::json!(error.to_string()));
-                self.logger
-                    .error("Failed to get or create gauge", attributes);
+                tracing::error!(metric = metric_name, error = %error, "Failed to get or create gauge");
                 return;
             }
         };

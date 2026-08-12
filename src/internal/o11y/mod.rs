@@ -1,4 +1,4 @@
-//! OpenTelemetry 指标、日志 handler 与诊断日志设施。
+//! OpenTelemetry 指标与诊断日志设施。
 //!
 //! 目录逐文件对应 Go `internal/o11y`。Go 的 `context.Context` 值存储在 Rust 中由
 //! `O11yContext` 显式表达，取消则统一使用 `CancellationToken`；这避免全局可变状态，
@@ -8,7 +8,6 @@ mod discard_o11y_service;
 mod metric_types;
 mod metrics;
 mod o11y_service;
-mod otel_logging;
 mod otel_metrics;
 mod types;
 

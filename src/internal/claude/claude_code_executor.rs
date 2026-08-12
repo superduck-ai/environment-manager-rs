@@ -10,6 +10,7 @@
 //! 创建或终止 process group，以保留 Go `exec.CommandContext` 的孙进程语义。
 
 use std::{
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     fs::OpenOptions as StdOpenOptions,
     io::{self, Write as _},
@@ -45,7 +46,7 @@ use crate::internal::{
     api::{ClaudeCodeExecutionError, LogCategory, LogLevel},
     auth::AuthContext,
     config::{ClaudeConfig, Source, StartupContext},
-    logger::{LogHandler, LogLevel as LoggerLevel, LogWriter, Logger},
+    logger::LogWriter,
     process::{go_spawn_error, resolve_go_command},
     session::ActivityRecorder,
     util::{Tailer, version},
@@ -57,7 +58,7 @@ use super::{
     session_urls::build_session_urls,
     types::{
         ClaudeCodeExecutor, ClaudeError, ClaudeObservability, Executor, McpServerRegistration,
-        claude_attrs, format_exit_status,
+        format_exit_status,
     },
 };
 
@@ -83,16 +84,12 @@ pub(super) struct TokenDescriptor {
 /// 不改变 FD 的所有权、CLOEXEC 标志或 child 的目标编号。
 pub(super) struct TokenSourceFd {
     fd: Option<OwnedFd>,
-    logger: Logger,
 }
 
 impl TokenSourceFd {
     /// 接管一个高位 CLOEXEC source FD；此后仅由本包装负责关闭。
-    fn new(fd: OwnedFd, logger: Logger) -> Self {
-        Self {
-            fd: Some(fd),
-            logger,
-        }
+    fn new(fd: OwnedFd) -> Self {
+        Self { fd: Some(fd) }
     }
 
     /// 返回仍由本包装拥有的 FD；只在析构前的安装与测试阶段调用。
@@ -127,10 +124,7 @@ impl Drop for TokenSourceFd {
             return;
         };
         if let Err(error) = close_owned_fd(fd.into_raw_fd()) {
-            self.logger.debug(
-                "Failed to close token file descriptor",
-                claude_attrs!("error" => error.to_string()),
-            );
+            tracing::debug!(error = %error, "Failed to close token file descriptor");
         }
     }
 }
@@ -153,7 +147,6 @@ struct ActiveTailer {
 /// 构造 Claude Code 执行器，并保留尚未消费的 MCP/lease 上下文。
 #[allow(clippy::too_many_arguments)]
 pub fn new_claude_code_executor(
-    logger: Logger,
     cfg: Option<ClaudeConfig>,
     session_id: impl Into<String>,
     startup_context: StartupContext,
@@ -161,7 +154,6 @@ pub fn new_claude_code_executor(
     mcp_registrations: Vec<Arc<dyn McpServerRegistration>>,
     outcomes: Option<Outcomes>,
     activity_recorder: Arc<dyn ActivityRecorder>,
-    otel_log_handler: Arc<dyn LogHandler>,
     lease_manager: Option<Arc<dyn crate::internal::envtype::LeaseManagerHandle>>,
     _target_version: &str,
 ) -> Result<ClaudeCodeExecutor, ClaudeError> {
@@ -173,22 +165,18 @@ pub fn new_claude_code_executor(
     let api_base_url = if startup_context.api_base_url.is_empty() {
         DEFAULT_API_BASE_URL.to_owned()
     } else {
-        logger.info(
-            "Using APIBaseURL from startup context",
-            claude_attrs!("url" => &startup_context.api_base_url),
-        );
+        tracing::info!(url = %startup_context.api_base_url, "Using APIBaseURL from startup context");
         startup_context.api_base_url.clone()
     };
-    let claude_path = get_claude_path(&logger, cfg.as_ref());
+    let claude_path = get_claude_path(cfg.as_ref());
     if let Some(outcomes) = outcomes.as_ref().filter(|outcomes| !outcomes.is_empty()) {
-        logger.info(
-            "ClaudeCodeExecutor initialized with repository outcomes",
-            claude_attrs!("repo_count" => outcomes.len()),
+        tracing::info!(
+            repo_count = outcomes.len(),
+            "ClaudeCodeExecutor initialized with repository outcomes"
         );
     }
 
     Ok(ClaudeCodeExecutor {
-        logger,
         cfg,
         session_id,
         claude_path,
@@ -198,7 +186,6 @@ pub fn new_claude_code_executor(
         _outcomes: outcomes,
         _mcp_registrations: mcp_registrations,
         activity_recorder,
-        otel_log_handler,
         _lease_manager: lease_manager,
         observability: None,
     })
@@ -241,7 +228,6 @@ pub(super) fn write_ccr_upstream_proxy_token(
 
 /// 创建 token pipe、写入一行 token，并安排为 child 的下一个 ExtraFiles FD。
 pub(super) fn add_token_via_file_descriptor(
-    logger: &Logger,
     token: &str,
     token_name: &str,
     descriptors: &mut Vec<TokenDescriptor>,
@@ -256,19 +242,13 @@ pub(super) fn add_token_via_file_descriptor(
     // 因此这里必须把两次结果分开保存，不能用 `?` 提前离开并依赖静默 Drop。
     let write_error = writer.write_all(format!("{token}\n").as_bytes()).err();
     if let Err(error) = close_owned_fd(writer.into_raw_fd()) {
-        logger.error(
-            format!("Failed to close write end of {token_name} pipe"),
-            claude_attrs!("error" => error.to_string()),
-        );
+        tracing::error!(error = %error, "Failed to close write end of {token_name} pipe");
     }
     if let Some(error) = write_error {
         // Go 只在写入失败时立即关闭读端；成功路径由 Execute 的 defer 在整个
         // child 生命周期结束后关闭，所以不能把这个清理提前到普通路径。
         if let Err(close_error) = close_owned_fd(read_end.into_raw_fd()) {
-            logger.debug(
-                format!("Failed to close read end of {token_name} pipe"),
-                claude_attrs!("error" => close_error.to_string()),
-            );
+            tracing::debug!(error = %close_error, "Failed to close read end of {token_name} pipe");
         }
         return Err(ClaudeError::message(format!(
             "failed to write {token_name} to pipe: {error}"
@@ -286,13 +266,10 @@ pub(super) fn add_token_via_file_descriptor(
     let source = unsafe { OwnedFd::from_raw_fd(duplicated) };
     let target = i32::try_from(descriptors.len()).unwrap_or(i32::MAX) + 3;
     descriptors.push(TokenDescriptor {
-        source: TokenSourceFd::new(source, logger.clone()),
+        source: TokenSourceFd::new(source),
         target,
     });
-    logger.info(
-        format!("Passed {token_name} via file descriptor"),
-        claude_attrs!("fd" => target),
-    );
+    tracing::info!(fd = target, "Passed {token_name} via file descriptor");
     Ok(target)
 }
 
@@ -341,12 +318,10 @@ impl ClaudeCodeExecutor {
         mut args: Vec<String>,
     ) -> Result<Vec<String>, ClaudeError> {
         let gateway_args = &self.startup_context.claude_code_args;
-        self.logger.info(
-            "Building command args from sandbox-gateway config",
-            claude_attrs!(
-                "gateway_args_count" => gateway_args.len(),
-                "has_mcp_config_file" => self.startup_context.mcp_config_file.is_some(),
-            ),
+        tracing::info!(
+            gateway_args_count = gateway_args.len(),
+            has_mcp_config_file = self.startup_context.mcp_config_file.is_some(),
+            "Building command args from sandbox-gateway config"
         );
         if self.startup_context.mcp_config_file.is_some() {
             self.write_mcp_config_file_from_gateway()
@@ -364,10 +339,7 @@ impl ClaudeCodeExecutor {
             }
             let flag = format!("--{key}");
             args.extend([flag.clone(), value.clone()]);
-            self.logger.info(
-                "Added gateway arg to command",
-                claude_attrs!("flag" => flag, "value" => value),
-            );
+            tracing::info!(flag = %flag, value = %value, "Added gateway arg to command");
         }
 
         if let Some(local_prompt) = self
@@ -391,9 +363,9 @@ impl ClaudeCodeExecutor {
             } else {
                 args.extend(["--append-system-prompt".to_owned(), local_prompt.to_owned()]);
             }
-            self.logger.info(
-                "Merged local append system prompt with gateway config",
-                claude_attrs!("local_prompt_length" => local_prompt.len()),
+            tracing::info!(
+                local_prompt_length = local_prompt.len(),
+                "Merged local append system prompt with gateway config"
             );
         }
         Ok(args)
@@ -430,19 +402,13 @@ impl ClaudeCodeExecutor {
         file.shutdown().await.map_err(|error| {
             ClaudeError::message(format!("failed to write MCP config to {path}: {error}"))
         })?;
-        self.logger.info(
-            "Wrote MCP config file from gateway",
-            claude_attrs!("path" => path, "size_bytes" => decoded.len()),
-        );
+        tracing::info!(path = %path, size_bytes = decoded.len(), "Wrote MCP config file from gateway");
         Ok(path.to_owned())
     }
 
     /// 执行完整 Claude child 生命周期，并保持 Go 参数、环境和副作用。
     async fn execute_inner(&self, cancellation: &CancellationToken) -> Result<(), ClaudeError> {
-        self.logger.info(
-            "Starting ClaudeCodeExecutor",
-            claude_attrs!("session_id" => &self.session_id),
-        );
+        tracing::info!(session_id = %self.session_id, "Starting ClaudeCodeExecutor");
         let local_testing_mode = self.cfg.as_ref().is_some_and(|cfg| cfg.local_testing_mode);
         let mut args = vec![
             "--output-format=stream-json".to_owned(),
@@ -455,10 +421,7 @@ impl ClaudeCodeExecutor {
                 "--debug-to-stderr".to_owned(),
             ]);
         }
-        self.logger.info(
-            "Using sandbox-gateway config for Claude Code args",
-            Default::default(),
-        );
+        tracing::info!("Using sandbox-gateway config for Claude Code args");
         args = self
             .build_args_from_gateway_config(args)
             .await
@@ -481,12 +444,10 @@ impl ClaudeCodeExecutor {
                 if source_dir.as_os_str().is_empty() {
                     continue;
                 }
-                self.logger.info(
-                    "Adding repository directory to Claude multi-root",
-                    claude_attrs!(
-                        "directory" => source_dir.display().to_string(),
-                        "source_type" => source.get_type(),
-                    ),
+                tracing::info!(
+                    directory = %source_dir.display(),
+                    source_type = %source.get_type(),
+                    "Adding repository directory to Claude multi-root"
                 );
                 args.extend([
                     "--add-dir".to_owned(),
@@ -500,12 +461,10 @@ impl ClaudeCodeExecutor {
         } else {
             "v1"
         };
-        self.logger.info(
-            "Endpoint selection based on CCR_USE_V2_ENDPOINT",
-            claude_attrs!(
-                "use_v2_endpoint" => api_version == "v2",
-                "api_version" => api_version,
-            ),
+        tracing::info!(
+            use_v2_endpoint = api_version == "v2",
+            api_version = %api_version,
+            "Endpoint selection based on CCR_USE_V2_ENDPOINT"
         );
         if !local_testing_mode {
             let (sdk_url, resume_url) = build_session_urls(
@@ -519,42 +478,28 @@ impl ClaudeCodeExecutor {
                 sdk_url.clone(),
                 format!("--resume={resume_url}"),
             ]);
-            self.logger.info(
-                "Using SDK URL",
-                claude_attrs!(
-                    "sdk_url" => sdk_url,
-                    "resume_url" => &resume_url,
-                    "api_version" => api_version,
-                    "api_base_url" => &self.api_base_url,
-                    "session_id" => &self.session_id,
-                ),
+            tracing::info!(
+                sdk_url = %sdk_url,
+                resume_url = %resume_url,
+                api_version = %api_version,
+                api_base_url = %self.api_base_url,
+                session_id = %self.session_id,
+                "Using SDK URL"
             );
-            self.logger.info(
-                "Using cloud session persistence with resume URL",
-                claude_attrs!("resume_url" => resume_url),
-            );
+            tracing::info!(resume_url = %resume_url, "Using cloud session persistence with resume URL");
         } else {
-            self.logger.info(
-                "WebSocket disabled, running Claude Code in standalone mode",
-                Default::default(),
-            );
+            tracing::info!("WebSocket disabled, running Claude Code in standalone mode");
         }
         if std::env::var_os("CLAUDE_CODE_DEBUG").is_some_and(|value| !value.is_empty()) {
             args.push("--debug".to_owned());
-            self.logger.info(
-                "CLAUDE_CODE_DEBUG is set, adding --debug flag",
-                Default::default(),
-            );
+            tracing::info!("CLAUDE_CODE_DEBUG is set, adding --debug flag");
         }
 
         let working_dir = self.resolve_working_directory(configured_working_dir);
         if local_testing_mode {
             // Go 在构造 `cmd.Stdin` 时立即记录此事件；实际字节仍由 Tokio 在 spawn
             // 后写入匿名 stdin pipe，但日志顺序必须保持在环境和文件准备之前。
-            self.logger.info(
-                "Passing user message via stdin (WebSocket disabled)",
-                Default::default(),
-            );
+            tracing::info!("Passing user message via stdin (WebSocket disabled)");
         }
         let mut environment = self.build_child_environment();
         let mut descriptors = Vec::new();
@@ -592,7 +537,6 @@ impl ClaudeCodeExecutor {
         let log_file = open_claude_log().await?;
         let log_file = Arc::new(Mutex::new(log_file));
         write_log_header(
-            &self.logger,
             &log_file,
             &self.claude_path,
             &args,
@@ -600,12 +544,13 @@ impl ClaudeCodeExecutor {
             working_dir.as_deref(),
         )
         .await;
-        write_command_file(&self.logger, &self.claude_path, &args).await;
-        let active_tailer = start_cc_log_tailer(&self.logger, &self.session_id).await;
+        write_command_file(&self.claude_path, &args).await;
+        let active_tailer = start_cc_log_tailer(&self.session_id).await;
 
-        self.logger.info(
-            "Starting Claude Code execution",
-            claude_attrs!("has_cancel" => true, "args_count" => args.len()),
+        tracing::info!(
+            has_cancel = true,
+            args_count = args.len(),
+            "Starting Claude Code execution"
         );
         if let Some(observability) = self.observability.as_deref() {
             observability.increment_claude_code_start();
@@ -643,7 +588,7 @@ impl ClaudeCodeExecutor {
             .await;
 
         // 日志与 token read FD 的清理只告警，不覆盖 child 的主返回结果。
-        close_claude_log(&self.logger, log_file).await;
+        close_claude_log(log_file).await;
         drop(descriptors);
         result
     }
@@ -660,31 +605,22 @@ impl ClaudeCodeExecutor {
             } else {
                 PathBuf::from(configured)
             };
-            self.logger.info(
-                "Claude Code will run in directory",
-                claude_attrs!("working_dir" => directory.display().to_string()),
-            );
+            tracing::info!(working_dir = %directory.display(), "Claude Code will run in directory");
             return Some(directory);
         }
 
         match std::env::current_dir() {
             Err(error) => {
-                self.logger.warn(
-                    "Failed to get current working directory",
-                    claude_attrs!("error" => error.to_string()),
-                );
-                self.logger.info(
-                    "Claude Code will run in current directory (no working_dir configured)",
-                    claude_attrs!("working_dir" => "unknown"),
+                tracing::warn!(error = %error, "Failed to get current working directory");
+                tracing::info!(
+                    working_dir = "unknown",
+                    "Claude Code will run in current directory (no working_dir configured)"
                 );
                 None
             }
             // 错误分支和成功分支保留各自的 Rust 日志调用位置。
             Ok(directory) => {
-                self.logger.info(
-                    "Claude Code will run in current directory (no working_dir configured)",
-                    claude_attrs!("working_dir" => directory.display().to_string()),
-                );
+                tracing::info!(working_dir = %directory.display(), "Claude Code will run in current directory (no working_dir configured)");
                 Some(directory)
             }
         }
@@ -705,10 +641,7 @@ impl ClaudeCodeExecutor {
                 OsString::from("ANTHROPIC_BASE_URL"),
                 OsString::from(&self.startup_context.api_base_url),
             ));
-            self.logger.info(
-                "Set ANTHROPIC_BASE_URL from startup context (fallback)",
-                claude_attrs!("api_base_url" => &self.startup_context.api_base_url),
-            );
+            tracing::info!(api_base_url = %self.startup_context.api_base_url, "Set ANTHROPIC_BASE_URL from startup context (fallback)");
         }
         environment.extend([
             (
@@ -752,10 +685,7 @@ impl ClaudeCodeExecutor {
         for (key, value) in &self.startup_context.environment_variables {
             environment.push((OsString::from(key), OsString::from(value)));
             if key == "ANTHROPIC_BASE_URL" {
-                self.logger.info(
-                    "Using ANTHROPIC_BASE_URL from environment config",
-                    claude_attrs!("api_base_url" => value),
-                );
+                tracing::info!(api_base_url = %value, "Using ANTHROPIC_BASE_URL from environment config");
             }
         }
         environment
@@ -773,38 +703,27 @@ impl ClaudeCodeExecutor {
         };
         let session_token = auth.get_session_ingress_token();
         if !session_token.is_empty() && !local_testing_mode {
-            let fd = add_token_via_file_descriptor(
-                &self.logger,
-                session_token,
-                "session ingress token",
-                descriptors,
-            )?;
+            let fd =
+                add_token_via_file_descriptor(session_token, "session ingress token", descriptors)?;
             environment.push((
                 OsString::from("CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR"),
                 OsString::from(fd.to_string()),
             ));
             match create_remote_session_directory() {
-                Err(error) => self.logger.warn(
-                    "Failed to create remote session directory",
-                    claude_attrs!(
-                        "error" => error.to_string(),
-                        "path" => "/home/claude/.claude/remote",
-                    ),
-                ),
+                Err(error) => {
+                    tracing::warn!(error = %error, path = "/home/claude/.claude/remote", "Failed to create remote session directory")
+                }
                 Ok(()) => {
                     if let Err(error) = write_session_ingress_token_file(session_token) {
-                        self.logger.warn(
-                            "Failed to write session ingress token file",
-                            claude_attrs!("error" => error.to_string(), "path" => SESSION_INGRESS_TOKEN_PATH),
-                        );
+                        tracing::warn!(error = %error, path = SESSION_INGRESS_TOKEN_PATH, "Failed to write session ingress token file");
                     } else {
                         environment.push((
                             OsString::from("CLAUDE_SESSION_INGRESS_TOKEN_FILE"),
                             OsString::from(SESSION_INGRESS_TOKEN_PATH),
                         ));
-                        self.logger.info(
-                            "Wrote session ingress token to file for bash access",
-                            claude_attrs!("path" => SESSION_INGRESS_TOKEN_PATH),
+                        tracing::info!(
+                            path = SESSION_INGRESS_TOKEN_PATH,
+                            "Wrote session ingress token to file for bash access"
                         );
                     }
                 }
@@ -813,7 +732,6 @@ impl ClaudeCodeExecutor {
 
         if !auth.get_anthropic_oauth_token().is_empty() {
             let fd = add_token_via_file_descriptor(
-                &self.logger,
                 auth.get_anthropic_oauth_token(),
                 "OAuth token",
                 descriptors,
@@ -824,7 +742,6 @@ impl ClaudeCodeExecutor {
             ));
         } else if !auth.get_anthropic_api_token().is_empty() {
             let fd = add_token_via_file_descriptor(
-                &self.logger,
                 auth.get_anthropic_api_token(),
                 "API key",
                 descriptors,
@@ -872,9 +789,9 @@ impl ClaudeCodeExecutor {
             token: token.to_owned(),
         })
         .await?;
-        self.logger.info(
-            "Prepared session ingress token for CCR upstream proxy relay",
-            claude_attrs!("path" => "environment-manager memory"),
+        tracing::info!(
+            path = "environment-manager memory",
+            "Prepared session ingress token for CCR upstream proxy relay"
         );
         Ok(Some(proxy))
     }
@@ -885,10 +802,7 @@ impl ClaudeCodeExecutor {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => {
-                self.logger.warn(
-                    "Failed to remove CCR upstream proxy token file",
-                    claude_attrs!("error" => error.to_string(), "path" => path.display().to_string()),
-                );
+                tracing::warn!(error = %error, path = %path.display(), "Failed to remove CCR upstream proxy token file");
                 Err(ClaudeError::message(format!(
                     "failed to remove stale CCR upstream proxy token: {error}"
                 )))
@@ -954,12 +868,7 @@ impl ClaudeCodeExecutor {
             verbose,
             None,
         ));
-        let log_writer = LogWriter::new(
-            Logger::new(Arc::clone(&self.otel_log_handler)),
-            LoggerLevel::Info,
-            "[claude] ",
-            claude_attrs!("process" => "claude"),
-        );
+        let log_writer = LogWriter::new(tracing::Level::INFO, "[claude] ");
         let stderr_task = tokio::spawn(copy_claude_stream(
             stderr,
             log_file,
@@ -1043,27 +952,20 @@ impl ClaudeCodeExecutor {
     ) -> Result<(), ClaudeError> {
         if let Some(error) = run.error.as_deref() {
             if cancellation.is_cancelled() {
-                append_log(
-                    &self.logger,
-                    log_file,
-                    format!(
+                append_log(log_file, format!(
                         "\n[{}] Command stopped gracefully after {duration_ms}ms (context cancelled)\n",
                         timestamp()
                     )
-                    .as_bytes(),
-                )
+                    .as_bytes())
                 .await;
-                self.logger.info(
-                    "Claude Code stopped due to context cancellation",
-                    claude_attrs!("duration_ms" => duration_ms),
+                tracing::info!(
+                    duration_ms,
+                    "Claude Code stopped due to context cancellation"
                 );
                 if self.cfg.as_ref().is_some_and(|cfg| cfg.print_code_logs) {
                     // 三个终止分支保留独立调用点，便于区分各自的 sync 失败。
                     if let Err(error) = log_file.lock().await.sync_all().await {
-                        self.logger.warn(
-                            "Failed to sync log file before printing",
-                            claude_attrs!("error" => error.to_string()),
-                        );
+                        tracing::warn!(error = %error, "Failed to sync log file before printing");
                     }
                     self.print_code_logs().await;
                 }
@@ -1076,7 +978,6 @@ impl ClaudeCodeExecutor {
             // 视图，最终返回的 ClaudeError 仍拼接原始 PathError 字节。
             let error_view = go_json_valid_utf8(error);
             append_log(
-                &self.logger,
                 log_file,
                 format!(
                     "\n[{}] Command FAILED after {duration_ms}ms: {error_view}\n",
@@ -1090,42 +991,34 @@ impl ClaudeCodeExecutor {
             } else {
                 tail_string(&run.stderr, 100 * 1024)
             };
-            self.logger.error(
-                "Claude code command failed",
-                claude_attrs!(
-                    "error" => &error_view,
-                    "exit_code" => run.exit_code,
-                    "duration_ms" => duration_ms,
-                    "stderr_tail" => stderr_tail,
-                ),
+            tracing::error!(
+                error = %error_view,
+                exit_code = run.exit_code,
+                duration_ms,
+                stderr_tail = %stderr_tail,
+                "Claude code command failed"
             );
             self.activity_recorder.record_activity(
                 LogLevel::Error,
                 LogCategory::Execute,
                 "Claude Code execution failed".to_owned(),
-                claude_attrs!(
-                    "error" => &error_view,
-                    "exit_code" => run.exit_code,
-                    "duration_ms" => duration_ms,
-                ),
+                BTreeMap::from([
+                    ("error".to_owned(), serde_json::json!(error_view)),
+                    ("exit_code".to_owned(), serde_json::json!(run.exit_code)),
+                    ("duration_ms".to_owned(), serde_json::json!(duration_ms)),
+                ]),
             );
             if let Err(record_error) = self
                 .activity_recorder
                 .record_failure_result(&ClaudeCodeExecutionError { fatal: true })
                 .await
             {
-                self.logger.error(
-                    "Failed to record Claude Code failure result",
-                    claude_attrs!("error" => record_error.to_string()),
-                );
+                tracing::error!(error = %record_error, "Failed to record Claude Code failure result");
             }
             if self.cfg.as_ref().is_some_and(|cfg| cfg.print_code_logs) {
                 // 对应普通失败分支，并保留独立的 Rust 调用位置。
                 if let Err(error) = log_file.lock().await.sync_all().await {
-                    self.logger.warn(
-                        "Failed to sync log file before printing",
-                        claude_attrs!("error" => error.to_string()),
-                    );
+                    tracing::warn!(error = %error, "Failed to sync log file before printing");
                 }
                 self.print_code_logs().await;
             }
@@ -1135,7 +1028,6 @@ impl ClaudeCodeExecutor {
         }
 
         append_log(
-            &self.logger,
             log_file,
             format!(
                 "\n[{}] Command completed successfully after {duration_ms}ms\n",
@@ -1144,17 +1036,15 @@ impl ClaudeCodeExecutor {
             .as_bytes(),
         )
         .await;
-        self.logger.info(
-            "Claude Code execution completed",
-            claude_attrs!("duration_ms" => duration_ms, "output_bytes" => run.stdout.len()),
+        tracing::info!(
+            duration_ms,
+            output_bytes = run.stdout.len(),
+            "Claude Code execution completed"
         );
         if self.cfg.as_ref().is_some_and(|cfg| cfg.print_code_logs) {
             // 对应 Go 的成功分支；保留第三个独立 source，不能与上面两处合并。
             if let Err(error) = log_file.lock().await.sync_all().await {
-                self.logger.warn(
-                    "Failed to sync log file before printing",
-                    claude_attrs!("error" => error.to_string()),
-                );
+                tracing::warn!(error = %error, "Failed to sync log file before printing");
             }
             self.print_code_logs().await;
         }
@@ -1166,18 +1056,12 @@ impl ClaudeCodeExecutor {
         let data = match tokio::fs::read(CLAUDE_CODE_LOG_PATH).await {
             Ok(data) => data,
             Err(error) => {
-                self.logger.warn(
-                    "Failed to read Claude Code logs",
-                    claude_attrs!("path" => CLAUDE_CODE_LOG_PATH, "error" => error.to_string()),
-                );
+                tracing::warn!(path = CLAUDE_CODE_LOG_PATH, error = %error, "Failed to read Claude Code logs");
                 return;
             }
         };
         if data.is_empty() {
-            self.logger.info(
-                "Claude Code log file is empty",
-                claude_attrs!("path" => CLAUDE_CODE_LOG_PATH),
-            );
+            tracing::info!(path = CLAUDE_CODE_LOG_PATH, "Claude Code log file is empty");
             return;
         }
         let separator = format!("{}\n", "=".repeat(80));
@@ -1196,18 +1080,11 @@ impl ClaudeCodeExecutor {
 
     /// 幂等删除 Bash 使用的 session ingress token。
     async fn destroy_inner(&self) -> Result<(), ClaudeError> {
-        self.logger.info(
-            "Destroying ClaudeCodeExecutor",
-            claude_attrs!("session_id" => &self.session_id),
-        );
-        remove_token_file(&self.logger, Path::new(SESSION_INGRESS_TOKEN_PATH), false);
+        tracing::info!(session_id = %self.session_id, "Destroying ClaudeCodeExecutor");
+        remove_token_file(Path::new(SESSION_INGRESS_TOKEN_PATH), false);
         let local_testing_mode = self.cfg.as_ref().is_some_and(|cfg| cfg.local_testing_mode);
         if self.should_start_agent_proxy(local_testing_mode) {
-            remove_token_file(
-                &self.logger,
-                Path::new(super::agent_proxy::STALE_RELAY_TOKEN_PATH),
-                true,
-            );
+            remove_token_file(Path::new(super::agent_proxy::STALE_RELAY_TOKEN_PATH), true);
         }
         Ok(())
     }
@@ -1296,7 +1173,6 @@ async fn open_claude_log() -> Result<File, ClaudeError> {
 /// 写入或 sync 失败只记录 warning，不阻止 Claude 启动；两次 I/O 必须按顺序都尝试，
 /// 因为 Go 即使 header Write 失败也继续调用 `Sync`。
 async fn write_log_header(
-    logger: &Logger,
     log_file: &Arc<Mutex<File>>,
     command: &str,
     args: &[String],
@@ -1314,16 +1190,10 @@ async fn write_log_header(
     );
     let mut file = log_file.lock().await;
     if let Err(error) = file.write_all(header.as_bytes()).await {
-        logger.warn(
-            "Failed to write header to log file",
-            claude_attrs!("error" => error.to_string()),
-        );
+        tracing::warn!(error = %error, "Failed to write header to log file");
     }
     if let Err(error) = file.sync_all().await {
-        logger.warn(
-            "Failed to sync log file",
-            claude_attrs!("error" => error.to_string()),
-        );
+        tracing::warn!(error = %error, "Failed to sync log file");
     }
 }
 
@@ -1331,7 +1201,7 @@ async fn write_log_header(
 ///
 /// 所有 stream task 与完成日志都结束后，Arc 应只剩调用方这一份。消费 Tokio File
 /// 并显式调用 `close(2)`，使罕见关闭错误也能按 Go 的 WARN 文案被观察到。
-async fn close_claude_log(logger: &Logger, log_file: Arc<Mutex<File>>) {
+async fn close_claude_log(log_file: Arc<Mutex<File>>) {
     let mutex = match Arc::try_unwrap(log_file) {
         Ok(mutex) => mutex,
         Err(still_shared) => {
@@ -1344,15 +1214,12 @@ async fn close_claude_log(logger: &Logger, log_file: Arc<Mutex<File>>) {
     let file = mutex.into_inner();
     let raw_fd = file.into_std().await.into_raw_fd();
     if let Err(error) = close_owned_fd(raw_fd) {
-        logger.warn(
-            "Failed to close claude-code.log",
-            claude_attrs!("error" => error.to_string()),
-        );
+        tracing::warn!(error = %error, "Failed to close claude-code.log");
     }
 }
 
 /// 写 `/tmp/claude-command` 的 shell 可复制形式；失败只记录 warning。
-async fn write_command_file(logger: &Logger, command: &str, args: &[String]) {
+async fn write_command_file(command: &str, args: &[String]) {
     let path = Path::new("/tmp/claude-command");
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true).mode(0o644);
@@ -1364,22 +1231,16 @@ async fn write_command_file(logger: &Logger, command: &str, args: &[String]) {
         Err(error) => Err(error),
     };
     if let Err(error) = result {
-        // open/write 两阶段必须汇合到同一 Logger callsite，避免重复
+        // open/write 两阶段必须汇合到同一 tracing callsite，避免重复
         // 记录同一次文件写入失败。
-        logger.warn(
-            "Failed to write claude command to file",
-            claude_attrs!("error" => error.to_string()),
-        );
+        tracing::warn!(error = %error, "Failed to write claude command to file");
     } else {
-        logger.info(
-            "Claude command written to /tmp/claude-command",
-            Default::default(),
-        );
+        tracing::info!("Claude command written to /tmp/claude-command");
     }
 }
 
 /// 在启用 `ENV_MANAGER_STREAM_CC_LOGS` 时启动从文件末尾跟随的日志转发。
-async fn start_cc_log_tailer(logger: &Logger, session_id: &str) -> Option<ActiveTailer> {
+async fn start_cc_log_tailer(session_id: &str) -> Option<ActiveTailer> {
     std::env::var_os("ENV_MANAGER_STREAM_CC_LOGS")?;
     let initialized =
         Tailer::new(CLAUDE_CODE_LOG_PATH, Duration::from_millis(100)).and_then(|tailer| {
@@ -1391,36 +1252,23 @@ async fn start_cc_log_tailer(logger: &Logger, session_id: &str) -> Option<Active
         Err(error) => {
             // Rust 的 receiver 所有权检查是 Go channel 不需要的结构步骤；无论失败
             // 来自 metadata 还是 receiver 初始化，都汇入 Go `NewTailer` 唯一日志点。
-            logger.warn(
-                "Failed to start CC log tailer, logs will not stream",
-                claude_attrs!("error" => error.to_string(), "path" => CLAUDE_CODE_LOG_PATH),
-            );
+            tracing::warn!(error = %error, path = CLAUDE_CODE_LOG_PATH, "Failed to start CC log tailer, logs will not stream");
             return None;
         }
     };
     if let Err(error) = tailer.start(CancellationToken::new()).await {
-        logger.warn(
-            "Failed to start CC log tailer goroutine",
-            claude_attrs!("error" => error.to_string(), "path" => CLAUDE_CODE_LOG_PATH),
-        );
+        tracing::warn!(error = %error, path = CLAUDE_CODE_LOG_PATH, "Failed to start CC log tailer goroutine");
         return None;
     }
-    let logger = logger.clone();
     let session_id = session_id.to_owned();
     let hostname = std::env::var("HOSTNAME").unwrap_or_default();
     let consumer = tokio::spawn(async move {
         while let Some(line) = lines.recv().await {
             if let Some(error) = line.error {
-                logger.error(
-                    "CC log tailer error",
-                    claude_attrs!("error" => error, "session_id" => &session_id, "hostname" => &hostname),
-                );
+                tracing::error!(error = %error, session_id = %session_id, hostname = %hostname, "CC log tailer error");
                 return;
             }
-            logger.info(
-                "CC log",
-                claude_attrs!("line" => line.text, "session_id" => &session_id, "hostname" => &hostname),
-            );
+            tracing::info!(line = %line.text, session_id = %session_id, hostname = %hostname, "CC log");
         }
     });
     Some(ActiveTailer { tailer, consumer })
@@ -1489,12 +1337,9 @@ async fn join_stream(task: JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, V
 ///
 /// 三种 child 结局共用同一 closure/source；写入失败沿用历史上略显宽泛的
 /// `Failed to write header` 文案，并且绝不覆盖取消或 child 失败的主结果。
-async fn append_log(logger: &Logger, log_file: &Arc<Mutex<File>>, bytes: &[u8]) {
+async fn append_log(log_file: &Arc<Mutex<File>>, bytes: &[u8]) {
     if let Err(error) = log_file.lock().await.write_all(bytes).await {
-        logger.warn(
-            "Failed to write header to log file",
-            claude_attrs!("error" => error.to_string()),
-        );
+        tracing::warn!(error = %error, "Failed to write header to log file");
     }
 }
 
@@ -1538,8 +1383,7 @@ fn shell_quote(value: &str) -> String {
 
 /// 复刻 Go `tailString` 对任意 stderr 字节的截断与 UTF-8 处理。
 ///
-/// 未截断时 Go 把原始 string 交给 slog/JSON，后者逐个无效字节写 U+FFFD；发生截断
-/// 时则调用 `strings.ToValidUTF8(..., "")`，删除尾部切片中的所有无效字节。
+/// 未截断时把无效字节写成 U+FFFD；发生截断时删除尾部切片中的所有无效字节。
 pub(super) fn tail_string(value: &[u8], max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return go_json_valid_utf8(value);
@@ -1601,29 +1445,23 @@ fn exit_code(status: &std::io::Result<ExitStatus>) -> i32 {
         .unwrap_or(-1)
 }
 
-/// 对应 Go：`ClaudeCodeExecutor.Destroy` 清理 session/CCR token 的两个分支。
-///
-/// `ccr_token` 只选择兼容文案，不改变删除语义。两个文件共用一个 Rust 调用点，
-/// 但条件表达式保留四个静态消息，使 source resolver 能分别映射 Go 的四个位置；
-/// `NotFound` 与 Go `os.IsNotExist` 一样保持静默。
-fn remove_token_file(logger: &Logger, path: &Path, ccr_token: bool) {
+/// 清理 session/CCR token；文件不存在时保持静默。
+fn remove_token_file(path: &Path, ccr_token: bool) {
     match std::fs::remove_file(path) {
-        Ok(()) => logger.info(
+        Ok(()) => {
             if ccr_token {
-                "Removed CCR upstream proxy token file"
+                tracing::info!(path = %path.display(), "Removed CCR upstream proxy token file");
             } else {
-                "Removed session ingress token file"
-            },
-            claude_attrs!("path" => path.display().to_string()),
-        ),
+                tracing::info!(path = %path.display(), "Removed session ingress token file");
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => logger.warn(
+        Err(error) => {
             if ccr_token {
-                "Failed to remove CCR upstream proxy token file"
+                tracing::warn!(error = %error, path = %path.display(), "Failed to remove CCR upstream proxy token file");
             } else {
-                "Failed to remove session ingress token file"
-            },
-            claude_attrs!("error" => error.to_string(), "path" => path.display().to_string()),
-        ),
+                tracing::warn!(error = %error, path = %path.display(), "Failed to remove session ingress token file");
+            }
+        }
     }
 }

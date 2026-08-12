@@ -16,7 +16,6 @@ use tar::{Builder as TarBuilder, Header};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
-use crate::internal::logger::{LogAttributes, Logger, default_logger};
 use crate::internal::tunnel::actions::{ActionError, ProgressUpdate};
 
 use super::types::{AntspaceClient, AntspaceDeployResult, AntspaceResponse, OptionalProgress};
@@ -33,7 +32,6 @@ const ANTSPACE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 pub fn new_antspace_client(
     control_plane_url: impl Into<String>,
     auth_token: impl Into<String>,
-    logger: Option<Logger>,
 ) -> AntspaceClient {
     let http_client = reqwest::Client::builder()
         .timeout(ANTSPACE_REQUEST_TIMEOUT)
@@ -43,7 +41,6 @@ pub fn new_antspace_client(
         control_plane_url: control_plane_url.into(),
         auth_token: auth_token.into(),
         http_client,
-        logger,
     }
 }
 
@@ -253,11 +250,7 @@ impl AntspaceClient {
         {
             // 此事件必须在 Go 对应分支直接调用 facade；若经动态 wrapper 转发，
             // `#[track_caller]` 会把 source 错记为 wrapper，而不是进度失败分支。
-            let logger = self.log();
-            logger.warn(
-                "antspace_progress_send_error",
-                collect_log_attributes([("error", serde_json::Value::String(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "antspace_progress_send_error");
         }
 
         Ok(Some(AntspaceDeployResult {
@@ -265,29 +258,6 @@ impl AntspaceClient {
             service: response.service,
         }))
     }
-
-    /// 返回 Antspace client 配置的 logger；缺省时使用进程级 tracing logger。
-    fn log(&self) -> &Logger {
-        match self.logger.as_ref() {
-            Some(logger) => logger,
-            None => default_logger(),
-        }
-    }
-}
-
-/// 把 Antspace 日志属性转换为保持插入顺序的 map。
-///
-/// 该 helper 只负责数据转换，不调用 logger，因而不会截断 `#[track_caller]` 从真实
-/// 业务分支向 facade 传递的 source 位置。
-fn collect_log_attributes<I, K>(attributes: I) -> LogAttributes
-where
-    I: IntoIterator<Item = (K, serde_json::Value)>,
-    K: Into<String>,
-{
-    attributes
-        .into_iter()
-        .map(|(key, value)| (key.into(), value))
-        .collect()
 }
 
 /// 在内存中构造与 Go `mime/multipart.Writer` 相同顺序的完整请求体。

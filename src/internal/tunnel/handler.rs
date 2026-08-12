@@ -24,7 +24,6 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, Version}
 use http_body_util::{BodyExt as _, Full};
 use hyper::ext::ReasonPhrase;
 use hyper_util::rt::TokioIo;
-use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt as _, AsyncWrite, BufReader, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -32,8 +31,8 @@ use tokio_util::io::StreamReader;
 use tokio_util::sync::CancellationToken;
 use xxhash_rust::xxh64::Xxh64;
 
-use super::helpers::{canonical_mime_header_key, handler_logger};
-use crate::internal::{logger::LogAttributes, util::go_duration_nanoseconds};
+use super::helpers::canonical_mime_header_key;
+use crate::internal::util::duration_nanoseconds;
 
 use super::{
     Handler, Header, HttpTunnelRequest, HttpTunnelResponseChunk, HttpTunnelResponseError,
@@ -83,44 +82,34 @@ impl Drop for ActiveRequestGuard<'_> {
 /// 中专用于本地端口的显式 `http.Transport` 一样始终直连 loopback。请求本身通过
 /// `CancellationToken` 管理，只对响应 header 设置 30 秒门限，不截断长响应 body。
 ///
-/// # 参数
-/// - `logger`：可选结构化日志器；为 `None` 时仅关闭诊断日志，不改变转发行为。
-///
 /// # 返回
-/// 返回初始化完成的处理器。签名保留 `Result` 是为了和迁移期间既有调用点兼容；当前
-/// Hyper HTTP connector 的构造不会失败。
-pub fn new_handler(
-    logger: Option<crate::internal::logger::Logger>,
-) -> Result<Handler, TunnelError> {
+/// 返回初始化完成的处理器。当前 Hyper HTTP connector 的构造不会失败。
+pub fn new_handler() -> Result<Handler, TunnelError> {
     Ok(Handler {
-        logger,
         response_header_timeout: RESPONSE_HEADER_TIMEOUT,
         connect_delay: Duration::ZERO,
         active_requests: std::sync::Mutex::new(BTreeMap::new()),
     })
 }
 
-/// 构造带可控计时参数的 HTTP Tunnel 处理器，仅供 Linux ARM64 差分探针使用。
+/// 构造带可控计时参数的 HTTP Tunnel 处理器，仅供单元测试使用。
 ///
 /// Go 的 `ResponseHeaderTimeout` 从完整请求写入成功后才开始。生产值固定为 30 秒，
-/// 无法在门禁中稳定覆盖“慢连接”和“慢上传不消耗 header timeout”。这个隐藏构造器
-/// 只缩短探针时间并在拨号前注入确定延迟，传输状态机与生产构造完全相同。
+/// 无法在测试中快速覆盖“慢连接”和“慢上传不消耗 header timeout”。这个构造器只
+/// 缩短测试时间并在拨号前注入确定延迟，传输状态机与生产构造完全相同。
 ///
 /// # 参数
-/// - `logger`：可选结构化日志器。
 /// - `response_header_timeout`：请求写完后等待首个响应 header 的时限。
 /// - `connect_delay`：拨号前延迟；它明确位于 header timeout 计时范围之外。
 ///
 /// # 返回
 /// 返回使用指定计时参数的处理器；该构造过程不访问网络且不会失败。
-#[doc(hidden)]
-pub fn new_handler_with_timing_for_probe(
-    logger: Option<crate::internal::logger::Logger>,
+#[cfg(test)]
+pub(crate) fn new_handler_with_timing_for_test(
     response_header_timeout: Duration,
     connect_delay: Duration,
 ) -> Result<Handler, TunnelError> {
     Ok(Handler {
-        logger,
         response_header_timeout,
         connect_delay,
         active_requests: std::sync::Mutex::new(BTreeMap::new()),
@@ -979,8 +968,8 @@ impl Handler {
 
     /// 对应 Go 成功读取 EOF 后的 `http_tunnel_request_complete` 日志。
     ///
-    /// duration 使用纳秒整数并保留字段名 `duration`，对应 Go `slog` JSON handler 对
-    /// `time.Duration` 的编码；不能改成毫秒字段，否则日志消费者会看到不同 schema。
+    /// duration 使用纳秒整数并保留字段名 `duration`；不能改成毫秒字段，否则日志
+    /// 消费者会看到不同 schema。
     ///
     /// # 参数
     /// - `request`：完成的请求，用于 request ID。
@@ -999,19 +988,15 @@ impl Handler {
         hash: u64,
         duration: std::time::Duration,
     ) {
-        let logger = handler_logger(self);
-        let attributes: LogAttributes = [
-            ("bytes", Value::from(total_bytes)),
-            ("chunks", Value::from(total_chunks)),
-            ("duration", Value::from(go_duration_nanoseconds(duration))),
-            ("request_id", Value::String(request.request_id.clone())),
-            ("status_code", Value::from(status_code)),
-            ("xxhash", Value::from(hash)),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect();
-        logger.info("http_tunnel_request_complete", attributes);
+        tracing::info!(
+            bytes = total_bytes,
+            chunks = total_chunks,
+            duration = duration_nanoseconds(duration),
+            request_id = %request.request_id,
+            status_code,
+            xxhash = hash,
+            "http_tunnel_request_complete"
+        );
     }
 }
 
@@ -1614,7 +1599,7 @@ fn go_connect_error(error: &io::Error, port: i32) -> String {
 ///
 /// Hyper 的顶层文本带有内部 parser 分类；本函数沿 source 链提取 Linux IO 错误，
 /// 并保留响应前缀与连接地址，供 malformed response、EOF 和 reset 场景重建 Go 文本。
-/// 探针覆盖的错误映射在 ARM64 Go 1.25.7 oracle 上逐字节固定。
+/// 错误映射由 Rust 回归测试固定。
 ///
 /// # 参数
 /// - `error`：Hyper HTTP/1 连接或 `send_request` 返回的错误。

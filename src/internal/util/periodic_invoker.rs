@@ -15,8 +15,6 @@ use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, Logger};
-
 use super::{BoxError, Stopper, format_go_duration};
 
 type PeriodicFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send + 'static>>;
@@ -48,7 +46,6 @@ struct InvokerState {
 
 /// 管理单个周期函数生命周期的异步组件。
 pub struct PeriodicInvoker {
-    logger: Logger,
     interval: Duration,
     function: PeriodicFunction,
     state: Mutex<InvokerState>,
@@ -59,11 +56,7 @@ impl PeriodicInvoker {
     ///
     /// 与 Go 构造函数的 panic 不同，配置错误通过 `Result` 返回，避免配置输入
     /// 导致整个服务崩溃。函数使用 async future，网络调用无需阻塞 Tokio worker。
-    pub fn new<F, Fut, E>(
-        logger: Logger,
-        interval: Duration,
-        function: F,
-    ) -> Result<Self, PeriodicInvokerError>
+    pub fn new<F, Fut, E>(interval: Duration, function: F) -> Result<Self, PeriodicInvokerError>
     where
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), E>> + Send + 'static,
@@ -78,7 +71,6 @@ impl PeriodicInvoker {
                 as PeriodicFuture
         });
         Ok(Self {
-            logger,
             interval,
             function,
             state: Mutex::new(InvokerState::default()),
@@ -106,10 +98,9 @@ impl PeriodicInvoker {
 
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
-        let logger = self.logger.clone();
         let function = Arc::clone(&self.function);
         let interval = self.interval;
-        let task = runtime.spawn(Self::run(logger, function, interval, task_cancellation));
+        let task = runtime.spawn(Self::run(function, interval, task_cancellation));
 
         state.running = true;
         state.cancellation = Some(cancellation);
@@ -186,17 +177,9 @@ impl PeriodicInvoker {
     ///
     /// 立即调用一次 callback，随后按固定间隔持续执行；单次错误只记录而不终止。
     /// `cancellation` 被触发后退出循环，JoinHandle 由 `stop` 汇合。
-    async fn run(
-        logger: Logger,
-        function: PeriodicFunction,
-        interval: Duration,
-        cancellation: CancellationToken,
-    ) {
+    async fn run(function: PeriodicFunction, interval: Duration, cancellation: CancellationToken) {
         if let Err(error) = function().await {
-            logger.error(
-                "periodic function failed",
-                periodic_error_attributes(error.as_ref(), interval),
-            );
+            tracing::error!(error = %error, interval_ms = interval.as_millis(), "periodic function failed");
         }
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -208,12 +191,8 @@ impl PeriodicInvoker {
                 _ = cancellation.cancelled() => break,
                 _ = ticker.tick() => {
                     if let Err(error) = function().await {
-                        // 这里不能与首次调用合并成同一个 logger helper：Go 的两个
-                        // 保留独立调用点，便于区分两个停止分支。
-                        logger.error(
-                            "periodic function failed",
-                            periodic_error_attributes(error.as_ref(), interval),
-                        );
+                        // 与首次调用保留独立事件，便于区分两个停止分支。
+                        tracing::error!(error = %error, interval_ms = interval.as_millis(), "periodic function failed");
                     }
                 },
             }
@@ -223,10 +202,8 @@ impl PeriodicInvoker {
 
 /// 对应 Go：`periodic_invoker.go` 中的 `NewPeriodicInvoker`。
 ///
-/// 这是保持机械符号名称的自由函数入口；Rust 无法表达 nil logger/函数，间隔配置
-/// 错误仍由 [`PeriodicInvoker::new`] 的类型化结果返回。
+/// 自由函数构造入口；间隔配置错误由 [`PeriodicInvoker::new`] 的类型化结果返回。
 pub fn new_periodic_invoker<F, Fut, E>(
-    logger: Logger,
     interval: Duration,
     function: F,
 ) -> Result<PeriodicInvoker, PeriodicInvokerError>
@@ -235,7 +212,7 @@ where
     Fut: Future<Output = Result<(), E>> + Send + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
-    PeriodicInvoker::new(logger, interval, function)
+    PeriodicInvoker::new(interval, function)
 }
 
 #[async_trait]
@@ -256,20 +233,4 @@ impl Drop for PeriodicInvoker {
     fn drop(&mut self) {
         self.request_stop();
     }
-}
-
-/// 构造 Go 周期错误日志的有序属性，并把 Duration 编码为纳秒整数。
-fn periodic_error_attributes(
-    error: &(dyn std::error::Error + Send + Sync),
-    interval: Duration,
-) -> LogAttributes {
-    [
-        ("error".to_owned(), serde_json::json!(error.to_string())),
-        (
-            "interval".to_owned(),
-            serde_json::json!(i64::try_from(interval.as_nanos()).unwrap_or(i64::MAX)),
-        ),
-    ]
-    .into_iter()
-    .collect()
 }

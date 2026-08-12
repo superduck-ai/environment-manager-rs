@@ -17,7 +17,6 @@ use serde::{
 use crate::internal::{
     auth::AuthContext,
     config::{SessionMode, StartupContext},
-    logger::Logger,
     util::BoxError,
 };
 
@@ -181,8 +180,6 @@ impl<'de> Visitor<'de> for LanguageVisitor {
 pub struct AnthropicEnvironmentType {
     /// 正常构造时存在；`None` 只用于保留 Go nil-config 错误路径。
     pub(crate) config: Option<Config>,
-    /// manager 传入的结构化 logger；生产构造和测试 fixture 都必须显式提供。
-    pub(crate) logger: Logger,
     /// stdin/work secret 解码出的启动上下文。
     pub(crate) startup_context: Option<StartupContext>,
     /// 当前 session 的认证上下文。
@@ -192,12 +189,11 @@ pub struct AnthropicEnvironmentType {
 }
 
 impl fmt::Debug for AnthropicEnvironmentType {
-    /// 输出配置和 session 元数据，但不展开认证凭据或 logger handler。
+    /// 输出配置和 session 元数据，但不展开认证凭据。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AnthropicEnvironmentType")
             .field("config", &self.config)
-            .field("logger", &"configured")
             .field("startup_context", &self.startup_context)
             .field("has_auth_context", &self.auth_context.is_some())
             .field("session_mode", &self.session_mode)

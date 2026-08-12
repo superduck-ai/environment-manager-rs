@@ -12,13 +12,11 @@ use serde_json::Value;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::api::{DiagLogEntry, SessionBackend};
-use crate::internal::logger::{LogAttributes, Logger, default_logger};
-
 use super::{
     DiagContext, DiagError, DiagFile, DiagService, DiagState, LogFlusher, SessionBackendLogFlusher,
     new_cc_log_collector,
 };
+use crate::internal::api::{DiagLogEntry, SessionBackend};
 
 pub(super) const MAX_BUFFERED_LOGS: usize = 5_000;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
@@ -31,47 +29,19 @@ pub async fn new_diag_service(
     cancellation: CancellationToken,
     flusher: Arc<dyn LogFlusher>,
 ) -> Result<(Arc<DiagService>, DiagContext), DiagError> {
-    new_diag_service_with_logger(cancellation, flusher, default_logger().clone()).await
-}
-
-/// 对应 Go：`diag.NewDiagService`，并允许 Rust 测试注入可观测 logger。
-///
-/// 生产入口总是传入进程级 tracing logger；单独保留此内部入口，是为了
-/// 测试消息、级别和属性顺序，而不写入进程级日志。两份临时文件创建、
-/// collector 启动和 flusher task 启动仍严格按 Go 顺序执行；任一步失败时，已经创建的
-/// `File` 会被 drop/close，但 `keep()` 后的路径与 Go `os.CreateTemp` 一样不会删除。
-///
-/// # 参数
-/// - `cancellation`：父会话取消树，供 tailer 与远端 flush 使用。
-/// - `flusher`：把按时间排序的非空 batch 发送到 session backend 的实现。
-/// - `logger`：已经解析完成、可跨异步任务克隆的 concrete logger。
-///
-/// # 返回
-/// 成功时返回共享服务和显式诊断上下文；文件或 tailer 初始化失败时返回带 Go 前缀错误。
-///
-/// # 副作用
-/// 创建两个 `0600` 临时文件，并启动一个 collector task 和一个周期 flush task。
-pub(super) async fn new_diag_service_with_logger(
-    cancellation: CancellationToken,
-    flusher: Arc<dyn LogFlusher>,
-    logger: Logger,
-) -> Result<(Arc<DiagService>, DiagContext), DiagError> {
-    let env_manager_log_file =
-        create_diag_file("environment-manager", &logger).map_err(|error| {
-            DiagError::message(format!(
-                "failed to create diag log for environment-manager: {error}"
-            ))
-        })?;
-    let cc_log_file = create_diag_file("claude-code", &logger).map_err(|error| {
+    let env_manager_log_file = create_diag_file("environment-manager").map_err(|error| {
+        DiagError::message(format!(
+            "failed to create diag log for environment-manager: {error}"
+        ))
+    })?;
+    let cc_log_file = create_diag_file("claude-code").map_err(|error| {
         DiagError::message(format!(
             "failed to create diag log for claude-code: {error}"
         ))
     })?;
-    let cc_collector =
-        new_cc_log_collector(cancellation.clone(), &cc_log_file.path, logger.clone()).await?;
+    let cc_collector = new_cc_log_collector(cancellation.clone(), &cc_log_file.path).await?;
 
     let service = Arc::new(DiagService {
-        logger,
         state: Mutex::new(DiagState {
             env_manager_logs: Vec::new(),
             env_manager_log_file: Some(env_manager_log_file),
@@ -113,7 +83,7 @@ pub async fn new_diag_service_with_backend(
 /// 成功后先以 `file` 为唯一属性写 INFO，再返回仍打开的文件与路径；创建或 `keep`
 /// 失败时保留 `error creating file {prefix}` 前缀且不写成功日志。文件权限由 tempfile
 /// 维持为 `0600`，路径脱离 RAII 删除，后续 shutdown 只关闭 fd。
-pub(super) fn create_diag_file(prefix: &str, logger: &Logger) -> Result<DiagFile, DiagError> {
+pub(super) fn create_diag_file(prefix: &str) -> Result<DiagFile, DiagError> {
     let named = tempfile::Builder::new()
         .prefix(&format!("{prefix}-"))
         .suffix(".diag.log")
@@ -122,12 +92,7 @@ pub(super) fn create_diag_file(prefix: &str, logger: &Logger) -> Result<DiagFile
     let (file, path) = named
         .keep()
         .map_err(|error| DiagError::message(format!("error creating file {prefix}: {error}")))?;
-    let mut attributes = LogAttributes::new();
-    attributes.insert(
-        "file".to_owned(),
-        serde_json::json!(path.to_string_lossy().into_owned()),
-    );
-    logger.info("Created diagnostic file", attributes);
+    tracing::info!(file = %path.display(), "Created diagnostic file");
     Ok(DiagFile { path, file })
 }
 
@@ -193,10 +158,7 @@ impl DiagService {
                     ))),
                 },
                 _ = cancellation.cancelled() => {
-                    self.logger.warn(
-                        "Shutdown timed out waiting for diag log flusher to stop",
-                        LogAttributes::new(),
-                    );
+                    tracing::warn!("{}", "Shutdown timed out waiting for diag log flusher to stop");
                     errors.push(DiagError::message(
                         "shutdown timed out waiting for final flush: context canceled"
                     ));
@@ -236,10 +198,7 @@ impl DiagService {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if state.is_shutdown {
-            self.logger.warn(
-                "DiagService is shutdown; discarding log entry",
-                LogAttributes::new(),
-            );
+            tracing::warn!("{}", "DiagService is shutdown; discarding log entry");
             return;
         }
 
@@ -255,11 +214,8 @@ impl DiagService {
         .into_iter()
         .collect();
         let existing = std::mem::take(&mut state.env_manager_logs);
-        state.env_manager_logs = append_and_cap_logs(
-            &self.logger,
-            existing,
-            vec![DiagLogEntry { timestamp, fields }],
-        );
+        state.env_manager_logs =
+            append_and_cap_logs(existing, vec![DiagLogEntry { timestamp, fields }]);
 
         let file_entry: BTreeMap<String, Value> = [
             ("data".to_owned(), data),
@@ -275,10 +231,7 @@ impl DiagService {
         let mut line = match serde_json::to_vec(&file_entry) {
             Ok(line) => line,
             Err(error) => {
-                let mut attributes = LogAttributes::new();
-                attributes.insert("error".to_owned(), serde_json::json!(error.to_string()));
-                self.logger
-                    .error("Failed to marshal diag log entry", attributes);
+                tracing::error!(%error, "Failed to marshal diag log entry");
                 return;
             }
         };
@@ -287,10 +240,7 @@ impl DiagService {
         if let Some(file) = state.env_manager_log_file.as_mut()
             && let Err(error) = file.file.write_all(&line)
         {
-            let mut attributes = LogAttributes::new();
-            attributes.insert("error".to_owned(), serde_json::json!(error.to_string()));
-            self.logger
-                .error("Failed to write diag log entry", attributes);
+            tracing::error!(%error, "Failed to write diag log entry");
         }
     }
 
@@ -309,22 +259,11 @@ impl DiagService {
                     return match self.flush_diag_logs_to_remote(&pending).await {
                         Ok(()) => Ok(()),
                         Err(error) if error.is_endpoint_not_implemented() => {
-                            let mut attributes = LogAttributes::new();
-                            attributes.insert("count".to_owned(), serde_json::json!(pending.len()));
-                            self.logger.warn(
-                                "Final diag log flush skipped; endpoint not implemented",
-                                attributes,
-                            );
+                            tracing::warn!(count = pending.len(), "Final diag log flush skipped; endpoint not implemented");
                             Ok(())
                         }
                         Err(error) => {
-                            let mut attributes = LogAttributes::new();
-                            attributes
-                                .insert("error".to_owned(), serde_json::json!(error.to_string()));
-                            self.logger.error(
-                                "Final diag log flush failed during shutdown",
-                                attributes,
-                            );
+                            tracing::error!(%error, "Final diag log flush failed during shutdown");
                             Err(error)
                         }
                     };
@@ -334,19 +273,11 @@ impl DiagService {
                     match self.flush_diag_logs_to_remote(&pending).await {
                         Ok(()) => pending.clear(),
                         Err(error) if error.is_endpoint_not_implemented() => {
-                            let mut attributes = LogAttributes::new();
-                            attributes.insert("count".to_owned(), serde_json::json!(pending.len()));
-                            self.logger.warn(
-                                "Diag logs endpoint not implemented; discarding logs",
-                                attributes,
-                            );
+                            tracing::warn!(count = pending.len(), "Diag logs endpoint not implemented; discarding logs");
                             pending.clear();
                         }
                         Err(error) => {
-                            let mut attributes = LogAttributes::new();
-                            attributes
-                                .insert("error".to_owned(), serde_json::json!(error.to_string()));
-                            self.logger.error("Diag log flush failed", attributes);
+                            tracing::error!(%error, "Diag log flush failed");
                         }
                     }
                 }
@@ -359,9 +290,9 @@ impl DiagService {
         &self,
         mut pending: Vec<DiagLogEntry>,
     ) -> Vec<DiagLogEntry> {
-        pending = append_and_cap_logs(&self.logger, pending, self.drain_env_manager_logs());
+        pending = append_and_cap_logs(pending, self.drain_env_manager_logs());
         if let Some(collector) = &self.cc_collector {
-            pending = append_and_cap_logs(&self.logger, pending, collector.drain());
+            pending = append_and_cap_logs(pending, collector.drain());
         }
         // `sort_by_key` 仍是稳定排序；相同时间戳的条目继续保留合并前的来源顺序。
         pending.sort_by_key(|entry| entry.timestamp);
@@ -406,7 +337,6 @@ pub fn log_env_manager_no_pii(
 /// WARN，再删除最早插入项。该函数不按时间排序，排序只发生在远端 flush 前，避免
 /// 改变 Go 在多个来源分别触发 cap 时的丢弃对象。
 pub(super) fn append_and_cap_logs(
-    logger: &Logger,
     mut existing: Vec<DiagLogEntry>,
     new_logs: Vec<DiagLogEntry>,
 ) -> Vec<DiagLogEntry> {
@@ -416,18 +346,10 @@ pub(super) fn append_and_cap_logs(
     }
 
     let discarded_count = existing.len() - MAX_BUFFERED_LOGS;
-    let mut attributes = LogAttributes::new();
-    attributes.insert(
-        "discarded_count".to_owned(),
-        serde_json::json!(discarded_count),
-    );
-    attributes.insert(
-        "max_entries".to_owned(),
-        serde_json::json!(MAX_BUFFERED_LOGS),
-    );
-    logger.warn(
-        "Dropping oldest diag log entries due to buffer cap",
-        attributes,
+    tracing::warn!(
+        discarded_count,
+        max_entries = MAX_BUFFERED_LOGS,
+        "Dropping oldest diag log entries due to buffer cap"
     );
     drop(existing.drain(..discarded_count));
     existing

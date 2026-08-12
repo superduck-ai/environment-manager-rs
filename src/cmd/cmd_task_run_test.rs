@@ -18,7 +18,6 @@ use crate::internal::{
     auth::AuthContext,
     claude::{ClaudeError, Outcomes},
     config::{self, StartupContext},
-    logger::{LogAttributes, LogHandler, LogHandlerError, LogLevel, LogRecord, Logger},
     manager::{ManagerApiClient, ManagerError},
 };
 
@@ -31,37 +30,6 @@ use super::task_run::{
 use super::types::{StdinConfigClient, TaskContext};
 
 use super::*;
-
-/// 测试中丢弃全部日志，避免污染 CLI golden 的 stdout/stderr。
-#[derive(Clone, Default)]
-struct DiscardHandler;
-
-impl LogHandler for DiscardHandler {
-    /// 允许 logger 构造所有级别的记录。
-    fn enabled(&self, _level: LogLevel) -> bool {
-        true
-    }
-
-    /// 丢弃记录并报告成功。
-    fn handle(&self, _record: &LogRecord) -> Result<(), LogHandlerError> {
-        Ok(())
-    }
-
-    /// 派生 handler 仍丢弃附加属性。
-    fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-
-    /// 派生 group handler 仍丢弃全部记录。
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-}
-
-/// 构造无输出的 task-run 测试 logger。
-fn test_logger() -> Logger {
-    Logger::new(Arc::new(DiscardHandler))
-}
 
 /// task-run 缺少 session 时必须是 Clap 的 usage error。
 #[test]
@@ -213,7 +181,6 @@ async fn test_stdin_config_client() {
         config: Some(environment.clone()),
         auth_context: None,
         outcomes: Some(outcomes.clone()),
-        logger: test_logger(),
     };
 
     assert_eq!(
@@ -230,7 +197,6 @@ async fn test_stdin_config_client() {
 /// 对应 Go `TestAcknowledgeWorkIfNeededSkipAndValidation`，跳过分支不得误触发网络。
 #[tokio::test]
 async fn test_acknowledge_work_if_needed_skip_and_validation() {
-    let logger = test_logger();
     let cancellation = CancellationToken::new();
     for (work_id, environment_id, skip_ack) in [
         ("", "env", false),
@@ -239,7 +205,6 @@ async fn test_acknowledge_work_if_needed_skip_and_validation() {
     ] {
         acknowledge_work_if_needed(
             &cancellation,
-            &logger,
             &empty_task_context(),
             work_id,
             environment_id,
@@ -249,36 +214,24 @@ async fn test_acknowledge_work_if_needed_skip_and_validation() {
         .expect("skip branch must succeed");
     }
 
-    let error = acknowledge_work_if_needed(
-        &cancellation,
-        &logger,
-        &empty_task_context(),
-        "work",
-        "env",
-        false,
-    )
-    .await
-    .expect_err("missing auth must fail before network");
+    let error =
+        acknowledge_work_if_needed(&cancellation, &empty_task_context(), "work", "env", false)
+            .await
+            .expect_err("missing auth must fail before network");
     assert!(error.contains("missing auth context"));
 }
 
 /// 对应 Go `TestBuildTaskRunBackendNoopModes`，跳过 Claude 和 setup-only 都使用空端点。
 #[tokio::test]
 async fn test_build_task_run_backend_noop_modes() {
-    let logger = test_logger();
     for (mode, skip_claude_code) in [
         (config::SessionMode::New, true),
         (config::SessionMode::SetupOnly, false),
     ] {
-        let selected = build_task_run_backend(
-            &logger,
-            &empty_task_context(),
-            "session-1",
-            mode,
-            skip_claude_code,
-        )
-        .await
-        .expect("noop backend selection must succeed");
+        let selected =
+            build_task_run_backend(&empty_task_context(), "session-1", mode, skip_claude_code)
+                .await
+                .expect("noop backend selection must succeed");
         assert_eq!(selected.backend.otlp_endpoints(), Default::default());
         assert!(selected.ccr_backend.is_none());
     }
@@ -294,15 +247,10 @@ async fn test_build_task_run_backend_session_ingress() {
     });
     task_context.auth_context = Some(new_task_run_auth_context("session-1", "ingress-token"));
 
-    let selected = build_task_run_backend(
-        &test_logger(),
-        &task_context,
-        "session-1",
-        config::SessionMode::New,
-        false,
-    )
-    .await
-    .expect("session ingress backend must be created");
+    let selected =
+        build_task_run_backend(&task_context, "session-1", config::SessionMode::New, false)
+            .await
+            .expect("session ingress backend must be created");
     assert!(selected.ccr_backend.is_none());
     let endpoints = selected.backend.otlp_endpoints();
     assert_eq!(
@@ -387,7 +335,6 @@ async fn test_build_task_run_backend_ccr_registers_worker() {
     task_context.auth_context = Some(new_task_run_auth_context("session-ccr", "ingress-token"));
 
     let selected = build_task_run_backend(
-        &test_logger(),
         &task_context,
         "session-ccr",
         config::SessionMode::New,
@@ -440,15 +387,14 @@ async fn test_task_run_claude_path() {
     let original = std::env::var_os("CLAUDE_DEFAULT_PATH");
     // SAFETY: 全仓库进程状态锁防止其他测试并发读写该环境变量。
     unsafe { std::env::set_var("CLAUDE_DEFAULT_PATH", "/env/claude") };
-    let logger = test_logger();
-    assert_eq!(task_run_claude_path(&logger, None), "/env/claude");
+    assert_eq!(task_run_claude_path(None), "/env/claude");
     assert_eq!(
-        task_run_claude_path(&logger, Some(std::path::Path::new("/flag/claude"))),
+        task_run_claude_path(Some(std::path::Path::new("/flag/claude"))),
         "/flag/claude"
     );
     // SAFETY: 仍持有同一全局测试锁。
     unsafe { std::env::set_var("CLAUDE_DEFAULT_PATH", "") };
-    assert_eq!(task_run_claude_path(&logger, None), "claude");
+    assert_eq!(task_run_claude_path(None), "claude");
     match original {
         Some(value) => {
             // SAFETY: 仍持有全局测试锁，正在恢复原始值。
@@ -487,7 +433,6 @@ async fn task_run_v0_invalid_startup_context_returns_error() {
     ] {
         let error = load_context_from_bytes(
             &CancellationToken::new(),
-            &test_logger(),
             "session-v0-ordinary-error",
             InputFormat::V0,
             std::path::Path::new("/workspace"),
@@ -539,7 +484,6 @@ async fn test_run_task_run_manager_wraps_failure() {
     };
     let error = run_task_run_manager(
         &CancellationToken::new(),
-        &test_logger(),
         &mut manager,
         config::SessionMode::New,
         Instant::now(),
@@ -564,7 +508,6 @@ async fn test_run_task_run_manager_treats_context_canceled_as_success() {
     };
     run_task_run_manager(
         &CancellationToken::new(),
-        &test_logger(),
         &mut manager,
         config::SessionMode::New,
         Instant::now(),
@@ -593,7 +536,6 @@ async fn task_run_preserves_raw_manager_error_through_rendering() {
     };
     let error = run_task_run_manager(
         &CancellationToken::new(),
-        &test_logger(),
         &mut manager,
         config::SessionMode::New,
         Instant::now(),
@@ -643,7 +585,7 @@ async fn test_init_diag_logging_disabled() {
     // SAFETY: 全仓库进程状态锁防止并发测试观察中间值。
     unsafe { std::env::remove_var("ENV_MANAGER_ENABLE_DIAG_LOGS") };
     let backend: Arc<dyn SessionBackend> = Arc::new(NoopBackend::new());
-    let result = init_diag_logging(&CancellationToken::new(), backend, &test_logger())
+    let result = init_diag_logging(&CancellationToken::new(), backend)
         .await
         .expect("disabled diagnostic logging must succeed");
     assert!(result.is_none());

@@ -8,7 +8,6 @@ source "${script_dir}/container-images.env"
 readonly machine="${ORB_MACHINE:-ubuntu-2404}"
 readonly user="${ORB_USER:-arthur}"
 readonly target="/home/${user}/environment-manager"
-readonly go_root="${VM_GO_SOURCE_ROOT:-/mnt/mac/Users/${user}/GolandProjects/environment-manager}"
 readonly image="${RUST_RELEASE_IMAGE:-${DEFAULT_RUST_RELEASE_IMAGE}}"
 readonly output_directory="dist/preflight"
 readonly almalinux_mirror="${ALMALINUX_MIRROR:-https://mirrors.aliyun.com/almalinux}"
@@ -38,17 +37,16 @@ fi
 "${script_dir}/sync.sh"
 
 orb -m "${machine}" -u "${user}" -w "${target}" bash -s -- \
-  "${image}" "${target}" "${go_root}" "${output_directory}" "${almalinux_mirror}" \
+  "${image}" "${target}" "${output_directory}" "${almalinux_mirror}" \
   "${CONTAINER_IMAGE_ALLOWLIST_VERSION}" "${build_git_hash}" "${build_time}" <<'REMOTE'
 set -euo pipefail
 image="$1"
 target="$2"
-go_root="$3"
-output_directory="$4"
-almalinux_mirror="$5"
-image_allowlist_version="$6"
-build_git_hash="$7"
-build_time="$8"
+output_directory="$3"
+almalinux_mirror="$4"
+image_allowlist_version="$5"
+build_git_hash="$6"
+build_time="$7"
 artifact_name="environment-manager_linux_arm64"
 cache_root="${XDG_CACHE_HOME:-${HOME}/.cache}/environment-manager"
 mkdir -p "${cache_root}"
@@ -117,8 +115,7 @@ publication="$(mktemp -d "${dist_directory}/.preflight-publish.XXXXXX")"
 # 与其中 0755 binary 和 0644 manifest 的既有读取语义保持一致。
 chmod 0755 "${publication}"
 
-# 候选构建可以被单独调用，因此仍需自行验证 Go 基线和 Cargo 依赖。
-scripts/linux-arm64/verify-go-baseline.sh "${go_root}"
+# 候选构建可以被单独调用，因此仍需自行验证 Cargo 依赖。
 scripts/linux-arm64/verify-cargo-dependencies.sh "${target}"
 
 # 在构建前记录完整源码状态。清单无时间戳，后续 release 可以逐字节复算；构建

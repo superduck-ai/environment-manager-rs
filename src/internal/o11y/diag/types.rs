@@ -10,10 +10,7 @@ use async_trait::async_trait;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::{
-    api::{ApiError, DiagLogEntry, SessionBackend},
-    logger::Logger,
-};
+use crate::internal::api::{ApiError, DiagLogEntry, SessionBackend};
 
 use super::CcLogCollector;
 
@@ -104,8 +101,6 @@ pub(super) struct DiagState {
 
 /// 诊断日志服务的共享运行状态。
 pub struct DiagService {
-    /// 构造时固定的 tracing logger，供后台任务和同步记录路径共享。
-    pub(super) logger: Logger,
     pub(super) state: Mutex<DiagState>,
     pub(super) cc_collector: Option<Arc<CcLogCollector>>,
     pub(super) flusher: Arc<dyn LogFlusher>,

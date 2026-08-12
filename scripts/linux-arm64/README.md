@@ -1,137 +1,47 @@
 # Linux ARM64 验证与发布
 
-这些脚本唯一支持 `aarch64-unknown-linux-gnu`。macOS 只负责编辑源码和通过
-OrbStack 发起命令；构建、测试、差分、产物执行与发布提升都发生在
-`ubuntu-2404` ARM64 虚拟机。验证脚本同时检查 `/etc/os-release`、`uname -m`、
-Debian architecture 和 `rustc -vV` 的 host triple，其他 Linux 发行版或 Rust host
-均不构成发布证据。
+这里的脚本是自包含的 Rust 构建、验证和发布流程。
 
-## 镜像审核清单
+## 权威验证
 
-[`container-images.env`](container-images.env) 是版本化镜像 allowlist。目前只允许：
+`verify.sh` 先将源码同步到 OrbStack 的 Ubuntu 24.04 ARM64 虚拟机，再依次执行：
 
-- Go 1.25.7 ARM64：
-  `docker.io/library/golang@sha256:f630c6aaf1842769464a1ddec76b2f5aff68783fe4479d4299ead44d8b488eb1`
-- AlmaLinux 9 ARM64：
-  `docker.io/library/almalinux@sha256:2c999b3bd705fad8b115741d9036ae2499148ba162752f09f2f4ab62b0c07320`
+- 校验 Ubuntu 24.04、AArch64 和 Rust 1.97.0 GNU host；
+- 审计 `Cargo.lock` 中禁止的依赖；
+- `cargo fmt --all --check`；
+- 中文注释与 rustdoc 链接审计；
+- `cargo clippy --all-targets --locked -- -D warnings`；
+- `cargo test --locked`。
 
-`GO_ORACLE_IMAGE` 和 `RUST_RELEASE_IMAGE` 仍可显式传入，但值必须与当前版本的
-allowlist 某一项逐字相等。仅仅带有 `@sha256:` 并不足以通过。增加或替换镜像时要
-提升 allowlist schema、审核实际平台与工具链，并重新完成全部本地门禁和 staging
-E2E。
+任一门禁失败都会汇总并返回非零状态。
 
-## 本地门禁
+## 候选构建
 
-```bash
-scripts/linux-arm64/verify.sh
-```
+`build-release-artifact.sh` 在审核过的 AlmaLinux 9 ARM64 镜像中构建 Rust
+release，并将唯一候选写入 `dist/preflight`。镜像必须与
+`container-images.env` 中固定的 digest 完全一致。
 
-脚本同步源码到 `/home/arthur/environment-manager` 后，依次检查 Ubuntu 24.04 ARM64、
-Rust 1.97.0、原生 GNU host triple、不可变 Go 基线、格式、中文注释、rustdoc 链接、
-Cargo.lock 禁止依赖、完整符号映射、Clippy、全部 Rust 测试以及 Go/Rust 协议差分。
+候选目录恰好包含四份证据：
 
-`verify-cargo-dependencies.sh` 使用 Python `tomllib` 解析 Cargo 实际 lockfile，而不是
-扫描 Cargo.toml 文本。它拒绝 `tonic`/`tonic-*`、`git2`/`libgit2-sys`、
-`openssl`/`openssl-sys`、`native-tls`、`hyper-tls` 和 `tokio-native-tls`；
-`openssl-probe` 仅用于 rustls 的系统证书路径发现，不链接 OpenSSL，因此明确允许。
-该检查也由候选构建脚本独立执行，不能通过跳过 `verify.sh` 把禁止依赖带入产物。
+- `environment-manager_linux_arm64`；
+- `environment-manager_linux_arm64.sha256`；
+- `environment-manager_linux_arm64.source-manifest`；
+- `environment-manager_linux_arm64.manifest`。
 
-差分 runner 唯一固定为 `scripts/compat/run_differential.sh`，默认且无条件执行。
-设置 `DIFFERENTIAL_RUNNER` 会立即失败；`REQUIRE_DIFFERENTIAL=0` 也不能跳过。
-runner 同时收到值完全相同的 `GO_SOURCE_ROOT` 和 `GO_SOURCE_DIR`，所以二进制 oracle
-与 overlay protocol probe 使用同一棵只读 Go 工作树。
+源码清单不含时间戳，可在正式提升前逐字节复算。构建期间源码发生变化时，候选
+会被拒绝。
 
-当前 runner 比较协议 transcript，不再将 Rust CLI 与 Go/Cobra 文本和参数行为
-做逐字节差分。协议范围包括
-HTTP API、V0/V1 input、MCP Streamable HTTP 以及 Tunnel HTTP/WebSocket ProtoJSON。
-请求/响应原文不会在被测实现中归一化；input 的不可预测解析耗时保留原始整数，
-仅由比较器按 manifest 中唯一审核规则验证后处理。
+## 正式提升与回滚
 
-日志使用 Rust `tracing` 输出到 stderr 和 `/tmp/env-manager.log`，不再生成或校验 Go
-`slog` source oracle。协议差分仍比较明确列入 transcript 的业务日志级别、消息和属性。
-
-## Go 基线和 oracle 构建
-
-`verify-go-baseline.sh` 除 HEAD、tracked diff 和关键文件 SHA 外，还读取：
-
-- `compat/go-untracked-paths.txt`：已审核的全部未跟踪路径；任何新增路径均失败。
-- `compat/go-untracked-build-inputs.sha256`：未跟踪 Go 构建输入及其内容摘要；删除或
-  修改均失败。
-
-检查过程只调用 Git、find 和 sha256sum 读取 Go 工作树，不写入任何文件。
-
-正式 rollback 的唯一构建定义是：
-
-```bash
-scripts/linux-arm64/build-go-oracle.sh \
-  /mnt/mac/Users/arthur/GolandProjects/environment-manager \
-  /tmp/environment-manager_go_linux_arm64
-```
-
-它与未跟踪 Makefile 的 `linux-arm64` 定义一致：`CGO_ENABLED=0`、`GOOS=linux`、
-`GOARCH=arm64`、`-trimpath`、`-s -w`，版本来自 `git describe`；额外关闭 VCS 自动
-注入，使构建信息不受容器 Git 探测差异影响。helper 在安装前后都验证 rollback 是
-静态 AArch64 ELF、没有 `INTERP` 和动态 `NEEDED`，并在 Ubuntu ARM64 宿主执行一次
-限时 `--help` 烟测；release 对即将提升的最终路径再独立复核一次。
-
-协议差分用 `go test -overlay` 注入 probe；overlay 不进入 Go 工作树，也不属于 rollback
-定义。
-
-## 构建 staging 候选
-
-```bash
-scripts/linux-arm64/build-release-artifact.sh
-```
-
-脚本不接受输出目录参数。取得独占 flock 后，它先通过目录 rename 原子使旧
-`dist/preflight` 失效；此后任何失败都会删除 canonical 候选路径，不能继续误用旧 SHA。
-新 binary、SHA、source manifest 和 manifest 先完整写入 `dist` 内的隐藏目录，最后用
-同文件系统目录 rename 一次性发布四件套。它在 allowlist 中的
-AlmaLinux 9 ARM64 镜像内使用 Rust 1.97.0 构建，然后用 `file`/`readelf` 验证
-AArch64 GNU ELF、动态加载器、libc、无 OpenSSL 依赖及最高 `GLIBC_2.34`。
-即使不先运行 `verify.sh`，候选脚本也会重新检查只读 Go 基线和 Cargo 依赖。
-
-候选目录包含四份互相绑定的证据：
-
-- `environment-manager_linux_arm64`
-- `environment-manager_linux_arm64.sha256`
-- `environment-manager_linux_arm64.source-manifest`
-- `environment-manager_linux_arm64.manifest`
-
-源码清单确定性记录除 `.git`、`.idea`、`target`、`dist`、Finder 文件和同步 marker
-外的所有文件/符号链接、mode、size 与内容 SHA。它覆盖生产代码、测试、fixture、
-门禁脚本和配置。构建前后清单必须完全一致，候选 manifest 再绑定源码 SHA、产物
-SHA、目标 triple、Rust 版本、allowlist 版本和 AlmaLinux 镜像 digest。manifest
-不包含时间戳或主机名。
-
-## staging E2E 后正式提升
-
-把候选 SHA 记录到 staging E2E 结果中；全部真实后端流程通过后，以同一个 SHA
-执行：
+完成 staging E2E 后，以候选的精确 SHA 执行：
 
 ```bash
 STAGING_E2E_APPROVED=1 \
-STAGING_E2E_ARTIFACT_SHA256=<64位小写候选SHA> \
+STAGING_E2E_ARTIFACT_SHA256=<sha256> \
 scripts/linux-arm64/release.sh
 ```
 
-`release.sh` 会重新执行完整 `verify.sh`，随后逐字段检查 preflight manifest、候选
-SHA 和审批 SHA，并复算当前源码清单。任何源码、测试、门禁或配置漂移都会要求重建
-候选并重跑 staging E2E。
+`release.sh` 会重新执行权威验证、复算源码清单，并把 staging 已验证的同一 Rust
+二进制提升到 `dist`；它不会重新构建。
 
-正式提升不会调用 Cargo，也不会调用 `build-release-artifact.sh`。它通过 `cp`、
-`cmp` 和 SHA 校验把已验证候选的原字节提升为
-`dist/environment-manager_linux_arm64`，同时保留其 manifest 与源码清单。
-
-在移动 Rust 正式产物前，release 必须用统一 helper 构建并验证 Go ARM64 rollback：
-
-- `dist/rollback/environment-manager_go_linux_arm64`
-- `dist/rollback/environment-manager_go_linux_arm64.sha256`
-- `dist/rollback/environment-manager_go_linux_arm64.manifest`
-
-rollback manifest 固定记录 Go HEAD、tracked diff SHA、未跟踪基线摘要、Go 1.25.7、
-构建版本、目标、allowlist 版本、镜像 digest 和产物 SHA。rollback 构建或二次 Go
-基线校验失败时，Rust 候选不会被提升。
-
-`ALMALINUX_MIRROR` 仅控制 AlmaLinux 签名软件包的 HTTPS 下载源；它不改变基础镜像
-digest，DNF 仍执行发行版 GPG 校验。
+回滚使用上一版已经发布并留存的 Rust artifact；当前发布流程只处理 Rust 产物。

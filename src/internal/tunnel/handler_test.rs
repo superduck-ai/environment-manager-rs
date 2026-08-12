@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use super::actions::ActionError;
 use super::{
     Header, HttpTunnelRequest, HttpTunnelResponseChunk, HttpTunnelResponseError,
-    HttpTunnelResponseHeaders, ResponseSender, new_handler, new_handler_with_timing_for_probe,
+    HttpTunnelResponseHeaders, ResponseSender, new_handler, new_handler_with_timing_for_test,
 };
 
 #[derive(Default)]
@@ -107,7 +107,7 @@ async fn run_raw_http_exchange(
 ) {
     let (port, request_rx, server) = start_raw_http_server(response).await;
     request.port = port;
-    let handler = new_handler(None).unwrap();
+    let handler = new_handler().unwrap();
     let sender = Arc::new(RecordingSender::default());
     let result = handler
         .handle_request(CancellationToken::new(), request, sender.clone())
@@ -140,7 +140,7 @@ async fn start_local_http_server(router: Router) -> (i32, JoinHandle<()>) {
 
 #[tokio::test]
 async fn test_handle_request_rejects_invalid_port() {
-    let handler = new_handler(None).unwrap();
+    let handler = new_handler().unwrap();
     let sender = Arc::new(RecordingSender::default());
 
     handler
@@ -164,7 +164,7 @@ async fn test_handle_request_rejects_invalid_port() {
 
 #[tokio::test]
 async fn test_handle_request_rejects_path_without_slash() {
-    let handler = new_handler(None).unwrap();
+    let handler = new_handler().unwrap();
     let sender = Arc::new(RecordingSender::default());
 
     handler
@@ -225,7 +225,7 @@ async fn test_handle_request_forwards_and_streams_response() {
     );
     let (port, server) = start_local_http_server(router).await;
 
-    let handler = new_handler(None).unwrap();
+    let handler = new_handler().unwrap();
     let sender = Arc::new(RecordingSender::default());
     handler
         .handle_request(
@@ -306,7 +306,7 @@ async fn test_cancel_request_cancels_active_http_forward() {
     );
     let (port, server) = start_local_http_server(router).await;
 
-    let handler = Arc::new(new_handler(None).unwrap());
+    let handler = Arc::new(new_handler().unwrap());
     let sender = Arc::new(RecordingSender::default());
     let running_handler = Arc::clone(&handler);
     let running_sender = sender.clone();
@@ -360,7 +360,7 @@ async fn test_streams_one_byte_flush_without_waiting_for_eof() {
         stream.shutdown().await.unwrap();
     });
 
-    let handler = new_handler(None).unwrap();
+    let handler = new_handler().unwrap();
     let sender = Arc::new(RecordingSender::default());
     let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
     *sender.chunk_events.lock().unwrap() = Some(chunk_tx);
@@ -546,7 +546,7 @@ async fn test_go_url_request_target_preserves_query_and_escapes_backslash() {
 
 #[tokio::test]
 async fn test_invalid_method_url_and_header_keep_go_error_categories() {
-    let handler = new_handler(None).unwrap();
+    let handler = new_handler().unwrap();
     let sender = Arc::new(RecordingSender::default());
     let method_error = handler
         .handle_request(
@@ -772,7 +772,7 @@ async fn test_aborted_future_drops_active_request_registration() {
         server_accepted.notify_one();
         std::future::pending::<()>().await;
     });
-    let handler = Arc::new(new_handler(None).unwrap());
+    let handler = Arc::new(new_handler().unwrap());
     let running_handler = Arc::clone(&handler);
     let task = tokio::spawn(async move {
         running_handler
@@ -809,7 +809,7 @@ async fn test_response_header_timeout_uses_go_error_text() {
     // 生产门限仍固定为 30 秒；测试通过同一传输状态机的计时构造器缩短等待，避免
     // 仅验证固定错误文本就给每次 Linux ARM64 完整门禁增加 30 秒。
     let handler =
-        new_handler_with_timing_for_probe(None, Duration::from_millis(50), Duration::ZERO).unwrap();
+        new_handler_with_timing_for_test(Duration::from_millis(50), Duration::ZERO).unwrap();
     let sender = Arc::new(RecordingSender::default());
     timeout(
         Duration::from_secs(2),

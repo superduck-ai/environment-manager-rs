@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -20,54 +20,10 @@ use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{body_json, body_string, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::internal::logger::{
-    LogAttributes, LogHandler, LogHandlerError, LogLevel as LoggerLevel, LogRecord, Logger,
-};
 use crate::internal::util::go_path_escape;
 
 use super::session_ingress_client::diag_logs_to_wire_format;
 use super::*;
-
-/// 收集 API 测试中的结构化日志，同时保留真实生产调用顺序。
-#[derive(Clone, Default)]
-struct ApiLogCapture {
-    records: Arc<Mutex<Vec<LogRecord>>>,
-}
-
-impl LogHandler for ApiLogCapture {
-    /// 故障注入测试必须观察 debug 到 error 的完整 defer 时序。
-    fn enabled(&self, _level: LoggerLevel) -> bool {
-        true
-    }
-
-    /// 复制记录，避免断言借用 Logger 内部生命周期。
-    fn handle(&self, record: &LogRecord) -> Result<(), LogHandlerError> {
-        self.records.lock().unwrap().push(record.clone());
-        Ok(())
-    }
-
-    /// 本组测试没有绑定属性；派生 logger 继续共享同一捕获槽。
-    fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-
-    /// group 不影响消息时序；派生 logger 继续共享同一捕获槽。
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-}
-
-impl ApiLogCapture {
-    /// 返回绑定到本捕获槽的 Logger。
-    fn logger(&self) -> Logger {
-        Logger::new(Arc::new(self.clone()))
-    }
-
-    /// 返回当前记录的拥有型快照。
-    fn snapshot(&self) -> Vec<LogRecord> {
-        self.records.lock().unwrap().clone()
-    }
-}
 
 /// 启动一次性 raw HTTP/1.1 loopback，返回 base URL 和实际请求字节。
 async fn spawn_raw_api_response(response: Vec<u8>) -> (String, oneshot::Receiver<Vec<u8>>) {
@@ -122,7 +78,7 @@ async fn response_close_error_fault_survives_retry_transport() {
         .expect(1)
         .mount(&server)
         .await;
-    let mut client = HttpClient::new(&server.uri(), None, None).unwrap();
+    let mut client = HttpClient::new(&server.uri(), None).unwrap();
     client.inject_response_close_error_for_test("synthetic close failure");
     let request = client
         .http_client
@@ -139,78 +95,6 @@ async fn response_close_error_fault_survives_retry_transport() {
     );
 }
 
-/// Session 查询必须在成功日志之后执行 Go defer 对应的 Close warning。
-#[tokio::test]
-async fn session_response_close_error_uses_go_defer_order_and_attributes() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "session_context": { "cwd": "/workspace" }
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let capture = ApiLogCapture::default();
-    let logger = capture.logger();
-    let mut http_client = HttpClient::new(&server.uri(), Some(logger.clone()), None).unwrap();
-    http_client.inject_response_close_error_for_test("close-session");
-    let client = SessionsClient::new(http_client, "token", Some(logger));
-    client
-        .get_session_context(&CancellationToken::new(), "session-1")
-        .await
-        .expect("Close 错误只写日志，不能覆盖成功结果");
-
-    let records = capture.snapshot();
-    let success = records
-        .iter()
-        .position(|record| record.message == "Successfully fetched session context")
-        .expect("必须记录 session 成功事件");
-    let close = records
-        .iter()
-        .position(|record| record.message == "Failed to close response body")
-        .expect("必须记录注入的 Close 失败");
-    assert!(success < close, "Go defer 必须晚于成功日志执行");
-    assert_eq!(records[close].level, LoggerLevel::Warn);
-    assert_eq!(records[close].attributes["error"], "close-session");
-    assert_eq!(
-        records[close].attributes["endpoint"],
-        format!("{}/v2/sessions/session-1", server.uri())
-    );
-}
-
-/// ACK 成功返回值不得被 Close 错误替换，且 Error 日志位于成功日志之后。
-#[tokio::test]
-async fn ack_response_close_error_uses_go_defer_order_and_level() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let capture = ApiLogCapture::default();
-    let logger = capture.logger();
-    let mut http_client = HttpClient::new(&server.uri(), Some(logger.clone()), None).unwrap();
-    http_client.inject_response_close_error_for_test("close-ack");
-    let client = WorkClient::new(http_client, "token", Some(logger));
-    client
-        .acknowledge_work(&CancellationToken::new(), "env-1", "work-1")
-        .await
-        .expect("Close 错误不能覆盖 ACK 成功");
-
-    let records = capture.snapshot();
-    let success = records
-        .iter()
-        .position(|record| record.message == "Work ACK successful")
-        .expect("必须记录 ACK 成功事件");
-    let close = records
-        .iter()
-        .position(|record| record.message == "Failed to close ACK response body")
-        .expect("必须记录 ACK Close 失败");
-    assert!(success < close, "Go defer 必须晚于 ACK 成功日志执行");
-    assert_eq!(records[close].level, LoggerLevel::Error);
-    assert_eq!(records[close].attributes["error"], "close-ack");
-}
-
 /// 生成一个完整 gzip member，供 Go Transport 自动解压测试使用。
 fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -222,7 +106,6 @@ fn gzip_bytes(body: &[u8]) -> Vec<u8> {
 fn test_new_http_client() {
     let client = HttpClient::new(
         "api.example.com///",
-        None,
         Some(RetryConfig {
             max_retries: 1,
             initial_backoff: Duration::from_millis(1),
@@ -305,7 +188,6 @@ async fn test_post_json_with_response() {
 
     let client = HttpClient::with_options(
         &server.uri(),
-        None,
         ClientOptions {
             timeout: None,
             retry_config: Some(RetryConfig {
@@ -343,7 +225,6 @@ async fn test_post_json_not_implemented() {
         .await;
     let client = HttpClient::with_options(
         &server.uri(),
-        None,
         ClientOptions {
             retry_config: Some(RetryConfig {
                 max_retries: 0,
@@ -407,7 +288,7 @@ async fn test_retryable_http_do_retries_and_replays_body() {
         max_backoff: Duration::from_nanos(1),
         backoff_factor: 1.0,
     };
-    let client = HttpClient::new(&server.uri(), None, Some(retry)).unwrap();
+    let client = HttpClient::new(&server.uri(), Some(retry)).unwrap();
     let request = client
         .http_client
         .post(server.uri())
@@ -427,9 +308,8 @@ async fn test_retryable_http_do_retries_and_replays_body() {
 #[test]
 fn test_session_ingress_helpers() {
     let client = HttpSessionIngressClient::new(
-        HttpClient::new("https://api.example.com", None, None).unwrap(),
+        HttpClient::new("https://api.example.com", None).unwrap(),
         "token",
-        None,
         false,
     );
     assert_eq!(
@@ -486,9 +366,8 @@ async fn test_get_session_context_escapes_session_id_like_go() {
         .await;
 
     let client = SessionsClient::new(
-        HttpClient::new(&server.uri(), None, None).unwrap(),
+        HttpClient::new(&server.uri(), None).unwrap(),
         "session-token",
-        None,
     );
     let error = client
         .get_session_context(&CancellationToken::new(), "session/%2e;,:@&=+$中文")
@@ -510,11 +389,7 @@ async fn test_acknowledge_work_escapes_both_ids_like_go() {
         .mount(&server)
         .await;
 
-    let client = WorkClient::new(
-        HttpClient::new(&server.uri(), None, None).unwrap(),
-        "service-key",
-        None,
-    );
+    let client = WorkClient::new(HttpClient::new(&server.uri(), None).unwrap(), "service-key");
     client
         .acknowledge_work(&CancellationToken::new(), "env/%2e;中文", "work,:@&=+$")
         .await
@@ -537,10 +412,9 @@ async fn test_ccr_backend_escapes_session_id_like_go() {
         .await;
 
     let backend = CCRBackend::new(
-        HttpClient::new(&server.uri(), None, None).unwrap(),
+        HttpClient::new(&server.uri(), None).unwrap(),
         "session-token",
         "session/%2E%2E;,:@&=+$中文",
-        None,
     );
     assert_eq!(
         backend
@@ -571,7 +445,6 @@ async fn ccr_register_worker_epoch_accepts_go_null_and_missing_zero_values() {
         let backend = CCRBackend::new(
             HttpClient::new(
                 &base_url,
-                None,
                 Some(RetryConfig {
                     max_retries: 0,
                     initial_backoff: Duration::ZERO,
@@ -582,7 +455,6 @@ async fn ccr_register_worker_epoch_accepts_go_null_and_missing_zero_values() {
             .unwrap(),
             "token",
             "session",
-            None,
         );
         assert_eq!(
             backend
@@ -607,7 +479,6 @@ async fn json_transport_headers_and_gzip_match_go() {
     let (base_url, request) = spawn_raw_api_response(raw_response).await;
     let client = HttpClient::with_options(
         &base_url,
-        None,
         ClientOptions {
             timeout: Some(Duration::ZERO),
             retry_config: Some(RetryConfig {
@@ -660,7 +531,6 @@ async fn explicit_accept_encoding_disables_transport_gzip() {
     let (base_url, request) = spawn_raw_api_response(raw_response).await;
     let client = HttpClient::with_options(
         &base_url,
-        None,
         ClientOptions {
             retry_config: Some(RetryConfig {
                 max_retries: 0,
@@ -704,7 +574,7 @@ async fn explicit_accept_encoding_disables_transport_gzip() {
 /// Go 允许显式空 User-Agent 完全禁止默认 header，不能发送一个空值 header。
 #[test]
 fn explicit_empty_user_agent_suppresses_transport_default() {
-    let client = HttpClient::new("https://api.example.test", None, None).unwrap();
+    let client = HttpClient::new("https://api.example.test", None).unwrap();
     let mut request = client
         .http_client
         .get("https://api.example.test/path")
@@ -727,7 +597,6 @@ async fn truncated_non_ok_response_keeps_partial_body() {
     let (base_url, _request) = spawn_raw_api_response(response).await;
     let client = HttpClient::with_options(
         &base_url,
-        None,
         ClientOptions {
             retry_config: Some(RetryConfig {
                 max_retries: 0,
@@ -761,7 +630,6 @@ async fn ccr_request_bodies_preserve_go_dynamic_json_and_map_order() {
     let event_backend = CCRBackend::new(
         HttpClient::new(
             &event_base,
-            None,
             Some(RetryConfig {
                 max_retries: 0,
                 initial_backoff: Duration::ZERO,
@@ -772,7 +640,6 @@ async fn ccr_request_bodies_preserve_go_dynamic_json_and_map_order() {
         .unwrap(),
         "token",
         "session",
-        None,
     );
     event_backend
         .post_event(
@@ -809,7 +676,6 @@ async fn ccr_request_bodies_preserve_go_dynamic_json_and_map_order() {
     let diagnostics_backend = CCRBackend::new(
         HttpClient::new(
             &diagnostics_base,
-            None,
             Some(RetryConfig {
                 max_retries: 0,
                 initial_backoff: Duration::ZERO,
@@ -820,7 +686,6 @@ async fn ccr_request_bodies_preserve_go_dynamic_json_and_map_order() {
         .unwrap(),
         "token",
         "session",
-        None,
     );
     diagnostics_backend
         .flush_logs(
@@ -848,8 +713,7 @@ async fn ccr_request_bodies_preserve_go_dynamic_json_and_map_order() {
 #[test]
 fn session_ingress_otlp_endpoints_keep_raw_base_url() {
     let backend =
-        SessionIngressBackend::new("https://api.example.test///", "token", "session", None)
-            .unwrap();
+        SessionIngressBackend::new("https://api.example.test///", "token", "session").unwrap();
     let endpoints = backend.otlp_endpoints();
     assert_eq!(
         endpoints.metrics_endpoint,
@@ -866,7 +730,6 @@ fn session_ingress_otlp_endpoints_keep_raw_base_url() {
 async fn retry_errors_use_go_context_and_transport_mapping() {
     let client = HttpClient::new(
         "http://127.0.0.1:9",
-        None,
         Some(RetryConfig {
             max_retries: 0,
             initial_backoff: Duration::ZERO,

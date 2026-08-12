@@ -5,7 +5,7 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -15,10 +15,6 @@ use super::{
     install_sandbox_runtime, load_and_validate_config, new_sandbox_runtime_with_config,
     validate_config, write_config_file,
 };
-use crate::internal::logger::{
-    LogAttributes, LogHandler, LogHandlerError, LogLevel, LogRecord, Logger,
-};
-
 /// 构造满足 Anthropic 必需域名约束的最小配置。
 fn valid_sandbox_config() -> SrtConfig {
     SrtConfig {
@@ -41,7 +37,6 @@ fn valid_sandbox_config() -> SrtConfig {
 /// 验证配置往返、0600 权限、显式删除以及空路径清理的幂等语义。
 #[test]
 fn test_write_load_validate_and_cleanup_config_file() {
-    let _logger = sandbox_test_logger();
     let config = valid_sandbox_config();
     let path = write_config_file(&config).unwrap();
     #[cfg(unix)]
@@ -114,10 +109,8 @@ fn test_load_and_validate_config_reports_read_parse_and_validation_errors() {
 /// 自动配置必须加入工作目录、包装 SRT 参数，并在显式 cleanup 后删除 owned 文件。
 #[test]
 fn test_new_sandbox_runtime_with_generated_config_wrap_and_cleanup() {
-    let logger = sandbox_test_logger();
     let mut runtime = new_sandbox_runtime_with_config(
         br#"{"session":"ignored"}"#,
-        Some(&logger),
         None,
         Some(Path::new("/workspace/project")),
     )
@@ -145,9 +138,7 @@ fn test_new_sandbox_runtime_with_custom_config_does_not_cleanup_file() {
     let path = temp.path().join("custom-srt.json");
     write_sandbox_config(&path, &valid_sandbox_config());
     {
-        let logger = sandbox_test_logger();
-        let mut runtime =
-            new_sandbox_runtime_with_config(&[], Some(&logger), Some(&path), None).unwrap();
+        let mut runtime = new_sandbox_runtime_with_config(&[], Some(&path), None).unwrap();
         assert!(runtime.uses_custom_config());
         let (command, args) = runtime.wrap_command("claude", &[]);
         assert_eq!(command, "srt");
@@ -165,8 +156,7 @@ fn test_new_sandbox_runtime_rejects_invalid_custom_config() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("invalid-srt.json");
     std::fs::write(&path, br#"{"network":{"allowedDomains":["example.com"]}}"#).unwrap();
-    let logger = sandbox_test_logger();
-    let error = new_sandbox_runtime_with_config(&[], Some(&logger), Some(&path), None)
+    let error = new_sandbox_runtime_with_config(&[], Some(&path), None)
         .err()
         .expect("非法自定义配置必须失败");
     assert!(
@@ -183,7 +173,7 @@ fn test_new_sandbox_runtime_rejects_invalid_custom_config() {
 async fn test_install_sandbox_runtime_skips_current_version() {
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    install_sandbox_runtime(&cancellation, &sandbox_test_logger(), "current")
+    install_sandbox_runtime(&cancellation, "current")
         .await
         .unwrap();
     assert_eq!(default_config().network.allowed_domains.len(), 3);
@@ -200,34 +190,4 @@ fn write_sandbox_config(path: &Path, config: &SrtConfig) {
 /// 对应 Go `contains`，按精确字符串判断 allow/deny 列表成员。
 fn contains(values: &[String], target: &str) -> bool {
     values.iter().any(|value| value == target)
-}
-
-/// 对应 Go `sandboxTestLogger`，创建静默结构化 logger 供 fixture 使用。
-fn sandbox_test_logger() -> Logger {
-    Logger::new(Arc::new(SandboxDiscardHandler))
-}
-
-/// 丢弃 sandbox 测试日志，同时保留所有级别和派生 logger 的调用路径。
-struct SandboxDiscardHandler;
-
-impl LogHandler for SandboxDiscardHandler {
-    /// 测试需让 DEBUG 调用也经过 facade，以暴露 source/属性构造问题。
-    fn enabled(&self, _level: LogLevel) -> bool {
-        true
-    }
-
-    /// 丢弃一条测试记录。
-    fn handle(&self, _record: &LogRecord) -> Result<(), LogHandlerError> {
-        Ok(())
-    }
-
-    /// 返回同样丢弃记录的属性派生 handler。
-    fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        Arc::new(Self)
-    }
-
-    /// 返回同样丢弃记录的分组派生 handler。
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(Self)
-    }
 }

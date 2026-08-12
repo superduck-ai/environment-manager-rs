@@ -12,14 +12,10 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::internal::auth::{
-    AuthError, new_auth_context_with_session_id, new_auth_context_with_session_id_and_logger,
-};
-use crate::internal::config::{ConfigError, StartupContext};
-use crate::internal::logger::{LogAttributes, Logger};
-
 use super::types::{EnvironmentConfigResponse, InputParser, Outcomes, ParsedContext, V0Parser};
 use super::v1_parser::normalize_api_base_url;
+use crate::internal::auth::{AuthError, new_auth_context_with_session_id};
+use crate::internal::config::{ConfigError, StartupContext};
 
 /// V0 stdin 解析失败。
 #[derive(Debug, Error)]
@@ -96,115 +92,46 @@ where
 impl V0Parser {
     /// 解析完整 V0 stdin payload。
     pub fn parse(&self, data: &[u8]) -> Result<ParsedContext, V0ParseError> {
-        self.parse_with_optional_logger(
-            data,
-            None,
-            MissingStartupContextBehavior::PanicLikeGoParser,
-        )
+        self.parse_internal(data, MissingStartupContextBehavior::PanicLikeGoParser)
     }
 
-    /// 使用生产 logger 解析完整 V0 stdin payload。
+    /// 解析 CLI 收到的完整 V0 stdin payload。
     ///
-    /// 对应 Go：`(*V0Parser).Parse`。logger 事件的顺序、级别和非敏感字段与 Go
-    /// 保持一致；解析错误仍从首次失败阶段返回，后续阶段不会产生额外日志。
-    pub fn parse_with_logger(
-        &self,
-        data: &[u8],
-        logger: &Logger,
-    ) -> Result<ParsedContext, V0ParseError> {
-        self.parse_with_optional_logger(
-            data,
-            Some(logger),
-            MissingStartupContextBehavior::PanicLikeGoParser,
-        )
-    }
-
-    /// 使用生产 logger 解析 CLI 收到的完整 V0 stdin payload。
-    ///
-    /// 除缺失 `startup_context` 外，本方法与 [`Self::parse_with_logger`] 的阶段、日志和
-    /// 错误完全一致；该唯一分支返回 [`V0ParseError::StartupContextRequired`]。
+    /// 除缺失 `startup_context` 外，本方法与 [`Self::parse`] 的阶段、日志和错误完全
+    /// 一致；该唯一分支返回 [`V0ParseError::StartupContextRequired`]。
     ///
     /// # 参数
     /// - `data`：已经从 stdin 读到 EOF 的原始 JSON 字节，仅在调用期间借用。
-    /// - `logger`：task-run 的生产 logger，用于保持崩溃前日志顺序。
     ///
     /// # 返回
     /// 成功时返回完整解析上下文；输入缺字段或其他阶段失败时返回类型化解析错误。
-    pub(crate) fn parse_with_logger_for_cli(
-        &self,
-        data: &[u8],
-        logger: &Logger,
-    ) -> Result<ParsedContext, V0ParseError> {
-        self.parse_with_optional_logger(
-            data,
-            Some(logger),
-            MissingStartupContextBehavior::ReturnErrorForCli,
-        )
+    pub(crate) fn parse_for_cli(&self, data: &[u8]) -> Result<ParsedContext, V0ParseError> {
+        self.parse_internal(data, MissingStartupContextBehavior::ReturnErrorForCli)
     }
 
     /// 执行 V0 共享解析流程，并按调用入口决定日志及缺字段行为。
     ///
     /// `missing_startup_context` 只改变 Go nil 解引用的承载方式，不能改变它之前的
     /// JSON 解码和日志，也不能让它之后的 environment/auth 阶段继续执行。
-    fn parse_with_optional_logger(
+    fn parse_internal(
         &self,
         data: &[u8],
-        logger: Option<&Logger>,
         missing_startup_context: MissingStartupContextBehavior,
     ) -> Result<ParsedContext, V0ParseError> {
         let started = Instant::now();
-        if let Some(logger) = logger {
-            logger.info(
-                "Parsing V0 input format",
-                log_attributes([("data_size_bytes", serde_json::json!(data.len()))]),
-            );
-        }
+        tracing::info!("data_size_bytes" = ?(data.len()), "{}", "Parsing V0 input format");
         let input: serde_json::Map<String, Value> =
             serde_json::from_slice(data).map_err(V0ParseError::InvalidStdin)?;
         let startup_context =
             self.parse_startup_context(input.get("startup_context"), missing_startup_context)?;
-        self.log_startup_context(logger, &startup_context);
+        self.log_startup_context(&startup_context);
         let environment = self.parse_environment(input.get("environment"))?;
-        if let Some(logger) = logger {
-            logger.info(
-                "Parsed environment from V0 input",
-                log_attributes([
-                    (
-                        "environment_type",
-                        serde_json::json!(&environment.environment_type),
-                    ),
-                    (
-                        "has_allowed_tools",
-                        serde_json::json!(!environment.allowed_tools.is_empty()),
-                    ),
-                    (
-                        "has_disallowed_tools",
-                        serde_json::json!(!environment.disallowed_tools.is_empty()),
-                    ),
-                ]),
-            );
-        }
-        let auth_context = self.parse_auth(input.get("auth"), logger)?;
-        if let Some(logger) = logger {
-            logger.info(
-                "Parsed auth from V0 input",
-                log_attributes([(
-                    "has_auth_data",
-                    serde_json::json!(input.contains_key("auth")),
-                )]),
-            );
-        }
-        let outcomes = self.parse_outcomes(&startup_context, logger);
+        tracing::info!("environment_type" = ?(&environment.environment_type), "has_allowed_tools" = ?(!environment.allowed_tools.is_empty()), "has_disallowed_tools" = ?(!environment.disallowed_tools.is_empty()), "{}", "Parsed environment from V0 input");
+        let auth_context = self.parse_auth(input.get("auth"))?;
+        tracing::info!("has_auth_data" = ?(input.contains_key("auth")), "{}", "Parsed auth from V0 input");
+        let outcomes = self.parse_outcomes(&startup_context);
 
-        if let Some(logger) = logger {
-            logger.info(
-                "Completed parsing V0 input",
-                log_attributes([(
-                    "parse_duration_ms",
-                    serde_json::json!(duration_milliseconds(started)),
-                )]),
-            );
-        }
+        tracing::info!("parse_duration_ms" = ?(duration_milliseconds(started)), "{}", "Completed parsing V0 input");
 
         Ok(ParsedContext {
             startup_context,
@@ -219,66 +146,18 @@ impl V0Parser {
     }
 
     /// 记录 V0 startup context 摘要以及可选的预计算 sandbox gateway 配置。
-    fn log_startup_context(&self, logger: Option<&Logger>, startup_context: &StartupContext) {
-        let Some(logger) = logger else {
-            return;
-        };
-        logger.info(
-            "Parsed startup context from V0 input",
-            log_attributes([
-                (
-                    "has_api_base_url",
-                    serde_json::json!(!startup_context.api_base_url.is_empty()),
-                ),
-                (
-                    "api_base_url",
-                    serde_json::json!(&startup_context.api_base_url),
-                ),
-                (
-                    "sources_count",
-                    serde_json::json!(startup_context.sources.len()),
-                ),
-                (
-                    "allowed_tools_count",
-                    serde_json::json!(startup_context.allowed_tools.len()),
-                ),
-                (
-                    "disallowed_tools_count",
-                    serde_json::json!(startup_context.disallowed_tools.len()),
-                ),
-            ]),
-        );
+    fn log_startup_context(&self, startup_context: &StartupContext) {
+        tracing::info!("has_api_base_url" = ?(!startup_context.api_base_url.is_empty()), "api_base_url" = ?(&startup_context.api_base_url), "sources_count" = ?(startup_context.sources.len()), "allowed_tools_count" = ?(startup_context.allowed_tools.len()), "disallowed_tools_count" = ?(startup_context.disallowed_tools.len()), "{}", "Parsed startup context from V0 input");
 
         if startup_context.claude_code_args.is_empty() && startup_context.mcp_config_file.is_none()
         {
             return;
         }
-        logger.info(
-            "Received pre-computed args from sandbox-gateway",
-            log_attributes([
-                (
-                    "claude_code_args_count",
-                    serde_json::json!(startup_context.claude_code_args.len()),
-                ),
-                (
-                    "has_mcp_config_file",
-                    serde_json::json!(startup_context.mcp_config_file.is_some()),
-                ),
-            ]),
-        );
+        tracing::info!("claude_code_args_count" = ?(startup_context.claude_code_args.len()), "has_mcp_config_file" = ?(startup_context.mcp_config_file.is_some()), "{}", "Received pre-computed args from sandbox-gateway");
         if let Some(config_file) = &startup_context.mcp_config_file
             && let Ok(content) = STANDARD.decode(&config_file.content)
         {
-            logger.debug(
-                "Pre-computed MCP config file",
-                log_attributes([
-                    ("path", serde_json::json!(&config_file.path)),
-                    (
-                        "content",
-                        serde_json::json!(String::from_utf8_lossy(&content)),
-                    ),
-                ]),
-            );
+            tracing::debug!("path" = ?(&config_file.path), "content" = ?(String::from_utf8_lossy(&content)), "{}", "Pre-computed MCP config file");
         }
     }
 
@@ -346,29 +225,17 @@ impl V0Parser {
     fn parse_auth(
         &self,
         value: Option<&Value>,
-        logger: Option<&Logger>,
     ) -> Result<crate::internal::auth::AuthContext, V0ParseError> {
         let encoded = match value {
             None => Vec::new(),
             Some(value) => serde_json::to_vec(value).map_err(V0ParseError::AuthEncoding)?,
         };
-        match logger {
-            Some(logger) => new_auth_context_with_session_id_and_logger(
-                &encoded,
-                self.session_id.clone(),
-                logger,
-            ),
-            None => new_auth_context_with_session_id(&encoded, self.session_id.clone()),
-        }
-        .map_err(V0ParseError::InvalidAuth)
+        new_auth_context_with_session_id(&encoded, self.session_id.clone())
+            .map_err(V0ParseError::InvalidAuth)
     }
 
     /// 把有效的单分支 git_repository outcomes 转成运行时映射。
-    fn parse_outcomes(
-        &self,
-        startup_context: &StartupContext,
-        logger: Option<&Logger>,
-    ) -> Outcomes {
+    fn parse_outcomes(&self, startup_context: &StartupContext) -> Outcomes {
         let mut outcomes = Outcomes::new();
         if startup_context.outcomes.is_empty() {
             return outcomes;
@@ -378,55 +245,18 @@ impl V0Parser {
                 continue;
             }
             if outcome.git_info.branches.len() != 1 {
-                if let Some(logger) = logger {
-                    logger.warn(
-                        "Outcome skipped: exactly one branch must be specified",
-                        log_attributes([
-                            ("repo", serde_json::json!(&outcome.git_info.repo)),
-                            (
-                                "branch_count",
-                                serde_json::json!(outcome.git_info.branches.len()),
-                            ),
-                        ]),
-                    );
-                }
+                tracing::warn!("repo" = ?(&outcome.git_info.repo), "branch_count" = ?(outcome.git_info.branches.len()), "{}", "Outcome skipped: exactly one branch must be specified");
                 continue;
             }
             outcomes.add(&outcome.git_info.repo, &outcome.git_info.branches);
         }
         let validated = outcomes.validate();
-        if let Some(logger) = logger {
-            logger.info(
-                "Parsed outcomes from V0 input",
-                log_attributes([
-                    (
-                        "outcome_count",
-                        serde_json::json!(startup_context.outcomes.len()),
-                    ),
-                    ("repo_count", serde_json::json!(validated.len())),
-                ]),
-            );
-            for outcome in &startup_context.outcomes {
-                logger.debug(
-                    "Repository outcome",
-                    log_attributes([
-                        ("type", serde_json::json!(&outcome.outcome_type)),
-                        ("repo", serde_json::json!(&outcome.git_info.repo)),
-                        ("branches", serde_json::json!(&outcome.git_info.branches)),
-                    ]),
-                );
-            }
+        tracing::info!("outcome_count" = ?(startup_context.outcomes.len()), "repo_count" = ?(validated.len()), "{}", "Parsed outcomes from V0 input");
+        for outcome in &startup_context.outcomes {
+            tracing::debug!("type" = ?(&outcome.outcome_type), "repo" = ?(&outcome.git_info.repo), "branches" = ?(&outcome.git_info.branches), "{}", "Repository outcome");
         }
         validated
     }
-}
-
-/// 按 Go slog 参数顺序创建 V0 parser 日志属性。
-fn log_attributes<const N: usize>(entries: [(&str, Value); N]) -> LogAttributes {
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }
 
 /// 将单调时钟耗时转换为 Go `Duration.Milliseconds()` 的截断毫秒值。

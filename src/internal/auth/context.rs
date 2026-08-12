@@ -4,10 +4,7 @@
 //! 值胜出；未知提供方和空 token 会立即终止解析。
 
 use serde::Deserialize;
-use serde_json::json;
 use thiserror::Error;
-
-use crate::internal::logger::Logger;
 
 use super::types::{AuthConfig, AuthContext, deserialize_string_or_null};
 
@@ -61,29 +58,11 @@ pub fn new_auth_context_with_session_id(
     auth_json: &[u8],
     session_id: impl Into<String>,
 ) -> Result<AuthContext, AuthError> {
-    parse_auth_context(auth_json, session_id.into(), None)
-}
-
-/// 使用生产 logger 解析 auth JSON，并复刻 Go 每个 provider 配置完成后的日志。
-///
-/// 对应 Go：`auth.NewAuthContextWithSessionID`。日志只包含 provider 类型以及
-/// Antspace URL、Supabase project ref 这两个 Go 原实现会记录的非 secret 字段；
-/// token、密码和匿名 key 永远不会进入日志。某一项校验失败时，该项不会产生
-/// “Configured” 日志，之前已经成功的项则不会回滚。
-pub fn new_auth_context_with_session_id_and_logger(
-    auth_json: &[u8],
-    session_id: impl Into<String>,
-    logger: &Logger,
-) -> Result<AuthContext, AuthError> {
-    parse_auth_context(auth_json, session_id.into(), Some(logger))
+    parse_auth_context(auth_json, session_id.into())
 }
 
 /// 执行共享 auth 解析流程，并按入口决定是否发出生产日志。
-fn parse_auth_context(
-    auth_json: &[u8],
-    session_id: String,
-    logger: Option<&Logger>,
-) -> Result<AuthContext, AuthError> {
+fn parse_auth_context(auth_json: &[u8], session_id: String) -> Result<AuthContext, AuthError> {
     let mut context = AuthContext {
         session_id,
         ..AuthContext::default()
@@ -107,22 +86,22 @@ fn parse_auth_context(
             "session_ingress" => {
                 require_token("session_ingress", &configuration.token)?;
                 context.session_ingress_token = configuration.token;
-                log_configured(logger, "Configured session ingress token", &auth_type, None);
+                tracing::info!(auth_type, "Configured session ingress token");
             }
             "anthropic_api" => {
                 require_token("anthropic_api", &configuration.token)?;
                 context.anthropic_api_token = configuration.token;
-                log_configured(logger, "Configured Anthropic API token", &auth_type, None);
+                tracing::info!(auth_type, "Configured Anthropic API token");
             }
             "anthropic_oauth" => {
                 require_token("anthropic_oauth", &configuration.token)?;
                 context.anthropic_oauth_token = configuration.token;
-                log_configured(logger, "Configured Anthropic OAuth token", &auth_type, None);
+                tracing::info!(auth_type, "Configured Anthropic OAuth token");
             }
             "vercel_deploy" => {
                 require_token("vercel_deploy", &configuration.token)?;
                 context.vercel_deploy_token = configuration.token;
-                log_configured(logger, "Configured Vercel deploy token", &auth_type, None);
+                tracing::info!(auth_type, "Configured Vercel deploy token");
             }
             "antspace_deploy" => {
                 require_token("antspace_deploy", &configuration.token)?;
@@ -132,11 +111,10 @@ fn parse_auth_context(
                 let credentials = credentials.unwrap_or_default();
                 context.antspace_control_plane_url = credentials.url;
                 context.antspace_auth_token = credentials.auth_token;
-                log_configured(
-                    logger,
-                    "Configured Antspace deploy credentials",
-                    &auth_type,
-                    Some(("url", json!(&context.antspace_control_plane_url))),
+                tracing::info!(
+                    auth_type,
+                    url = %context.antspace_control_plane_url,
+                    "Configured Antspace deploy credentials"
                 );
             }
             "supabase" => {
@@ -149,11 +127,10 @@ fn parse_auth_context(
                 context.supabase_anon_key = credentials.anon_key;
                 context.supabase_db_pass = credentials.db_pass;
                 context.supabase_pat = credentials.pat;
-                log_configured(
-                    logger,
-                    "Configured Supabase credentials",
-                    &auth_type,
-                    Some(("project_ref", json!(&context.supabase_project_ref))),
+                tracing::info!(
+                    auth_type,
+                    project_ref = %context.supabase_project_ref,
+                    "Configured Supabase credentials"
                 );
             }
             unknown => return Err(AuthError::UnknownProvider(unknown.to_owned())),
@@ -161,24 +138,6 @@ fn parse_auth_context(
     }
 
     Ok(context)
-}
-
-/// 写入一条 Go auth provider 配置完成日志，并保持属性插入顺序。
-fn log_configured(
-    logger: Option<&Logger>,
-    message: &str,
-    auth_type: &str,
-    extra: Option<(&str, serde_json::Value)>,
-) {
-    let Some(logger) = logger else {
-        return;
-    };
-    let mut attributes = serde_json::Map::new();
-    attributes.insert("auth_type".to_owned(), json!(auth_type));
-    if let Some((key, value)) = extra {
-        attributes.insert(key.to_owned(), value);
-    }
-    logger.info(message, attributes);
 }
 
 /// 验证已知提供方的 token 非空，并生成与 Go 兼容的错误文本。

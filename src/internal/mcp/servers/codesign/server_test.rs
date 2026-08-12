@@ -14,9 +14,7 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate, matchers::method};
 use crate::internal::{
     auth::{AuthConfig, AuthContext, new_auth_context_with_session_id},
     config::{BaseSource, GitInfo, GitRepositorySource, Source, StartupContext},
-    logger::Logger,
     mcp::{BaseServer, CallToolParams, CallToolRequest, CallToolResult},
-    o11y::{DiscardO11yService, O11yService},
     session::NoopActivityRecorder,
 };
 
@@ -119,11 +117,6 @@ fn new_codesign_auth_context(session_id: &str, session_ingress_token: &str) -> A
     )
 }
 
-/// 对应 Go `codesignTestLogger`；测试不观察日志，但显式传递 discard logger。
-fn codesign_test_logger() -> Logger {
-    Logger::new(DiscardO11yService.log_handler())
-}
-
 /// 对应 Go `mcpResultContains`，只检查实际返回的 MCP 文本内容。
 fn mcp_result_contains(result: &CallToolResult, want: &str) -> bool {
     result
@@ -173,7 +166,7 @@ async fn test_configure_server_resolves_signing_server_url() {
 
     SigningUrlEnvironment::set("");
     let server = configure_server(
-        Arc::new(BaseServer::new(codesign_test_logger(), "codesign", "0.0.1")),
+        Arc::new(BaseServer::new("codesign", "0.0.1")),
         Some(Arc::clone(&auth)),
         Some(Arc::new(StartupContext {
             api_base_url: "api.example.test/".to_owned(),
@@ -196,7 +189,7 @@ async fn test_configure_server_resolves_signing_server_url() {
 
     SigningUrlEnvironment::set("https://signing.example.test/base");
     let server = configure_server(
-        Arc::new(BaseServer::new(codesign_test_logger(), "codesign", "0.0.1")),
+        Arc::new(BaseServer::new("codesign", "0.0.1")),
         Some(Arc::clone(&auth)),
         Some(Arc::new(StartupContext {
             api_base_url: "api.example.test".to_owned(),
@@ -214,7 +207,7 @@ async fn test_configure_server_resolves_signing_server_url() {
 
     SigningUrlEnvironment::set("");
     let error = configure_server(
-        Arc::new(BaseServer::new(codesign_test_logger(), "codesign", "0.0.1")),
+        Arc::new(BaseServer::new("codesign", "0.0.1")),
         Some(auth),
         Some(Arc::new(StartupContext::default())),
         "/workspace".into(),
@@ -233,7 +226,7 @@ fn test_get_tools_and_identify_source() {
     let nested = repository.join("nested");
     std::fs::create_dir_all(&nested).expect("创建 repository");
     let server = Arc::new(CodeSignMCPServer::new(
-        Arc::new(BaseServer::new(codesign_test_logger(), "codesign", "0.0.1")),
+        Arc::new(BaseServer::new("codesign", "0.0.1")),
         None,
         workspace.path().to_path_buf(),
         "http://127.0.0.1",
@@ -260,10 +253,10 @@ fn test_get_tools_and_identify_source() {
 }
 
 #[tokio::test]
-async fn test_execute_sign_uses_recovered_endpoints_and_headers() {
+async fn test_execute_sign_uses_expected_endpoints_and_headers() {
     let signing = start_signing_test_server(200, r#"{"signature":"sig-session-ingress"}"#).await;
     let server = CodeSignMCPServer::new(
-        Arc::new(BaseServer::new(codesign_test_logger(), "codesign", "0.0.1")),
+        Arc::new(BaseServer::new("codesign", "0.0.1")),
         Some(new_codesign_auth_context("session-123", "ingress-token")),
         Path::new("/workspace").to_path_buf(),
         signing.uri(),
@@ -297,7 +290,7 @@ async fn test_execute_sign_uses_recovered_endpoints_and_headers() {
     let code_sessions =
         start_signing_test_server(200, r#"{"signature":"sig-code-sessions"}"#).await;
     let code_sessions_server = CodeSignMCPServer::new(
-        Arc::new(BaseServer::new(codesign_test_logger(), "codesign", "0.0.1")),
+        Arc::new(BaseServer::new("codesign", "0.0.1")),
         Some(new_codesign_auth_context("session-123", "ingress-token")),
         Path::new("/workspace").to_path_buf(),
         code_sessions.uri(),
@@ -331,7 +324,7 @@ async fn test_execute_sign_uses_recovered_endpoints_and_headers() {
 #[tokio::test]
 async fn test_execute_sign_reports_auth_and_remote_errors() {
     let missing_session = CodeSignMCPServer::new(
-        Arc::new(BaseServer::new(codesign_test_logger(), "codesign", "0.0.1")),
+        Arc::new(BaseServer::new("codesign", "0.0.1")),
         Some(new_codesign_auth_context("", "ingress-token")),
         Path::new("/workspace").to_path_buf(),
         "http://127.0.0.1",
@@ -349,7 +342,7 @@ async fn test_execute_sign_reports_auth_and_remote_errors() {
     assert!(error.to_string().contains("session ID is required"));
 
     let missing_token = CodeSignMCPServer::new(
-        Arc::new(BaseServer::new(codesign_test_logger(), "codesign", "0.0.1")),
+        Arc::new(BaseServer::new("codesign", "0.0.1")),
         Some(new_codesign_auth_context("session-123", "")),
         Path::new("/workspace").to_path_buf(),
         "http://127.0.0.1",
@@ -367,7 +360,7 @@ async fn test_execute_sign_reports_auth_and_remote_errors() {
 
     let unavailable = start_signing_test_server(502, "unavailable").await;
     let remote_error = CodeSignMCPServer::new(
-        Arc::new(BaseServer::new(codesign_test_logger(), "codesign", "0.0.1")),
+        Arc::new(BaseServer::new("codesign", "0.0.1")),
         Some(new_codesign_auth_context("session-123", "ingress-token")),
         Path::new("/workspace").to_path_buf(),
         unavailable.uri(),
@@ -385,7 +378,7 @@ async fn test_execute_sign_reports_auth_and_remote_errors() {
 
     let empty = start_signing_test_server(200, r#"{"signature":""}"#).await;
     let empty_signature = CodeSignMCPServer::new(
-        Arc::new(BaseServer::new(codesign_test_logger(), "codesign", "0.0.1")),
+        Arc::new(BaseServer::new("codesign", "0.0.1")),
         Some(new_codesign_auth_context("session-123", "ingress-token")),
         Path::new("/workspace").to_path_buf(),
         empty.uri(),
@@ -408,7 +401,7 @@ async fn test_sign_content_and_handle_sign_file() {
     std::fs::write(&file_path, b"commit content").expect("写入待签名内容");
     let signing = start_signing_test_server(200, r#"{"signature":"signed-content"}"#).await;
     let server = CodeSignMCPServer::new(
-        Arc::new(BaseServer::new(codesign_test_logger(), "codesign", "0.0.1")),
+        Arc::new(BaseServer::new("codesign", "0.0.1")),
         Some(new_codesign_auth_context("session-123", "ingress-token")),
         workspace.path().to_path_buf(),
         signing.uri(),
@@ -463,7 +456,7 @@ async fn test_sign_content_and_handle_sign_file() {
 #[tokio::test]
 async fn test_handle_sign_file_validation_errors() {
     let server = CodeSignMCPServer::new(
-        Arc::new(BaseServer::new(codesign_test_logger(), "codesign", "0.0.1")),
+        Arc::new(BaseServer::new("codesign", "0.0.1")),
         None,
         Path::new("/workspace").to_path_buf(),
         "http://127.0.0.1",
@@ -515,7 +508,7 @@ async fn test_sanitize_source_and_read_file_content() {
 #[tokio::test]
 async fn test_sign_content_wraps_failures() {
     let server = CodeSignMCPServer::new(
-        Arc::new(BaseServer::new(codesign_test_logger(), "codesign", "0.0.1")),
+        Arc::new(BaseServer::new("codesign", "0.0.1")),
         None,
         Path::new("/workspace").to_path_buf(),
         "http://127.0.0.1",

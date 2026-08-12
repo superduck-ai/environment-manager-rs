@@ -8,9 +8,7 @@ use std::io;
 use http::header::{HOST, HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 
-use crate::internal::logger::{Logger, default_logger};
-
-use super::{Client, Handler, Header, TunnelError, WsHandler};
+use super::{Header, TunnelError};
 
 /// Go `protojson` 紧凑格式的 Serde JSON formatter。
 ///
@@ -66,33 +64,6 @@ where
     let mut serializer = serde_json::Serializer::with_formatter(&mut output, GoProtoJsonFormatter);
     value.serialize(&mut serializer)?;
     Ok(output)
-}
-
-/// 返回 tunnel client 配置的 logger；未注入时使用进程级 tracing logger。
-#[must_use]
-pub(crate) fn client_logger(client: &Client) -> &Logger {
-    match client.logger.as_ref() {
-        Some(logger) => logger,
-        None => default_logger(),
-    }
-}
-
-/// 返回 HTTP handler 配置的 logger；未注入时使用进程级 tracing logger。
-#[must_use]
-pub(crate) fn handler_logger(handler: &Handler) -> &Logger {
-    match handler.logger.as_ref() {
-        Some(logger) => logger,
-        None => default_logger(),
-    }
-}
-
-/// 返回 WebSocket handler 配置的 logger；未注入时使用进程级 tracing logger。
-#[must_use]
-pub(crate) fn ws_logger(handler: &WsHandler) -> &Logger {
-    match handler.logger.as_ref() {
-        Some(logger) => logger,
-        None => default_logger(),
-    }
 }
 
 /// 对应 Go：`applyTunnelHeaders`。

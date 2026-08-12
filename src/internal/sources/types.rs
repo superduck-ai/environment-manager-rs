@@ -17,7 +17,6 @@ use tokio_util::sync::CancellationToken;
 use crate::internal::{
     auth::{AuthContext, SourceAuthProvider},
     config::{GitRepositorySource, Source as ConfigSource},
-    logger::Logger,
     session::ActivityRecorder,
 };
 
@@ -262,7 +261,6 @@ pub trait GitProxyFactory: Send + Sync {
 /// wrapper。handler 及包含它的 manager 都不得比该借用活得更久，这一约束由类型系统
 /// 在构造、注册 handler 和销毁 manager 时统一检查。
 pub struct GitHandler<'recorder> {
-    pub(super) logger: Option<Logger>,
     pub(super) base_dir: PathBuf,
     pub(super) auth_context: Option<Arc<AuthContext>>,
     pub(super) sdk_base_url: String,
@@ -281,7 +279,6 @@ pub struct GitHandler<'recorder> {
 /// `'recorder` 同时约束 manager 自己保存的 recorder 和所有动态 handler。这样 Git
 /// handler 不可能经 `register_handler` 或 trait object 容器逃出 recorder 的借用范围。
 pub struct SourceHandlerManager<'recorder> {
-    pub(super) logger: Option<Logger>,
     pub(super) handlers: Vec<Arc<dyn SourceHandler + 'recorder>>,
     pub(super) base_dir: PathBuf,
     pub(super) activity_recorder: Option<Arc<dyn ActivityRecorder + 'recorder>>,

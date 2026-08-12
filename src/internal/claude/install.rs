@@ -4,17 +4,16 @@
 //! 不引入额外 regex 依赖。所有命令使用 Tokio，取消只 kill direct child；升级失败
 //! 且已有版本时继续使用旧安装，这是调用方可观察的非致命回退。
 
-use std::{ffi::OsString, time::Duration};
+use std::{collections::BTreeMap, ffi::OsString, time::Duration};
 
 use crate::internal::{
     api::{LogCategory, LogLevel},
-    logger::Logger,
     session::ActivityRecorder,
 };
 use tokio_util::sync::CancellationToken;
 
 use super::types::{
-    CapturedCommandError, ClaudeError, ClaudeObservability, claude_attrs, run_combined_command,
+    CapturedCommandError, ClaudeError, ClaudeObservability, run_combined_command,
     run_stdout_command,
 };
 
@@ -95,7 +94,6 @@ pub(super) async fn get_installed_version(
 /// 通过 `npm install -g` 安装 Claude；具体版本会附加到 package 名称。
 async fn install_via_npm(
     cancellation: &CancellationToken,
-    logger: &Logger,
     version: &str,
 ) -> Result<(), ClaudeError> {
     let install_target = if is_specific_version(version) {
@@ -103,10 +101,7 @@ async fn install_via_npm(
     } else {
         CLAUDE_PACKAGE.to_owned()
     };
-    logger.info(
-        "Installing Claude Code via npm",
-        claude_attrs!("package" => &install_target),
-    );
+    tracing::info!("package" = ?(&install_target), "{}", "Installing Claude Code via npm");
     let args = [
         OsString::from("install"),
         OsString::from("-g"),
@@ -114,10 +109,7 @@ async fn install_via_npm(
     ];
     match run_combined_command(cancellation, "npm".as_ref(), &args, None, None).await {
         Ok(output) => {
-            logger.debug(
-                "npm install completed",
-                claude_attrs!("output" => String::from_utf8_lossy(&output)),
-            );
+            tracing::debug!("output" = ?(String::from_utf8_lossy(&output)), "{}", "npm install completed");
             Ok(())
         }
         Err(error) => Err(command_error("npm install failed", error)),
@@ -127,21 +119,14 @@ async fn install_via_npm(
 /// 通过现有 Claude 二进制的 `install <version>` 子命令执行升级。
 async fn upgrade_via_cli(
     cancellation: &CancellationToken,
-    logger: &Logger,
     claude_path: &str,
     version: &str,
 ) -> Result<(), ClaudeError> {
-    logger.info(
-        "Upgrading Claude Code via CLI",
-        claude_attrs!("version" => version),
-    );
+    tracing::info!("version" = ?(version), "{}", "Upgrading Claude Code via CLI");
     let args = [OsString::from("install"), OsString::from(version)];
     match run_combined_command(cancellation, claude_path.as_ref(), &args, None, None).await {
         Ok(output) => {
-            logger.debug(
-                "claude install completed",
-                claude_attrs!("output" => String::from_utf8_lossy(&output)),
-            );
+            tracing::debug!("output" = ?(String::from_utf8_lossy(&output)), "{}", "claude install completed");
             Ok(())
         }
         Err(error) => Err(command_error("claude install failed", error)),
@@ -151,14 +136,12 @@ async fn upgrade_via_cli(
 /// 安装或更新 Claude Code；未提供 o11y adapter 时只执行真实安装和活动记录。
 pub async fn install_or_update_claude_code(
     cancellation: &CancellationToken,
-    logger: &Logger,
     claude_path: &str,
     target_version: &str,
     activity_recorder: &dyn ActivityRecorder,
 ) -> Result<String, ClaudeError> {
     install_or_update_claude_code_with_observability(
         cancellation,
-        logger,
         claude_path,
         target_version,
         activity_recorder,
@@ -170,7 +153,6 @@ pub async fn install_or_update_claude_code(
 /// 安装或更新 Claude Code，并把 Go o11y 调用交给显式 adapter。
 pub async fn install_or_update_claude_code_with_observability(
     cancellation: &CancellationToken,
-    logger: &Logger,
     claude_path: &str,
     target_version: &str,
     activity_recorder: &dyn ActivityRecorder,
@@ -182,20 +164,14 @@ pub async fn install_or_update_claude_code_with_observability(
         target_version
     };
     if target_version == "skip" {
-        logger.debug(
-            "Skipping Claude Code installation (version=skip)",
-            Default::default(),
-        );
+        tracing::debug!("{}", "Skipping Claude Code installation (version=skip)");
         return Ok(String::new());
     }
 
     let existing_version = get_installed_version(cancellation, claude_path).await;
     if target_version == "current" {
         if existing_version.is_empty() {
-            logger.error(
-                "Claude Code required but not found (version=current)",
-                Default::default(),
-            );
+            tracing::error!("{}", "Claude Code required but not found (version=current)");
             activity_recorder.record_activity(
                 LogLevel::Error,
                 LogCategory::Init,
@@ -207,15 +183,12 @@ pub async fn install_or_update_claude_code_with_observability(
             ));
         }
 
-        logger.debug(
-            "Using existing Claude Code installation (version=current)",
-            claude_attrs!("cc_version" => &existing_version),
-        );
+        tracing::debug!("cc_version" = ?(&existing_version), "{}", "Using existing Claude Code installation (version=current)");
         activity_recorder.record_activity(
             LogLevel::Debug,
             LogCategory::Init,
             format!("Using existing Claude Code installation (version {existing_version})"),
-            claude_attrs!("cc_version" => &existing_version),
+            BTreeMap::from([("cc_version".to_owned(), serde_json::json!(existing_version))]),
         );
         return Ok(existing_version);
     }
@@ -224,17 +197,16 @@ pub async fn install_or_update_claude_code_with_observability(
         LogLevel::Debug,
         LogCategory::Init,
         format!("Installing/updating Claude Code to version {target_version}"),
-        claude_attrs!("target_version" => target_version),
+        BTreeMap::from([(
+            "target_version".to_owned(),
+            serde_json::json!(target_version),
+        )]),
     );
 
     if existing_version.is_empty() {
-        logger.info(
-            "Installing Claude Code via npm",
-            claude_attrs!("target_version" => target_version),
-        );
-        if let Err(error) = install_via_npm(cancellation, logger, target_version).await {
+        tracing::info!("target_version" = ?(target_version), "{}", "Installing Claude Code via npm");
+        if let Err(error) = install_via_npm(cancellation, target_version).await {
             return handle_install_error(
-                logger,
                 activity_recorder,
                 observability,
                 error,
@@ -244,30 +216,19 @@ pub async fn install_or_update_claude_code_with_observability(
         }
     } else {
         if is_specific_version(target_version) && existing_version == target_version {
-            logger.debug(
-                "Claude Code already at desired version",
-                claude_attrs!("cc_version" => &existing_version),
-            );
+            tracing::debug!("cc_version" = ?(&existing_version), "{}", "Claude Code already at desired version");
             activity_recorder.record_activity(
                 LogLevel::Debug,
                 LogCategory::Init,
                 format!("Claude Code already at desired version {existing_version}"),
-                claude_attrs!("cc_version" => &existing_version),
+                BTreeMap::from([("cc_version".to_owned(), serde_json::json!(existing_version))]),
             );
             return Ok(existing_version);
         }
 
-        logger.info(
-            "Upgrading Claude Code via CLI",
-            claude_attrs!(
-                "currentVersion" => &existing_version,
-                "target_version" => target_version,
-            ),
-        );
-        if let Err(error) = upgrade_via_cli(cancellation, logger, claude_path, target_version).await
-        {
+        tracing::info!("currentVersion" = ?(&existing_version), "target_version" = ?(target_version), "{}", "Upgrading Claude Code via CLI");
+        if let Err(error) = upgrade_via_cli(cancellation, claude_path, target_version).await {
             return handle_install_error(
-                logger,
                 activity_recorder,
                 observability,
                 error,
@@ -280,7 +241,6 @@ pub async fn install_or_update_claude_code_with_observability(
     let installed_version = get_installed_version(cancellation, claude_path).await;
     if installed_version.is_empty() {
         return handle_install_error(
-            logger,
             activity_recorder,
             observability,
             ClaudeError::message("claude not found after installation"),
@@ -290,7 +250,6 @@ pub async fn install_or_update_claude_code_with_observability(
     }
     if is_specific_version(target_version) && installed_version != target_version {
         return handle_install_error(
-            logger,
             activity_recorder,
             observability,
             ClaudeError::message(format!(
@@ -301,22 +260,21 @@ pub async fn install_or_update_claude_code_with_observability(
         );
     }
 
-    logger.info(
-        "Claude Code installed successfully",
-        claude_attrs!("cc_version" => &installed_version),
-    );
+    tracing::info!("cc_version" = ?(&installed_version), "{}", "Claude Code installed successfully");
     activity_recorder.record_activity(
         LogLevel::Info,
         LogCategory::Init,
         format!("Claude Code installed successfully (version {installed_version})"),
-        claude_attrs!("cc_version" => &installed_version),
+        BTreeMap::from([(
+            "cc_version".to_owned(),
+            serde_json::json!(installed_version),
+        )]),
     );
     Ok(installed_version)
 }
 
 /// 按是否存在旧版本决定降级为 warning 还是返回致命安装错误。
 fn handle_install_error(
-    logger: &Logger,
     activity_recorder: &dyn ActivityRecorder,
     observability: Option<&dyn ClaudeObservability>,
     error: ClaudeError,
@@ -327,28 +285,22 @@ fn handle_install_error(
         if let Some(observability) = observability {
             observability.log_claude_update_failed_nonfatal(operation);
         }
-        logger.warn(
-            "Claude Code update failed, continuing with existing installation",
-            claude_attrs!("operation" => operation, "error" => error.to_string()),
-        );
+        tracing::warn!("operation" = ?(operation), "error" = ?(error.to_string()), "{}", "Claude Code update failed, continuing with existing installation");
         activity_recorder.record_activity(
             LogLevel::Warning,
             LogCategory::Init,
             format!("Claude Code update failed during {operation} (continuing with existing)"),
-            claude_attrs!("error" => error.to_string()),
+            BTreeMap::from([("error".to_owned(), serde_json::json!(error.to_string()))]),
         );
         return Ok(existing_version.to_owned());
     }
 
-    logger.error(
-        "Claude Code installation failed with no fallback",
-        claude_attrs!("operation" => operation, "error" => error.to_string()),
-    );
+    tracing::error!("operation" = ?(operation), "error" = ?(error.to_string()), "{}", "Claude Code installation failed with no fallback");
     activity_recorder.record_activity(
         LogLevel::Error,
         LogCategory::Init,
         format!("Claude Code installation failed during {operation}"),
-        claude_attrs!("error" => error.to_string()),
+        BTreeMap::from([("error".to_owned(), serde_json::json!(error.to_string()))]),
     );
     let mut message = format!("claude code installation failed during {operation}: ").into_bytes();
     // 安装命令的 CombinedOutput 可能不是 UTF-8；外层 `%w` 只追加前缀，不应把

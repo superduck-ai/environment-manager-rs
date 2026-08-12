@@ -1,6 +1,6 @@
 //! 进程执行结果与错误类型。
 //!
-//! 这些声明对应 Go `internal/process/zz_recovered_types.go`。Go 恢复类型名为
+//! 进程执行的公共结果与错误类型。旧实现的类型名为
 //! `Result`；Rust 同时保留该精确名称和迁移早期使用的 `ProcessResult` 别名，避免与
 //! 标准库 `Result<T, E>` 混淆时仍可逐项对照。
 
@@ -108,7 +108,7 @@ pub enum ProcessExitError {
     Wait(String),
 }
 
-/// 对应 Go `internal/process/zz_recovered_types.go` 中的 `Result`。
+/// 子进程执行结果。
 ///
 /// 保存一次进程执行的退出状态和时间信息。非零退出不会让 `execute` 本身返回错误，
 /// 而是写入 `error`，以保留 Go 调用方区分“未能启动”和“已运行但失败”的方式。

@@ -1,14 +1,6 @@
 //! `internal/auth` 的行为回归测试，机械对应 Go 的 `auth_test.go`。
 //!
-//! 测试函数保持 Go 名称的 snake_case 映射，使兼容清单能够逐场景核对；Go 版本
-//! 的 logger 由生产入口保留；多数领域测试使用无日志入口隔离数据断言，日志顺序
-//! 则由 input 生产链路的记录型 handler 单独覆盖。
-
-use std::sync::Arc;
-
-use crate::internal::logger::{
-    LogAttributes, LogHandler, LogHandlerError, LogLevel, LogRecord, Logger,
-};
+//! 测试覆盖 provider 解析、凭据访问和错误边界。
 
 use super::*;
 
@@ -20,40 +12,11 @@ fn auth_config_json(configurations: &[AuthConfig]) -> Vec<u8> {
     serde_json::to_vec(configurations).expect("测试认证配置必须能够序列化")
 }
 
-/// 对应 Go：`authTestLogger`。
-///
-/// 丢弃测试日志但保留完整 Logger facade 调用路径的 handler。
-struct DiscardHandler;
-
-impl LogHandler for DiscardHandler {
-    fn enabled(&self, _level: LogLevel) -> bool {
-        false
-    }
-
-    fn handle(&self, _record: &LogRecord) -> Result<(), LogHandlerError> {
-        Ok(())
-    }
-
-    fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        Arc::new(Self)
-    }
-
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(Self)
-    }
-}
-
-/// 返回丢弃事件的 logger，保留 Go 测试辅助函数的符号映射。
-fn auth_test_logger() -> Logger {
-    Logger::new(Arc::new(DiscardHandler))
-}
-
 /// 对应 Go：`TestNewAuthContextWithSessionIDParsesAllRecoveredProviders`。
 ///
 /// 验证全部恢复的 provider、getter，以及 session 与 ingress token 的覆盖 setter。
 #[test]
-fn test_new_auth_context_with_session_id_parses_all_recovered_providers() {
-    let _logger = auth_test_logger();
+fn test_new_auth_context_with_session_id_parses_all_providers() {
     let auth_json = auth_config_json(&[
         AuthConfig {
             auth_type: "session_ingress".into(),
@@ -112,7 +75,6 @@ fn test_new_auth_context_with_session_id_parses_all_recovered_providers() {
 /// 验证 nil/空 auth wire 值只保留 session ID，不凭空产生任何 provider 凭据。
 #[test]
 fn test_new_auth_context_with_session_id_handles_empty_auth() {
-    let _logger = auth_test_logger();
     let context = new_auth_context_with_session_id(&[], "session-123").expect("空 auth 必须被接受");
     assert_eq!(context.get_session_id(), "session-123");
     assert!(context.get_session_ingress_token().is_empty());
@@ -156,7 +118,6 @@ fn auth_null_and_missing_nested_fields_keep_go_zero_values() {
 /// 逐项校验兼容错误文本，防止错误归类顺序在迁移中变化。
 #[test]
 fn test_new_auth_context_with_session_id_reports_errors() {
-    let _logger = auth_test_logger();
     let invalid =
         new_auth_context_with_session_id(b"{bad json", "session").expect_err("非法 JSON 必须失败");
     assert!(
@@ -248,11 +209,10 @@ fn test_new_auth_context_with_session_id_reports_errors() {
 /// 与 scheme 不发生变化。
 #[test]
 fn test_git_hub_source_auth_provider_authenticates_https_urls() {
-    let logger = auth_test_logger();
     let context = AuthContext::default();
     let permission = Permission::from("read");
 
-    let provider = new_github_source_auth_provider(logger.clone(), "ghp-secret");
+    let provider = new_github_source_auth_provider("ghp-secret");
     assert_eq!(provider.auth_type(), GitHubAuthType::Token);
     let (authenticated, ok) = provider.authenticate_url(
         &context,
@@ -266,7 +226,7 @@ fn test_git_hub_source_auth_provider_authenticates_https_urls() {
     assert_eq!(parsed.host_str(), Some("github.com"));
     assert_eq!(parsed.path(), "/anthropic/demo.git");
 
-    let colon_provider = new_github_source_auth_provider(logger, "x-access-token:secret");
+    let colon_provider = new_github_source_auth_provider("x-access-token:secret");
     let (authenticated, ok) = colon_provider.authenticate_url(
         &context,
         "https://github.com/anthropic/demo.git",
@@ -300,10 +260,9 @@ fn test_git_hub_source_auth_provider_authenticates_https_urls() {
 /// 原样返回并报告未认证。
 #[test]
 fn test_git_hub_source_auth_provider_handles_proxy_jwt_and_unsupported_urls() {
-    let logger = auth_test_logger();
     let context = AuthContext::default();
     let permission = Permission::from("read");
-    let provider = new_github_source_auth_provider(logger.clone(), "sk-ant-ccsr-jwt");
+    let provider = new_github_source_auth_provider("sk-ant-ccsr-jwt");
     assert_eq!(provider.auth_type(), GitHubAuthType::GitProxyJwt);
 
     let (authenticated, ok) = provider.authenticate_url(
@@ -328,7 +287,7 @@ fn test_git_hub_source_auth_provider_handles_proxy_jwt_and_unsupported_urls() {
         );
     }
 
-    let empty_provider = new_github_source_auth_provider(logger, "");
+    let empty_provider = new_github_source_auth_provider("");
     let public = "https://github.com/anthropic/demo.git";
     assert_eq!(
         empty_provider.authenticate_url(&context, public, &permission),
@@ -342,7 +301,7 @@ fn test_git_hub_source_auth_provider_handles_proxy_jwt_and_unsupported_urls() {
 /// 保留公开仓库 URL 以便诊断。
 #[test]
 fn test_git_hub_source_auth_provider_sanitizes_output() {
-    let provider = new_github_source_auth_provider(auth_test_logger(), "sk-ant-ccsr-secret");
+    let provider = new_github_source_auth_provider("sk-ant-ccsr-secret");
     let public = "https://github.com/anthropic/demo.git";
     let authenticated = "https://unused:sk-ant-ccsr-secret@github.com/anthropic/demo.git";
     let output = format!(

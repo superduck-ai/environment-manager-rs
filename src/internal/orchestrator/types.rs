@@ -10,8 +10,6 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, Logger, default_logger};
-
 /// 与 Go `json.RawMessage` 对应的原始 JSON 字节。
 pub type RawMessage = Vec<u8>;
 
@@ -87,8 +85,6 @@ pub struct SandboxRequest {
     pub args: Vec<String>,
     /// `None` 表示没有 Hook 级超时。
     pub timeout: Option<Duration>,
-    /// 已绑定 Hook 固定属性的 logger，供 sandbox 内部沿用同一 Go logger 链。
-    pub logger: Logger,
 }
 
 /// Hook 对尚在迁移的 sandbox runtime 的显式适配接口。
@@ -210,8 +206,6 @@ pub struct OrchestratorConfig {
     pub loop_timeout: Duration,
     /// 连续 poll 失败上限；0 表示无限重试。
     pub max_poll_failures: i64,
-    /// 可选结构化 logger；缺省使用进程级 Rust tracing logger。
-    pub logger: Option<Logger>,
     /// 可选 o11y adapter。
     pub observer: Option<Arc<dyn OrchestratorObserver>>,
     /// 可选 session 输出 adapter。
@@ -228,7 +222,7 @@ impl Default for OrchestratorConfig {
             poll_timeout: Duration::ZERO,
             loop_timeout: Duration::ZERO,
             max_poll_failures: 0,
-            logger: None,
+
             observer: None,
             session_output: None,
         }
@@ -238,7 +232,6 @@ impl Default for OrchestratorConfig {
 /// 持有已经验证配置的 orchestrator 状态机。
 pub struct Orchestrator {
     pub(crate) config: OrchestratorConfig,
-    pub(crate) logger: Logger,
 }
 
 /// execute Hook 从 work JSON 中读取的最小 session DTO。
@@ -259,8 +252,6 @@ pub struct PollHook {
     pub timeout: Duration,
     /// 序列化到 stdin 的环境身份。
     pub stdin_context: PollHookContext,
-    /// 结构化 logger。
-    pub logger: Logger,
 }
 
 /// PollHook stdin 协议。
@@ -283,7 +274,6 @@ pub struct Poller {
     pub(crate) worker_id: String,
     pub(crate) reclaim_older_than_ms: i64,
     pub(crate) http_client: reqwest::Client,
-    pub(crate) logger: Logger,
 }
 
 /// work 的类型专属数据。
@@ -324,7 +314,6 @@ pub struct WhoamiClient {
     pub(crate) api_base_url: String,
     pub(crate) auth_token: String,
     pub(crate) http_client: reqwest::Client,
-    pub(crate) logger: Logger,
 }
 
 /// `/whoami` 响应。
@@ -338,26 +327,4 @@ pub struct WhoamiResponse {
     pub organization_uuid: String,
     /// environment ID。
     pub environment_id: String,
-}
-
-/// 返回 orchestrator 的进程级默认 logger。
-///
-/// # 返回
-/// 返回 Rust tracing logger 的轻量克隆。
-///
-/// # 副作用
-/// 第一次调用会惰性初始化进程级 subscriber，之后的 INFO 及以上
-/// 记录会写到 stderr 和默认日志文件。
-pub fn default_orchestrator_logger() -> Logger {
-    default_logger().clone()
-}
-
-/// 创建有序结构化日志属性。
-pub(crate) fn log_attributes(
-    entries: impl IntoIterator<Item = (impl Into<String>, serde_json::Value)>,
-) -> LogAttributes {
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.into(), value))
-        .collect::<LogAttributes>()
 }

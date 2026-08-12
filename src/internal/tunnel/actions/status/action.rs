@@ -10,7 +10,6 @@ use async_trait::async_trait;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, Logger, default_logger};
 use crate::internal::tunnel::actions::{
     Action, ActionError, ActionRequest, ActionResult, ProgressReporter,
 };
@@ -22,8 +21,8 @@ pub const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 对应 Go：`status.NewStatusAction`。
 #[must_use]
-pub fn new_status_action(logger: Option<Logger>) -> StatusAction {
-    StatusAction { logger }
+pub fn new_status_action() -> StatusAction {
+    StatusAction {}
 }
 
 #[async_trait]
@@ -61,23 +60,13 @@ impl Action for StatusAction {
             }
         };
 
-        let mut attributes = LogAttributes::new();
-        // 按业务参数顺序组装结构化属性。
-        attributes.insert(
-            "session_id".to_owned(),
-            serde_json::Value::String(request.session_id),
+        tracing::info!(
+            session_id = %request.session_id,
+            address,
+            port = status_request.port,
+            listening,
+            "status_check"
         );
-        attributes.insert("address".to_owned(), serde_json::Value::String(address));
-        attributes.insert(
-            "port".to_owned(),
-            serde_json::Value::from(status_request.port),
-        );
-        attributes.insert("listening".to_owned(), serde_json::Value::Bool(listening));
-        let logger = match self.logger.as_ref() {
-            Some(logger) => logger,
-            None => default_logger(),
-        };
-        logger.info("status_check", attributes);
 
         Ok(ActionResult {
             status_code: 200,

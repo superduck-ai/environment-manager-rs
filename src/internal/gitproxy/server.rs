@@ -18,8 +18,6 @@ use axum::Router;
 use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, LogLevel, Logger, default_logger};
-
 use super::{
     Config, GitProxyError, GitProxyResult, Server, SharedServer,
     handler::{Handler, new_http_client},
@@ -36,7 +34,6 @@ struct ServerState {
 /// Go 私有 `server` 的 Tokio 对应实现。
 pub(super) struct ServerImpl {
     config: Arc<Config>,
-    logger: Logger,
     state: Mutex<ServerState>,
     bound_port: AtomicI64,
 }
@@ -45,32 +42,11 @@ impl ServerImpl {
     /// 使用已验证配置创建尚未监听的 server。
     fn new(config: Config) -> Self {
         let bound_port = config.port;
-        // 在构造边界解析默认 logger，让 server、serve task 和 handler
-        // 共享同一个 tracing 接收端。
-        let logger = config
-            .logger
-            .clone()
-            .unwrap_or_else(|| default_logger().clone());
         Self {
             config: Arc::new(config),
-            logger,
             state: Mutex::new(ServerState::default()),
             bound_port: AtomicI64::new(bound_port),
         }
-    }
-
-    /// 记录 server 生命周期事件。
-    ///
-    /// # 参数
-    /// - `level`：Go 调用点对应的日志级别。
-    /// - `message`：与 Go 源码逐字一致的消息。
-    /// - `attributes`：保持 Go 参数顺序和 JSON 标量类型的属性。
-    ///
-    /// # 副作用
-    /// 调用结构化 logger；日志接收端错误不会改变 server 结果。
-    #[track_caller]
-    fn log(&self, level: LogLevel, message: &str, attributes: LogAttributes) {
-        self.logger.log(level, message, attributes);
     }
 }
 
@@ -146,18 +122,12 @@ impl Server for ServerImpl {
 
         let shutdown = CancellationToken::new();
         let serve_shutdown = shutdown.clone();
-        let logger = self.logger.clone();
         let serve_task = tokio::spawn(async move {
             let result = axum::serve(listener, app)
                 .with_graceful_shutdown(serve_shutdown.cancelled_owned())
                 .await;
             if let Err(error) = result {
-                let mut attributes = LogAttributes::new();
-                attributes.insert(
-                    "error".to_owned(),
-                    serde_json::Value::String(error.to_string()),
-                );
-                logger.log(LogLevel::Error, "Git proxy server failed", attributes);
+                tracing::error!(error = %error, "Git proxy server failed");
             }
         });
 
@@ -166,13 +136,7 @@ impl Server for ServerImpl {
         state.serve_task = Some(serve_task);
         state.started = true;
 
-        let mut attributes = LogAttributes::new();
-        attributes.insert(
-            "base_url".to_owned(),
-            serde_json::Value::String(format!("http://127.0.0.1:{port}")),
-        );
-        attributes.insert("port".to_owned(), serde_json::Value::from(port));
-        self.log(LogLevel::Info, "Git proxy server started", attributes);
+        tracing::info!(base_url = %format!("http://127.0.0.1:{port}"), port, "Git proxy server started");
         Ok(())
     }
 
@@ -209,11 +173,7 @@ impl Server for ServerImpl {
         state.shutdown = None;
         state.serve_task = None;
         self.bound_port.store(self.config.port, Ordering::Release);
-        self.log(
-            LogLevel::Info,
-            "Git proxy server stopped",
-            LogAttributes::new(),
-        );
+        tracing::info!("{}", "Git proxy server stopped");
         Ok(())
     }
 

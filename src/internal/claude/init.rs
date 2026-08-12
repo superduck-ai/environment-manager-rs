@@ -6,44 +6,34 @@
 
 use std::{ffi::OsString, path::Path, time::Instant};
 
-use crate::internal::{config::ClaudeConfig, logger::Logger};
+use crate::internal::config::ClaudeConfig;
 use tokio_util::sync::CancellationToken;
 
 use super::{
     claude_code_executor::filter_init_only_from_environ,
     config_helpers::get_claude_path,
-    types::{
-        ClaudeError, ClaudeObservability, claude_attrs, go_utf8_error_view, run_combined_command,
-    },
+    types::{ClaudeError, ClaudeObservability, go_utf8_error_view, run_combined_command},
 };
 
 /// 执行 init hook；未提供 o11y adapter 时不伪造诊断事件。
 pub async fn run_init(
     cancellation: &CancellationToken,
-    logger: &Logger,
     cfg: Option<&ClaudeConfig>,
     working_dir: impl AsRef<Path>,
 ) -> Result<(), ClaudeError> {
-    run_init_with_observability(cancellation, logger, cfg, working_dir, None).await
+    run_init_with_observability(cancellation, cfg, working_dir, None).await
 }
 
 /// 执行 init hook，并将成功或失败诊断交给显式 o11y adapter。
 pub async fn run_init_with_observability(
     cancellation: &CancellationToken,
-    logger: &Logger,
     cfg: Option<&ClaudeConfig>,
     working_dir: impl AsRef<Path>,
     observability: Option<&dyn ClaudeObservability>,
 ) -> Result<(), ClaudeError> {
     let working_dir = working_dir.as_ref();
-    let claude_path = get_claude_path(logger, cfg);
-    logger.info(
-        "Running claude --init-only for session start hooks",
-        claude_attrs!(
-            "claude_path" => &claude_path,
-            "working_dir" => working_dir.display().to_string(),
-        ),
-    );
+    let claude_path = get_claude_path(cfg);
+    tracing::info!("claude_path" = ?(&claude_path), "working_dir" = ?(working_dir.display().to_string()), "{}", "Running claude --init-only for session start hooks");
 
     let started = Instant::now();
     let mut environment = filter_init_only_from_environ(std::env::vars_os());
@@ -67,10 +57,7 @@ pub async fn run_init_with_observability(
 
     match result {
         Ok(_) => {
-            logger.info(
-                "claude --init-only completed successfully",
-                claude_attrs!("duration_ms" => duration_ms),
-            );
+            tracing::info!("duration_ms" = ?(duration_ms), "{}", "claude --init-only completed successfully");
             if let Some(observability) = observability {
                 observability.log_claude_init(true, None, duration_ms);
             }
@@ -78,15 +65,7 @@ pub async fn run_init_with_observability(
         }
         Err(error) => {
             let error_view = go_utf8_error_view(&error.error);
-            logger.error(
-                "claude --init-only failed",
-                claude_attrs!(
-                    "error" => &error_view,
-                    "exit_code" => error.exit_code,
-                    "duration_ms" => duration_ms,
-                    "output" => String::from_utf8_lossy(&error.output),
-                ),
-            );
+            tracing::error!("error" = ?(&error_view), "exit_code" = ?(error.exit_code), "duration_ms" = ?(duration_ms), "output" = ?(String::from_utf8_lossy(&error.output)), "{}", "claude --init-only failed");
             if let Some(observability) = observability {
                 observability.log_claude_init(false, Some(error.exit_code), duration_ms);
             }

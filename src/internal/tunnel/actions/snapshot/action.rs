@@ -17,7 +17,6 @@ use async_trait::async_trait;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, Logger, default_logger};
 use crate::internal::tunnel::actions::{
     Action, ActionError, ActionRequest, ActionResult, ProgressReporter,
 };
@@ -33,12 +32,10 @@ pub(super) const TOTAL_CAP: usize = 5 * 1024 * 1024;
 
 /// 对应 Go：`snapshot.NewSnapshotAction`。
 ///
-/// 固定路径仅面向唯一支持的 Linux 容器布局；logger 为 `None` 时回退到进程默认
-/// logger，复刻 Go `(*SnapshotAction).log` 的行为。
+/// 固定路径仅面向唯一支持的 Linux 容器布局；事件写入进程 tracing subscriber。
 #[must_use]
-pub fn new_snapshot_action(logger: Option<Logger>) -> SnapshotAction {
+pub fn new_snapshot_action() -> SnapshotAction {
     SnapshotAction {
-        logger,
         drafts_path: PathBuf::from("/home/claude/project/.baku/drafts"),
         explorations_path: PathBuf::from("/home/claude/project/.baku/explorations"),
         project_path: PathBuf::from("/home/claude/project"),
@@ -82,35 +79,7 @@ impl Action for SnapshotAction {
             truncated: drafts_truncated || explorations_truncated,
             app_modified,
         };
-
-        let logger = self.log();
-        logger.info(
-            "snapshot_complete",
-            values_to_attributes([
-                ("session_id", serde_json::Value::String(request.session_id)),
-                (
-                    "drafts_count",
-                    serde_json::Value::from(response.drafts.len()),
-                ),
-                (
-                    "explorations_count",
-                    serde_json::Value::from(response.explorations.len()),
-                ),
-                (
-                    "files_cached",
-                    serde_json::Value::from(draft_bytes + exploration_bytes),
-                ),
-                (
-                    "commit_count",
-                    serde_json::Value::from(response.commit_count),
-                ),
-                ("truncated", serde_json::Value::Bool(response.truncated)),
-                (
-                    "app_modified",
-                    serde_json::Value::Bool(response.app_modified),
-                ),
-            ]),
-        );
+        tracing::info!("session_id" = ?(request.session_id), "drafts_count" = ?(response.drafts.len()), "explorations_count" = ?(response.explorations.len()), "files_cached" = ?(draft_bytes + exploration_bytes), "commit_count" = ?(response.commit_count), "truncated" = ?(serde_json::Value::Bool(response.truncated)), "app_modified" = ?(serde_json::Value::Bool(response.app_modified)), "{}", "snapshot_complete");
 
         Ok(ActionResult {
             status_code: 200,
@@ -147,56 +116,19 @@ impl SnapshotAction {
                 return (Vec::new(), 0, false);
             }
             Err(error) => {
-                let logger = self.log();
-                logger.warn(
-                    "snapshot_resolve_error",
-                    values_to_attributes([
-                        (
-                            "dir",
-                            serde_json::Value::String(directory.display().to_string()),
-                        ),
-                        ("error", serde_json::Value::String(error.to_string())),
-                    ]),
-                );
+                tracing::warn!("dir" = ?(directory.display().to_string()), "error" = ?(error.to_string()), "{}", "snapshot_resolve_error");
                 return (Vec::new(), 0, false);
             }
         };
         if resolved_directory.strip_prefix(resolved_project).is_err() {
-            let logger = self.log();
-            logger.warn(
-                "snapshot_dir_escapes_project",
-                values_to_attributes([
-                    (
-                        "dir",
-                        serde_json::Value::String(directory.display().to_string()),
-                    ),
-                    (
-                        "resolved_dir",
-                        serde_json::Value::String(resolved_directory.display().to_string()),
-                    ),
-                    (
-                        "project_path",
-                        serde_json::Value::String(resolved_project.display().to_string()),
-                    ),
-                ]),
-            );
+            tracing::warn!("dir" = ?(directory.display().to_string()), "resolved_dir" = ?(resolved_directory.display().to_string()), "project_path" = ?(resolved_project.display().to_string()), "{}", "snapshot_dir_escapes_project");
             return (Vec::new(), 0, false);
         }
 
         let mut directory_entries = match std::fs::read_dir(&resolved_directory) {
             Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
             Err(error) => {
-                let logger = self.log();
-                logger.warn(
-                    "snapshot_readdir_error",
-                    values_to_attributes([
-                        (
-                            "dir",
-                            serde_json::Value::String(resolved_directory.display().to_string()),
-                        ),
-                        ("error", serde_json::Value::String(error.to_string())),
-                    ]),
-                );
+                tracing::warn!("dir" = ?(resolved_directory.display().to_string()), "error" = ?(error.to_string()), "{}", "snapshot_readdir_error");
                 return (Vec::new(), 0, false);
             }
         };
@@ -249,34 +181,14 @@ impl SnapshotAction {
                 return None;
             }
             Err(error) => {
-                let logger = self.log();
-                logger.warn(
-                    "snapshot_open_error",
-                    values_to_attributes([
-                        (
-                            "path",
-                            serde_json::Value::String(path.display().to_string()),
-                        ),
-                        ("error", serde_json::Value::String(error.to_string())),
-                    ]),
-                );
+                tracing::warn!("path" = ?(path.display().to_string()), "error" = ?(error.to_string()), "{}", "snapshot_open_error");
                 return None;
             }
         };
         let metadata = match file.metadata() {
             Ok(metadata) => metadata,
             Err(error) => {
-                let logger = self.log();
-                logger.warn(
-                    "snapshot_stat_error",
-                    values_to_attributes([
-                        (
-                            "path",
-                            serde_json::Value::String(path.display().to_string()),
-                        ),
-                        ("error", serde_json::Value::String(error.to_string())),
-                    ]),
-                );
+                tracing::warn!("path" = ?(path.display().to_string()), "error" = ?(error.to_string()), "{}", "snapshot_stat_error");
                 return None;
             }
         };
@@ -284,34 +196,13 @@ impl SnapshotAction {
             return None;
         }
         if metadata.len() > PER_FILE_CAP {
-            let logger = self.log();
-            logger.warn(
-                "snapshot_file_oversized",
-                values_to_attributes([
-                    (
-                        "path",
-                        serde_json::Value::String(path.display().to_string()),
-                    ),
-                    ("size", serde_json::Value::from(metadata.len())),
-                    ("max_size", serde_json::Value::from(PER_FILE_CAP)),
-                ]),
-            );
+            tracing::warn!("path" = ?(path.display().to_string()), "size" = ?(metadata.len()), "max_size" = ?(PER_FILE_CAP), "{}", "snapshot_file_oversized");
             return None;
         }
 
         let mut content = Vec::with_capacity(metadata.len() as usize);
         if let Err(error) = file.read_to_end(&mut content) {
-            let logger = self.log();
-            logger.warn(
-                "snapshot_read_error",
-                values_to_attributes([
-                    (
-                        "path",
-                        serde_json::Value::String(path.display().to_string()),
-                    ),
-                    ("error", serde_json::Value::String(error.to_string())),
-                ]),
-            );
+            tracing::warn!("path" = ?(path.display().to_string()), "error" = ?(error.to_string()), "{}", "snapshot_read_error");
             return None;
         }
         Some(content)
@@ -326,17 +217,7 @@ impl SnapshotAction {
         let output = match self.git_output(cancellation, &arguments).await {
             Ok(output) => output,
             Err(error) => {
-                let logger = self.log();
-                logger.warn(
-                    "snapshot_git_error",
-                    values_to_attributes([
-                        (
-                            "project_path",
-                            serde_json::Value::String(self.project_path.display().to_string()),
-                        ),
-                        ("error", serde_json::Value::String(error)),
-                    ]),
-                );
+                tracing::warn!("project_path" = ?(self.project_path.display().to_string()), "error" = ?(error), "{}", "snapshot_git_error");
                 return 0;
             }
         };
@@ -365,17 +246,7 @@ impl SnapshotAction {
         let root_output = match self.git_output(cancellation, &root_arguments).await {
             Ok(output) => output,
             Err(error) => {
-                let logger = self.log();
-                logger.warn(
-                    "snapshot_git_root_error",
-                    values_to_attributes([
-                        (
-                            "project_path",
-                            serde_json::Value::String(self.project_path.display().to_string()),
-                        ),
-                        ("error", serde_json::Value::String(error)),
-                    ]),
-                );
+                tracing::warn!("project_path" = ?(self.project_path.display().to_string()), "error" = ?(error), "{}", "snapshot_git_root_error");
                 return false;
             }
         };
@@ -393,17 +264,7 @@ impl SnapshotAction {
         let diff_output = match self.git_output(cancellation, &diff_arguments).await {
             Ok(output) => output,
             Err(error) => {
-                let logger = self.log();
-                logger.warn(
-                    "snapshot_git_diff_error",
-                    values_to_attributes([
-                        (
-                            "project_path",
-                            serde_json::Value::String(self.project_path.display().to_string()),
-                        ),
-                        ("error", serde_json::Value::String(error)),
-                    ]),
-                );
+                tracing::warn!("project_path" = ?(self.project_path.display().to_string()), "error" = ?(error), "{}", "snapshot_git_diff_error");
                 return false;
             }
         };
@@ -441,14 +302,6 @@ impl SnapshotAction {
             }
         }
     }
-
-    /// 返回快照 action 配置的 logger；缺省时使用进程级 tracing logger。
-    fn log(&self) -> &Logger {
-        match self.logger.as_ref() {
-            Some(logger) => logger,
-            None => default_logger(),
-        }
-    }
 }
 
 /// 把 Unix 子进程终态格式化为 Go `os/exec.ExitError.Error()` 的常见文本。
@@ -467,12 +320,4 @@ fn git_exit_error(status: &ExitStatus) -> String {
         Some(signal) => format!("signal {signal}"),
         None => "exit status unknown".to_owned(),
     }
-}
-
-/// 将定长日志属性数组转成确定顺序 map。
-fn values_to_attributes<const N: usize>(values: [(&str, serde_json::Value); N]) -> LogAttributes {
-    values
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }

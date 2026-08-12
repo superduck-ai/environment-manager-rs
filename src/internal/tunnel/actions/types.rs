@@ -1,6 +1,6 @@
 //! Tunnel action 的共享类型声明。
 //!
-//! 对应 Go `internal/tunnel/actions/zz_recovered_types.go`。Go 的空接口 sender 已收紧为
+//! Action 注册、执行与响应类型。旧实现的空接口 sender 已收紧为
 //! Prost 消息参数，消除运行时反射和类型断言；网络侧 JSON/Proto 行为不变。
 
 use std::collections::BTreeMap;
@@ -10,8 +10,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
-
-use crate::internal::logger::Logger;
 
 /// action、进度上报或 Tunnel sender 返回的线程安全错误。
 pub type ActionError = Box<dyn Error + Send + Sync + 'static>;
@@ -117,6 +115,4 @@ pub struct Registry {
     pub(crate) actions: RwLock<BTreeMap<String, Arc<dyn Action>>>,
     /// 当前正在执行的 action 名称集合。
     pub(crate) running: Mutex<std::collections::BTreeSet<String>>,
-    /// 兼容结构化日志输出；测试可以不提供。
-    pub(crate) logger: Option<Logger>,
 }

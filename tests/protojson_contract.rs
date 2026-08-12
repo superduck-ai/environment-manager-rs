@@ -1,10 +1,10 @@
-//! Tunnel ProtoJSON 的字段名、oneof、默认省略和 bytes Base64 兼容测试。
+//! Tunnel ProtoJSON 的字段名、oneof、默认省略和 bytes Base64 契约测试。
 
 use environment_manager::r#gen::proto::anthropic::sessions::tunnel::v1alpha::{
     Header, HttpTunnelRequest, TunnelRequest, tunnel_request,
 };
 
-/// 验证 pbjson 输出与 Go `protojson.MarshalOptions{UseProtoNames:false}` 完全一致。
+/// 验证 pbjson 输出使用标准 ProtoJSON lowerCamel 字段名和 Base64 bytes。
 #[test]
 fn tunnel_request_uses_lower_camel_and_base64_bytes() {
     let request = TunnelRequest {

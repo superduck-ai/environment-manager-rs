@@ -15,10 +15,7 @@ use std::{
 use std::os::unix::fs::OpenOptionsExt;
 
 use fs2::FileExt;
-use serde_json::json;
 use thiserror::Error;
-
-use crate::internal::logger::Logger;
 
 use super::go_path_escape;
 
@@ -101,7 +98,6 @@ enum AcquirePathError {
 pub struct FileLockGuard {
     file: Option<File>,
     path: PathBuf,
-    logger: Logger,
     scope: LockScope,
 }
 
@@ -115,7 +111,7 @@ enum LockScope {
 }
 
 impl fmt::Debug for FileLockGuard {
-    /// 输出锁路径和作用域，但不展开 logger handler。
+    /// 输出锁路径和作用域。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FileLockGuard")
@@ -164,25 +160,12 @@ impl FileLockGuard {
     fn log_unlock_error(&self, error: &dyn fmt::Display) {
         let path = self.path.display().to_string();
         match &self.scope {
-            LockScope::Container => self.logger.warn(
-                "Failed to unlock container lockfile",
-                [
-                    ("lockfile_path".to_owned(), json!(path)),
-                    ("error".to_owned(), json!(error.to_string())),
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            LockScope::Session { session_id } => self.logger.warn(
-                "Failed to unlock file",
-                [
-                    ("session_id".to_owned(), json!(session_id)),
-                    ("lockfile_path".to_owned(), json!(path)),
-                    ("error".to_owned(), json!(error.to_string())),
-                ]
-                .into_iter()
-                .collect(),
-            ),
+            LockScope::Container => {
+                tracing::warn!("lockfile_path" = ?(path), "error" = ?(error.to_string()), "{}", "Failed to unlock container lockfile")
+            }
+            LockScope::Session { session_id } => {
+                tracing::warn!("session_id" = ?(session_id), "lockfile_path" = ?(path), "error" = ?(error.to_string()), "{}", "Failed to unlock file")
+            }
         }
     }
 
@@ -190,25 +173,12 @@ impl FileLockGuard {
     fn log_close_error(&self, error: &dyn fmt::Display) {
         let path = self.path.display().to_string();
         match &self.scope {
-            LockScope::Container => self.logger.warn(
-                "Failed to close container lockfile during cleanup",
-                [
-                    ("lockfile_path".to_owned(), json!(path)),
-                    ("error".to_owned(), json!(error.to_string())),
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            LockScope::Session { session_id } => self.logger.warn(
-                "Failed to close lockfile during cleanup",
-                [
-                    ("session_id".to_owned(), json!(session_id)),
-                    ("lockfile_path".to_owned(), json!(path)),
-                    ("error".to_owned(), json!(error.to_string())),
-                ]
-                .into_iter()
-                .collect(),
-            ),
+            LockScope::Container => {
+                tracing::warn!("lockfile_path" = ?(path), "error" = ?(error.to_string()), "{}", "Failed to close container lockfile during cleanup")
+            }
+            LockScope::Session { session_id } => {
+                tracing::warn!("session_id" = ?(session_id), "lockfile_path" = ?(path), "error" = ?(error.to_string()), "{}", "Failed to close lockfile during cleanup")
+            }
         }
     }
 
@@ -216,25 +186,12 @@ impl FileLockGuard {
     fn log_remove_error(&self, error: &dyn fmt::Display) {
         let path = self.path.display().to_string();
         match &self.scope {
-            LockScope::Container => self.logger.debug(
-                "Could not remove container lockfile",
-                [
-                    ("lockfile_path".to_owned(), json!(path)),
-                    ("error".to_owned(), json!(error.to_string())),
-                ]
-                .into_iter()
-                .collect(),
-            ),
-            LockScope::Session { session_id } => self.logger.debug(
-                "Could not remove lockfile",
-                [
-                    ("session_id".to_owned(), json!(session_id)),
-                    ("lockfile_path".to_owned(), json!(path)),
-                    ("error".to_owned(), json!(error.to_string())),
-                ]
-                .into_iter()
-                .collect(),
-            ),
+            LockScope::Container => {
+                tracing::debug!("lockfile_path" = ?(path), "error" = ?(error.to_string()), "{}", "Could not remove container lockfile")
+            }
+            LockScope::Session { session_id } => {
+                tracing::debug!("session_id" = ?(session_id), "lockfile_path" = ?(path), "error" = ?(error.to_string()), "{}", "Could not remove lockfile")
+            }
         }
     }
 
@@ -242,21 +199,12 @@ impl FileLockGuard {
     fn log_released(&self) {
         let path = self.path.display().to_string();
         match &self.scope {
-            LockScope::Container => self.logger.info(
-                "Released container-level lock",
-                [("lockfile_path".to_owned(), json!(path))]
-                    .into_iter()
-                    .collect(),
-            ),
-            LockScope::Session { session_id } => self.logger.info(
-                "Released lockfile",
-                [
-                    ("session_id".to_owned(), json!(session_id)),
-                    ("lockfile_path".to_owned(), json!(path)),
-                ]
-                .into_iter()
-                .collect(),
-            ),
+            LockScope::Container => {
+                tracing::info!("lockfile_path" = ?(path), "{}", "Released container-level lock")
+            }
+            LockScope::Session { session_id } => {
+                tracing::info!("session_id" = ?(session_id), "lockfile_path" = ?(path), "{}", "Released lockfile")
+            }
         }
     }
 }
@@ -272,37 +220,21 @@ impl Drop for FileLockGuard {
 ///
 /// 锁路径固定为 Go 实现使用的 `/tmp/environment-manager-container.lock`，
 /// 用于阻止同一容器同时运行多个 orchestrator/session。
-pub fn acquire_container_lock(logger: &Logger) -> Result<FileLockGuard, LockError> {
+pub fn acquire_container_lock() -> Result<FileLockGuard, LockError> {
     let path = PathBuf::from(CONTAINER_LOCK_PATH);
     let file = acquire_path(path.clone()).map_err(|error| match error {
         AcquirePathError::Open { path, source } => LockError::ContainerOpen { path, source },
         AcquirePathError::AlreadyHeld { path } => {
-            logger.error(
-                "Another orchestrator/session is already running on this container",
-                [(
-                    "lockfile_path".to_owned(),
-                    json!(path.display().to_string()),
-                )]
-                .into_iter()
-                .collect(),
-            );
+            tracing::error!("lockfile_path" = ?(path.display().to_string()), "{}", "Another orchestrator/session is already running on this container");
             LockError::ContainerAlreadyHeld { path }
         }
         AcquirePathError::Acquire { path, source } => LockError::ContainerAcquire { path, source },
     })?;
-    logger.info(
-        "Acquired container-level lock",
-        [
-            ("pid".to_owned(), json!(std::process::id())),
-            ("lockfile_path".to_owned(), json!(CONTAINER_LOCK_PATH)),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    tracing::info!("pid" = ?(std::process::id()), "lockfile_path" = ?(CONTAINER_LOCK_PATH), "{}", "Acquired container-level lock");
     Ok(FileLockGuard {
         file: Some(file),
         path,
-        logger: logger.clone(),
+
         scope: LockScope::Container,
     })
 }
@@ -312,23 +244,12 @@ pub fn acquire_container_lock(logger: &Logger) -> Result<FileLockGuard, LockErro
 /// session ID 按 URL path segment 规则转义，避免 `/`、Unicode 或 `..` 改变
 /// 锁文件目录。竞争时立即返回 [`LockError::SessionAlreadyHeld`]，
 /// 不会阻塞 Tokio worker，错误文本保留 Go 中的原始 session ID。
-pub fn acquire_lock(logger: &Logger, session_id: &str) -> Result<FileLockGuard, LockError> {
+pub fn acquire_lock(session_id: &str) -> Result<FileLockGuard, LockError> {
     let path = get_lock_path(session_id);
     let file = acquire_path(path.clone()).map_err(|error| match error {
         AcquirePathError::Open { path, source } => LockError::SessionOpen { path, source },
         AcquirePathError::AlreadyHeld { path } => {
-            logger.error(
-                "Session already running (lock held)",
-                [
-                    ("session_id".to_owned(), json!(session_id)),
-                    (
-                        "lockfile_path".to_owned(),
-                        json!(path.display().to_string()),
-                    ),
-                ]
-                .into_iter()
-                .collect(),
-            );
+            tracing::error!("session_id" = ?(session_id), "lockfile_path" = ?(path.display().to_string()), "{}", "Session already running (lock held)");
             LockError::SessionAlreadyHeld {
                 session_id: session_id.to_owned(),
                 path,
@@ -336,23 +257,11 @@ pub fn acquire_lock(logger: &Logger, session_id: &str) -> Result<FileLockGuard, 
         }
         AcquirePathError::Acquire { path, source } => LockError::SessionAcquire { path, source },
     })?;
-    logger.debug(
-        "Acquired lockfile using flock",
-        [
-            ("session_id".to_owned(), json!(session_id)),
-            ("pid".to_owned(), json!(std::process::id())),
-            (
-                "lockfile_path".to_owned(),
-                json!(path.display().to_string()),
-            ),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    tracing::debug!("session_id" = ?(session_id), "pid" = ?(std::process::id()), "lockfile_path" = ?(path.display().to_string()), "{}", "Acquired lockfile using flock");
     Ok(FileLockGuard {
         file: Some(file),
         path,
-        logger: logger.clone(),
+
         scope: LockScope::Session {
             session_id: session_id.to_owned(),
         },
@@ -393,87 +302,20 @@ fn get_lock_path(session_id: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt as _;
-    use std::sync::{Arc, Mutex};
-
-    use crate::internal::logger::{
-        LogAttributes, LogHandler, LogHandlerError, LogLevel, LogRecord,
-    };
-
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     const LOCK_PROBE_ENVIRONMENT_KEY: &str = "ENV_MANAGER_LOCKFILE_PROBE";
     const LOCK_PROBE_EXPECTATION_KEY: &str = "ENV_MANAGER_LOCKFILE_EXPECTATION";
     const LOCK_PROBE_TEST_NAME: &str = "internal::util::lockfile::tests::lockfile_subprocess_probe";
 
-    /// 锁测试显式提供一个无输出 handler，避免退回全局 tracing。
-    #[derive(Debug)]
-    struct DiscardHandler;
-
-    impl LogHandler for DiscardHandler {
-        /// 接受全部级别，使生产 Logger 调用点真实执行 source 解析。
-        fn enabled(&self, _level: LogLevel) -> bool {
-            true
-        }
-
-        /// 测试只观察锁副作用，日志记录本身直接丢弃。
-        fn handle(&self, _record: &LogRecord) -> Result<(), LogHandlerError> {
-            Ok(())
-        }
-
-        /// 派生属性不改变 discard 行为。
-        fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-            Arc::new(Self)
-        }
-
-        /// 派生 group 不改变 discard 行为。
-        fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-            Arc::new(Self)
-        }
-    }
-
-    /// 构造与 Go 测试 discard slog 等价的具体 Logger。
-    fn test_logger() -> Logger {
-        Logger::new(Arc::new(DiscardHandler))
-    }
-
-    /// 保存锁生命周期日志，供 panic/defer 顺序测试使用。
-    #[derive(Clone, Default)]
-    struct RecordingHandler {
-        records: Arc<Mutex<Vec<LogRecord>>>,
-    }
-
-    impl LogHandler for RecordingHandler {
-        /// 捕获所有级别，尤其是获取时的 debug 与释放时的 info。
-        fn enabled(&self, _level: LogLevel) -> bool {
-            true
-        }
-
-        /// 按 handler 收到的顺序复制完整记录。
-        fn handle(&self, record: &LogRecord) -> Result<(), LogHandlerError> {
-            self.records.lock().unwrap().push(record.clone());
-            Ok(())
-        }
-
-        /// 派生属性 logger 继续共享同一顺序槽。
-        fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-            Arc::new(self.clone())
-        }
-
-        /// 派生 group logger 继续共享同一顺序槽。
-        fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-            Arc::new(self.clone())
-        }
-    }
-
     /// 验证同一路径上的第二个非阻塞锁会立即报告竞争。
     #[test]
     fn lock_rejects_concurrent_owner_and_cleans_up() {
         let unique = format!("test-{}-{}", std::process::id(), line!());
-        let logger = test_logger();
-        let first = acquire_lock(&logger, &unique).expect("first lock should succeed");
+        let first = acquire_lock(&unique).expect("first lock should succeed");
         let path = first.path().to_owned();
-        let error = acquire_lock(&logger, &unique).unwrap_err();
+        let error = acquire_lock(&unique).unwrap_err();
         assert!(matches!(&error, LockError::SessionAlreadyHeld { .. }));
         assert_eq!(
             error.to_string(),
@@ -481,27 +323,6 @@ mod tests {
         );
         drop(first);
         assert!(!path.exists());
-    }
-
-    /// guard Drop 必须像 Go defer 一样在作用域退出时记录 `Released lockfile`。
-    #[test]
-    fn lock_guard_drop_emits_go_release_event_after_acquire() {
-        let unique = format!("release-log-{}-{}", std::process::id(), line!());
-        let handler = RecordingHandler::default();
-        let records = Arc::clone(&handler.records);
-        let logger = Logger::new(Arc::new(handler));
-        let guard = acquire_lock(&logger, &unique).expect("获取 release 日志测试锁");
-        let expected_path = guard.path().display().to_string();
-        drop(guard);
-
-        let records = records.lock().unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].message, "Acquired lockfile using flock");
-        assert_eq!(records[0].level, LogLevel::Debug);
-        assert_eq!(records[1].message, "Released lockfile");
-        assert_eq!(records[1].level, LogLevel::Info);
-        assert_eq!(records[1].attributes["session_id"], unique);
-        assert_eq!(records[1].attributes["lockfile_path"], expected_path);
     }
 
     /// 供父测试在独立 Linux 进程中探测同一个 flock 和新文件 mode。
@@ -514,14 +335,13 @@ mod tests {
             return;
         };
         let session_id = session_id.to_string_lossy();
-        let logger = test_logger();
         match std::env::var(LOCK_PROBE_EXPECTATION_KEY).as_deref() {
             Ok("held") => assert!(matches!(
-                acquire_lock(&logger, &session_id),
+                acquire_lock(&session_id),
                 Err(LockError::SessionAlreadyHeld { .. })
             )),
             Ok("mode-0644") => {
-                let guard = acquire_lock(&logger, &session_id).unwrap();
+                let guard = acquire_lock(&session_id).unwrap();
                 assert_eq!(
                     std::fs::metadata(guard.path())
                         .unwrap()
@@ -540,7 +360,7 @@ mod tests {
     #[test]
     fn flock_rejects_owner_in_another_process() {
         let unique = format!("cross-process-{}-{}", std::process::id(), line!());
-        let first = acquire_lock(&test_logger(), &unique).unwrap();
+        let first = acquire_lock(&unique).unwrap();
         let output = run_lock_probe(&unique, "held", false);
         assert_probe_succeeded(&output);
         drop(first);

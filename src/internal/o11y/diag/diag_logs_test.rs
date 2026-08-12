@@ -12,49 +12,13 @@ use chrono::{TimeDelta, TimeZone, Utc};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::{
-    api::{ApiError, DiagLogEntry},
-    logger::{LogAttributes, LogHandler, LogHandlerError, LogLevel, LogRecord, Logger},
-    o11y::discard_o11y_service::DiscardLogHandler,
-};
+use crate::internal::api::{ApiError, DiagLogEntry};
 
 use super::{
     CcLogCollector, DiagService, DiagState, LogFlusher, append_and_cap_logs,
-    diag_logs::{MAX_BUFFERED_LOGS, new_diag_service_with_logger},
-    get_claude_code_diag_file_path, log_env_manager_no_pii, logs_enabled, new_cc_log_collector,
+    diag_logs::MAX_BUFFERED_LOGS, get_claude_code_diag_file_path, log_env_manager_no_pii,
+    logs_enabled, new_cc_log_collector, new_diag_service,
 };
-
-/// 保存 logger 收到的完整结构化记录，供消息、级别和属性顺序断言。
-#[derive(Clone, Default)]
-struct RecordingLogHandler {
-    records: Arc<Mutex<Vec<LogRecord>>>,
-}
-
-impl LogHandler for RecordingLogHandler {
-    /// 测试需要观察 DEBUG 以上的所有输入，不在 handler 层过滤。
-    fn enabled(&self, _level: LogLevel) -> bool {
-        true
-    }
-
-    /// 按调用顺序保存 owned 记录快照。
-    fn handle(&self, record: &LogRecord) -> Result<(), LogHandlerError> {
-        self.records
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(record.clone());
-        Ok(())
-    }
-
-    /// 本测试没有绑定属性；返回共享同一记录队列的 handler。
-    fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-
-    /// 本测试没有 group；返回共享同一记录队列的 handler。
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-}
 
 /// 测试 flusher 的固定失败模式。
 #[derive(Clone, Copy, Debug, Default)]
@@ -148,11 +112,9 @@ async fn test_logs_enabled() {
 async fn test_new_diag_service_context_and_shutdown_flushes() {
     let flusher = Arc::new(RecordingFlusher::default());
     let flusher_trait: Arc<dyn LogFlusher> = flusher.clone();
-    let (logger, log_records) = recording_logger();
-    let (service, context) =
-        new_diag_service_with_logger(CancellationToken::new(), flusher_trait, logger)
-            .await
-            .expect("create diag service");
+    let (service, context) = new_diag_service(CancellationToken::new(), flusher_trait)
+        .await
+        .expect("create diag service");
     let (env_path, cc_path) = service_paths(&service);
 
     assert_eq!(
@@ -184,35 +146,6 @@ async fn test_new_diag_service_context_and_shutdown_flushes() {
     assert_eq!(file_entry["event"], "start_task_run");
     assert_eq!(file_entry["source"], "env_manager");
 
-    let records = recorded_logs(&log_records);
-    assert_eq!(records.len(), 3);
-    assert_eq!(records[0].level, LogLevel::Info);
-    assert_eq!(records[0].message, "Created diagnostic file");
-    assert_eq!(
-        records[0]
-            .attributes
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["file"]
-    );
-    assert_eq!(records[1].level, LogLevel::Info);
-    assert_eq!(records[1].message, "Created diagnostic file");
-    assert_eq!(
-        records[1]
-            .attributes
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["file"]
-    );
-    assert_eq!(records[2].level, LogLevel::Warn);
-    assert_eq!(
-        records[2].message,
-        "DiagService is shutdown; discarding log entry"
-    );
-    assert!(records[2].attributes.is_empty());
-
     let _ = fs::remove_file(env_path);
     let _ = fs::remove_file(cc_path);
 }
@@ -224,32 +157,15 @@ async fn test_new_diag_service_treats_endpoint_not_implemented_as_clean_shutdown
         calls: Mutex::new(Vec::new()),
         failure: FlushFailure::EndpointNotImplemented,
     });
-    let (logger, log_records) = recording_logger();
-    let (service, context) =
-        new_diag_service_with_logger(CancellationToken::new(), flusher, logger)
-            .await
-            .expect("create diag service");
+    let (service, context) = new_diag_service(CancellationToken::new(), flusher)
+        .await
+        .expect("create diag service");
     let (env_path, cc_path) = service_paths(&service);
     log_env_manager_no_pii(Some(&context), "endpoint_missing", None);
     service
         .shutdown(&CancellationToken::new())
         .await
         .expect("501 must be clean shutdown");
-    let records = recorded_logs(&log_records);
-    let final_flush = records
-        .iter()
-        .find(|record| record.message == "Final diag log flush skipped; endpoint not implemented")
-        .expect("final endpoint warning");
-    assert_eq!(final_flush.level, LogLevel::Warn);
-    assert_eq!(
-        final_flush
-            .attributes
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["count"]
-    );
-    assert_eq!(final_flush.attributes["count"], json!(1));
     let _ = fs::remove_file(env_path);
     let _ = fs::remove_file(cc_path);
 }
@@ -261,11 +177,9 @@ async fn test_shutdown_returns_final_flush_error() {
         calls: Mutex::new(Vec::new()),
         failure: FlushFailure::RemoteUnavailable,
     });
-    let (logger, log_records) = recording_logger();
-    let (service, context) =
-        new_diag_service_with_logger(CancellationToken::new(), flusher, logger)
-            .await
-            .expect("create diag service");
+    let (service, context) = new_diag_service(CancellationToken::new(), flusher)
+        .await
+        .expect("create diag service");
     let (env_path, cc_path) = service_paths(&service);
     log_env_manager_no_pii(Some(&context), "flush_error", None);
     let error = service
@@ -276,24 +190,6 @@ async fn test_shutdown_returns_final_flush_error() {
         error
             .to_string()
             .contains("failed to flush diag logs: remote unavailable")
-    );
-    let records = recorded_logs(&log_records);
-    let final_flush = records
-        .iter()
-        .find(|record| record.message == "Final diag log flush failed during shutdown")
-        .expect("final flush failure log");
-    assert_eq!(final_flush.level, LogLevel::Error);
-    assert_eq!(
-        final_flush
-            .attributes
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["error"]
-    );
-    assert_eq!(
-        final_flush.attributes["error"],
-        json!("failed to flush diag logs: remote unavailable")
     );
     let _ = fs::remove_file(env_path);
     let _ = fs::remove_file(cc_path);
@@ -306,8 +202,7 @@ async fn test_cc_log_collector_parses_json_lines() {
     let path = directory.path().join("claude-code.diag.log");
     fs::write(&path, b"").expect("create empty log");
     let cancellation = CancellationToken::new();
-    let (logger, log_records) = recording_logger();
-    let collector = new_cc_log_collector(cancellation.clone(), &path, logger)
+    let collector = new_cc_log_collector(cancellation.clone(), &path)
         .await
         .expect("create CC collector");
 
@@ -342,21 +237,6 @@ async fn test_cc_log_collector_parses_json_lines() {
     assert_eq!(logs[0].fields.get("message"), Some(&json!("hello")));
     assert_eq!(logs[1].fields.get("source"), Some(&json!("cc")));
     assert_eq!(logs[1].fields.get("message"), Some(&json!("world")));
-    let records = recorded_logs(&log_records);
-    let invalid_line = records
-        .iter()
-        .find(|record| record.message == "Failed to parse CC log line as JSON")
-        .expect("invalid JSON warning");
-    assert_eq!(invalid_line.level, LogLevel::Warn);
-    assert_eq!(
-        invalid_line
-            .attributes
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["error", "line"]
-    );
-    assert_eq!(invalid_line.attributes["line"], json!("not json"));
 }
 
 /// 验证 pending、环境与 CC 三个来源稳定排序，并在合并后清空来源队列。
@@ -370,7 +250,6 @@ fn test_collect_and_merge_logs_sorts_and_drains_buffers() {
         CcLogCollector::buffered_for_test(vec![entry(base + TimeDelta::seconds(1), "cc")]);
     let flusher: Arc<dyn LogFlusher> = Arc::new(RecordingFlusher::default());
     let service = DiagService {
-        logger: diag_test_logger(),
         state: Mutex::new(DiagState {
             env_manager_logs: vec![entry(base + TimeDelta::seconds(2), "env")],
             env_manager_log_file: None,
@@ -417,33 +296,12 @@ fn test_append_and_cap_logs_drops_oldest_entries() {
             .collect(),
     };
 
-    let (logger, log_records) = recording_logger();
-    let logs = append_and_cap_logs(&logger, existing, vec![newest]);
+    let logs = append_and_cap_logs(existing, vec![newest]);
     assert_eq!(logs.len(), MAX_BUFFERED_LOGS);
     assert_eq!(logs[0].fields.get("index"), Some(&json!(1)));
     assert_eq!(
         logs.last().and_then(|entry| entry.fields.get("index")),
         Some(&json!(MAX_BUFFERED_LOGS))
-    );
-    let records = recorded_logs(&log_records);
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].level, LogLevel::Warn);
-    assert_eq!(
-        records[0].message,
-        "Dropping oldest diag log entries due to buffer cap"
-    );
-    assert_eq!(
-        records[0]
-            .attributes
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["discarded_count", "max_entries"]
-    );
-    assert_eq!(records[0].attributes["discarded_count"], json!(1));
-    assert_eq!(
-        records[0].attributes["max_entries"],
-        json!(MAX_BUFFERED_LOGS)
     );
 }
 
@@ -470,24 +328,4 @@ fn entry(timestamp: chrono::DateTime<Utc>, source: &str) -> DiagLogEntry {
         timestamp,
         fields: BTreeMap::from([("source".to_owned(), json!(source))]),
     }
-}
-
-/// 构造不写 stderr 的 concrete logger，避免测试覆盖默认进程日志。
-fn diag_test_logger() -> Logger {
-    Logger::new(Arc::new(DiscardLogHandler))
-}
-
-/// 构造记录 logger，并返回其共享记录队列用于断言。
-fn recording_logger() -> (Logger, Arc<Mutex<Vec<LogRecord>>>) {
-    let handler = RecordingLogHandler::default();
-    let records = Arc::clone(&handler.records);
-    (Logger::new(Arc::new(handler)), records)
-}
-
-/// 获取当前完整日志快照，避免断言期间长期持有 mutex。
-fn recorded_logs(records: &Arc<Mutex<Vec<LogRecord>>>) -> Vec<LogRecord> {
-    records
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
 }

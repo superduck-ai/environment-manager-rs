@@ -8,20 +8,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::gitproxy;
-use crate::internal::logger::Logger;
-
 use super::{GitProxyConfig, GitProxyFactory, GitProxyManager, SourcesError, SourcesResult};
+use crate::internal::gitproxy;
 
 /// 将 sources 配置转换给真实 gitproxy manager 的默认 factory。
-pub(super) struct ProductionGitProxyFactory {
-    logger: Option<Logger>,
-}
+pub(super) struct ProductionGitProxyFactory {}
 
 impl ProductionGitProxyFactory {
-    /// 让 proxy 生命周期复用 Git handler 的结构化 logger。
-    pub(super) fn new(logger: Option<Logger>) -> Self {
-        Self { logger }
+    /// 创建生产 Git proxy factory。
+    pub(super) fn new() -> Self {
+        Self {}
     }
 }
 
@@ -42,7 +38,6 @@ impl GitProxyFactory for ProductionGitProxyFactory {
                 .collect(),
             port: 0,
             token_backend: config.token_backend,
-            logger: self.logger.clone(),
         }))
         .map_err(|error| SourcesError::message(error.to_string()))?;
         Ok(Arc::new(ProductionGitProxyManager { inner: manager }))
@@ -91,7 +86,7 @@ mod tests {
     /// 默认 factory 应启动并停止真实 loopback proxy，而不是测试占位实现。
     #[tokio::test]
     async fn production_factory_uses_internal_gitproxy_manager() {
-        let factory = ProductionGitProxyFactory::new(None);
+        let factory = ProductionGitProxyFactory::new();
         let manager = factory
             .create(GitProxyConfig {
                 session_ingress_url: "https://api.example.test".to_owned(),

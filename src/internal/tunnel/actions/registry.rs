@@ -18,14 +18,12 @@ use futures_util::FutureExt as _;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::r#gen::proto::anthropic::sessions::tunnel::v1alpha::{
-    Header, HttpTunnelResponseChunk, HttpTunnelResponseError, HttpTunnelResponseHeaders,
-};
-use crate::internal::logger::{LogAttributes, Logger, default_logger};
-
 use super::{
     Action, ActionError, ActionRequest, ActionResult, ProgressReporter, ProgressUpdate, Registry,
     ResponseSender,
+};
+use crate::r#gen::proto::anthropic::sessions::tunnel::v1alpha::{
+    Header, HttpTunnelResponseChunk, HttpTunnelResponseError, HttpTunnelResponseHeaders,
 };
 
 /// 对应 Go `DefaultActionTimeout`：action 未声明超时时使用五分钟。
@@ -33,13 +31,12 @@ pub const DEFAULT_ACTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// 对应 Go：`actions.NewRegistry`。
 ///
-/// 创建空 action 表和运行集合。logger 为 `None` 时使用进程级 tracing logger。
+/// 创建空 action 表和运行集合。
 #[must_use]
-pub fn new_registry(logger: Option<Logger>) -> Registry {
+pub fn new_registry() -> Registry {
     Registry {
         actions: RwLock::new(BTreeMap::new()),
         running: Mutex::new(BTreeSet::new()),
-        logger,
     }
 }
 
@@ -54,11 +51,7 @@ impl Registry {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(name.clone(), action);
-        let logger = self.log();
-        logger.info(
-            "control_action_registered",
-            log_attributes([("action", Value::String(name))]),
-        );
+        tracing::info!("action" = ?(name), "{}", "control_action_registered");
     }
 
     /// 对应 Go：`(*Registry).Execute`。
@@ -144,15 +137,7 @@ impl Registry {
         sender: &Arc<SequencedSender>,
         action: Arc<dyn Action>,
     ) {
-        let logger = self.log();
-        logger.info(
-            "control_action_start",
-            log_attributes([
-                ("action", Value::String(action_name.to_owned())),
-                ("session_id", Value::String(session_id.to_owned())),
-                ("request_id", Value::String(request_id.to_owned())),
-            ]),
-        );
+        tracing::info!("action" = ?(action_name.to_owned()), "session_id" = ?(session_id.to_owned()), "request_id" = ?(request_id.to_owned()), "{}", "control_action_start");
 
         let headers = HttpTunnelResponseHeaders {
             request_id: request_id.to_owned(),
@@ -171,14 +156,7 @@ impl Registry {
             sequence_number: 0,
         };
         if let Err(error) = sender.send_headers(headers).await {
-            let logger = self.log();
-            logger.error(
-                "control_action_send_headers_failed",
-                log_attributes([
-                    ("action", Value::String(action_name.to_owned())),
-                    ("error", Value::String(error.to_string())),
-                ]),
-            );
+            tracing::error!("action" = ?(action_name.to_owned()), "error" = ?(error.to_string()), "{}", "control_action_send_headers_failed");
             return;
         }
 
@@ -238,32 +216,14 @@ impl Registry {
                 (payload, false, false)
             }
             ActionOutcome::Error(error) => {
-                let logger = self.log();
-                logger.error(
-                    "control_action_failed",
-                    log_attributes([
-                        ("action", Value::String(action_name.to_owned())),
-                        ("error", Value::String(error.clone())),
-                        ("session_id", Value::String(session_id.to_owned())),
-                    ]),
-                );
+                tracing::error!("action" = ?(action_name.to_owned()), "error" = ?(error.clone()), "session_id" = ?(session_id.to_owned()), "{}", "control_action_failed");
                 let mut payload = BTreeMap::new();
                 payload.insert("error".to_owned(), Value::String(error));
                 payload.insert("type".to_owned(), Value::String("error".to_owned()));
                 (payload, true, false)
             }
             ActionOutcome::Panic { value, stack } => {
-                let logger = self.log();
-                logger.error(
-                    "control_action_panicked",
-                    log_attributes([
-                        ("action", Value::String(action_name.to_owned())),
-                        ("panic", Value::String(value)),
-                        ("stack", Value::String(stack)),
-                        ("session_id", Value::String(session_id.to_owned())),
-                        ("request_id", Value::String(request_id.to_owned())),
-                    ]),
-                );
+                tracing::error!("action" = ?(action_name.to_owned()), "panic" = ?(value), "stack" = ?(stack), "session_id" = ?(session_id.to_owned()), "request_id" = ?(request_id.to_owned()), "{}", "control_action_panicked");
                 let mut payload = BTreeMap::new();
                 payload.insert(
                     "error".to_owned(),
@@ -291,15 +251,7 @@ impl Registry {
         if panicked {
             return;
         }
-        let logger = self.log();
-        logger.info(
-            "control_action_complete",
-            log_attributes([
-                ("action", Value::String(action_name.to_owned())),
-                ("is_error", Value::Bool(is_error)),
-                ("session_id", Value::String(session_id.to_owned())),
-            ]),
-        );
+        tracing::info!(action = %action_name, is_error, session_id = %session_id, "control_action_complete");
     }
 
     /// 对应 Go：`(*Registry).sendJSONResponse`。
@@ -334,14 +286,6 @@ impl Registry {
                 sequence_number: 0,
             })
             .await;
-    }
-
-    /// 返回 registry 配置的 logger；未配置时使用进程级 tracing logger。
-    fn log(&self) -> &Logger {
-        match self.logger.as_ref() {
-            Some(logger) => logger,
-            None => default_logger(),
-        }
     }
 }
 
@@ -385,14 +329,6 @@ fn action_name_from_path(path: &str) -> String {
         )
         .trim_end_matches('/')
         .to_owned()
-}
-
-/// 把定长 key/value 数组转成 logger 使用的确定顺序属性。
-fn log_attributes<const N: usize>(values: [(&str, Value); N]) -> LogAttributes {
-    values
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }
 
 /// 为 header/chunk 分配单调递增序号的 sender 包装器。

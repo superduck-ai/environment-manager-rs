@@ -4,10 +4,8 @@
 
 use reqwest::header::HeaderValue;
 use reqwest::{Method, StatusCode};
-use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::Logger;
 use crate::internal::util::go_path_escape;
 
 use super::client::{
@@ -20,20 +18,14 @@ use super::{ApiError, HttpClient};
 pub struct WorkClient {
     http_client: HttpClient,
     auth_token: String,
-    logger: Option<Logger>,
 }
 
 impl WorkClient {
-    /// 对应 Go `NewWorkClient`，保存共享 HTTP client、service key 和结构化 logger。
-    pub fn new(
-        http_client: HttpClient,
-        auth_token: impl Into<String>,
-        logger: Option<Logger>,
-    ) -> Self {
+    /// 保存共享 HTTP client 和 service key。
+    pub fn new(http_client: HttpClient, auth_token: impl Into<String>) -> Self {
         Self {
             http_client,
             auth_token: auth_token.into(),
-            logger,
         }
     }
 
@@ -70,18 +62,7 @@ impl WorkClient {
         );
         add_version_headers(request.headers_mut())?;
 
-        if let Some(logger) = &self.logger {
-            logger.debug(
-                "Sending work ACK request",
-                [
-                    ("endpoint".to_owned(), json!(&endpoint)),
-                    ("environment_id".to_owned(), json!(environment_id)),
-                    ("work_id".to_owned(), json!(work_id)),
-                ]
-                .into_iter()
-                .collect(),
-            );
-        }
+        tracing::debug!("endpoint" = ?(&endpoint), "environment_id" = ?(environment_id), "work_id" = ?(work_id), "{}", "Sending work ACK request");
         let response = self
             .http_client
             .retryable_http_do(cancellation, &request, None)
@@ -99,26 +80,13 @@ impl WorkClient {
                 String::from_utf8_lossy(&body)
             )))
         } else {
-            if let Some(logger) = &self.logger {
-                logger.debug(
-                    "Work ACK successful",
-                    [
-                        ("environment_id".to_owned(), json!(environment_id)),
-                        ("work_id".to_owned(), json!(work_id)),
-                    ]
-                    .into_iter()
-                    .collect(),
-                );
-            }
+            tracing::debug!("environment_id" = ?(environment_id), "work_id" = ?(work_id), "{}", "Work ACK successful");
             Ok(())
         };
         // Go 的 defer 在成功日志或错误值完成之后执行；Close 失败只写日志，不覆盖
         // ACK 的业务返回值。标准 Reqwest 响应没有该扩展，因此不会生成伪警报。
-        if let (Some(logger), Some(error)) = (&self.logger, close_error) {
-            logger.error(
-                "Failed to close ACK response body",
-                [("error".to_owned(), json!(error))].into_iter().collect(),
-            );
+        if let Some(error) = close_error {
+            tracing::error!("error" = ?(error), "{}", "Failed to close ACK response body");
         }
         result
     }

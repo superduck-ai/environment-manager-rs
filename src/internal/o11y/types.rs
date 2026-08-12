@@ -16,8 +16,6 @@ use opentelemetry::metrics::{Counter, Gauge, Meter};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogHandler, Logger};
-
 /// 指标标签集合；有序 map 让 OTel attributes 与单元测试输出保持确定性。
 pub type MetricTags = BTreeMap<String, String>;
 
@@ -40,16 +38,16 @@ impl O11yError {
     }
 }
 
-/// metrics/logs OTLP 配置，对应 Go `O11yConfig`。
+/// OpenTelemetry 配置。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct O11yConfig {
     /// OTLP/HTTP metrics 完整 endpoint，包括 `/v1/metrics`。
     pub metrics_endpoint: String,
-    /// OTLP/HTTP logs 完整 endpoint；当前恢复的 Go logger 仍为 discard handler。
+    /// 预留的 OTLP/HTTP logs endpoint；应用日志由 tracing subscriber 处理。
     pub logs_endpoint: String,
     /// metrics 与 logs 共享的请求头。
     pub headers: BTreeMap<String, String>,
-    /// 是否初始化 OTel logger；恢复实现初始化成功后仍静默丢弃日志。
+    /// 预留的日志导出开关。
     pub enable_logging: bool,
     /// 是否用 stdout exporter 取代 OTLP exporter；该选项优先级更高。
     pub use_stdout_metrics: bool,
@@ -112,9 +110,6 @@ pub trait TagProvider: Send + Sync {
 /// O11y 服务抽象；所有记录方法都保持无返回值，instrument 故障只写日志。
 #[async_trait]
 pub trait O11yService: Send + Sync {
-    /// 返回可组合进应用 logger 的 handler。
-    fn log_handler(&self) -> Arc<dyn LogHandler>;
-
     /// 刷新并关闭所有 exporter；取消 token 只约束等待，不改变关闭顺序。
     async fn shutdown(&self, cancellation: &CancellationToken) -> Result<(), O11yError>;
 
@@ -166,16 +161,9 @@ impl O11yContext {
     }
 }
 
-/// 实际 O11y 服务，分别持有 metrics provider、logging provider 与 handler。
+/// 实际 O11y 服务。
 pub struct O11yServiceImpl {
     pub(crate) metrics_provider: Option<Arc<O11yMetricsProvider>>,
-    pub(crate) logging_provider: Option<Arc<O11yLoggingProvider>>,
-    pub(crate) log_handler: Arc<dyn LogHandler>,
-}
-
-/// 当前恢复的 logging provider；handler 为 discard，关闭钩子保留未来扩展点。
-pub(crate) struct O11yLoggingProvider {
-    pub(crate) handler: Arc<dyn LogHandler>,
 }
 
 /// 已创建 instrument 的强类型缓存值。
@@ -189,9 +177,6 @@ pub(crate) enum CachedInstrument {
 
 /// OTel meter provider 及其 instrument 缓存。
 pub(crate) struct O11yMetricsProvider {
-    /// instrument 创建失败时使用的 logger；构造时已解析为具体
-    /// tracing logger，因此记录路径不再需要第二套 fallback。
-    pub(crate) logger: Logger,
     pub(crate) meter_provider: Option<SdkMeterProvider>,
     pub(crate) instrument_cache: Mutex<HashMap<String, CachedInstrument>>,
     pub(crate) meter: Mutex<Option<Meter>>,

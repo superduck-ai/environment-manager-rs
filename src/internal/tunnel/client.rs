@@ -28,13 +28,10 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketCon
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
-use crate::internal::{
-    logger::{LogAttributes, Logger},
-    util::format_go_duration,
-};
+use crate::internal::util::format_go_duration;
 
 use super::actions::{ActionError, Registry, ResponseSender};
-use super::helpers::{client_logger, marshal_protojson};
+use super::helpers::marshal_protojson;
 use super::{
     Client, ClientOption, ClientWsResponseSender, HttpResponseSender, HttpTunnelCancel,
     HttpTunnelRequest, HttpTunnelResponseChunk, HttpTunnelResponseError, HttpTunnelResponseHeaders,
@@ -205,16 +202,14 @@ impl EnvironmentProxyConfig {
 /// 创建 HTTP/WS handler 并依次应用 option。认证 token 进入 `SecretString`，不会被
 /// Debug 或日志意外输出。HTTP client 构造失败时返回错误，不产生半初始化对象。
 pub fn new_client(
-    logger: Option<Logger>,
     session_id: impl Into<String>,
     ws_url: impl Into<String>,
     auth_token: impl Into<String>,
     options: Vec<ClientOption>,
 ) -> Result<Arc<Client>, TunnelError> {
-    let http_handler = Arc::new(new_handler(logger.clone())?);
-    let ws_handler = Arc::new(new_ws_handler(logger.clone()));
+    let http_handler = Arc::new(new_handler()?);
+    let ws_handler = Arc::new(new_ws_handler());
     let mut client = Client {
-        logger,
         http_handler: Some(http_handler),
         ws_handler: Some(ws_handler),
         session_id: session_id.into(),
@@ -294,11 +289,7 @@ impl Client {
             .last_pong_time
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
-        let logger = client_logger(self);
-        logger.info(
-            "tunnel_connected",
-            log_attributes([("session_id", Value::String(self.session_id.clone()))]),
-        );
+        tracing::info!("session_id" = ?(self.session_id.clone()), "{}", "tunnel_connected");
         Ok(())
     }
 
@@ -351,11 +342,7 @@ impl Client {
                 return Err(TunnelError::message("context canceled"));
             }
             if let Err(error) = result {
-                let logger = client_logger(self);
-                logger.warn(
-                    "tunnel_run_failed",
-                    log_attributes([("error", Value::String(error.to_string()))]),
-                );
+                tracing::warn!("error" = ?(error.to_string()), "{}", "tunnel_run_failed");
             }
 
             let wait = add_jitter(delay);
@@ -397,14 +384,7 @@ impl Client {
                 Err(error) if cancellation.is_cancelled() => return Err(error),
                 Err(error) => {
                     let wait = add_jitter(delay);
-                    let logger = client_logger(self);
-                    logger.warn(
-                        "tunnel_connect_failed",
-                        log_attributes([
-                            ("error", Value::String(error.to_string())),
-                            ("retry_in", Value::String(format_go_duration(wait))),
-                        ]),
-                    );
+                    tracing::warn!("error" = ?(error.to_string()), "retry_in" = ?(format_go_duration(wait)), "{}", "tunnel_connect_failed");
                     tokio::select! {
                         () = cancellation.cancelled() => return Err(TunnelError::message("context canceled")),
                         () = tokio::time::sleep(wait) => {}
@@ -438,11 +418,7 @@ impl Client {
             let request = match decode_tunnel_request(&data) {
                 Ok(request) => request,
                 Err(error) => {
-                    let logger = client_logger(self);
-                    logger.error(
-                        "tunnel_request_decode_failed",
-                        log_attributes([("error", Value::String(error.to_string()))]),
-                    );
+                    tracing::error!("error" = ?(error.to_string()), "{}", "tunnel_request_decode_failed");
                     continue;
                 }
             };
@@ -450,17 +426,7 @@ impl Client {
                 && !self.session_id.is_empty()
                 && request.session_id != self.session_id
             {
-                let logger = client_logger(self);
-                logger.warn(
-                    "tunnel_request_session_mismatch",
-                    log_attributes([
-                        (
-                            "request_session_id",
-                            Value::String(request.session_id.clone()),
-                        ),
-                        ("client_session_id", Value::String(self.session_id.clone())),
-                    ]),
-                );
+                tracing::warn!("request_session_id" = ?(request.session_id.clone()), "client_session_id" = ?(self.session_id.clone()), "{}", "tunnel_request_session_mismatch");
             }
             self.dispatch_request(cancellation.clone(), request).await;
         }
@@ -533,8 +499,7 @@ impl Client {
                 self.handle_ws_close(&cancellation, Ok(message)).await;
             }
             None => {
-                let logger = client_logger(self);
-                logger.warn("tunnel_request_empty_payload", LogAttributes::new());
+                tracing::warn!("{}", "tunnel_request_empty_payload");
             }
         }
     }
@@ -553,11 +518,7 @@ impl Client {
         let request = match request {
             Ok(request) => request,
             Err(error) => {
-                let logger = client_logger(self);
-                logger.error(
-                    "http_tunnel_request_invalid",
-                    log_attributes([("error", Value::String(error.to_string()))]),
-                );
+                tracing::error!("error" = ?(error.to_string()), "{}", "http_tunnel_request_invalid");
                 return;
             }
         };
@@ -594,14 +555,7 @@ impl Client {
             .handle_request(cancellation, request.clone(), sender)
             .await
         {
-            let logger = client_logger(self);
-            logger.error(
-                "http_tunnel_request_failed",
-                log_attributes([
-                    ("request_id", Value::String(request.request_id)),
-                    ("error", Value::String(error.to_string())),
-                ]),
-            );
+            tracing::error!("request_id" = ?(request.request_id), "error" = ?(error.to_string()), "{}", "http_tunnel_request_failed");
         }
     }
 
@@ -613,22 +567,14 @@ impl Client {
         let cancel = match cancel {
             Ok(cancel) => cancel,
             Err(error) => {
-                let logger = client_logger(self);
-                logger.error(
-                    "http_tunnel_cancel_invalid",
-                    log_attributes([("error", Value::String(error.to_string()))]),
-                );
+                tracing::error!("error" = ?(error.to_string()), "{}", "http_tunnel_cancel_invalid");
                 return;
             }
         };
         if let Some(handler) = &self.http_handler {
             handler.cancel_request(&cancel.request_id);
         }
-        let logger = client_logger(self);
-        logger.info(
-            "http_tunnel_request_cancelled",
-            log_attributes([("request_id", Value::String(cancel.request_id))]),
-        );
+        tracing::info!("request_id" = ?(cancel.request_id), "{}", "http_tunnel_request_cancelled");
     }
 
     /// 对应 Go：`(*Client).handleWSOpen`。
@@ -643,11 +589,7 @@ impl Client {
         let request = match request {
             Ok(request) => request,
             Err(error) => {
-                let logger = client_logger(self);
-                logger.error(
-                    "ws_tunnel_open_invalid",
-                    log_attributes([("error", Value::String(error.to_string()))]),
-                );
+                tracing::error!("error" = ?(error.to_string()), "{}", "ws_tunnel_open_invalid");
                 return;
             }
         };
@@ -668,14 +610,7 @@ impl Client {
             .open_tunnel(cancellation, request.clone(), sender)
             .await
         {
-            let logger = client_logger(self);
-            logger.error(
-                "ws_tunnel_open_failed",
-                log_attributes([
-                    ("tunnel_id", Value::String(request.tunnel_id)),
-                    ("error", Value::String(error.to_string())),
-                ]),
-            );
+            tracing::error!("tunnel_id" = ?(request.tunnel_id), "error" = ?(error.to_string()), "{}", "ws_tunnel_open_failed");
         }
     }
 
@@ -691,37 +626,19 @@ impl Client {
         let message = match message {
             Ok(message) => message,
             Err(error) => {
-                let logger = client_logger(self);
-                logger.error(
-                    "ws_tunnel_message_invalid",
-                    log_attributes([("error", Value::String(error.to_string()))]),
-                );
+                tracing::error!("error" = ?(error.to_string()), "{}", "ws_tunnel_message_invalid");
                 return;
             }
         };
         let Some(handler) = &self.ws_handler else {
             // nil-handler 分支只有 error 属性；不能与下方真实发送失败合并，
             // 否则会误用不同的 Rust 调用位置，还会凭空增加 tunnel_id。
-            let logger = client_logger(self);
-            logger.error(
-                "ws_tunnel_message_failed",
-                log_attributes([(
-                    "error",
-                    Value::String("websocket handler is not configured".to_owned()),
-                )]),
-            );
+            tracing::error!("error" = ?("websocket handler is not configured".to_owned()), "{}", "ws_tunnel_message_failed");
             return;
         };
         let tunnel_id = message.tunnel_id.clone();
         if let Err(error) = handler.send_message(cancellation, message).await {
-            let logger = client_logger(self);
-            logger.error(
-                "ws_tunnel_message_failed",
-                log_attributes([
-                    ("tunnel_id", Value::String(tunnel_id)),
-                    ("error", Value::String(error.to_string())),
-                ]),
-            );
+            tracing::error!("tunnel_id" = ?(tunnel_id), "error" = ?(error.to_string()), "{}", "ws_tunnel_message_failed");
         }
     }
 
@@ -737,35 +654,17 @@ impl Client {
         let message = match message {
             Ok(message) => message,
             Err(error) => {
-                let logger = client_logger(self);
-                logger.error(
-                    "ws_tunnel_close_invalid",
-                    log_attributes([("error", Value::String(error.to_string()))]),
-                );
+                tracing::error!("error" = ?(error.to_string()), "{}", "ws_tunnel_close_invalid");
                 return;
             }
         };
         let Some(handler) = &self.ws_handler else {
-            let logger = client_logger(self);
-            logger.error(
-                "ws_tunnel_close_failed",
-                log_attributes([(
-                    "error",
-                    Value::String("websocket handler is not configured".to_owned()),
-                )]),
-            );
+            tracing::error!("error" = ?("websocket handler is not configured".to_owned()), "{}", "ws_tunnel_close_failed");
             return;
         };
         let tunnel_id = message.tunnel_id.clone();
         if let Err(error) = handler.close_tunnel(cancellation, message).await {
-            let logger = client_logger(self);
-            logger.error(
-                "ws_tunnel_close_failed",
-                log_attributes([
-                    ("tunnel_id", Value::String(tunnel_id)),
-                    ("error", Value::String(error.to_string())),
-                ]),
-            );
+            tracing::error!("tunnel_id" = ?(tunnel_id), "error" = ?(error.to_string()), "{}", "ws_tunnel_close_failed");
         }
     }
 
@@ -1910,12 +1809,4 @@ fn sanitize_headers(value: Option<&mut Value>) {
 /// 仅保留允许的 JSON object key，其他 key 模拟 ProtoJSON DiscardUnknown 丢弃。
 fn retain_fields(object: &mut serde_json::Map<String, Value>, allowed: &[&str]) {
     object.retain(|key, _| allowed.contains(&key.as_str()));
-}
-
-/// 构造稳定顺序的结构化日志属性。
-fn log_attributes<const N: usize>(pairs: [(&str, Value); N]) -> LogAttributes {
-    pairs
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }

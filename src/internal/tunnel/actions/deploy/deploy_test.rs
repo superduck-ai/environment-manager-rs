@@ -61,8 +61,8 @@ fn new_test_vercel_client(server: &MockServer) -> VercelClient {
 /// 对应 Go `TestNewDeployAction`，验证凭据、client、target 和 action 元数据。
 #[test]
 fn test_new_deploy_action() {
-    let antspace = new_antspace_client("https://control.example", "token", None);
-    let action = new_deploy_action(None, "vercel-token", "team", Some(antspace), "antspace");
+    let antspace = new_antspace_client("https://control.example", "token");
+    let action = new_deploy_action("vercel-token", "team", Some(antspace), "antspace");
     assert_eq!(action.vercel_token, "vercel-token");
     assert_eq!(action.vercel_team_id, "team");
     assert!(action.antspace_client.is_some());
@@ -74,10 +74,9 @@ fn test_new_deploy_action() {
 /// 对应 Go `TestNewAntspaceClient`，验证控制面地址、凭据和 HTTP client 初始化。
 #[test]
 fn test_new_antspace_client() {
-    let antspace = new_antspace_client("https://control.example", "token", None);
+    let antspace = new_antspace_client("https://control.example", "token");
     assert_eq!(antspace.control_plane_url, "https://control.example");
     assert_eq!(antspace.auth_token, "token");
-    assert!(antspace.logger.is_none());
 }
 
 /// 验证 session 前缀、20 字节截断、Unicode 非法尾部和字符 allow-list。
@@ -175,7 +174,6 @@ async fn test_antspace_deploy_sends_multipart_request() {
         control_plane_url: server.uri(),
         auth_token: "token".to_owned(),
         http_client: reqwest::Client::new(),
-        logger: None,
     };
     let progress = Arc::new(RecordingProgress::default());
     let result = client
@@ -231,7 +229,6 @@ async fn test_antspace_read_deploy_response_errors() {
         control_plane_url: unavailable.uri(),
         auth_token: String::new(),
         http_client: reqwest::Client::new(),
-        logger: None,
     };
     let error = client
         .deploy(&CancellationToken::new(), "app", Vec::new(), None)
@@ -249,7 +246,6 @@ async fn test_antspace_read_deploy_response_errors() {
         control_plane_url: invalid.uri(),
         auth_token: String::new(),
         http_client: reqwest::Client::new(),
-        logger: None,
     };
     let error = client
         .deploy(&CancellationToken::new(), "app", Vec::new(), None)
@@ -270,7 +266,6 @@ async fn test_antspace_read_deploy_response_errors() {
         control_plane_url: response_error.uri(),
         auth_token: String::new(),
         http_client: reqwest::Client::new(),
-        logger: None,
     };
     let error = client
         .deploy(&CancellationToken::new(), "app", Vec::new(), None)
@@ -501,7 +496,7 @@ async fn test_get_commit_sha() {
 /// 验证 JSON、目录和 target 配置错误均在构建/网络副作用前返回。
 #[tokio::test]
 async fn test_execute_early_errors() {
-    let action = new_deploy_action(None, "", "", None, "antspace");
+    let action = new_deploy_action("", "", None, "antspace");
     let progress: Arc<dyn ProgressReporter> = Arc::new(RecordingProgress::default());
 
     let error = action

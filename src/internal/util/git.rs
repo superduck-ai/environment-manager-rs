@@ -1,8 +1,7 @@
 //! Git 引用维护工具。
 //!
 //! 本文件对应 Go 的 `internal/util/git.go`。模块只通过外部 `git update-ref` 更新
-//! remote-tracking ref，并由调用方注入的 [`Logger`] 记录结构化事件；当调用方
-//! 没有 logger 时，退回进程级 Rust tracing logger。
+//! remote-tracking ref，并通过 `tracing` 记录结构化事件。
 //!
 //! Rust 与 Go 的结构差异仅在取消信号：Go 使用 `context.Context`，Rust 使用
 //! [`CancellationToken`]。两者都只终止当前直接子进程，不创建或清理进程组。
@@ -17,8 +16,6 @@ use nix::{fcntl::OFlag, unistd::pipe2};
 use thiserror::Error;
 use tokio::{io::AsyncReadExt as _, process::Command};
 use tokio_util::sync::CancellationToken;
-
-use crate::internal::logger::{LogAttributes, Logger, default_logger};
 
 /// 更新 remote-tracking ref 时的兼容错误。
 ///
@@ -51,7 +48,6 @@ struct CombinedCommandFailure {
 /// # 参数
 /// - `cancellation`：调用链的取消信号；预取消时不启动进程，运行中取消只 kill 并
 ///   回收直接 `git` 子进程。
-/// - `logger`：业务结构化 logger；`None` 时使用进程级 Rust tracing logger。
 /// - `repo_path`：Git 工作区目录，仅在子进程执行期间借用。
 /// - `remote_name`：remote 名称，作为 ref 路径的一部分原样使用。
 /// - `branch_name`：branch 名称，作为 ref 路径的一部分原样使用。
@@ -70,46 +66,29 @@ struct CombinedCommandFailure {
 /// 否则输出交错顺序以及尾随换行都会偏离 Go。
 pub async fn update_remote_tracking_branch(
     cancellation: &CancellationToken,
-    logger: Option<&Logger>,
     repo_path: impl AsRef<Path>,
     remote_name: &str,
     branch_name: &str,
     revision: &str,
 ) -> Result<(), GitRefError> {
-    // 显式 match 允许 `'static` 默认引用安全缩短到调用方借用期；`unwrap_or_else`
-    // 会把泛型返回值错误推导成 `'static`，进而要求传入引用逃逸函数体。
-    let logger = match logger {
-        Some(logger) => logger,
-        None => default_logger(),
-    };
     let repo_path: PathBuf = repo_path.as_ref().to_owned();
     let reference = format!("refs/remotes/{remote_name}/{branch_name}");
 
     match run_update_ref(cancellation, &repo_path, &reference, revision).await {
         Ok(_) => {
-            let mut attributes = LogAttributes::new();
-            attributes.insert("ref".to_owned(), serde_json::json!(&reference));
-            attributes.insert("revision".to_owned(), serde_json::json!(revision));
-            logger.info("Updated remote tracking branch", attributes);
+            tracing::info!(reference, revision, "Updated remote tracking branch");
             Ok(())
         }
         Err(failure) => {
-            // 属性插入顺序必须与 Go 的 `WarnContext` 参数顺序一致；JSON handler 会
-            // 保留该顺序，差分测试把它视为外部协议的一部分。
-            let mut attributes = LogAttributes::new();
-            attributes.insert(
-                "repo_path".to_owned(),
-                serde_json::json!(repo_path.to_string_lossy()),
+            tracing::warn!(
+                repo_path = %repo_path.display(),
+                remote = remote_name,
+                branch = branch_name,
+                revision,
+                output = %String::from_utf8_lossy(&failure.output),
+                error = %failure.error,
+                "Failed to update remote tracking branch"
             );
-            attributes.insert("remote".to_owned(), serde_json::json!(remote_name));
-            attributes.insert("branch".to_owned(), serde_json::json!(branch_name));
-            attributes.insert("revision".to_owned(), serde_json::json!(revision));
-            attributes.insert(
-                "output".to_owned(),
-                serde_json::json!(String::from_utf8_lossy(&failure.output)),
-            );
-            attributes.insert("error".to_owned(), serde_json::json!(&failure.error));
-            logger.warn("Failed to update remote tracking branch", attributes);
 
             Err(GitRefError {
                 reference,

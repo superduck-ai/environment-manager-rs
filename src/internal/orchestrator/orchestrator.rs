@@ -9,16 +9,15 @@ use std::{
 };
 
 use async_trait::async_trait;
-use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use super::{
     NoopOrchestratorObserver, Orchestrator, OrchestratorConfig, OrchestratorError,
     OrchestratorEvent, OrchestratorObserver, OrchestratorResult, RawMessage, SessionOutput,
-    StdoutSessionOutput, default_orchestrator_logger, log_attributes,
+    StdoutSessionOutput,
 };
-use crate::internal::util::go_duration_nanoseconds;
+use crate::internal::util::duration_nanoseconds;
 
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_LOOP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -41,13 +40,7 @@ pub fn new_orchestrator(mut config: OrchestratorConfig) -> OrchestratorResult<Or
         config.session_output = Some(Arc::new(StdoutSessionOutput));
     }
 
-    let logger = config
-        .logger
-        .clone()
-        .unwrap_or_else(default_orchestrator_logger)
-        .with_attrs(log_attributes([("component", json!("orchestrator"))]));
-    config.logger = Some(logger.clone());
-    Ok(Orchestrator { config, logger })
+    Ok(Orchestrator { config })
 }
 
 impl Orchestrator {
@@ -65,18 +58,12 @@ impl Orchestrator {
             return (loop_start_time, self.config.loop_timeout - elapsed);
         }
 
-        self.logger.info(
-            "loop timeout reached, triggering timeout hook",
-            Default::default(),
-        );
+        tracing::info!("{}", "loop timeout reached, triggering timeout hook");
         self.observer().record_event(OrchestratorEvent::Timeout);
         if let Some(hook) = &self.config.timeout_hook
-            && let Err(error) = hook.execute(cancellation, &self.logger).await
+            && let Err(error) = hook.execute(cancellation).await
         {
-            self.logger.error(
-                "timeout hook failed",
-                log_attributes([("error", json!(error.to_string()))]),
-            );
+            tracing::error!("error" = ?(error.to_string()), "{}", "timeout hook failed");
         }
 
         (Instant::now(), self.config.loop_timeout)
@@ -96,16 +83,7 @@ impl Orchestrator {
     ) -> OrchestratorResult<Option<RawMessage>> {
         let now = Instant::now();
         let poll_deadline = now.checked_add(poll_timeout).unwrap_or(now);
-        self.logger.info(
-            "starting poll loop",
-            log_attributes([
-                ("poll_timeout", json!(go_duration_nanoseconds(poll_timeout))),
-                (
-                    "remaining_loop_time",
-                    json!(go_duration_nanoseconds(remaining_loop_time)),
-                ),
-            ]),
-        );
+        tracing::info!("poll_timeout" = ?(duration_nanoseconds(poll_timeout)), "remaining_loop_time" = ?(duration_nanoseconds(remaining_loop_time)), "{}", "starting poll loop");
 
         while Instant::now() < poll_deadline {
             self.observer().record_event(OrchestratorEvent::PollAttempt);
@@ -117,13 +95,7 @@ impl Orchestrator {
             let session_json = match poll_result {
                 Ok(session_json) => session_json,
                 Err(error) => {
-                    self.logger.error(
-                        "poll failed",
-                        log_attributes([
-                            ("duration", json!(go_duration_nanoseconds(poll_duration))),
-                            ("error", json!(error.to_string())),
-                        ]),
-                    );
+                    tracing::error!("duration" = ?(duration_nanoseconds(poll_duration)), "error" = ?(error.to_string()), "{}", "poll failed");
                     self.observer().record_event(OrchestratorEvent::PollError);
                     *consecutive_failures = (*consecutive_failures).saturating_add(1);
                     if self.config.max_poll_failures > 0
@@ -138,13 +110,7 @@ impl Orchestrator {
                     let exponent = (*consecutive_failures).clamp(0, 6) as u32;
                     let backoff_seconds = (1_u64 << exponent).min(60);
                     let backoff = Duration::from_secs(backoff_seconds);
-                    self.logger.warn(
-                        "backing off after poll failure",
-                        log_attributes([
-                            ("consecutive_failures", json!(*consecutive_failures)),
-                            ("backoff", json!(go_duration_nanoseconds(backoff))),
-                        ]),
-                    );
+                    tracing::warn!("consecutive_failures" = ?(*consecutive_failures), "backoff" = ?(duration_nanoseconds(backoff)), "{}", "backing off after poll failure");
 
                     // 取消优先于刚好同时到期的 timer，保证 shutdown 不会额外发一次请求。
                     tokio::select! {
@@ -164,8 +130,7 @@ impl Orchestrator {
                 return Ok(session_json);
             }
 
-            self.logger
-                .debug("queue is empty, will retry", Default::default());
+            tracing::debug!("queue is empty, will retry");
             self.observer().record_event(OrchestratorEvent::QueueEmpty);
             self.poller()
                 .sleep_with_jitter(cancellation)
@@ -177,19 +142,13 @@ impl Orchestrator {
                 })?;
         }
 
-        self.logger.info(
-            "poll timeout reached, queue empty",
-            log_attributes([("poll_timeout", json!(go_duration_nanoseconds(poll_timeout)))]),
-        );
+        tracing::info!("poll_timeout" = ?(duration_nanoseconds(poll_timeout)), "{}", "poll timeout reached, queue empty");
         Ok(None)
     }
 
     /// 对应 Go `(*Orchestrator).outputSession`，把原始 JSON 加换行写 stdout。
     pub async fn output_session(&self, session_json: &[u8]) -> OrchestratorResult<()> {
-        self.logger.info(
-            "received session task, writing to stdout",
-            Default::default(),
-        );
+        tracing::info!("{}", "received session task, writing to stdout");
         self.observer()
             .record_event(OrchestratorEvent::SessionStart);
         self.session_output()
@@ -201,10 +160,7 @@ impl Orchestrator {
                 ))
             })?;
 
-        self.logger.info(
-            "session task written to stdout, exiting",
-            Default::default(),
-        );
+        tracing::info!("{}", "session task written to stdout, exiting");
         self.observer().record_event(OrchestratorEvent::SessionEnd);
         Ok(())
     }
@@ -214,28 +170,15 @@ impl Orchestrator {
     /// 每轮有效 poll timeout 是配置窗口与 loop 剩余时间的较小值。execute Hook 存在时
     /// work JSON 只送 stdin，不写 stdout；Hook 失败记录 session end error 并立即返回。
     pub async fn run(&self, cancellation: &CancellationToken) -> OrchestratorResult<()> {
-        self.logger.info(
-            "starting orchestrator",
-            log_attributes([
-                (
-                    "poll_timeout",
-                    json!(go_duration_nanoseconds(self.config.poll_timeout)),
-                ),
-                (
-                    "loop_timeout",
-                    json!(go_duration_nanoseconds(self.config.loop_timeout)),
-                ),
-                ("max_poll_failures", json!(self.config.max_poll_failures)),
-            ]),
-        );
+        tracing::info!("poll_timeout" = ?(duration_nanoseconds(self.config.poll_timeout)), "loop_timeout" = ?(duration_nanoseconds(self.config.loop_timeout)), "max_poll_failures" = ?(self.config.max_poll_failures), "{}", "starting orchestrator");
 
         let mut consecutive_failures = 0_i64;
         let mut loop_start_time = Instant::now();
         loop {
             if cancellation.is_cancelled() {
-                self.logger.info(
-                    "orchestrator shutting down due to context cancellation",
-                    Default::default(),
+                tracing::info!(
+                    "{}",
+                    "orchestrator shutting down due to context cancellation"
                 );
                 return Err(OrchestratorError::message(
                     "orchestrator stopped: context canceled",
@@ -260,18 +203,14 @@ impl Orchestrator {
             };
 
             if let Some(execute_hook) = &self.config.execute_hook {
-                self.logger
-                    .info("executing session with execute hook", Default::default());
+                tracing::info!("executing session with execute hook");
                 self.observer()
                     .record_event(OrchestratorEvent::SessionStart);
                 if let Err(error) = execute_hook
-                    .execute_with_stdin(cancellation, &self.logger, &session_json)
+                    .execute_with_stdin(cancellation, &session_json)
                     .await
                 {
-                    self.logger.error(
-                        "execute hook failed",
-                        log_attributes([("error", json!(error.to_string()))]),
-                    );
+                    tracing::error!("error" = ?(error.to_string()), "{}", "execute hook failed");
                     self.observer()
                         .record_event(OrchestratorEvent::SessionEndError(error.to_string()));
                     return Err(OrchestratorError::message(format!(
@@ -279,8 +218,7 @@ impl Orchestrator {
                     )));
                 }
 
-                self.logger
-                    .info("execute hook completed successfully", Default::default());
+                tracing::info!("execute hook completed successfully");
                 self.observer().record_event(OrchestratorEvent::SessionEnd);
                 return Ok(());
             }

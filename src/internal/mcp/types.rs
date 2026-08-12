@@ -1,6 +1,6 @@
 //! MCP 迁移边界的数据类型与异步接口。
 //!
-//! 类型源自 Go `zz_recovered_types.go`。JSON 类型使用 `serde(flatten)` 保存未知
+//! MCP server、tool 与 JSON 请求类型。JSON 类型使用 `serde(flatten)` 保存未知
 //! 字段，避免代理或新协议版本经过本服务时被旧结构无意裁剪；运行期资源使用 Arc、
 //! Tokio cancellation token 与显式 async trait，替代 Go interface、goroutine 和 channel。
 
@@ -25,7 +25,6 @@ use tokio_util::sync::CancellationToken;
 use crate::internal::{
     auth::AuthContext,
     config::{ClaudeConfig, StartupContext},
-    logger::{LogAttributes, Logger},
     session::ActivityRecorder,
 };
 
@@ -327,7 +326,6 @@ pub type FactoryFuture =
 pub type MCPServerFactory = Arc<
     dyn Fn(
             CancellationToken,
-            Logger,
             Option<Arc<AuthContext>>,
             PathBuf,
             Option<Arc<StartupContext>>,
@@ -393,8 +391,6 @@ pub(crate) struct ServerRuntime {
 
 /// 业务 server 共享的 loopback HTTP 实现。
 pub struct BaseServer {
-    /// 结构化 logger；不观察日志的调用方也必须显式传入 discard handler。
-    pub logger: Logger,
     /// server 稳定名称。
     pub name: String,
     /// MCP implementation 版本。
@@ -412,9 +408,8 @@ pub struct BaseServer {
 impl BaseServer {
     /// 创建尚未启动的基础 server。
     #[must_use]
-    pub fn new(logger: Logger, name: impl Into<String>, version: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
         Self {
-            logger,
             name: name.into(),
             version: version.into(),
             bearer_token: RwLock::new(String::new()),
@@ -470,14 +465,6 @@ impl fmt::Debug for BaseServer {
             .field("has_bearer_token", &!self.bearer_token().is_empty())
             .finish_non_exhaustive()
     }
-}
-
-/// 构造 logger 属性，集中避免各调用点重复样板。
-pub(crate) fn log_attributes<const N: usize>(fields: [(&str, Value); N]) -> LogAttributes {
-    fields
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }
 
 /// registry 进程级存储的具体容器类型。

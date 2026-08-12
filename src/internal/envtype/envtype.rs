@@ -1,15 +1,12 @@
 //! 环境类型注册与创建逻辑。
 //!
-//! 对应 Go：`internal/envtype/envtype.go`。本文件实现注册表创建、覆盖注册以及按类型
-//! 名称调用 Factory；Rust 将 Go 的 `*slog.Logger` 表达为必填、可克隆的 [`Logger`]，
-//! 由 manager 经注册表原样交给具体环境。
+//! 本文件实现环境类型注册表的创建、覆盖注册以及按类型名称调用 Factory。
 //!
 //! 注册表保留 Go 的覆盖语义：相同名称后注册者覆盖前者。无效注册仍 panic，
 //! 因为它属于启动期程序配置错误；运行时未知类型和工厂错误则使用类型化错误。
 
 use thiserror::Error;
 
-use crate::internal::logger::Logger;
 use crate::internal::util::BoxError;
 
 use super::{EnvTypes, EnvironmentType, Registration};
@@ -55,14 +52,11 @@ impl EnvTypes {
 
     /// 对应 Go：`internal/envtype/envtype.go` 中的 `EnvTypes.Create`。
     ///
-    /// 使用命中的工厂原样传递 JSON 字节和 manager logger，并创建环境实例。
-    /// logger 的接收端和固定属性都会随 clone 保留，确保环境初始化日志
-    /// 进入与 manager 相同的 tracing 输出链。
+    /// 使用命中的工厂原样传递 JSON 字节，并创建环境实例。
     ///
     /// # 参数
     /// - `type_name`：配置声明的稳定环境类型名称。
     /// - `raw_config`：后端返回的原始 JSON 配置。
-    /// - `logger`：本次 session 的结构化 logger，所有权转交给工厂。
     ///
     /// # 返回
     /// 未注册类型返回 `NotFound`；工厂解析或校验失败时返回透明的 `Factory` 错误。
@@ -70,7 +64,6 @@ impl EnvTypes {
         &self,
         type_name: &str,
         raw_config: &[u8],
-        logger: Logger,
     ) -> Result<Box<dyn EnvironmentType>, EnvTypeError> {
         let registration = self
             .registry
@@ -82,7 +75,7 @@ impl EnvTypes {
             .factory
             .as_ref()
             .expect("register rejects registrations without a factory");
-        factory(raw_config, logger).map_err(EnvTypeError::Factory)
+        factory(raw_config).map_err(EnvTypeError::Factory)
     }
 
     /// 返回当前注册项数量，主要供启动诊断和测试使用。

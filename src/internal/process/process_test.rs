@@ -16,11 +16,7 @@ use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::{
-    logger::Logger,
-    o11y::{DiscardO11yService, O11yService as _},
-    util::{OutputStreamer, StreamType, output_streamer},
-};
+use crate::internal::util::{OutputStreamer, StreamType, output_streamer};
 
 use super::process::stream_pipe;
 use super::script::split_pattern;
@@ -132,32 +128,18 @@ impl RecordedStreams {
     }
 }
 
-/// 对应 Go：`processTestLogger`。
-///
-/// 返回使用显式 discard handler 的具体 Logger。生产 API 不保留 Go 的 nil logger
-/// fallback，因此每个测试都必须明确注入 handler，防止错误日志污染测试 stderr。
-fn process_test_logger() -> Logger {
-    Logger::new(DiscardO11yService.log_handler())
-}
-
 /// 验证成功状态、时间字段以及 stdout/stderr 并发转发。
 #[tokio::test]
 async fn test_execute_streams_output_and_records_success() {
-    let logger = process_test_logger();
     let temp = TempDir::new().unwrap();
     let script = write_executable_script(
         &temp,
         "#!/bin/sh\nprintf 'hello stdout'\nprintf 'hello stderr' >&2\n",
     );
     let streams = new_recorded_streams();
-    let result = execute(
-        &CancellationToken::new(),
-        logger,
-        &script,
-        streams.streamer(),
-    )
-    .await
-    .unwrap();
+    let result = execute(&CancellationToken::new(), &script, streams.streamer())
+        .await
+        .unwrap();
     assert_eq!(result.exit_code, 0);
     assert!(result.error.is_none());
     assert!(result.end_time >= result.start_time);
@@ -168,18 +150,12 @@ async fn test_execute_streams_output_and_records_success() {
 /// 验证非零退出仍返回执行结果并保留退出前输出。
 #[tokio::test]
 async fn test_execute_records_exit_error() {
-    let logger = process_test_logger();
     let temp = TempDir::new().unwrap();
     let script = write_executable_script(&temp, "#!/bin/sh\nprintf 'before failure'\nexit 7\n");
     let streams = new_recorded_streams();
-    let result = execute(
-        &CancellationToken::new(),
-        logger,
-        &script,
-        streams.streamer(),
-    )
-    .await
-    .unwrap();
+    let result = execute(&CancellationToken::new(), &script, streams.streamer())
+        .await
+        .unwrap();
     assert_eq!(result.exit_code, 7);
     assert_eq!(result.error, Some(ProcessExitError::ExitCode(7)));
     assert_eq!(streams.output(StreamType::Stdout), "before failure");
@@ -188,16 +164,9 @@ async fn test_execute_records_exit_error() {
 /// 验证空 executable path 在创建子进程前被同步拒绝。
 #[tokio::test]
 async fn test_execute_validation_errors() {
-    let logger = process_test_logger();
     let streams = new_recorded_streams();
     assert!(matches!(
-        execute(
-            &CancellationToken::new(),
-            logger,
-            Path::new(""),
-            streams.streamer(),
-        )
-        .await,
+        execute(&CancellationToken::new(), Path::new(""), streams.streamer(),).await,
         Err(ProcessError::EmptyPath)
     ));
 }
@@ -214,14 +183,9 @@ async fn pre_cancelled_execute_never_attempts_spawn() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    let error = execute(
-        &cancellation,
-        process_test_logger(),
-        &path,
-        new_recorded_streams().streamer(),
-    )
-    .await
-    .unwrap_err();
+    let error = execute(&cancellation, &path, new_recorded_streams().streamer())
+        .await
+        .unwrap_err();
     assert!(matches!(error, ProcessError::Cancelled));
     assert_eq!(
         error.to_string(),
@@ -248,7 +212,6 @@ async fn look_path_and_slash_permission_errors_match_go() {
 
     let lookup_error = execute(
         &CancellationToken::new(),
-        process_test_logger(),
         Path::new("blocked-tool"),
         new_recorded_streams().streamer(),
     )
@@ -261,7 +224,6 @@ async fn look_path_and_slash_permission_errors_match_go() {
 
     let slash_error = execute(
         &CancellationToken::new(),
-        process_test_logger(),
         &non_executable,
         new_recorded_streams().streamer(),
     )
@@ -289,7 +251,6 @@ async fn slash_spawn_errors_preserve_non_utf8_path_bytes() {
         .join(OsString::from_vec(b"missing-\xff".to_vec()));
     let missing_error = execute(
         &CancellationToken::new(),
-        process_test_logger(),
         &missing,
         new_recorded_streams().streamer(),
     )
@@ -307,7 +268,6 @@ async fn slash_spawn_errors_preserve_non_utf8_path_bytes() {
     std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o600)).unwrap();
     let denied_error = execute(
         &CancellationToken::new(),
-        process_test_logger(),
         &denied,
         new_recorded_streams().streamer(),
     )
@@ -344,7 +304,6 @@ async fn look_path_honors_errdot_and_godebug_override() {
 
     let error = execute(
         &CancellationToken::new(),
-        process_test_logger(),
         Path::new("relative-tool"),
         new_recorded_streams().streamer(),
     )
@@ -360,7 +319,6 @@ async fn look_path_honors_errdot_and_godebug_override() {
     let streams = new_recorded_streams();
     let result = execute(
         &CancellationToken::new(),
-        process_test_logger(),
         Path::new("relative-tool"),
         streams.streamer(),
     )
@@ -394,7 +352,6 @@ async fn look_path_preserves_non_utf8_directory_bytes() {
     let streams = new_recorded_streams();
     let result = execute(
         &CancellationToken::new(),
-        process_test_logger(),
         Path::new("byte-path-tool"),
         streams.streamer(),
     )
@@ -406,7 +363,6 @@ async fn look_path_preserves_non_utf8_directory_bytes() {
     let missing_name = PathBuf::from(OsString::from_vec(b"missing-\xff-tool".to_vec()));
     let error = execute(
         &CancellationToken::new(),
-        process_test_logger(),
         &missing_name,
         new_recorded_streams().streamer(),
     )
@@ -424,7 +380,6 @@ async fn test_execute_script_writes_runs_and_cleans_temp_script() {
     // fixture 内的 shell 通过 PATH 查找 stat；与临时替换 PATH 的 LookPath 测试
     // 共享全局锁，避免默认并行执行时产生与被测逻辑无关的启动失败。
     let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
-    let logger = process_test_logger();
     let output = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&output);
     let streamer = output_streamer(move |stream, bytes| {
@@ -433,13 +388,7 @@ async fn test_execute_script_writes_runs_and_cleans_temp_script() {
         }
         Ok::<_, io::Error>(())
     });
-    let result = execute_script(
-        &CancellationToken::new(),
-        logger,
-        "#!/bin/sh\nprintf 'SCRIPT_PATH:%s\\n' \"$0\"\nprintf 'SCRIPT_MODE:%s\\n' \"$(stat -c %a \"$0\")\"\n",
-        "process-test-*.sh",
-        streamer,
-    )
+    let result = execute_script(&CancellationToken::new(), "#!/bin/sh\nprintf 'SCRIPT_PATH:%s\\n' \"$0\"\nprintf 'SCRIPT_MODE:%s\\n' \"$(stat -c %a \"$0\")\"\n", "process-test-*.sh", streamer)
     .await
     .unwrap();
     assert_eq!(result.exit_code, 0);
@@ -453,10 +402,9 @@ async fn test_execute_script_writes_runs_and_cleans_temp_script() {
 /// 验证空脚本在触碰文件系统前被拒绝。
 #[tokio::test]
 async fn test_execute_script_validation_errors() {
-    let logger = process_test_logger();
     let streamer = output_streamer(|_, _| Ok::<_, io::Error>(()));
     assert!(matches!(
-        execute_script(&CancellationToken::new(), logger, "", "test-*", streamer).await,
+        execute_script(&CancellationToken::new(), "", "test-*", streamer).await,
         Err(ScriptError::EmptyContent)
     ));
 }
@@ -464,7 +412,6 @@ async fn test_execute_script_validation_errors() {
 /// 验证输出回调报错后 reader 立即停止，而不是继续排空 pipe。
 #[tokio::test]
 async fn test_stream_pipe_stops_when_streamer_errors() {
-    let logger = process_test_logger();
     let (mut writer, reader) = tokio::io::duplex(64);
     writer.write_all(b"hello").await.unwrap();
     drop(writer);
@@ -475,14 +422,13 @@ async fn test_stream_pipe_stops_when_streamer_errors() {
         observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(io::Error::other("stop"))
     });
-    stream_pipe(logger, reader, StreamType::Stdout, streamer).await;
+    stream_pipe(reader, StreamType::Stdout, streamer).await;
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 /// 验证取消 token 只终止直接子进程，并让无孙进程的命令及时回收。
 #[tokio::test]
 async fn cancellation_kills_process() {
-    let logger = process_test_logger();
     let temp = TempDir::new().unwrap();
     // 使用 shell 自身的 busy loop，避免产生孙进程。若使用 `sleep 60`，严格兼容
     // Go 的“只杀直接 child”会让 sleep 继续持有 pipe，测试也应观察到长期阻塞。
@@ -496,7 +442,7 @@ async fn cancellation_kills_process() {
     });
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        execute(&cancellation, logger, &script, streams.streamer()),
+        execute(&cancellation, &script, streams.streamer()),
     )
     .await
     .unwrap()
@@ -535,15 +481,7 @@ async fn cancellation_kills_only_direct_child_with_sigkill() {
     let execution = tokio::spawn({
         let cancellation = cancellation.clone();
         let streams = new_recorded_streams();
-        async move {
-            execute(
-                &cancellation,
-                process_test_logger(),
-                script,
-                streams.streamer(),
-            )
-            .await
-        }
+        async move { execute(&cancellation, script, streams.streamer()).await }
     });
     for _ in 0..100 {
         if pid_file.exists() {
@@ -590,15 +528,7 @@ async fn cancellation_waits_for_descendant_that_holds_pipes() {
     let mut execution = tokio::spawn({
         let cancellation = cancellation.clone();
         let streams = new_recorded_streams();
-        async move {
-            execute(
-                &cancellation,
-                process_test_logger(),
-                script,
-                streams.streamer(),
-            )
-            .await
-        }
+        async move { execute(&cancellation, script, streams.streamer()).await }
     });
     for _ in 0..100 {
         if pid_file.exists() {
