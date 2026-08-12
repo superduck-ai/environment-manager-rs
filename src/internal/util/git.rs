@@ -1,8 +1,8 @@
 //! Git 引用维护工具。
 //!
 //! 本文件对应 Go 的 `internal/util/git.go`。模块只通过外部 `git update-ref` 更新
-//! remote-tracking ref，并由调用方注入的 [`Logger`] 复刻 Go `slog` 消息；当调用方
-//! 没有 logger 时，退回进程级 `slog.Default()` 兼容实现。
+//! remote-tracking ref，并由调用方注入的 [`Logger`] 记录结构化事件；当调用方
+//! 没有 logger 时，退回进程级 Rust tracing logger。
 //!
 //! Rust 与 Go 的结构差异仅在取消信号：Go 使用 `context.Context`，Rust 使用
 //! [`CancellationToken`]。两者都只终止当前直接子进程，不创建或清理进程组。
@@ -18,7 +18,7 @@ use thiserror::Error;
 use tokio::{io::AsyncReadExt as _, process::Command};
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, Logger, default_slog_logger};
+use crate::internal::logger::{LogAttributes, Logger, default_logger};
 
 /// 更新 remote-tracking ref 时的兼容错误。
 ///
@@ -51,8 +51,7 @@ struct CombinedCommandFailure {
 /// # 参数
 /// - `cancellation`：调用链的取消信号；预取消时不启动进程，运行中取消只 kill 并
 ///   回收直接 `git` 子进程。
-/// - `logger`：业务结构化 logger；`None` 精确对应 Go 的 nil logger，并退回
-///   `slog.Default()`。
+/// - `logger`：业务结构化 logger；`None` 时使用进程级 Rust tracing logger。
 /// - `repo_path`：Git 工作区目录，仅在子进程执行期间借用。
 /// - `remote_name`：remote 名称，作为 ref 路径的一部分原样使用。
 /// - `branch_name`：branch 名称，作为 ref 路径的一部分原样使用。
@@ -81,7 +80,7 @@ pub async fn update_remote_tracking_branch(
     // 会把泛型返回值错误推导成 `'static`，进而要求传入引用逃逸函数体。
     let logger = match logger {
         Some(logger) => logger,
-        None => default_slog_logger(),
+        None => default_logger(),
     };
     let repo_path: PathBuf = repo_path.as_ref().to_owned();
     let reference = format!("refs/remotes/{remote_name}/{branch_name}");

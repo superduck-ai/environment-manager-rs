@@ -34,7 +34,7 @@ use crate::internal::{
     claude::{self, ClaudeObservability, Executor, Outcomes},
     config::{self, SessionMode as ConfigSessionMode},
     envtype,
-    logger::{LogAttributes, Logger, create_logger_with_file_output},
+    logger::{LogAttributes, Logger, create_logger},
     manager::{
         ClaudeExecutorFactory, Manager, ManagerApiClient, ManagerError, ManagerObservability,
         new_manager_with_executor_and_claude_config,
@@ -954,7 +954,7 @@ pub async fn run_task_run(arguments: &TaskRunArgs) -> Result<(), RuntimeError> {
         unsafe { std::env::set_var("SKIP_GIT_CONFIG", "true") };
     }
 
-    let logger = create_logger_with_file_output(logger_level(arguments.log_level));
+    let logger = create_logger(logger_level(arguments.log_level));
     if arguments.stdin_was_set {
         logger.warn(
             "The --stdin flag is deprecated and will be removed in a future release. Stdin is now always used.",

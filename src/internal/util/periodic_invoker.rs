@@ -209,7 +209,7 @@ impl PeriodicInvoker {
                 _ = ticker.tick() => {
                     if let Err(error) = function().await {
                         // 这里不能与首次调用合并成同一个 logger helper：Go 的两个
-                        // slog 调用点具有不同 source 行号，差分门禁需要独立 caller。
+                        // 保留独立调用点，便于区分两个停止分支。
                         logger.error(
                             "periodic function failed",
                             periodic_error_attributes(error.as_ref(), interval),

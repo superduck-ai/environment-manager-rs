@@ -5,26 +5,9 @@
 `tunnel_protojson`、`tunnel_http_runtime` 和 `tunnel_ws_runtime` 七份 transcript。
 Go 侧使用固定 Go 1.25.7 digest 镜像和 `go test -overlay`；overlay backing file
 位于 Rust 仓库，Go 工作树始终以只读方式挂载。`process_edge` 是只依赖 Go 标准库的
-独立 probe，仍在同一个固定镜像内执行，不向 Go 工作树注入或写入文件。
-
-除此之外，Linux ARM64 总门禁还固定运行
-`scripts/compat/run_logger_source_differential.sh`。它不是七 transcript comparator
-的可选 normalizer，而是单独的严格证据链：先从固定 Go 1.25.7 `-trimpath` ARM64 ELF
-提取每个生产 slog 调用表达式中的 PC，再由同一个 ELF 通过 `runtime.CallersFrames`
-重建 `function/file/line` oracle。候选 PC 是静态近似：已由 canonical CLI 实际输出证明
-不同的项目必须逐项登记在 `compat/go-log-source-canonical-overrides.tsv`，同时钉住
-probe 旧值与 canonical 新值；任一侧漂移都会失败，不能扩大成 source normalizer。
-catalog probe 只在容器临时副本中参与链接；一个
-不可达环境变量分支负责保留链接器原本会裁掉的调用点，既不执行业务逻辑，也不写入
-Go 工作树。
-
-`go-rust-log-sources.tsv` 必须 100% 为 `mapped-oracle`。审计同时从 Rust 向 Go 检查
-runtime 规则，并从 Go 向 Rust 检查 683 个生产调用点均被恰好一个 Rust callsite 消费；
-零消费、多消费、identity 冲突和无来源规则都失败。生产 `tracing::*` 宏由独立扫描器
-一律作为 `tracing-event-not-source-compatible` blocker，不能绕过 Logger source
-映射。之后门禁逐字节比较 Go/Rust `LogWriter` 的完整行和截断行 source。transcript
-刻意不写 time；source 三字段永不替换、trim、路径归一化或忽略。生产 Rust 调用未映射
-时输出 `<unmapped-go-log-source>`，因此不会以 Rust caller fallback 制造假阳性。
+独立 probe，仍在同一个固定镜像内执行，不向 Go 工作树注入或写入文件。日志输出已经
+迁移到 Rust `tracing`，不再比较 Go `slog` 的 source 或编码格式；协议 transcript 仍可
+比较业务事件的级别、消息和属性。
 
 协议 transcript 外层 JSON 只是 probe 容器，比较时 object key 顺序不重要。下面这些
 字段保存真正的 wire 字节并按字符串精确比较，不会 parse、trim 或重排：
@@ -75,9 +58,8 @@ normalizer。Rust CLI 已改为 Clap 原生行为，不再运行 Go/Cobra CLI �
   覆盖 prompt、model、cwd fallback、inline MCP presence 以及 repository outcomes。
 - `v1_invalid_base64`：比较生产 DecodeWorkSecret 的外层错误文本和失败前日志。
 
-Input transcript 故意不比较 logger `source`，因为 Go/Rust 文件名与函数名属于不同语言，
-且完整 caller/source 精确映射由独立 logger source 门禁覆盖；这里专注 parser 的业务
-事件、级别、顺序和属性。事件时间同样不进入 transcript。
+Input transcript 不比较 logger source 或输出格式，只比较 parser 的业务事件、级别、
+顺序和属性。事件时间同样不进入 transcript。
 
 ## HTTP API cases
 
@@ -185,9 +167,6 @@ transcript。
 - `target/differential/protocol/go/process_edge.raw`
 - `target/differential/protocol/rust/process_edge.raw`
 - `target/differential/protocol/report.json`
-- `target/differential/logger-source/go.jsonl`
-- `target/differential/logger-source/rust.jsonl`
-- `target/differential/logger-source/go-log-source-oracle.tsv`
 
 比较器还用 manifest 固定 case 名称和顺序，所以同时从 Go/Rust probe 删除同一场景也
 会失败，不能用“双方一起漏测”制造假阳性。

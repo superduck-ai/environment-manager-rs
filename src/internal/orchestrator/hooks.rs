@@ -213,7 +213,7 @@ pub(crate) fn log_command_wrapped_with_sandbox(
 
 /// 对应 Go `(*Hook).ExecuteWithStdin.func1` 中 sandbox cleanup 失败日志。
 ///
-/// 与 [`log_command_wrapped_with_sandbox`] 一样，本函数固定 Go source 所属模块；清理
+/// 与 [`log_command_wrapped_with_sandbox`] 一样，本函数集中记录命令包装事件；清理
 /// 失败只记录 warning，绝不覆盖已经得到的命令执行结果。
 ///
 /// # 参数

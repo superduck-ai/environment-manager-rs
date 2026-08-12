@@ -71,7 +71,7 @@ pub struct Config {
     pub port: i64,
     /// 空字符串使用默认 token 后端，`tvs` 显式选择 TVS。
     pub token_backend: String,
-    /// 可选结构化 logger；缺省时与 Go 一样在构造器中捕获 `slog.Default()`。
+    /// 可选结构化 logger；缺省时在构造器中捕获进程级 tracing logger。
     pub logger: Option<Logger>,
 }
 

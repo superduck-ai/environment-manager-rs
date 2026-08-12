@@ -57,8 +57,8 @@ pub trait EnvironmentType: Send + Sync {
 /// 对应 Go：`internal/envtype/envtype.go` 中的 `Factory`。
 ///
 /// 环境工厂接收原始 JSON 配置和 manager 已经组装好的结构化 logger。`Logger`
-/// 是一个只克隆内部 `Arc` 的轻量句柄；按值传递可让新环境直接保存它，并避免用
-/// 生命周期擦除或全局 tracing 代替 Go 的 `*slog.Logger`。
+/// 是一个只克隆内部 `Arc` 的轻量句柄；按值传递可让新环境直接保存它，
+/// 同时保留可测试的注入边界。
 ///
 /// # 参数
 /// - 第一个参数：后端返回的原始 JSON 字节，只在本次调用期间有效。

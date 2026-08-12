@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::CliError;
 use super::utils::{LogLevel, logger_level, parse_log_level};
-use crate::internal::logger::create_logger_with_file_output;
+use crate::internal::logger::create_logger;
 use crate::internal::orchestrator::{new_poller_with_worker_id, new_whoami_client};
 
 const LONG_ABOUT: &str = r#"The poll command makes a single non-blocking request to the API for work.
@@ -117,7 +117,7 @@ pub async fn run_poll(
     cancellation: &CancellationToken,
     output: &mut dyn Write,
 ) -> Result<(), String> {
-    let logger = create_logger_with_file_output(logger_level(arguments.log_level));
+    let logger = create_logger(logger_level(arguments.log_level));
     let service_key = if let Some(path) = &arguments.service_key_file {
         let bytes = std::fs::read(path).map_err(|error| {
             format!(

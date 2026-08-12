@@ -18,7 +18,7 @@ use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, Logger, default_slog_logger};
+use crate::internal::logger::{LogAttributes, Logger, default_logger};
 use crate::internal::tunnel::actions::{
     Action, ActionError, ActionRequest, ActionResult, ProgressReporter, ProgressUpdate,
 };
@@ -149,8 +149,8 @@ impl Action for DeployAction {
             ]),
         );
 
-        // 六个阶段故意各自保留一次 warning 调用，而不抽成通用 helper：Go 的
-        // `slog.Source` 会把它们记录为六个不同调用位置，差分日志必须保持这一行为。
+        // 六个阶段各自保留 warning 调用，使业务阶段与 Rust 调用位置
+        // 均可直接辨识。
         if let Err(error) = send_progress(
             Some(progress.as_ref()),
             ProgressUpdate {
@@ -454,11 +454,11 @@ impl DeployAction {
         })
     }
 
-    /// 返回 action 配置的 logger；缺省时复刻 Go `slog.Default()` 回退。
+    /// 返回 action 配置的 logger；缺省时使用进程级 tracing logger。
     fn log(&self) -> &Logger {
         match self.logger.as_ref() {
             Some(logger) => logger,
-            None => default_slog_logger(),
+            None => default_logger(),
         }
     }
 }
@@ -646,7 +646,7 @@ fn format_exit_status(status: ExitStatus) -> String {
     }
 }
 
-/// 按调用顺序收集任意日志属性迭代器，供 slog JSON handler 原样输出。
+/// 按调用顺序收集任意日志属性迭代器。
 fn collect_log_attributes<I, K>(attributes: I) -> LogAttributes
 where
     I: IntoIterator<Item = (K, serde_json::Value)>,

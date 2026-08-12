@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{LogAttributes, LogLevel, Logger, default_slog_logger};
+use crate::internal::logger::{LogAttributes, LogLevel, Logger, default_logger};
 
 use super::{
     Config, GitProxyError, GitProxyResult, Manager, SharedManager, SharedServer, new_server,
@@ -31,12 +31,12 @@ pub(super) struct ManagerImpl {
 impl ManagerImpl {
     /// 使用已创建的 server 与同一份逻辑配置构造未启动 manager。
     fn new(server: SharedServer, config: Config) -> Self {
-        // Go `NewManager` 会在 Config.Logger 为 nil 时立即捕获 `slog.Default()`；这里
-        // 同样在构造边界完成替换，避免后续每条日志走不同的 tracing 后备路径。
+        // 在构造边界解析默认 logger，避免后续每条日志重复选择
+        // tracing 接收端。
         let logger = config
             .logger
             .clone()
-            .unwrap_or_else(|| default_slog_logger().clone());
+            .unwrap_or_else(|| default_logger().clone());
         Self {
             server,
             config: Arc::new(config),
@@ -46,7 +46,7 @@ impl ManagerImpl {
         }
     }
 
-    /// 写入 manager 生命周期日志，并把真实业务调用点透传给 source 兼容层。
+    /// 写入 manager 生命周期日志。
     ///
     /// # 参数
     /// - `level`：与 Go `slog` 调用相同的日志级别。
@@ -54,8 +54,7 @@ impl ManagerImpl {
     /// - `attributes`：按 Go 参数出现顺序构造的结构化属性。
     ///
     /// # 副作用
-    /// 调用配置 logger；handler 自身的写入错误与 Go `slog.Logger` 一样不会改变
-    /// manager 生命周期操作的返回结果。
+    /// 调用配置 logger；日志接收端错误不会改变 manager 操作的返回结果。
     #[track_caller]
     fn log(&self, level: LogLevel, message: &str, attributes: LogAttributes) {
         self.logger.log(level, message, attributes);

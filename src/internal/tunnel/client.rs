@@ -700,8 +700,8 @@ impl Client {
             }
         };
         let Some(handler) = &self.ws_handler else {
-            // Go 的 nil-handler 分支只有 error 属性；不能与下方真实发送失败合并，
-            // 否则不仅 source 行号错误，还会凭空增加 tunnel_id。
+            // nil-handler 分支只有 error 属性；不能与下方真实发送失败合并，
+            // 否则会误用不同的 Rust 调用位置，还会凭空增加 tunnel_id。
             let logger = client_logger(self);
             logger.error(
                 "ws_tunnel_message_failed",
@@ -728,7 +728,7 @@ impl Client {
     /// 对应 Go：`(*Client).handleWSClose`。
     ///
     /// 按后端 close 请求关闭指定本地 tunnel。转换失败、nil-handler 与真实关闭失败
-    /// 三个事件不得合并，否则相同消息的两个 Go source 无法按分支逐点对应。
+    /// 三个事件不合并，以保留各分支的 Rust 调用位置。
     async fn handle_ws_close(
         &self,
         cancellation: &CancellationToken,
@@ -925,14 +925,12 @@ pub(super) async fn connect_websocket(
     connect_websocket_with_config(request, gorilla_websocket_config()).await
 }
 
-/// 统一的“WebSocket 出站连接器
+/// 统一的 WebSocket 出站连接器。
 ///
 /// 1. 读取并缓存 HTTP_PROXY、HTTPS_PROXY、NO_PROXY。
 /// 2. 根据目标 ws:// / wss:// 判断是否需要代理。
-/// 3. 选择建连方式：
-///     不走代理：直接 connect_async_with_config
-///     HTTP 代理：先发送 CONNECT，拿到透明 TCP 流
-///     SOCKS5：先完成 SOCKS5 握手
+/// 3. 选择建连方式：不走代理时直接连接，HTTP 代理先发送 CONNECT，
+///    SOCKS5 代理先完成 SOCKS5 握手。
 ///
 /// 4. 在 TCP 流上继续完成 TLS 和 WebSocket 握手。
 /// 5. 应用调用方传入的 WebSocketConfig，比如消息和 frame 大小限制
@@ -1737,6 +1735,7 @@ pub(super) async fn read_proxy_response(
     )))
 }
 
+/// 构造代理响应无法按 HTTP 语法解析时使用的稳定错误。
 fn malformed_proxy_response() -> WebSocketError {
     WebSocketError::Io(io::Error::other("malformed proxy response"))
 }

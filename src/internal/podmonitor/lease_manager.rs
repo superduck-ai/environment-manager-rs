@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::internal::api::HttpClient;
-use crate::internal::logger::{LogAttributes, LogLevel, Logger, default_slog_logger};
+use crate::internal::logger::{LogAttributes, LogLevel, Logger, default_logger};
 use crate::internal::util::{RetryConfig, RetryError, Stopper, retry_operation};
 
 use super::types::{
@@ -59,9 +59,9 @@ pub(super) fn claude_code_stuck_threshold_from(value: Option<&str>) -> Duration 
         return Duration::from_secs(seconds);
     }
 
-    // Go 在构造 LeaseManager 之前就解析环境变量，因此这里必须使用全局
-    // slog.Default，而不能借用稍后传入 manager 的 logger。
-    default_slog_logger().warn(
+    // 该环境变量在 LeaseManager 构造前解析，因此这里使用进程级
+    // tracing logger，而不借用稍后传入 manager 的 logger。
+    default_logger().warn(
         "invalid_claude_code_stuck_threshold",
         log_attributes([
             ("value", json!(value)),
@@ -183,9 +183,9 @@ pub(super) fn new_lease_manager_with_stuck_threshold(
             environment_id: environment_id.into(),
             organization_uuid: organization_uuid.into(),
             api_client,
-            // 对应 Go `NewLeaseManager` 的 nil logger 回退；从这里开始内部始终持有
-            // concrete logger，避免某些日志改走格式不同的 tracing 管线。
-            logger: logger.unwrap_or_else(|| default_slog_logger().clone()),
+            // 在构造边界解析默认 logger；从这里开始内部始终持有
+            // concrete logger，保证所有异步路径共享同一个 tracing 接收端。
+            logger: logger.unwrap_or_else(|| default_logger().clone()),
             health_file_path: health_file_path.into(),
             claude_code_stuck_threshold,
             state: std::sync::RwLock::new(LeaseState::default()),
@@ -379,10 +379,8 @@ impl LeaseManager {
             tokio::select! {
                 _ = ticker.tick() => {
                     if self.inner.cancellation.is_cancelled() {
-                        // 对应 Go `heartbeatLoop` 的 ticker 分支（lease_manager.go:331）。
-                        // 即使消息和属性与 context.Done 分支相同，也必须保留独立的真实
-                        // Logger 调用点：Go slog source 的行号是外部 JSON 日志契约，合并
-                        // 到共享 helper 会让两个 oracle source 无法无歧义映射。
+                        // 对应 Go `heartbeatLoop` 的 ticker 分支（lease_manager.go:331）；
+                        // 取消时仍保留该分支自身的业务日志。
                         self.inner.logger.info(
                             "heartbeat_loop_stopped",
                             log_attributes([

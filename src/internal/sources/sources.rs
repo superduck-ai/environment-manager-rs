@@ -15,7 +15,7 @@ use super::{
 use crate::internal::{
     api::SourceProcessingError,
     auth::AuthContext,
-    logger::{LogAttributes, LogLevel, Logger, default_slog_logger},
+    logger::{LogAttributes, LogLevel, Logger, default_logger},
     session::ActivityRecorder,
 };
 
@@ -286,12 +286,11 @@ impl<'recorder> SourceHandlerManager<'recorder> {
 
     /// 把一条 source manager 记录写入注入 logger，并保留 Go 属性顺序。
     ///
-    /// 测试构造器允许 `None`；该非生产分支使用 Go 进程级 `slog.Default()` 兼容
-    /// handler，而不是产生没有 Go source 的 `tracing` 事件。
+    /// 测试构造器允许 `None`；该分支使用进程级 tracing logger。
     fn log(&self, level: LogLevel, message: &str, attributes: LogAttributes) {
         let logger = match self.logger.as_ref() {
             Some(logger) => logger,
-            None => default_slog_logger(),
+            None => default_logger(),
         };
         logger.log(level, message, attributes);
     }

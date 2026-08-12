@@ -153,8 +153,8 @@ impl CodeSignMCPServer {
             }
         };
 
-        // open、write 和 flush 都对应 Go 的单次 `os.WriteFile`；合并成一个 Result
-        // 后只保留一个日志调用点，避免同一 Go source 被多个 Rust consumer 消费。
+        // open、write 和 flush 对外只是一次文件写入；合并成一个 Result 后
+        // 只保留一个日志调用点，避免重复记录同一事件。
         let write_result = async {
             let mut output = OpenOptions::new()
                 .create(true)

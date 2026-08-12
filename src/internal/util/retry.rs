@@ -6,7 +6,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use crate::internal::logger::{LogAttributes, default_slog_logger};
+use crate::internal::logger::{LogAttributes, default_logger};
 use thiserror::Error;
 
 /// 判断某个具体错误是否允许重试的线程安全分类器。
@@ -61,8 +61,8 @@ pub enum RetryError<E> {
 /// 让同一错误分类器和日志路径处理它。
 ///
 /// # 兼容性
-/// 四类重试事件必须经过 Go 进程级 `slog.Default()` 的 legacy stderr handler，
-/// 不能使用调用方的应用 JSON logger。退避 sleep 也故意不可被取消打断，与 Go
+/// 四类重试事件使用进程级 tracing logger。退避 sleep 故意不可被取消打断，
+/// 与 Go
 /// `time.Sleep` 一致。即使调用方在退避期间取消，sleep 完成后仍必须调用一次
 /// `operation`；这复刻 Go 闭包在 `time.Sleep` 后创建带 context 的 HTTP 请求，并
 /// 由该请求返回 `context.Canceled` 的时序。
@@ -91,7 +91,7 @@ where
                 "delay_ms".to_owned(),
                 serde_json::json!(duration_milliseconds(delay)),
             );
-            default_slog_logger().info("retrying_operation", attributes);
+            default_logger().info("retrying_operation", attributes);
             // Go 使用不可取消的 time.Sleep。即使 context 已取消，也要先完成本轮
             // backoff，之后才由操作等待分支观察取消，不能提前改变返回时序。
             tokio::time::sleep(delay).await;
@@ -112,18 +112,18 @@ where
                     attributes.insert("attempt".to_owned(), serde_json::json!(attempt + 1));
                     attributes.insert("error".to_owned(), serde_json::json!(error.to_string()));
                     attributes.insert("attempts".to_owned(), serde_json::json!(config.max_retries));
-                    default_slog_logger().info("error_not_retryable", attributes);
+                    default_logger().info("error_not_retryable", attributes);
                     return Err(RetryError::Operation(error));
                 }
                 let mut attributes = log_attributes.clone();
                 attributes.insert("attempt".to_owned(), serde_json::json!(attempt + 1));
                 attributes.insert("error".to_owned(), serde_json::json!(error.to_string()));
-                default_slog_logger().warn("operation_attempt_failed", attributes);
+                default_logger().warn("operation_attempt_failed", attributes);
                 if attempt + 1 == config.max_retries {
                     let mut attributes = log_attributes.clone();
                     attributes.insert("attempts".to_owned(), serde_json::json!(config.max_retries));
                     attributes.insert("error".to_owned(), serde_json::json!(error.to_string()));
-                    default_slog_logger().error("operation_failed_after_retries", attributes);
+                    default_logger().error("operation_failed_after_retries", attributes);
                     return Err(RetryError::Operation(error));
                 }
             }

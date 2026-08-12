@@ -365,7 +365,7 @@ mod tests {
     async fn current_version_skips_installation() {
         install_sandbox_runtime(
             &CancellationToken::new(),
-            crate::internal::logger::default_slog_logger(),
+            crate::internal::logger::default_logger(),
             "current",
         )
         .await

@@ -34,7 +34,7 @@ use environment_manager::{
     },
     internal::{
         api::{ClientOptions, HttpClient, RetryConfig},
-        logger::default_slog_logger,
+        logger::default_logger,
         mcp::{BaseServer, Tool, ToolConfig, ToolHandler, new_tool_result_text},
         tunnel::{
             HttpTunnelResponseError, ResponseSender, TunnelError, WsResponseSender, WsSenderError,
@@ -1965,9 +1965,8 @@ async fn capture_mcp_transcript() -> ProtocolMcpTranscript {
         std::env::var_os("MCP_DEBUG_TOKEN").is_some(),
         "MCP_DEBUG_TOKEN must be set before the Rust test process starts"
     );
-    // Go 的 nil logger 在构造器内回退到 slog.Default；Rust BaseServer 已把该
-    // 归一化放到调用边界，因此 probe 显式传入同一个兼容 logger。
-    let server = BaseServer::new(default_slog_logger().clone(), "protocol-probe", "1.2.3");
+    // probe 显式传入进程级 tracing logger。
+    let server = BaseServer::new(default_logger().clone(), "protocol-probe", "1.2.3");
     server.set_bearer_token("fixed-mcp-token");
 
     // mcp-go 的 Tool.MarshalJSON 会始终输出 annotations；显式扩展字段确保 Rust

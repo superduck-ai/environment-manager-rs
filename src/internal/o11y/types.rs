@@ -189,8 +189,8 @@ pub(crate) enum CachedInstrument {
 
 /// OTel meter provider 及其 instrument 缓存。
 pub(crate) struct O11yMetricsProvider {
-    /// instrument 创建失败时使用的 logger；构造时已将 Go 的 nil logger 解析为
-    /// `slog.Default()` 兼容实例，因此记录路径不再需要第二套 fallback。
+    /// instrument 创建失败时使用的 logger；构造时已解析为具体
+    /// tracing logger，因此记录路径不再需要第二套 fallback。
     pub(crate) logger: Logger,
     pub(crate) meter_provider: Option<SdkMeterProvider>,
     pub(crate) instrument_cache: Mutex<HashMap<String, CachedInstrument>>,

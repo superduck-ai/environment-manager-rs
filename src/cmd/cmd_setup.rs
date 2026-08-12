@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use super::error::CliError;
 use super::utils::{LogLevel, bool_value, flag_arg, logger_level, parse_log_level};
 use crate::internal::claude::install_or_update_claude_code;
-use crate::internal::logger::{LogAttributes, Logger, create_logger_with_file_output};
+use crate::internal::logger::{LogAttributes, Logger, create_logger};
 use crate::internal::orchestrator::new_whoami_client;
 use crate::internal::sandbox::install_sandbox_runtime as install_sandbox_runtime_package;
 use crate::internal::session::NoopActivityRecorder;
@@ -177,7 +177,7 @@ pub async fn run_setup(
     arguments: &SetupArgs,
     cancellation: &CancellationToken,
 ) -> Result<(), String> {
-    let logger = create_logger_with_file_output(logger_level(arguments.log_level));
+    let logger = create_logger(logger_level(arguments.log_level));
     logger.info(
         "Starting setup",
         [

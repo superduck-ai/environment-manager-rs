@@ -117,16 +117,9 @@ publication="$(mktemp -d "${dist_directory}/.preflight-publish.XXXXXX")"
 # 与其中 0755 binary 和 0644 manifest 的既有读取语义保持一致。
 chmod 0755 "${publication}"
 
-# 候选构建可以被单独调用，因此必须自行拒绝静态预测、未决歧义或源码漂移；
-# 不能依赖操作者此前恰好跑过 verify.sh。runtime loader 同样只加载 mapped-oracle。
+# 候选构建可以被单独调用，因此仍需自行验证 Go 基线和 Cargo 依赖。
 scripts/linux-arm64/verify-go-baseline.sh "${go_root}"
 scripts/linux-arm64/verify-cargo-dependencies.sh "${target}"
-PYTHONDONTWRITEBYTECODE=1 python3 \
-  scripts/compat/generate_log_source_map.py \
-  --go-root "${go_root}" \
-  --rust-root . \
-  --check \
-  --require-complete
 
 # 在构建前记录完整源码状态。清单无时间戳，后续 release 可以逐字节复算；构建
 # 完成后还会再算一次，避免并发同步造成“二进制与清单来自两个源码状态”。

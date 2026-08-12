@@ -135,9 +135,8 @@ impl LeaseManagerHandle for podmonitor::LeaseManager {
 /// 对应 Go：`internal/envtype/byoc/byoc.go` 中的 `New`。
 ///
 /// 从原始 JSON 创建 BYOC 环境、保存 manager logger，并在产生任何副作用前完成
-/// 配置校验。Go 允许 nil logger 后在每个方法里回退到 `slog.Default()`；Rust 的
-/// Factory 契约要求传入具体 `Logger`，测试也必须显式使用 discard handler，因此
-/// 生产调用不会静默落入无 subscriber 的 tracing。
+/// 配置校验。Rust 的 Factory 契约要求传入具体 `Logger`，测试也必须
+/// 显式使用 discard handler，因此生产调用一定进入已初始化的 tracing 输出链。
 ///
 /// CWD 除了必须是绝对路径，还必须与词法归一化结果逐字节相同。
 /// 因而 `..`、`.`、重复分隔符和非根目录的尾随分隔符都会被拒绝，
