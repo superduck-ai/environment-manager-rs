@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 构建两个 Linux ARM64 二进制，并执行 CLI 与本地协议 transcript 差分门禁。
+# 构建 Linux ARM64 oracle，并执行本地协议 transcript 差分门禁。
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -15,23 +15,6 @@ fi
 python3 -m unittest discover \
   --start-directory "${repo_root}/tests" \
   --pattern 'differential_*_test.py'
-
-go_binary="$(${script_dir}/build_go_oracle.sh)"
-# panic 资产必须来自同一固定 Go 1.25.7 ARM64 ELF。check 模式运行 oracle 两次，只
-# 归一化预审中确实变化的九个 frame 参数槽；signal addr/PC、静态指针、长度、
-# 函数、文件、行号、稳定 frame offset 或顺序漂移都会在 Rust 构建前失败，而且不会
-# 在验证过程中改写源码。CLI manifest 另外只在这一 panic case 对结构化
-# 日志顶层 `read_duration_ms` 启用定时值归一化，其他数字和用例仍精确比较。
-python3 "${script_dir}/generate_v0_panic_asset.py" \
-  --go-binary "${go_binary}" \
-  --check
-cargo +1.97.0 build --locked --bin environment-manager
-rust_binary="${repo_root}/target/debug/environment-manager"
-
-python3 "${script_dir}/differential_cli.py" \
-  --go-binary "${go_binary}" \
-  --rust-binary "${rust_binary}" \
-  "$@"
 
 # 七份 transcript probe 使用与二进制 oracle 相同的固定 Go 1.25.7 digest 镜像。
 # Go 测试通过 overlay 注入只读工作树；Rust 测试只连接进程内 loopback mock。两边

@@ -192,7 +192,7 @@ pub(crate) fn resolve_go_command(program: &OsStr) -> std::result::Result<OsStrin
 pub(crate) fn go_spawn_error(resolved_program: &OsStr, source: &io::Error) -> GoCommandError {
     let mut message = b"fork/exec ".to_vec();
     // Go `PathError.Path` 是 string，允许包含任意非 NUL 字节；这里必须原样拼接，
-    // 不能使用 Path::display 或 from_utf8_lossy，否则 CLI 差分会在路径处失真。
+    // 不能使用 Path::display 或 from_utf8_lossy，否则字节级错误输出会在路径处失真。
     message.extend_from_slice(resolved_program.as_bytes());
     message.extend_from_slice(b": ");
     message.extend_from_slice(go_errno_text(source).as_bytes());

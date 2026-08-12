@@ -1,7 +1,7 @@
 # 确定性差分范围
 
-`scripts/compat/run_differential.sh` 是 Linux ARM64 的统一差分入口。它先执行 45 个
-CLI 场景，再生成并比较 `http_api`、`input`、`mcp`、`process_edge`、
+`scripts/compat/run_differential.sh` 是 Linux ARM64 的统一差分入口。它生成并比较
+`http_api`、`input`、`mcp`、`process_edge`、
 `tunnel_protojson`、`tunnel_http_runtime` 和 `tunnel_ws_runtime` 七份 transcript。
 Go 侧使用固定 Go 1.25.7 digest 镜像和 `go test -overlay`；overlay backing file
 位于 Rust 仓库，Go 工作树始终以只读方式挂载。`process_edge` 是只依赖 Go 标准库的
@@ -52,13 +52,7 @@ PID 只用于 probe 内部读取 `/proc` 和清理，不写入 transcript。zomb
 存在、future/channel 是否 pending、signal、errno、LookPath 结果和错误原始字节均逐值
 比较；不允许归一化 timing、state 或 error 语义。对于这些协议 transcript，除了上述
 producer 转换和唯一的 input duration comparator 规则之外，不允许任何
-normalizer。CLI 的独立 normalizer 则必须按下方用例逐项审核。
-
-`provision-packages` 的六条 CLI 用例覆盖 help、未知 flag、位置参数、缺协议、非法
-manifest 和敏感 option-like spec。后三条终态结果包含单调时钟产生的
-`duration_ms`；`provision_result_duration_ms` 只在这三条用例中启用，并且只接受唯一
-顶层失败 JSON 字段或完整匹配公开诊断格式的字段。其他 JSON key、顺序、枚举、退出码、
-换行和额外文本仍逐字节比较，原始 capture 继续保留真实耗时。
+normalizer。Rust CLI 已改为 Clap 原生行为，不再运行 Go/Cobra CLI 差分。
 
 ## Input parser cases
 
@@ -72,21 +66,6 @@ manifest 和敏感 option-like spec。后三条终态结果包含单调时钟产
 - `v0_missing_startup_context`：Go overlay 用 `recover`、Rust probe 用 `catch_unwind`
   分别记录 panic/error 分支，固定当前 Go nil dereference 行为；不能把崩溃场景从覆盖
   清单删除。`v0_null_startup_context` 独立比较显式 null 创建零值 context 后的校验错误。
-- 真实 CLI 另有 `task_run_v0_missing_startup_context_panic`：它不捕获 panic，而是比较
-  完整进程的 stdout、stderr 和退出码。独立 Go 进程捕获证明，仅 receiver、heap
-  slice/对象、argv 与 working-directory 字符串 data 指针所在的九个固定 frame 参数槽
-  会变化，因此该用例只对这些槽启用 `go_panic_runtime_hex`。读取 stdin
-  的 `read_duration_ms` 同样受 Linux 调度影响；`structured_log_read_duration_ms`
-  先确认整行是 JSON 对象、顶层 `msg` 唯一且精确为 `Read stdin data`，再且只替换
-  唯一的顶层同名数值。该 normalizer
-  在 manifest 校验中被锁定到本用例，原始 capture 仍保留真实耗时。signal 的
-  `addr=0xc0`/`pc=0x61a128`、静态指针、长度、
-  panic 文本、函数名、文件、行号、稳定 `+0x` frame 偏移、frame 顺序和 exit 2 仍
-  逐字节比较。Rust 输出资产必须由固定 Go 1.25.7 ARM64 oracle 通过
-  `scripts/compat/generate_v0_panic_asset.py` 捕获，普通 Rust panic hook 不参与该分支。
-  `run_differential.sh` 会在 Rust 构建前以 `--check` 再运行 oracle 两次；资产缺 frame、
-  frame 顺序改变或除白名单十六进制值外任一字节陈旧都会直接阻断门禁，验证过程不会
-  自动改写已提交资产。
 - `v1_code_session_full`：比较 padded URL-safe Base64 secret、source/auth、顶层 ingress
   token 覆盖、Claude args、MCP file、environment variables 和 working-directory fallback。
 - `v1_healthcheck_null_optional`：比较 work envelope、null-to-zero secret 和最小 healthcheck

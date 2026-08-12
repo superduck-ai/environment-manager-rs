@@ -1,6 +1,6 @@
 //! 对应 Go `cmd/cmd_code_sign.go` 的隐藏签名包装命令。
 //!
-//! Go 命令为兼容 Git 的 `gpg.ssh.program` 明确关闭 Cobra flag 解析，因此 `-Y`、
+//! Git 的 `gpg.ssh.program` 会传入 OpenSSH 的 `-Y`、
 //! `-f`、`-n` 等值必须原样保留。本文件还实现配置发现、Git object format 探测、
 //! loopback MCP JSON-RPC、指数退避以及 `.sig` 文件副作用校验。
 

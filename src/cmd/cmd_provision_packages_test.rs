@@ -146,6 +146,9 @@ async fn test_provision_packages_command_returns_stable_failure_exit() {
     .await
     .unwrap_err();
     assert_eq!(error.exit_code(), 10);
+    let (rendered, exit_code) = crate::cmd::render_runtime_error(&error);
+    assert_eq!(exit_code, 10);
+    assert!(rendered.starts_with(b"Error: package provisioning status=failed"));
     assert!(error.to_string().contains("status=failed"));
     assert!(!error.to_string().contains("category="));
     assert_eq!(output.iter().filter(|byte| **byte == b'\n').count(), 1);
@@ -208,7 +211,7 @@ async fn test_provision_packages_command_emits_invalid_manifest_result() {
     assert!(output.contains(r#""stage":"decode""#));
 }
 
-/// 对应 Go `TestProvisionPackagesCommandMapsUnknownFlagToCLIExit`。
+/// 未知 flag 由 Clap 原生处理。
 #[test]
 fn test_provision_packages_command_maps_unknown_flag_to_cli_exit() {
     let unknown = format!("--{}", "secret".repeat(1000));
@@ -222,10 +225,8 @@ fn test_provision_packages_command_maps_unknown_flag_to_cli_exit() {
     )
     .unwrap_err();
     assert_eq!(error.exit_code(), 2);
-    assert_eq!(
-        error.rendered(),
-        "Error: invalid provision-packages flags\n"
-    );
+    assert!(error.rendered().starts_with("error:"));
+    assert!(error.rendered().contains("unexpected argument"));
 }
 
 /// 对应 Go `TestProvisionPackagesCommandConvertsInterruptToCancelledResult`。
@@ -283,7 +284,7 @@ async fn test_provision_packages_command_cancels_blocked_stdin_read() {
     assert!(output.contains(r#""stage":"decode""#));
 }
 
-/// 确认位置参数使用 Go 命令专用的单行错误和退出码 2。
+/// 确认位置参数使用 Clap 原生 usage error 和退出码 2。
 #[test]
 fn test_provision_packages_rejects_positionals() {
     let error = crate::cmd::parse_from(
@@ -292,8 +293,7 @@ fn test_provision_packages_rejects_positionals() {
     )
     .unwrap_err();
     assert_eq!(error.exit_code(), 2);
-    assert_eq!(
-        error.rendered(),
-        "Error: provision-packages does not accept positional arguments\n"
-    );
+    assert!(error.rendered().starts_with("error:"));
+    assert!(error.rendered().contains("unexpected"));
+    assert!(error.rendered().contains("Usage:"));
 }

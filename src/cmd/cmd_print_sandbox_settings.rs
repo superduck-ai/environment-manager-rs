@@ -8,7 +8,6 @@ use std::io::Write;
 use clap::{ArgMatches, Command};
 
 use super::error::CliError;
-use super::utils::ignored_positionals;
 
 const LONG_ABOUT: &str = r#"Outputs the default sandbox-runtime settings as JSON to stdout.
 
@@ -31,16 +30,12 @@ const EXAMPLES: &str = r#"Examples:
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PrintSandboxSettingsArgs;
 
-/// 对应 Go：`cmd/cmd_print_sandbox_settings.go` 中的 `AddPrintSandboxSettingsCommand`。
-///
-/// 构造 `print-sandbox-settings` 子命令。Rust 根命令通过返回值组装 Clap tree，替代
-/// Go 向可变 Cobra root 注册命令的写法；命令文本和位置参数兼容规则保持不变。
+/// 构造 `print-sandbox-settings` 子命令。
 pub(crate) fn add_print_sandbox_settings_command() -> Command {
     Command::new("print-sandbox-settings")
         .about("Print the default sandbox runtime settings")
         .long_about(LONG_ABOUT)
         .after_long_help(EXAMPLES)
-        .arg(ignored_positionals())
 }
 
 /// 构造 `print-sandbox-settings` 子命令的内部短别名。

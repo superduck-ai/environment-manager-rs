@@ -17,8 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::CliError;
 use super::utils::{
-    LogLevel, bool_value, ignored_positionals, logger_level, parse_go_duration, parse_log_level,
-    switch_arg,
+    LogLevel, bool_value, flag_arg, logger_level, parse_go_duration, parse_log_level,
 };
 use crate::internal::logger::{LogAttributes, Logger, create_logger_with_file_output};
 use crate::internal::orchestrator::{
@@ -146,7 +145,7 @@ pub struct OrchestratorArgs {
     pub skip_container_lock: bool,
 }
 
-/// 构造 `orchestrator` 子命令及全部兼容 flag。
+/// 构造 `orchestrator` 子命令及全部 flag。
 pub(crate) fn command() -> Command {
     Command::new("orchestrator")
         .about("Poll for session tasks and hand off for execution")
@@ -170,15 +169,13 @@ pub(crate) fn command() -> Command {
         .arg(Arg::new("sandbox-backend").long("sandbox-backend").default_value("sandbox-runtime").help("Sandbox backend for execute hook: none, sandbox-runtime.\nUse 'none' to disable sandboxing (allows running as non-root user).\nUse 'sandbox-runtime' (default) for sandboxed execution (requires root or unprivileged user namespaces).").value_parser(value_parser!(SandboxBackend)))
         .arg(optional_path_arg("sandbox-settings", "Path to custom sandbox-runtime settings JSON file (must include Anthropic domains)"))
         .arg(optional_path_arg("service-key-file", "Path to file containing the environment service key. If not set, falls back to ENVIRONMENT_SERVICE_KEY environment variable"))
-        .arg(switch_arg("skip-git-config", "Skip git configuration setup (use container's existing .gitconfig)"))
-        .arg(switch_arg("skip-container-lock", "Skip container-level lock (WARNING: allows multiple sessions per container, use only for development/testing)"))
-        .arg(ignored_positionals())
+        .arg(flag_arg("skip-git-config", "Skip git configuration setup (use container's existing .gitconfig)"))
+        .arg(flag_arg("skip-container-lock", "Skip container-level lock (WARNING: allows multiple sessions per container, use only for development/testing)"))
 }
 
-/// 对应 Go `AddOrchestratorCommand`，返回已注册全部兼容 flag 的子命令。
+/// 返回已注册全部 flag 的子命令。
 ///
-/// Rust 的根命令通过返回值组装 Clap tree，而不是传入可变 Cobra root；保留此机械
-/// 名称让 Go/Rust 符号表可以直接追踪命令构造职责。
+/// 该别名使根命令的组装点保持简洁。
 pub(crate) fn add_orchestrator_command() -> Command {
     command()
 }

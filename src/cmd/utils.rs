@@ -8,7 +8,7 @@ use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 use std::time::Duration;
 
-use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
+use clap::{Arg, ArgAction, ArgMatches};
 
 /// 与 Go `slog` 命令行取值一一对应的日志级别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,39 +57,9 @@ pub fn parse_log_level(value: &str) -> Result<LogLevel, String> {
     }
 }
 
-/// 对应 Go：`cmd/utils.go` 中的 `markRequiredFlags`。
-///
-/// 在命令的参数全部注册后，把指定参数统一标记为必填。这个辅助函数保留 Go
-/// 版本“先声明 flag、再集中标记 required”的构造顺序，使迁移符号可以直接对照，
-/// 也避免必填规则分散在较长的 Clap builder 链中。
-///
-/// # 参数
-/// - `command`：尚未用于解析参数的 Clap 命令；函数取得其所有权并更新参数定义。
-/// - `flags`：需要标记为必填的 Clap 参数 ID，必须已经注册在 `command` 中。
-///
-/// # 返回
-/// 返回已更新必填约束的命令，供调用方继续注册到根命令。
-///
-/// # Panics
-/// 与 Go 实现一致，参数 ID 不存在表示程序构造错误，函数会立即 panic，而不会把
-/// 该错误延迟到用户运行命令时才暴露。
-pub(crate) fn mark_required_flags(mut command: Command, flags: &[&str]) -> Command {
-    for flag in flags {
-        if !command
-            .get_arguments()
-            .any(|argument| argument.get_id().as_str() == *flag)
-        {
-            panic!("failed to mark {flag} as required: flag {flag:?} does not exist");
-        }
-
-        command = command.mut_arg(flag, |argument| argument.required(true));
-    }
-    command
-}
-
 /// 将 CLI 日志级别映射为内部 logger 的等价级别。
 ///
-/// 两个枚举刻意分离：CLI 层需要保持 Cobra 接受的字符串集合，logger 层还包含
+/// 两个枚举刻意分离：CLI 只接受公开的日志级别，logger 层还包含
 /// `Trace`。集中转换可避免各命令在默认级别或大小写规则上出现漂移。
 pub(crate) const fn logger_level(level: LogLevel) -> crate::internal::logger::LogLevel {
     match level {
@@ -148,39 +118,14 @@ pub fn parse_go_duration(input: &str) -> Result<Duration, String> {
     Ok(Duration::from_nanos(total_nanos as u64))
 }
 
-/// 构造一个默认关闭、出现时置真的 Cobra 风格布尔开关。
-///
-/// 所有普通 bool flag 通过同一帮助/动作定义生成，避免不同子命令意外显示 `false`
-/// 默认值或采用不一致的重复参数策略。
-pub(crate) fn switch_arg(id: &'static str, help: &'static str) -> Arg {
-    Arg::new(id)
-        .long(id)
-        .help(help)
-        .action(ArgAction::Set)
-        .num_args(0..=1)
-        .require_equals(true)
-        .default_missing_value("true")
-        .default_value("false")
-        .hide_default_value(true)
-        .overrides_with(id)
-        .value_name("bool")
-        .value_parser(value_parser!(bool))
+/// 构造一个默认关闭、出现时置真的 Clap 布尔开关。
+pub(crate) fn flag_arg(id: &'static str, help: &'static str) -> Arg {
+    Arg::new(id).long(id).help(help).action(ArgAction::SetTrue)
 }
 
-/// 读取由 [`switch_arg`] 创建、始终具有默认值的布尔参数。
+/// 读取由 [`flag_arg`] 创建的布尔参数。
 pub(crate) fn bool_value(matches: &ArgMatches, id: &str) -> bool {
-    *matches
-        .get_one::<bool>(id)
-        .unwrap_or_else(|| panic!("CLI invariant: missing boolean value for {id}"))
-}
-
-/// 构造用于兼容 Cobra 默认 `Args` 校验的隐藏位置参数。
-///
-/// Cobra 在未配置 `Args` 回调时允许多余的位置参数，旧命令随后忽略它们；Clap
-/// 默认会拒绝。每个普通子命令加入该参数即可保留这个较少见但真实存在的接口，
-/// 同时未知的 `--flag` 仍由 Clap 报错。
-pub(crate) fn ignored_positionals() -> Arg {
-    Arg::new("_ignored-positionals").num_args(0..).hide(true)
+    matches.get_flag(id)
 }
 
 /// 找出一个持续时间片段中十进制数字（含至多一个小数点）的末尾。

@@ -81,7 +81,7 @@ rm -f \
   "${catalog_runtime_frames}"
 
 # 复用 canonical Go oracle 构建脚本的基线 hash、固定 digest 和 `-trimpath` 参数；
-# 这样 source 证据与 CLI 差分使用同一个 ELF，而不是另造一套近似编译配置。
+# 这样 source 证据与行为 oracle 使用同一个 ELF，而不是另造一套近似编译配置。
 GO_ORACLE_OUTPUT="${go_binary}" \
 GO_ORACLE_IMAGE="${GO_ORACLE_IMAGE}" \
 GO_SOURCE_DIR="${go_source}" \

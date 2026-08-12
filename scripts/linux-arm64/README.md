@@ -29,7 +29,7 @@ scripts/linux-arm64/verify.sh
 脚本同步源码到 `/home/arthur/environment-manager` 后，依次检查 Ubuntu 24.04 ARM64、
 Rust 1.97.0、原生 GNU host triple、不可变 Go 基线、格式、中文注释、rustdoc 链接、
 Cargo.lock 禁止依赖、完整符号映射、100% Go logger source oracle 映射、Clippy、全部
-Rust 测试、logger source 严格 transcript，以及其余 Go/Rust 差分。
+Rust 测试、logger source 严格 transcript，以及 Go/Rust 协议差分。
 
 `verify-cargo-dependencies.sh` 使用 Python `tomllib` 解析 Cargo 实际 lockfile，而不是
 扫描 Cargo.toml 文本。它拒绝 `tonic`/`tonic-*`、`git2`/`libgit2-sys`、
@@ -42,7 +42,8 @@ Rust 测试、logger source 严格 transcript，以及其余 Go/Rust 差分。
 runner 同时收到值完全相同的 `GO_SOURCE_ROOT` 和 `GO_SOURCE_DIR`，所以二进制 oracle
 与 overlay protocol probe 使用同一棵只读 Go 工作树。
 
-当前 runner 比较 CLI 的退出码、stdout、stderr 和协议 transcript。协议范围包括
+当前 runner 比较协议 transcript，不再将 Rust CLI 与 Go/Cobra 文本和参数行为
+做逐字节差分。协议范围包括
 HTTP API、V0/V1 input、MCP Streamable HTTP 以及 Tunnel HTTP/WebSocket ProtoJSON。
 请求/响应原文不会在被测实现中归一化；input 的不可预测解析耗时保留原始整数，
 仅由比较器按 manifest 中唯一审核规则验证后处理。
@@ -90,7 +91,7 @@ scripts/linux-arm64/build-go-oracle.sh \
 静态 AArch64 ELF、没有 `INTERP` 和动态 `NEEDED`，并在 Ubuntu ARM64 宿主执行一次
 限时 `--help` 烟测；release 对即将提升的最终路径再独立复核一次。
 
-CLI 差分仍由 `scripts/compat/build_go_oracle.sh` 构建行为 oracle。它为了测试依赖
+logger source 差分仍由 `scripts/compat/build_go_oracle.sh` 构建行为 oracle。它为了测试依赖
 只读与复用缓存，使用 `CGO_ENABLED=1`、`-mod=readonly`、不剥离符号，并默认注入
 测试版本 `0.1.0`。因此这个二进制只用于对比外部行为，不承诺与正式 rollback
 逐字节相同，也不会被 release 保存。协议差分另外用 `go test -overlay` 注入 probe；

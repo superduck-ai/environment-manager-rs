@@ -12,6 +12,12 @@ readonly go_root="${VM_GO_SOURCE_ROOT:-/mnt/mac/Users/${user}/GolandProjects/env
 readonly image="${RUST_RELEASE_IMAGE:-${DEFAULT_RUST_RELEASE_IMAGE}}"
 readonly output_directory="dist/preflight"
 readonly almalinux_mirror="${ALMALINUX_MIRROR:-https://mirrors.aliyun.com/almalinux}"
+build_git_hash="$(git -C "${script_dir}/../.." rev-parse --short=12 HEAD)"
+if [[ -n "$(git -C "${script_dir}/../.." status --porcelain)" ]]; then
+  build_git_hash="${build_git_hash}-dirty"
+fi
+readonly build_git_hash
+readonly build_time="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
 # 正式发布不再调用本脚本，也不允许通过位置参数把候选直接写入 dist 根目录。
 # 这样 staging E2E 验证的 SHA 始终对应一个明确的 preflight 候选。
@@ -33,7 +39,7 @@ fi
 
 orb -m "${machine}" -u "${user}" -w "${target}" bash -s -- \
   "${image}" "${target}" "${go_root}" "${output_directory}" "${almalinux_mirror}" \
-  "${CONTAINER_IMAGE_ALLOWLIST_VERSION}" <<'REMOTE'
+  "${CONTAINER_IMAGE_ALLOWLIST_VERSION}" "${build_git_hash}" "${build_time}" <<'REMOTE'
 set -euo pipefail
 image="$1"
 target="$2"
@@ -41,6 +47,8 @@ go_root="$3"
 output_directory="$4"
 almalinux_mirror="$5"
 image_allowlist_version="$6"
+build_git_hash="$7"
+build_time="$8"
 artifact_name="environment-manager_linux_arm64"
 cache_root="${XDG_CACHE_HOME:-${HOME}/.cache}/environment-manager"
 mkdir -p "${cache_root}"
@@ -132,6 +140,8 @@ podman run --rm --pull=always --arch arm64 \
   --volume "${target}:/workspace:ro" \
   --volume "${staging}:/out" \
   --env "ALMALINUX_MIRROR=${almalinux_mirror}" \
+  --env "BUILD_GIT_HASH=${build_git_hash}" \
+  --env "BUILD_TIME=${build_time}" \
   --workdir /workspace \
   "${image}" \
   bash -euc '
