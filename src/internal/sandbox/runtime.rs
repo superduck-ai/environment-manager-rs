@@ -15,8 +15,6 @@ use super::{
     ConfigError, FilesystemConfig, NetworkConfig, SrtConfig, cleanup_config_file,
     load_and_validate_config, write_config_file,
 };
-use crate::internal::logger::{LogAttributes, Logger};
-
 /// runtime 初始化或清理错误。
 #[derive(Debug, Error)]
 pub enum SandboxRuntimeError {
@@ -35,7 +33,6 @@ pub enum SandboxRuntimeError {
 pub struct SandboxRuntime {
     srt_binary: String,
     config_path: PathBuf,
-    logger: Option<Logger>,
     owns_config_file: bool,
     custom_config: bool,
 }
@@ -83,8 +80,8 @@ impl SandboxRuntime {
 
     /// 对应 Go：`internal/sandbox/runtime.go` 中的 `(*SandboxRuntime).WrapCommand`。
     ///
-    /// 把原始命令转换为 `srt --settings <path> -- <command> <args...>`，并在存在
-    /// logger 时记录原始及包装后的参数数组。
+    /// 把原始命令转换为 `srt --settings <path> -- <command> <args...>`，并记录原始及
+    /// 包装后的参数数组。
     ///
     /// # 参数
     /// - `command`：未经 shell 解析的原始 executable。
@@ -94,7 +91,7 @@ impl SandboxRuntime {
     /// 返回 SRT executable 和拥有所有权的包装参数。
     ///
     /// # 副作用
-    /// logger 非空时产生一条 DEBUG 记录，属性顺序与 Go 实现一致。
+    /// 产生一条 DEBUG tracing 事件。
     pub fn wrap_command(&self, command: &str, args: &[String]) -> (String, Vec<String>) {
         let mut wrapped = Vec::with_capacity(args.len() + 4);
         wrapped.push("--settings".to_owned());
@@ -102,20 +99,7 @@ impl SandboxRuntime {
         wrapped.push("--".to_owned());
         wrapped.push(command.to_owned());
         wrapped.extend(args.iter().cloned());
-        if let Some(logger) = &self.logger {
-            logger.debug(
-                "wrapped command for sandbox",
-                log_attributes([
-                    ("original_command", serde_json::json!(command)),
-                    ("original_args", serde_json::json!(args)),
-                    (
-                        "wrapped_command",
-                        serde_json::json!(self.srt_binary.clone()),
-                    ),
-                    ("wrapped_args", serde_json::json!(wrapped.clone())),
-                ]),
-            );
-        }
+        tracing::debug!("original_command" = ?(command), "original_args" = ?(args), "wrapped_command" = ?(self.srt_binary.clone()), "wrapped_args" = ?(wrapped.clone()), "{}", "wrapped command for sandbox");
         (self.srt_binary.clone(), wrapped)
     }
 
@@ -135,39 +119,12 @@ impl SandboxRuntime {
             return Ok(());
         }
         if !self.owns_config_file {
-            if let Some(logger) = &self.logger {
-                logger.debug(
-                    "skipping cleanup of custom config",
-                    log_attributes([(
-                        "config_path",
-                        serde_json::json!(self.config_path.to_string_lossy()),
-                    )]),
-                );
-            }
+            tracing::debug!("config_path" = ?(self.config_path.to_string_lossy()), "{}", "skipping cleanup of custom config");
             return Ok(());
         }
-        if let Some(logger) = &self.logger {
-            logger.debug(
-                "cleaning up sandbox config",
-                log_attributes([(
-                    "config_path",
-                    serde_json::json!(self.config_path.to_string_lossy()),
-                )]),
-            );
-        }
+        tracing::debug!("config_path" = ?(self.config_path.to_string_lossy()), "{}", "cleaning up sandbox config");
         if let Err(error) = cleanup_config_file(&self.config_path) {
-            if let Some(logger) = &self.logger {
-                logger.warn(
-                    "failed to cleanup sandbox config",
-                    log_attributes([
-                        (
-                            "config_path",
-                            serde_json::json!(self.config_path.to_string_lossy()),
-                        ),
-                        ("error", serde_json::json!(error.to_string())),
-                    ]),
-                );
-            }
+            tracing::warn!("config_path" = ?(self.config_path.to_string_lossy()), "error" = ?(error.to_string()), "{}", "failed to cleanup sandbox config");
             return Err(error.into());
         }
         self.config_path.clear();
@@ -184,7 +141,6 @@ impl SandboxRuntime {
 ///
 /// # 参数
 /// - `_session_json`：原始 session JSON；当前基线不解析该参数。
-/// - `logger`：可选业务 logger；对应 Go 的可空 `*slog.Logger`，并随 runtime 保存。
 /// - `custom_config_path`：调用方拥有的 settings 路径；存在时只验证、不删除。
 /// - `working_dir`：自动配置额外允许写入的工作目录。
 ///
@@ -195,20 +151,11 @@ impl SandboxRuntime {
 /// 尝试以 0755 创建 `/tmp/claude`，可能创建 0600 临时 settings 文件并写日志。
 pub fn new_sandbox_runtime_with_config(
     _session_json: &[u8],
-    logger: Option<&Logger>,
     custom_config_path: Option<&Path>,
     working_dir: Option<&Path>,
 ) -> Result<SandboxRuntime, SandboxRuntimeError> {
-    if let Err(error) = create_claude_temp_directory(Path::new("/tmp/claude"))
-        && let Some(logger) = logger
-    {
-        logger.warn(
-            "failed to create claude tmp directory",
-            log_attributes([
-                ("path", serde_json::json!("/tmp/claude")),
-                ("error", serde_json::json!(error.to_string())),
-            ]),
-        );
+    if let Err(error) = create_claude_temp_directory(Path::new("/tmp/claude")) {
+        tracing::warn!("path" = ?("/tmp/claude"), "error" = ?(error.to_string()), "{}", "failed to create claude tmp directory");
     }
     let srt_binary = std::env::var("SRT_BINARY_PATH")
         .ok()
@@ -217,18 +164,7 @@ pub fn new_sandbox_runtime_with_config(
 
     let (config_path, owns_config_file, custom_config) = if let Some(path) = custom_config_path {
         let config = load_and_validate_config(path).map_err(SandboxRuntimeError::CustomConfig)?;
-        if let Some(logger) = logger {
-            logger.info(
-                "using custom sandbox config",
-                log_attributes([
-                    ("config_path", serde_json::json!(path.to_string_lossy())),
-                    (
-                        "allowed_domains",
-                        serde_json::json!(config.network.allowed_domains),
-                    ),
-                ]),
-            );
-        }
+        tracing::info!("config_path" = ?(path.to_string_lossy()), "allowed_domains" = ?(config.network.allowed_domains), "{}", "using custom sandbox config");
         (path.to_owned(), false, true)
     } else {
         let mut config = default_config();
@@ -244,36 +180,14 @@ pub fn new_sandbox_runtime_with_config(
         (path, true, false)
     };
 
-    if let Some(logger) = logger {
-        logger.info(
-            "sandbox runtime initialized",
-            log_attributes([
-                ("srt_binary", serde_json::json!(srt_binary.clone())),
-                (
-                    "config_path",
-                    serde_json::json!(config_path.to_string_lossy()),
-                ),
-                ("custom_config", serde_json::json!(custom_config)),
-            ]),
-        );
-    }
+    tracing::info!("srt_binary" = ?(srt_binary.clone()), "config_path" = ?(config_path.to_string_lossy()), "custom_config" = ?(custom_config), "{}", "sandbox runtime initialized");
     Ok(SandboxRuntime {
         srt_binary,
         config_path,
-        logger: logger.cloned(),
+
         owns_config_file,
         custom_config,
     })
-}
-
-/// 创建保持 Go `slog` 调用顺序的结构化属性。
-fn log_attributes(
-    entries: impl IntoIterator<Item = (impl Into<String>, serde_json::Value)>,
-) -> LogAttributes {
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.into(), value))
-        .collect()
 }
 
 /// 构造与 Go runtime.go 完全相同的默认网络与文件系统规则。
@@ -327,7 +241,6 @@ mod tests {
         let mut runtime = new_sandbox_runtime_with_config(
             br#"{"session":"ignored"}"#,
             None,
-            None,
             Some(Path::new("/workspace/project")),
         )
         .unwrap();
@@ -363,8 +276,7 @@ mod tests {
         let path = temp.path().join("custom.json");
         std::fs::write(&path, serde_json::to_vec(&default_config()).unwrap()).unwrap();
         {
-            let mut runtime =
-                new_sandbox_runtime_with_config(&[], None, Some(&path), None).unwrap();
+            let mut runtime = new_sandbox_runtime_with_config(&[], Some(&path), None).unwrap();
             assert!(runtime.custom_config);
             runtime.cleanup().unwrap();
         }
@@ -378,7 +290,7 @@ mod tests {
         let path = temp.path().join("invalid.json");
         std::fs::write(&path, br#"{"network":{"allowedDomains":["example.com"]}}"#).unwrap();
         assert!(matches!(
-            new_sandbox_runtime_with_config(&[], None, Some(&path), None),
+            new_sandbox_runtime_with_config(&[], Some(&path), None),
             Err(SandboxRuntimeError::CustomConfig(_))
         ));
     }

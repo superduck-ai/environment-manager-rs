@@ -1,13 +1,9 @@
 //! Snapshot action 的数据结构。
 //!
-//! 对应 Go `internal/tunnel/actions/snapshot/zz_recovered_types.go`。路径保留为字段，
+//! Snapshot action 类型。路径保留为字段，
 //! 使 Linux 测试能把固定生产路径替换为临时目录；外部协议字段显式使用 snake_case。
-
-use crate::internal::logger::Logger;
-
 /// 收集 Baku 草稿、探索文件和 Git 元数据的 action。
 pub struct SnapshotAction {
-    pub(crate) logger: Option<Logger>,
     pub(crate) drafts_path: std::path::PathBuf,
     pub(crate) explorations_path: std::path::PathBuf,
     pub(crate) project_path: std::path::PathBuf,

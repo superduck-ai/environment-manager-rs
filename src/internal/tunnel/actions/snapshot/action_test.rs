@@ -11,7 +11,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::Logger;
 use crate::internal::tunnel::actions::{
     Action, ActionError, ActionRequest, ActionResult, ProgressReporter, ProgressUpdate,
 };
@@ -33,9 +32,8 @@ impl ProgressReporter for NoopProgress {
 /// 对应 Go `TestNewSnapshotActionDefaults`，锁定仅支持 Linux 的固定项目路径。
 #[test]
 fn test_new_snapshot_action_defaults() {
-    let action = new_snapshot_action(test_logger());
+    let action = new_snapshot_action();
 
-    assert!(action.logger.is_none());
     assert_eq!(
         action.drafts_path,
         PathBuf::from("/home/claude/project/.baku/drafts")
@@ -89,7 +87,6 @@ async fn test_snapshot_execute_collects_files_and_git_metadata() {
 async fn test_snapshot_execute_returns_project_resolve_error() {
     let temporary = tempfile::tempdir().unwrap();
     let action = SnapshotAction {
-        logger: test_logger(),
         drafts_path: temporary.path().join("drafts"),
         explorations_path: temporary.path().join("explorations"),
         project_path: temporary.path().join("missing"),
@@ -203,16 +200,10 @@ fn assert_file_entry(entries: &serde_json::Value, filename: &str, content: &str)
 /// 对应 Go `newTestSnapshotAction`，把固定生产路径重定向至临时项目。
 fn new_test_snapshot_action(project: &Path) -> SnapshotAction {
     SnapshotAction {
-        logger: test_logger(),
         drafts_path: project.join(".baku/drafts"),
         explorations_path: project.join(".baku/explorations"),
         project_path: project.to_owned(),
     }
-}
-
-/// 对应 Go `testLogger`；这些行为测试关闭日志输出以保持断言确定性。
-fn test_logger() -> Option<Logger> {
-    None
 }
 
 /// 对应 Go `requireGit`；权威 Linux 镜像必须提供用于兼容测试的外部 Git。

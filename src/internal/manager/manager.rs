@@ -29,7 +29,6 @@ use crate::internal::{
     claude::{self, Executor, Outcomes},
     config::{self, ClaudeConfig, Session, SessionMode},
     envtype::EnvironmentType,
-    logger::{LogAttributes, Logger},
     mcp::MCPServer,
     session::{ActivityRecorder, EventPoster, NoopActivityRecorder, new_activity_recorder},
 };
@@ -60,7 +59,6 @@ const OFFICIAL_PLUGIN_MARKETPLACE: &str =
 #[must_use]
 pub fn new_manager_with_executor_and_claude_config(
     api_client: Arc<dyn ManagerApiClient>,
-    logger: Logger,
     session_config: Option<Session>,
     env_types: Arc<crate::internal::envtype::EnvTypes>,
     executor_factory: ClaudeExecutorFactory,
@@ -74,7 +72,6 @@ pub fn new_manager_with_executor_and_claude_config(
 ) -> Manager {
     Manager {
         api_client,
-        logger,
         session_config,
         env_types,
         executor_factory,
@@ -137,10 +134,7 @@ impl Manager {
             .session_config
             .as_ref()
             .map_or_else(String::new, |session| session.session_id.clone());
-        self.logger.info(
-            "Starting environment manager",
-            attributes([("session_id", json!(&session_id))]),
-        );
+        tracing::info!("session_id" = ?(&session_id), "{}", "Starting environment manager");
 
         let environment_response = match self
             .api_client
@@ -157,13 +151,7 @@ impl Manager {
         };
 
         if environment_response.environment_type == "byoc" && !self.session_mode_explicitly_set {
-            self.logger.info(
-                "Defaulting BYOC environment to resume-cached session mode",
-                attributes([
-                    ("original_mode", json!(self.session_mode.as_str())),
-                    ("new_mode", json!(SessionMode::ResumeCached.as_str())),
-                ]),
-            );
+            tracing::info!("original_mode" = ?(self.session_mode.as_str()), "new_mode" = ?(SessionMode::ResumeCached.as_str()), "{}", "Defaulting BYOC environment to resume-cached session mode");
             self.session_mode = SessionMode::ResumeCached;
         }
 
@@ -177,7 +165,6 @@ impl Manager {
         let mut environment = match self.env_types.create(
             &environment_response.environment_type,
             &raw_environment_config,
-            self.logger.clone(),
         ) {
             Ok(environment) => environment,
             Err(error) => {
@@ -207,10 +194,7 @@ impl Manager {
             claude_config
                 .allowed_tools
                 .clone_from(&environment_response.allowed_tools);
-            self.logger.info(
-                "Using allowed tools from environment config",
-                attributes([("allowed_tools", json!(&environment_response.allowed_tools))]),
-            );
+            tracing::info!("allowed_tools" = ?(&environment_response.allowed_tools), "{}", "Using allowed tools from environment config");
         }
         if !environment_response.disallowed_tools.is_empty()
             && claude_config.disallowed_tools.is_empty()
@@ -240,15 +224,14 @@ impl Manager {
             Some(event_poster) => Arc::new(new_activity_recorder(
                 cancellation.clone(),
                 Arc::clone(event_poster),
-                self.logger.clone(),
                 None,
             )),
             None => Arc::new(NoopActivityRecorder),
         };
 
-        self.logger.info(
-            "Starting parallel initialization: MCP servers, plugin marketplace, and environment setup",
-            LogAttributes::new(),
+        tracing::info!(
+            "{}",
+            "Starting parallel initialization: MCP servers, plugin marketplace, and environment setup"
         );
         self.log_diag("parallel_init_started", BTreeMap::new());
         let parallel_started = Instant::now();
@@ -270,18 +253,18 @@ impl Manager {
         });
 
         let plugin_task = if skip_claude_code {
-            self.logger.info(
-                "Skipping plugin marketplace installation because Claude Code is disabled",
-                LogAttributes::new(),
+            tracing::info!(
+                "{}",
+                "Skipping plugin marketplace installation because Claude Code is disabled"
             );
             None
         } else if matches!(
             std::env::var("SKIP_PLUGIN_MARKETPLACE").as_deref(),
             Ok("true")
         ) {
-            self.logger.info(
-                "Skipping plugin marketplace installation (SKIP_PLUGIN_MARKETPLACE=true)",
-                LogAttributes::new(),
+            tracing::info!(
+                "{}",
+                "Skipping plugin marketplace installation (SKIP_PLUGIN_MARKETPLACE=true)"
             );
             None
         } else {
@@ -324,15 +307,7 @@ impl Manager {
         };
 
         let parallel_duration_ms = duration_milliseconds(parallel_started);
-        self.logger.info(
-            "parallel_init_completed",
-            attributes([
-                ("duration_ms", json!(parallel_duration_ms)),
-                ("mcp_success", json!(mcp_error.is_none())),
-                ("plugin_success", json!(plugin_marketplace_error.is_none())),
-                ("env_success", json!(environment_initialization.is_ok())),
-            ]),
-        );
+        tracing::info!("duration_ms" = ?(parallel_duration_ms), "mcp_success" = ?(mcp_error.is_none()), "plugin_success" = ?(plugin_marketplace_error.is_none()), "env_success" = ?(environment_initialization.is_ok()), "{}", "parallel_init_completed");
         self.log_diag(
             "parallel_init_completed",
             attributes([
@@ -379,34 +354,25 @@ impl Manager {
                     .into_iter()
                     .collect(),
             );
-            self.logger.warn(
-                "Failed to register MCP servers (parallel)",
-                attributes([("error", json!(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to register MCP servers (parallel)");
         }
         if let Some(error) = &plugin_marketplace_error {
             self.log_diag("plugin_marketplace_failed", BTreeMap::new());
-            self.logger.warn(
-                "Plugin marketplace installation failed (parallel)",
-                attributes([("error", json!(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "Plugin marketplace installation failed (parallel)");
         }
 
         if skip_claude_code {
-            self.logger.info(
-                "ENVRUNNER_SKIP_CLAUDE_CODE mode: environment initialized, waiting for shutdown signal",
-                LogAttributes::new(),
+            tracing::info!(
+                "{}",
+                "ENVRUNNER_SKIP_CLAUDE_CODE mode: environment initialized, waiting for shutdown signal"
             );
-            wait_for_shutdown_signal(cancellation, &self.logger).await;
+            wait_for_shutdown_signal(cancellation).await;
             return Ok(());
         }
 
         let outcomes = match self.api_client.get_outcomes() {
             Some(outcomes) if !outcomes.is_empty() => {
-                self.logger.info(
-                    "ClaudeCodeExecutor initialized with repository outcomes",
-                    attributes([("outcome_count", json!(outcomes.len()))]),
-                );
+                tracing::info!("outcome_count" = ?(outcomes.len()), "{}", "ClaudeCodeExecutor initialized with repository outcomes");
                 outcomes
             }
             _ => Outcomes::new(),
@@ -448,10 +414,7 @@ impl Manager {
             runtime.handle.start().await.map_err(|error| {
                 ManagerError::message(format!("failed to start lease manager: {error}"))
             })?;
-            self.logger.info(
-                "Using lease manager context for Claude Code execution",
-                attributes([("session_id", json!(&session_id))]),
-            );
+            tracing::info!("session_id" = ?(&session_id), "{}", "Using lease manager context for Claude Code execution");
         }
         let executor_cancellation = lease_runtime.as_ref().map_or_else(
             || cancellation.clone(),
@@ -460,7 +423,6 @@ impl Manager {
 
         let executor_create_started = Instant::now();
         let executor = match (self.executor_factory)(
-            self.logger.clone(),
             claude_config.clone(),
             session_id.clone(),
             self.session_config
@@ -494,19 +456,7 @@ impl Manager {
         };
         let executor_create_duration_ms = duration_milliseconds(executor_create_started);
         let total_startup_duration_ms = duration_milliseconds(started);
-        self.logger.info(
-            "Starting Claude Code",
-            attributes([
-                (
-                    "executor_create_duration_ms",
-                    json!(executor_create_duration_ms),
-                ),
-                (
-                    "total_startup_duration_ms",
-                    json!(total_startup_duration_ms),
-                ),
-            ]),
-        );
+        tracing::info!("executor_create_duration_ms" = ?(executor_create_duration_ms), "total_startup_duration_ms" = ?(total_startup_duration_ms), "{}", "Starting Claude Code");
         activity_recorder.record_activity(
             LogLevel::Info,
             LogCategory::Init,
@@ -523,21 +473,16 @@ impl Manager {
         );
 
         let operation_result = if self.session_mode == SessionMode::SetupOnly {
-            self.logger.info(
-                "Session mode is setup-only, running init hooks before exit",
-                LogAttributes::new(),
+            tracing::info!(
+                "{}",
+                "Session mode is setup-only, running init hooks before exit"
             );
-            let result = run_init_only(
-                cancellation,
-                &self.logger,
-                &claude_config,
-                self.session_config.as_ref(),
-            )
-            .await;
+            let result =
+                run_init_only(cancellation, &claude_config, self.session_config.as_ref()).await;
             if result.is_ok() {
-                self.logger.info(
-                    "Session mode is setup-only, skipping Claude Code execution",
-                    LogAttributes::new(),
+                tracing::info!(
+                    "{}",
+                    "Session mode is setup-only, skipping Claude Code execution"
                 );
             }
             result
@@ -573,30 +518,21 @@ impl Manager {
         {
             let has_mcp_config = startup_context.mcp_config.is_some();
             environment.set_startup_context(Some(startup_context));
-            self.logger.info(
-                "Set startup context for environment",
-                attributes([("has_mcp_config", json!(has_mcp_config))]),
-            );
+            tracing::info!("has_mcp_config" = ?(has_mcp_config), "{}", "Set startup context for environment");
         }
         environment.set_auth_context(Some(auth_context.clone()));
-        self.logger.info(
-            "Set auth context for environment",
-            attributes([("session_id", json!(auth_context.get_session_id()))]),
-        );
+        tracing::info!("session_id" = ?(auth_context.get_session_id()), "{}", "Set auth context for environment");
         environment.set_session_mode(self.session_mode);
-        self.logger.info(
-            "Set session mode for environment",
-            attributes([("session_mode", json!(self.session_mode.as_str()))]),
-        );
+        tracing::info!("session_mode" = ?(self.session_mode.as_str()), "{}", "Set session mode for environment");
 
         if self
             .claude_config
             .as_ref()
             .is_some_and(|configuration| configuration.local_testing_mode)
         {
-            self.logger.info(
-                "Skipping git signing configuration in local testing mode",
-                LogAttributes::new(),
+            tracing::info!(
+                "{}",
+                "Skipping git signing configuration in local testing mode"
             );
             return;
         }
@@ -609,9 +545,9 @@ impl Manager {
     /// 通过 [`run_combined_command`] 只 kill 当前 direct child。
     async fn configure_git_signing(&self, cancellation: &CancellationToken) {
         if matches!(std::env::var("SKIP_GIT_CONFIG").as_deref(), Ok("true")) {
-            self.logger.info(
-                "Skipping git signing configuration (SKIP_GIT_CONFIG=true)",
-                LogAttributes::new(),
+            tracing::info!(
+                "{}",
+                "Skipping git signing configuration (SKIP_GIT_CONFIG=true)"
             );
             return;
         }
@@ -619,23 +555,14 @@ impl Manager {
         let executable_path = match std::env::current_exe() {
             Ok(path) => path,
             Err(error) => {
-                self.logger.warn(
-                    "Failed to get executable path for git signing config",
-                    attributes([("error", json!(error.to_string()))]),
-                );
+                tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to get executable path for git signing config");
                 return;
             }
         };
         let resolved_path = match executable_path.canonicalize() {
             Ok(path) => path,
             Err(error) => {
-                self.logger.warn(
-                    "failed to read symlink",
-                    attributes([
-                        ("path", json!(executable_path.display().to_string())),
-                        ("error", json!(error.to_string())),
-                    ]),
-                );
+                tracing::warn!("path" = ?(executable_path.display().to_string()), "error" = ?(error.to_string()), "{}", "failed to read symlink");
                 return;
             }
         };
@@ -644,14 +571,7 @@ impl Manager {
         if let Err(error) = symlink(&resolved_path, CODE_SIGN_PATH)
             && error.kind() != std::io::ErrorKind::AlreadyExists
         {
-            self.logger.warn(
-                "failed to create symlink",
-                attributes([
-                    ("target", json!(resolved_path.display().to_string())),
-                    ("link", json!(CODE_SIGN_PATH)),
-                    ("error", json!(error.to_string())),
-                ]),
-            );
+            tracing::warn!("target" = ?(resolved_path.display().to_string()), "link" = ?(CODE_SIGN_PATH), "error" = ?(error.to_string()), "{}", "failed to create symlink");
             return;
         }
 
@@ -675,24 +595,11 @@ impl Manager {
             if let Err(error) =
                 run_combined_command(cancellation, OsStr::new("git"), &arguments).await
             {
-                self.logger.warn(
-                    "Failed to set git signing key config",
-                    attributes([
-                        ("key", json!(key)),
-                        ("error", json!(error.error)),
-                        ("output", json!(String::from_utf8_lossy(&error.output))),
-                    ]),
-                );
+                tracing::warn!("key" = ?(key), "error" = ?(error.error), "output" = ?(String::from_utf8_lossy(&error.output)), "{}", "Failed to set git signing key config");
             }
         }
 
-        self.logger.info(
-            "Configured git signing",
-            attributes([
-                ("executable", json!(resolved_path.display().to_string())),
-                ("path", json!(CODE_SIGN_PATH)),
-            ]),
-        );
+        tracing::info!("executable" = ?(resolved_path.display().to_string()), "path" = ?(CODE_SIGN_PATH), "{}", "Configured git signing");
     }
 
     /// 将 environment 的 Claude 环境变量和非空 CWD 覆盖到最终执行配置。
@@ -706,17 +613,11 @@ impl Manager {
             .extend(environment.get_claude_environment_variables());
         let working_directory = environment.get_cwd();
         if working_directory.is_empty() {
-            self.logger.info(
-                "No working directory specified in environment config",
-                LogAttributes::new(),
-            );
+            tracing::info!("{}", "No working directory specified in environment config");
             return;
         }
         claude_config.working_dir = working_directory.to_owned();
-        self.logger.info(
-            "Set working directory from environment config",
-            attributes([("working_dir", json!(working_directory))]),
-        );
+        tracing::info!("working_dir" = ?(working_directory), "{}", "Set working directory from environment config");
     }
 
     /// 运行 `claude plugin marketplace add` 并返回完整 combined output 错误。
@@ -783,39 +684,20 @@ impl Manager {
                     Some(auth_context),
                 ) {
                     Ok(client) => tunnel_client = Some(client),
-                    Err(error) => self.logger.error(
-                        "Failed to create tunnel client",
-                        attributes([
-                            ("session_id", json!(session_id)),
-                            ("error", json!(error.to_string())),
-                        ]),
-                    ),
+                    Err(error) => {
+                        tracing::error!("session_id" = ?(session_id), "error" = ?(error.to_string()), "{}", "Failed to create tunnel client")
+                    }
                 }
             } else {
-                self.logger.warn(
-                    "Tunnel requested but startup context is unavailable",
-                    attributes([("session_id", json!(session_id))]),
-                );
+                tracing::warn!("session_id" = ?(session_id), "{}", "Tunnel requested but startup context is unavailable");
             }
         } else if self.create_tunnel_client_func.is_some() {
-            self.logger.info(
-                "Tunnel client disabled",
-                attributes([("session_id", json!(session_id))]),
-            );
+            tracing::info!("session_id" = ?(session_id), "{}", "Tunnel client disabled");
         } else {
-            self.logger.info(
-                "Tunnel client not registered",
-                attributes([("session_id", json!(session_id))]),
-            );
+            tracing::info!("session_id" = ?(session_id), "{}", "Tunnel client not registered");
         }
 
-        self.logger.info(
-            "Starting Claude Code execution",
-            attributes([
-                ("session_id", json!(session_id)),
-                ("session_mode", json!(self.session_mode.as_str())),
-            ]),
-        );
+        tracing::info!("session_id" = ?(session_id), "session_mode" = ?(self.session_mode.as_str()), "{}", "Starting Claude Code execution");
         let run_cancellation = executor_cancellation.child_token();
         let execute_token = run_cancellation.clone();
         let cancel_after_execute = run_cancellation.clone();
@@ -828,28 +710,18 @@ impl Manager {
         let execution_result = if let Some(client) = tunnel_client.as_ref() {
             let tunnel_run_client = Arc::clone(client);
             let tunnel_token = run_cancellation.clone();
-            let tunnel_logger = self.logger.clone();
             let tunnel_session_id = session_id.to_owned();
             let tunnel_future = async move {
                 match tunnel_run_client.connect_and_run(&tunnel_token).await {
-                    Err(error) if tunnel_token.is_cancelled() => tunnel_logger.info(
-                        "Tunnel client stopped after context cancellation",
-                        attributes([
-                            ("session_id", json!(&tunnel_session_id)),
-                            ("error", json!(error.to_string())),
-                        ]),
-                    ),
-                    Err(error) => tunnel_logger.error(
-                        "Tunnel client failed",
-                        attributes([
-                            ("session_id", json!(&tunnel_session_id)),
-                            ("error", json!(error.to_string())),
-                        ]),
-                    ),
-                    Ok(()) => tunnel_logger.info(
-                        "Tunnel client stopped",
-                        attributes([("session_id", json!(&tunnel_session_id))]),
-                    ),
+                    Err(error) if tunnel_token.is_cancelled() => {
+                        tracing::info!("session_id" = ?(&tunnel_session_id), "error" = ?(error.to_string()), "{}", "Tunnel client stopped after context cancellation")
+                    }
+                    Err(error) => {
+                        tracing::error!("session_id" = ?(&tunnel_session_id), "error" = ?(error.to_string()), "{}", "Tunnel client failed")
+                    }
+                    Ok(()) => {
+                        tracing::info!("session_id" = ?(&tunnel_session_id), "{}", "Tunnel client stopped")
+                    }
                 }
             };
             let (execution_result, ()) = tokio::join!(execute_future, tunnel_future);
@@ -863,29 +735,17 @@ impl Manager {
         }
         match execution_result {
             Ok(()) => {
-                self.logger.info(
-                    "Claude Code execution completed",
-                    attributes([
-                        ("duration_ms", json!(duration_milliseconds(manager_started))),
-                        ("session_id", json!(session_id)),
-                    ]),
-                );
+                tracing::info!("duration_ms" = ?(duration_milliseconds(manager_started)), "session_id" = ?(session_id), "{}", "Claude Code execution completed");
                 Ok(())
             }
             Err(error) if using_lease_context && executor_cancellation.is_cancelled() => {
-                self.logger.info(
-                    "Claude Code execution stopped after lease manager context cancellation",
-                    attributes([("error", json!(error.to_string()))]),
-                );
+                tracing::info!("error" = ?(error.to_string()), "{}", "Claude Code execution stopped after lease manager context cancellation");
                 Ok(())
             }
             Err(_) if executor_cancellation.is_cancelled() => Ok(()),
             Err(error) if is_cancellation_error(&error.to_string()) => Ok(()),
             Err(error) => {
-                self.logger.error(
-                    "Environment manager execution failed",
-                    attributes([("error", json!(error.to_string()))]),
-                );
+                tracing::error!("error" = ?(error.to_string()), "{}", "Environment manager execution failed");
                 // Go 的 `fmt.Errorf("execution failed: %w", err)` 只拼接字节；如果
                 // Claude/npm CombinedOutput 含非法 UTF-8，提前调用 Display 会改变最终
                 // stderr。日志上方仍使用逐坏字节替换视图，返回链则必须保留原字节。
@@ -919,17 +779,11 @@ impl Manager {
             deadline_cancellation.cancel();
         });
         for server in mcp_servers {
-            self.logger.info(
-                "Stopping MCP server",
-                attributes([("server_name", json!(server.get_name()))]),
-            );
+            tracing::info!("server_name" = ?(server.get_name()), "{}", "Stopping MCP server");
             server.stop().await;
         }
         if let Err(error) = executor.destroy(&cleanup_cancellation).await {
-            self.logger.warn(
-                "Failed to destroy Claude executor",
-                attributes([("error", json!(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to destroy Claude executor");
         }
         // 清理在 deadline 前完成时，Go 的 cancel defer 会立即通知所有派生
         // context 并释放 timer；先 cancel 再 abort 复刻这个顺序，也避免一个
@@ -957,7 +811,7 @@ pub fn is_tunnel_enabled(factory: Option<&CreateTunnelClientFunc>) -> bool {
 /// Linux 上 Go `signal.Notify` 没有可恢复的错误返回；Tokio 的注册接口虽然返回
 /// `Result`，但若该平台不变量被破坏，应直接暴露为内部 panic，而不是产生 Go
 /// 中不存在的 warning 后改成只等待 cancellation。
-pub async fn wait_for_shutdown_signal(cancellation: &CancellationToken, logger: &Logger) {
+pub async fn wait_for_shutdown_signal(cancellation: &CancellationToken) {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .expect("Linux SIGINT handler registration must succeed");
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -968,16 +822,12 @@ pub async fn wait_for_shutdown_signal(cancellation: &CancellationToken, logger: 
         _ = terminate.recv() => "terminated",
         () = cancellation.cancelled() => "context canceled",
     };
-    logger.info(
-        "Received signal, shutting down gracefully",
-        attributes([("signal", json!(signal))]),
-    );
+    tracing::info!("signal" = ?(signal), "{}", "Received signal, shutting down gracefully");
 }
 
 /// 对 setup-only 会话的每个 repository source 依次执行 `claude --init-only`。
 pub async fn run_init_only(
     cancellation: &CancellationToken,
-    logger: &Logger,
     claude_config: &ClaudeConfig,
     session_config: Option<&Session>,
 ) -> Result<(), ManagerError> {
@@ -998,24 +848,10 @@ pub async fn run_init_only(
         if repository_directory.as_os_str().is_empty() {
             continue;
         }
-        if let Err(error) = claude::run_init(
-            cancellation,
-            logger,
-            Some(claude_config),
-            &repository_directory,
-        )
-        .await
+        if let Err(error) =
+            claude::run_init(cancellation, Some(claude_config), &repository_directory).await
         {
-            logger.error(
-                "claude --init-only failed",
-                attributes([
-                    (
-                        "repo_dir",
-                        json!(repository_directory.display().to_string()),
-                    ),
-                    ("error", json!(error.to_string())),
-                ]),
-            );
+            tracing::error!("repo_dir" = ?(repository_directory.display().to_string()), "error" = ?(error.to_string()), "{}", "claude --init-only failed");
             // run_init 的 CombinedOutput 属于 Go error string 的一部分；日志使用上方
             // 的逐坏字节替换视图，返回路径则复刻 `%w` 的原始字节拼接。
             return Err(ManagerError::prefixed(
@@ -1023,19 +859,13 @@ pub async fn run_init_only(
                 error.as_bytes(),
             ));
         }
-        logger.info(
-            "claude --init-only completed successfully",
-            attributes([(
-                "repo_dir",
-                json!(repository_directory.display().to_string()),
-            )]),
-        );
+        tracing::info!("repo_dir" = ?(repository_directory.display().to_string()), "{}", "claude --init-only completed successfully");
         repository_count += 1;
     }
     if repository_count == 0 {
-        logger.info(
-            "Session mode is setup-only, no repositories found for init hooks",
-            LogAttributes::new(),
+        tracing::info!(
+            "{}",
+            "Session mode is setup-only, no repositories found for init hooks"
         );
     }
     Ok(())
@@ -1147,8 +977,8 @@ fn is_cancellation_error(error: &str) -> bool {
     error.contains("context canceled") || error.contains("operation canceled")
 }
 
-/// 把成对字段收集为 logger 和 diag 共用的稳定排序属性。
-fn attributes<const N: usize>(entries: [(&str, Value); N]) -> LogAttributes {
+/// 把成对字段收集为诊断事件使用的稳定排序属性。
+fn attributes<const N: usize>(entries: [(&str, Value); N]) -> BTreeMap<String, Value> {
     entries
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value))

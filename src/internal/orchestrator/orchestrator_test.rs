@@ -20,19 +20,14 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use super::*;
-use crate::internal::logger::{
-    LogAttributes, LogHandler, LogHandlerError, LogLevel, LogRecord, Logger,
-};
-
 /// 验证普通 Hook 的空命令、成功及带输出非零退出。
 #[tokio::test]
 async fn test_hook_execute_noop_success_and_failure() {
-    let logger = orchestrator_test_logger();
     Hook {
         name: "noop".to_owned(),
         ..Hook::default()
     }
-    .execute(&CancellationToken::new(), &logger)
+    .execute(&CancellationToken::new())
     .await
     .unwrap();
 
@@ -43,7 +38,7 @@ async fn test_hook_execute_noop_success_and_failure() {
         command: success.to_string_lossy().into_owned(),
         ..Hook::default()
     }
-    .execute(&CancellationToken::new(), &logger)
+    .execute(&CancellationToken::new())
     .await
     .unwrap();
 
@@ -54,7 +49,7 @@ async fn test_hook_execute_noop_success_and_failure() {
         command: failure.to_string_lossy().into_owned(),
         ..Hook::default()
     }
-    .execute(&CancellationToken::new(), &logger)
+    .execute(&CancellationToken::new())
     .await
     .unwrap_err();
     assert!(error.to_string().contains("hook fail failed"));
@@ -87,11 +82,7 @@ async fn test_hook_execute_with_stdin_injects_session_id() {
         timeout: Duration::from_secs(1),
         ..Hook::default()
     }
-    .execute_with_stdin(
-        &CancellationToken::new(),
-        &orchestrator_test_logger(),
-        stdin_data,
-    )
+    .execute_with_stdin(&CancellationToken::new(), stdin_data)
     .await
     .unwrap();
 
@@ -113,11 +104,7 @@ async fn hook_requires_sandbox_adapter_when_enabled() {
         sandbox_enabled: true,
         ..Hook::default()
     }
-    .execute_with_stdin(
-        &CancellationToken::new(),
-        &default_orchestrator_logger(),
-        br#"{"id":"session-1"}"#,
-    )
+    .execute_with_stdin(&CancellationToken::new(), br#"{"id":"session-1"}"#)
     .await
     .unwrap_err();
     assert!(
@@ -140,7 +127,7 @@ async fn hook_timeout_kills_child() {
         timeout: Duration::from_millis(20),
         ..Hook::default()
     }
-    .execute(&CancellationToken::new(), &default_orchestrator_logger())
+    .execute(&CancellationToken::new())
     .await
     .unwrap_err();
     assert!(error.to_string().contains("context deadline exceeded"));
@@ -165,7 +152,6 @@ async fn test_poll_hook_poll_returns_work_empty_and_errors() {
         "org-1",
         "env-1",
         "worker-1",
-        orchestrator_test_logger(),
     );
     poll_hook
         .args
@@ -196,7 +182,6 @@ async fn test_poll_hook_poll_returns_work_empty_and_errors() {
         "",
         "",
         "",
-        orchestrator_test_logger(),
     );
     assert!(
         empty_hook
@@ -214,7 +199,6 @@ async fn test_poll_hook_poll_returns_work_empty_and_errors() {
         "",
         "",
         "",
-        orchestrator_test_logger(),
     );
     let error = invalid_hook
         .poll(&CancellationToken::new())
@@ -228,14 +212,7 @@ async fn test_poll_hook_poll_returns_work_empty_and_errors() {
 async fn test_poll_hook_sleep_with_jitter_cancellation() {
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    let hook = new_poll_hook(
-        "/bin/true",
-        Duration::from_secs(1),
-        "",
-        "",
-        "",
-        orchestrator_test_logger(),
-    );
+    let hook = new_poll_hook("/bin/true", Duration::from_secs(1), "", "", "");
     let error = hook.sleep_with_jitter(&cancellation).await.unwrap_err();
     assert!(error.to_string().contains("jitter sleep interrupted"));
 }
@@ -249,14 +226,7 @@ async fn test_poller_poll_requests_work_and_handles_empty_queue() {
         br#"{"id":"work-1","type":"work","environment_id":"env-1","state":"available","data":{"type":"session","id":"session-1"},"secret":"secret"}"#,
     )
     .await;
-    let poller = new_poller_with_worker_id(
-        base_url,
-        "env-1",
-        "auth-token",
-        "worker-1",
-        123,
-        orchestrator_test_logger(),
-    );
+    let poller = new_poller_with_worker_id(base_url, "env-1", "auth-token", "worker-1", 123);
     let raw = poller
         .poll(&CancellationToken::new())
         .await
@@ -272,14 +242,7 @@ async fn test_poller_poll_requests_work_and_handles_empty_queue() {
     assert!(lower.contains("x-environment-runner-version:"));
 
     let (base_url, _request) = spawn_http_response(200, &[], b"null").await;
-    let empty = new_poller_with_worker_id(
-        base_url,
-        "env-1",
-        "auth-token",
-        "worker-1",
-        0,
-        orchestrator_test_logger(),
-    );
+    let empty = new_poller_with_worker_id(base_url, "env-1", "auth-token", "worker-1", 0);
     assert!(
         empty
             .poll(&CancellationToken::new())
@@ -294,27 +257,13 @@ async fn test_poller_poll_requests_work_and_handles_empty_queue() {
 async fn test_poller_poll_reports_http_and_validation_errors() {
     let (base_url, _request) =
         spawn_http_response(418, &[("x-request-id", "req-err")], b"nope").await;
-    let poller = new_poller_with_worker_id(
-        base_url,
-        "env-1",
-        "auth-token",
-        "worker-1",
-        0,
-        orchestrator_test_logger(),
-    );
+    let poller = new_poller_with_worker_id(base_url, "env-1", "auth-token", "worker-1", 0);
     let error = poller.poll(&CancellationToken::new()).await.unwrap_err();
     assert!(error.to_string().contains("status 418"));
     assert!(error.to_string().contains("req-err"));
 
     let (base_url, _request) = spawn_http_response(200, &[], br#"{"type":"other"}"#).await;
-    let poller = new_poller_with_worker_id(
-        base_url,
-        "env-1",
-        "auth-token",
-        "worker-1",
-        0,
-        orchestrator_test_logger(),
-    );
+    let poller = new_poller_with_worker_id(base_url, "env-1", "auth-token", "worker-1", 0);
     let error = poller.poll(&CancellationToken::new()).await.unwrap_err();
     assert!(error.to_string().contains("unexpected response type"));
 }
@@ -324,14 +273,7 @@ async fn test_poller_poll_reports_http_and_validation_errors() {
 async fn test_poller_sleep_with_jitter_cancellation() {
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    let poller = new_poller_with_worker_id(
-        "example.invalid",
-        "env-1",
-        "token",
-        "worker-1",
-        0,
-        orchestrator_test_logger(),
-    );
+    let poller = new_poller_with_worker_id("example.invalid", "env-1", "token", "worker-1", 0);
     let error = poller.sleep_with_jitter(&cancellation).await.unwrap_err();
     assert!(error.to_string().contains("jitter sleep interrupted"));
 }
@@ -344,7 +286,7 @@ async fn test_whoami_client_get_identity() {
     );
     let (base_url, request) =
         spawn_http_response(200, &[("Content-Encoding", "gzip")], &compressed_body).await;
-    let client = new_whoami_client(base_url, "auth-token", orchestrator_test_logger());
+    let client = new_whoami_client(base_url, "auth-token");
     let identity = client
         .get_identity(&CancellationToken::new())
         .await
@@ -379,11 +321,7 @@ async fn whoami_preserves_trailing_base_url_slash() {
         br#"{"type":"environment_whoami","organization_uuid":"org-1","environment_id":"env-1"}"#,
     )
     .await;
-    let client = new_whoami_client(
-        format!("{base_url}/"),
-        "auth-token",
-        orchestrator_test_logger(),
-    );
+    let client = new_whoami_client(format!("{base_url}/"), "auth-token");
     client
         .get_identity(&CancellationToken::new())
         .await
@@ -397,7 +335,7 @@ async fn whoami_preserves_trailing_base_url_slash() {
 #[tokio::test]
 async fn test_whoami_client_reports_status_parse_and_type_errors() {
     let (base_url, _request) = spawn_http_response(401, &[], b"nope").await;
-    let client = new_whoami_client(base_url, "token", orchestrator_test_logger());
+    let client = new_whoami_client(base_url, "token");
     let error = client
         .get_identity(&CancellationToken::new())
         .await
@@ -406,7 +344,7 @@ async fn test_whoami_client_reports_status_parse_and_type_errors() {
     assert!(error.to_string().contains("nope"));
 
     let (base_url, _request) = spawn_http_response(200, &[], b"{bad json").await;
-    let client = new_whoami_client(base_url, "token", orchestrator_test_logger());
+    let client = new_whoami_client(base_url, "token");
     let error = client
         .get_identity(&CancellationToken::new())
         .await
@@ -418,7 +356,7 @@ async fn test_whoami_client_reports_status_parse_and_type_errors() {
     );
 
     let (base_url, _request) = spawn_http_response(200, &[], br#"{"type":"other"}"#).await;
-    let client = new_whoami_client(base_url, "token", orchestrator_test_logger());
+    let client = new_whoami_client(base_url, "token");
     let error = client
         .get_identity(&CancellationToken::new())
         .await
@@ -436,7 +374,7 @@ async fn test_whoami_client_reports_status_parse_and_type_errors() {
         br#"{"type":null,"organization_uuid":null,"environment_id":null}"#.as_slice(),
     ] {
         let (base_url, _request) = spawn_http_response(200, &[], body).await;
-        let client = new_whoami_client(base_url, "token", orchestrator_test_logger());
+        let client = new_whoami_client(base_url, "token");
         let error = client
             .get_identity(&CancellationToken::new())
             .await
@@ -515,125 +453,6 @@ async fn orchestrator_cancellation_interrupts_backoff() {
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
-/// 验证 orchestrator 自身的所有 Go `slog.Duration` 属性保留原字段名和纳秒单位。
-#[tokio::test]
-async fn orchestrator_duration_logs_match_go_slog_duration() {
-    let (logger, records) = recording_orchestrator_logger();
-    let output = Arc::new(MemoryOutput::default());
-    let orchestrator = new_orchestrator(OrchestratorConfig {
-        poller: Some(Arc::new(SequencePoller::new([Ok(Some(
-            br#"{"id":"session-1"}"#.to_vec(),
-        ))]))),
-        poll_timeout: Duration::from_millis(1_500),
-        loop_timeout: Duration::from_secs(2),
-        session_output: Some(output),
-        logger: Some(logger),
-        ..OrchestratorConfig::default()
-    })
-    .unwrap();
-    orchestrator.run(&CancellationToken::new()).await.unwrap();
-
-    let records = records.lock().unwrap();
-    let starting = records
-        .iter()
-        .find(|record| record.message == "starting orchestrator")
-        .unwrap();
-    assert_eq!(starting.attributes["poll_timeout"], 1_500_000_000_i64);
-    assert_eq!(starting.attributes["loop_timeout"], 2_000_000_000_i64);
-    assert!(!starting.attributes.contains_key("poll_timeout_ms"));
-    assert!(!starting.attributes.contains_key("loop_timeout_ms"));
-
-    let polling = records
-        .iter()
-        .find(|record| record.message == "starting poll loop")
-        .unwrap();
-    assert_eq!(polling.attributes["poll_timeout"], 1_500_000_000_i64);
-    let remaining = polling.attributes["remaining_loop_time"].as_i64().unwrap();
-    assert!((1..=2_000_000_000).contains(&remaining));
-    assert!(!polling.attributes.contains_key("remaining_loop_time_ms"));
-}
-
-/// 验证失败耗时和退避时长不再以 Rust 专用 `_ms` 字段写入。
-#[tokio::test]
-async fn orchestrator_failure_duration_logs_match_go_slog_duration() {
-    let (logger, records) = recording_orchestrator_logger();
-    let orchestrator = new_orchestrator(OrchestratorConfig {
-        poller: Some(Arc::new(CancellingErrorPoller)),
-        poll_timeout: Duration::from_secs(30),
-        loop_timeout: Duration::from_secs(30),
-        logger: Some(logger),
-        ..OrchestratorConfig::default()
-    })
-    .unwrap();
-    orchestrator
-        .run(&CancellationToken::new())
-        .await
-        .unwrap_err();
-
-    let records = records.lock().unwrap();
-    let failed = records
-        .iter()
-        .find(|record| record.message == "poll failed")
-        .unwrap();
-    assert!(failed.attributes["duration"].as_i64().is_some());
-    assert!(!failed.attributes.contains_key("duration_ms"));
-
-    let backoff = records
-        .iter()
-        .find(|record| record.message == "backing off after poll failure")
-        .unwrap();
-    assert_eq!(backoff.attributes["backoff"], 2_000_000_000_i64);
-    assert!(!backoff.attributes.contains_key("backoff_ms"));
-}
-
-/// 验证命令 PollHook 与 HTTP Poller 的时长属性也使用 Go 纳秒整数。
-#[tokio::test]
-async fn poller_duration_logs_match_go_slog_duration() {
-    let (hook_logger, hook_records) = recording_orchestrator_logger();
-    let hook = new_poll_hook("/bin/true", Duration::from_secs(1), "", "", "", hook_logger);
-    assert!(
-        hook.poll(&CancellationToken::new())
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let cancelled = CancellationToken::new();
-    cancelled.cancel();
-    hook.sleep_with_jitter(&cancelled).await.unwrap_err();
-
-    {
-        let records = hook_records.lock().unwrap();
-        let empty = records
-            .iter()
-            .find(|record| record.message == "poll hook returned empty queue")
-            .unwrap();
-        assert!(empty.attributes["duration"].as_i64().is_some());
-        assert!(!empty.attributes.contains_key("duration_ms"));
-        assert_go_jitter_duration(&records, "sleep_duration");
-    }
-
-    let (base_url, _request) = spawn_http_response(200, &[], b"null").await;
-    let (poller_logger, poller_records) = recording_orchestrator_logger();
-    let poller = new_poller_with_worker_id(base_url, "env", "token", "worker", 0, poller_logger);
-    assert!(
-        poller
-            .poll(&CancellationToken::new())
-            .await
-            .unwrap()
-            .is_none()
-    );
-    poller.sleep_with_jitter(&cancelled).await.unwrap_err();
-
-    let records = poller_records.lock().unwrap();
-    let empty = records
-        .iter()
-        .find(|record| record.message == "queue empty")
-        .unwrap();
-    assert!(empty.attributes["poll_duration"].as_i64().is_some());
-    assert!(!empty.attributes.contains_key("poll_duration_ms"));
-    assert_go_jitter_duration(&records, "sleep_duration");
-}
-
 /// 验证 loop timeout 事件触发后重置完整预算，timeout Hook 失败不会上抛。
 #[tokio::test]
 async fn orchestrator_timeout_hook_failure_is_non_fatal() {
@@ -678,34 +497,6 @@ fn write_orchestrator_script(temp: &TempDir, name: &str, body: &str) -> PathBuf 
 /// 对应 Go：`shellQuote`，按 POSIX shell 单引号规则转义任意参数。
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-/// 对应 Go：`orchestratorTestLogger`，复用内存/丢弃兼容 logger。
-fn orchestrator_test_logger() -> crate::internal::logger::Logger {
-    default_orchestrator_logger()
-}
-
-/// 创建会保存所有结构化属性的 logger，供 duration schema 测试逐字段检查。
-fn recording_orchestrator_logger() -> (Logger, Arc<Mutex<Vec<LogRecord>>>) {
-    let records = Arc::new(Mutex::new(Vec::new()));
-    let logger = Logger::new(Arc::new(RecordingLogHandler {
-        records: Arc::clone(&records),
-        attributes: LogAttributes::new(),
-    }));
-    (logger, records)
-}
-
-/// 断言 jitter 日志使用 Go 字段名，并且随机值仍是 1、2、3 秒之一的纳秒数。
-fn assert_go_jitter_duration(records: &[LogRecord], field: &str) {
-    let record = records
-        .iter()
-        .find(|record| record.message == "sleeping with jitter after empty queue")
-        .unwrap();
-    assert!(matches!(
-        record.attributes[field].as_i64(),
-        Some(1_000_000_000 | 2_000_000_000 | 3_000_000_000)
-    ));
-    assert!(!record.attributes.contains_key("sleep_duration_ms"));
 }
 
 /// 生成测试响应使用的 gzip member，覆盖 Whoami 的 Go Transport 自动解压路径。
@@ -841,43 +632,6 @@ impl SessionOutput for MemoryOutput {
 #[derive(Default)]
 struct RecordingObserver {
     events: Mutex<Vec<OrchestratorEvent>>,
-}
-
-/// 保存日志及 `Logger::with_attrs` 固定属性的测试 handler。
-#[derive(Clone)]
-struct RecordingLogHandler {
-    records: Arc<Mutex<Vec<LogRecord>>>,
-    attributes: LogAttributes,
-}
-
-impl LogHandler for RecordingLogHandler {
-    /// duration 测试需要观察 debug 到 error 的全部级别。
-    fn enabled(&self, _level: LogLevel) -> bool {
-        true
-    }
-
-    /// 合并组件固定属性后保存记录，模拟生产 handler 最终看到的字段集合。
-    fn handle(&self, record: &LogRecord) -> Result<(), LogHandlerError> {
-        let mut record = record.clone();
-        record.attributes.extend(self.attributes.clone());
-        self.records.lock().unwrap().push(record);
-        Ok(())
-    }
-
-    /// 创建共享记录槽且追加固定属性的派生 handler。
-    fn with_attrs(&self, attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        let mut combined = self.attributes.clone();
-        combined.extend(attributes);
-        Arc::new(Self {
-            records: Arc::clone(&self.records),
-            attributes: combined,
-        })
-    }
-
-    /// 测试不改变 group 编码，只保留共享记录槽和固定属性。
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
 }
 
 impl OrchestratorObserver for RecordingObserver {

@@ -9,14 +9,12 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use serde_json::json;
-
 use crate::internal::{
     auth::AuthContext,
     config::{ClaudeConfig, StartupContext},
     mcp::{
         BaseServer, MCPServer, MCPServerConfigurator, MCPServerRegistration, McpError, McpResult,
-        new_registration, types::log_attributes,
+        new_registration,
     },
     session::ActivityRecorder,
 };
@@ -99,21 +97,9 @@ pub async fn configure_server(
     };
 
     if auth_context.get_supabase_project_ref().is_empty() {
-        base_server.logger.info(
-            "Supabase MCP server started (credentials pending)",
-            log_attributes([("working_dir", json!(working_dir.to_string_lossy()))]),
-        );
+        tracing::info!("working_dir" = ?(working_dir.to_string_lossy()), "{}", "Supabase MCP server started (credentials pending)");
     } else {
-        base_server.logger.info(
-            "Supabase MCP server configured",
-            log_attributes([
-                (
-                    "project_ref",
-                    json!(auth_context.get_supabase_project_ref()),
-                ),
-                ("working_dir", json!(working_dir.to_string_lossy())),
-            ]),
-        );
+        tracing::info!("project_ref" = ?(auth_context.get_supabase_project_ref()), "working_dir" = ?(working_dir.to_string_lossy()), "{}", "Supabase MCP server configured");
     }
 
     Ok(Arc::new(SupabaseMCPServer::new(

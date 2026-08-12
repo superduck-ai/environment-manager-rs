@@ -15,14 +15,12 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use futures_util::{FutureExt, StreamExt};
 use reqwest::header::CONTENT_TYPE;
-use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::internal::api::HttpClient;
-use crate::internal::logger::{LogAttributes, LogLevel, Logger, default_logger};
 use crate::internal::util::{RetryConfig, RetryError, Stopper, retry_operation};
 
 use super::types::{
@@ -59,18 +57,8 @@ pub(super) fn claude_code_stuck_threshold_from(value: Option<&str>) -> Duration 
         return Duration::from_secs(seconds);
     }
 
-    // 该环境变量在 LeaseManager 构造前解析，因此这里使用进程级
-    // tracing logger，而不借用稍后传入 manager 的 logger。
-    default_logger().warn(
-        "invalid_claude_code_stuck_threshold",
-        log_attributes([
-            ("value", json!(value)),
-            (
-                "default_seconds",
-                json!(DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD.as_secs()),
-            ),
-        ]),
-    );
+    // 该环境变量在 LeaseManager 构造前解析，事件直接写入进程 tracing subscriber。
+    tracing::warn!("value" = ?(value), "default_seconds" = ?(DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD.as_secs()), "{}", "invalid_claude_code_stuck_threshold");
     DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD
 }
 
@@ -142,7 +130,6 @@ pub fn new_lease_manager(
     environment_id: impl Into<String>,
     organization_uuid: impl Into<String>,
     api_client: HttpClient,
-    logger: Option<Logger>,
     interval: Duration,
     safety_window: Duration,
     health_file_path: impl Into<PathBuf>,
@@ -153,7 +140,6 @@ pub fn new_lease_manager(
         environment_id,
         organization_uuid,
         api_client,
-        logger,
         interval,
         safety_window,
         health_file_path,
@@ -169,7 +155,6 @@ pub(super) fn new_lease_manager_with_stuck_threshold(
     environment_id: impl Into<String>,
     organization_uuid: impl Into<String>,
     api_client: HttpClient,
-    logger: Option<Logger>,
     interval: Duration,
     safety_window: Duration,
     health_file_path: impl Into<PathBuf>,
@@ -183,9 +168,6 @@ pub(super) fn new_lease_manager_with_stuck_threshold(
             environment_id: environment_id.into(),
             organization_uuid: organization_uuid.into(),
             api_client,
-            // 在构造边界解析默认 logger；从这里开始内部始终持有
-            // concrete logger，保证所有异步路径共享同一个 tracing 接收端。
-            logger: logger.unwrap_or_else(|| default_logger().clone()),
             health_file_path: health_file_path.into(),
             claude_code_stuck_threshold,
             state: std::sync::RwLock::new(LeaseState::default()),
@@ -196,14 +178,6 @@ pub(super) fn new_lease_manager_with_stuck_threshold(
             activity_changed: tokio::sync::Notify::new(),
         }),
     }
-}
-
-/// 把固定大小的键值数组转换为 logger 的稳定有序属性。
-fn log_attributes<const N: usize>(entries: [(&str, Value); N]) -> LogAttributes {
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }
 
 /// 判断服务端状态是否已经进入停止流程。
@@ -230,7 +204,6 @@ impl LeaseManager {
         environment_id: impl Into<String>,
         organization_uuid: impl Into<String>,
         api_client: HttpClient,
-        logger: Option<Logger>,
         interval: Duration,
         safety_window: Duration,
         health_file_path: impl Into<PathBuf>,
@@ -241,7 +214,6 @@ impl LeaseManager {
             environment_id,
             organization_uuid,
             api_client,
-            logger,
             interval,
             safety_window,
             health_file_path,
@@ -262,12 +234,6 @@ impl LeaseManager {
             .state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// 写入构造阶段已完成默认值归一化的兼容 logger。
-    #[track_caller]
-    fn log(&self, level: LogLevel, message: &'static str, attributes: LogAttributes) {
-        self.inner.logger.log(level, message, attributes);
     }
 
     /// 发送初始 heartbeat，然后原子登记 heartbeat、expiry、stuck 三个任务。
@@ -308,21 +274,7 @@ impl LeaseManager {
             }
         }
 
-        self.log(
-            LogLevel::Info,
-            "lease_manager_started",
-            log_attributes([
-                ("session_id", json!(self.inner.session_id)),
-                (
-                    "heartbeat_interval_seconds",
-                    json!(self.inner.interval.as_secs()),
-                ),
-                (
-                    "safety_window_seconds",
-                    json!(self.inner.safety_window.as_secs()),
-                ),
-            ]),
-        );
+        tracing::info!("session_id" = ?(self.inner.session_id), "heartbeat_interval_seconds" = ?(self.inner.interval.as_secs()), "safety_window_seconds" = ?(self.inner.safety_window.as_secs()), "{}", "lease_manager_started");
         Ok(())
     }
 
@@ -354,14 +306,7 @@ impl LeaseManager {
     async fn run_heartbeat_task(self) {
         let result = AssertUnwindSafe(self.heartbeat_loop()).catch_unwind().await;
         if let Err(payload) = result {
-            self.log(
-                LogLevel::Error,
-                "heartbeat_loop_panic",
-                log_attributes([
-                    ("session_id", json!(self.inner.session_id)),
-                    ("panic", json!(panic_payload_to_string(payload.as_ref()))),
-                ]),
-            );
+            tracing::error!("session_id" = ?(self.inner.session_id), "panic" = ?(panic_payload_to_string(payload.as_ref())), "{}", "heartbeat_loop_panic");
             self.set_grace_period_and_cancel();
         }
         // 独立 token 精确对应 Go heartbeatLoop 的 `defer close(stopChan)`。
@@ -381,27 +326,14 @@ impl LeaseManager {
                     if self.inner.cancellation.is_cancelled() {
                         // 对应 Go `heartbeatLoop` 的 ticker 分支（lease_manager.go:331）；
                         // 取消时仍保留该分支自身的业务日志。
-                        self.inner.logger.info(
-                            "heartbeat_loop_stopped",
-                            log_attributes([
-                                ("session_id", json!(self.inner.session_id)),
-                                // Go 的 context.Canceled.Error() 固定为该小写文本。
-                                ("error", json!("context canceled")),
-                            ]),
-                        );
+                        tracing::info!(session_id = %self.inner.session_id, error = "context canceled", "heartbeat_loop_stopped");
                         return;
                     }
                 }
                 _ = self.inner.cancellation.cancelled() => {
                     // 对应 Go `heartbeatLoop` 的 context.Done 分支
                     //（lease_manager.go:365）。不得与上方 ticker 分支合并，原因同上。
-                    self.inner.logger.info(
-                        "heartbeat_loop_stopped",
-                        log_attributes([
-                            ("session_id", json!(self.inner.session_id)),
-                            ("error", json!("context canceled")),
-                        ]),
-                    );
+                    tracing::info!("session_id" = ?(self.inner.session_id), "error" = ?("context canceled"), "{}", "heartbeat_loop_stopped");
                     return;
                 }
             }
@@ -413,37 +345,16 @@ impl LeaseManager {
                     } else {
                         "permanent_heartbeat_error"
                     };
-                    self.log(
-                        LogLevel::Error,
-                        message,
-                        log_attributes([
-                            ("session_id", json!(self.inner.session_id)),
-                            ("error", json!(error.to_string())),
-                        ]),
-                    );
+                    tracing::error!("session_id" = ?(self.inner.session_id), "error" = ?(error.to_string()), "{}", message);
                     let cancellation = self.inner.cancellation.clone();
                     if let Err(stop_error) = self.call_stop_api(&cancellation, false).await {
-                        self.log(
-                            LogLevel::Error,
-                            "failed_to_stop_after_heartbeat_error",
-                            log_attributes([
-                                ("session_id", json!(self.inner.session_id)),
-                                ("error", json!(stop_error.to_string())),
-                            ]),
-                        );
+                        tracing::error!("session_id" = ?(self.inner.session_id), "error" = ?(stop_error.to_string()), "{}", "failed_to_stop_after_heartbeat_error");
                     }
                     self.set_grace_period_and_cancel();
                     return;
                 }
 
-                self.log(
-                    LogLevel::Warn,
-                    "heartbeat_failed",
-                    log_attributes([
-                        ("session_id", json!(self.inner.session_id)),
-                        ("error", json!(error.to_string())),
-                    ]),
-                );
+                tracing::warn!("session_id" = ?(self.inner.session_id), "error" = ?(error.to_string()), "{}", "heartbeat_failed");
                 continue;
             }
 
@@ -451,25 +362,10 @@ impl LeaseManager {
             // 仍会继续读取 terminal state、再次调用 stop，然后才返回；不能在此提前退出。
             let state = self.read_state().instance_state.clone();
             if is_stopping_state(&state) {
-                self.log(
-                    LogLevel::Info,
-                    "session_entered_terminal_state",
-                    log_attributes([
-                        ("session_id", json!(self.inner.session_id)),
-                        ("state", json!(state)),
-                    ]),
-                );
+                tracing::info!("session_id" = ?(self.inner.session_id), "state" = ?(state), "{}", "session_entered_terminal_state");
                 let cancellation = self.inner.cancellation.clone();
                 if let Err(error) = self.call_stop_api(&cancellation, false).await {
-                    self.log(
-                        LogLevel::Error,
-                        "failed_to_stop_terminal_session",
-                        log_attributes([
-                            ("session_id", json!(self.inner.session_id)),
-                            ("state", json!(state)),
-                            ("error", json!(error.to_string())),
-                        ]),
-                    );
+                    tracing::error!("session_id" = ?(self.inner.session_id), "state" = ?(state), "error" = ?(error.to_string()), "{}", "failed_to_stop_terminal_session");
                 }
                 self.set_grace_period_and_cancel();
                 return;
@@ -511,28 +407,13 @@ impl LeaseManager {
         let heartbeat: HeartbeatResponse = serde_json::from_slice(&body)
             .map_err(|error| HeartbeatError::Decode(error.to_string()))?;
         if !heartbeat.lease_extended {
-            self.log(
-                LogLevel::Warn,
-                "heartbeat_lease_not_extended",
-                log_attributes([
-                    ("session_id", json!(self.inner.session_id)),
-                    ("state", json!(heartbeat.state)),
-                ]),
-            );
+            tracing::warn!("session_id" = ?(self.inner.session_id), "state" = ?(heartbeat.state), "{}", "heartbeat_lease_not_extended");
             self.write_state().instance_state = heartbeat.state.clone();
 
             if is_stopping_state(&heartbeat.state) {
                 let cancellation = self.inner.cancellation.clone();
                 if let Err(error) = self.call_stop_api(&cancellation, false).await {
-                    self.log(
-                        LogLevel::Error,
-                        "failed_to_stop_after_lease_not_extended",
-                        log_attributes([
-                            ("session_id", json!(self.inner.session_id)),
-                            ("state", json!(heartbeat.state)),
-                            ("error", json!(error.to_string())),
-                        ]),
-                    );
+                    tracing::error!("session_id" = ?(self.inner.session_id), "state" = ?(heartbeat.state), "error" = ?(error.to_string()), "{}", "failed_to_stop_after_lease_not_extended");
                 }
                 self.set_grace_period_and_cancel();
             }
@@ -566,26 +447,9 @@ impl LeaseManager {
 
         self.schedule_lease_expiry_check();
         self.schedule_claude_code_stuck_check();
-        self.log(
-            LogLevel::Info,
-            "heartbeat_success",
-            log_attributes([
-                ("session_id", json!(self.inner.session_id)),
-                ("state", json!(heartbeat.state)),
-                ("ttl_seconds", json!(heartbeat.ttl_seconds)),
-                ("lease_extended", json!(true)),
-            ]),
-        );
+        tracing::info!("session_id" = ?(self.inner.session_id), "state" = ?(heartbeat.state), "ttl_seconds" = ?(heartbeat.ttl_seconds), "lease_extended" = ?(true), "{}", "heartbeat_success");
         if let Err(error) = self.update_health_file().await {
-            self.log(
-                LogLevel::Warn,
-                "failed_to_update_health_file",
-                log_attributes([
-                    ("session_id", json!(self.inner.session_id)),
-                    ("path", json!(self.inner.health_file_path)),
-                    ("error", json!(error.to_string())),
-                ]),
-            );
+            tracing::warn!("session_id" = ?(self.inner.session_id), "path" = ?(self.inner.health_file_path), "error" = ?(error.to_string()), "{}", "failed_to_update_health_file");
         }
         Ok(())
     }
@@ -646,24 +510,10 @@ impl LeaseManager {
                 continue;
             }
             let lease_expires_at = self.read_state().lease_expires_at;
-            self.log(
-                LogLevel::Error,
-                "lease_expiry_detected",
-                log_attributes([
-                    ("session_id", json!(self.inner.session_id)),
-                    ("lease_expires_at", json!(lease_expires_at)),
-                ]),
-            );
+            tracing::error!("session_id" = ?(self.inner.session_id), "lease_expires_at" = ?(lease_expires_at), "{}", "lease_expiry_detected");
             let cancellation = self.inner.cancellation.clone();
             if let Err(error) = self.call_stop_api(&cancellation, false).await {
-                self.log(
-                    LogLevel::Error,
-                    "failed_to_stop_expired_session",
-                    log_attributes([
-                        ("session_id", json!(self.inner.session_id)),
-                        ("error", json!(error.to_string())),
-                    ]),
-                );
+                tracing::error!("session_id" = ?(self.inner.session_id), "error" = ?(error.to_string()), "{}", "failed_to_stop_expired_session");
             }
             self.set_grace_period_and_cancel();
             return;
@@ -716,29 +566,10 @@ impl LeaseManager {
             if last_updated_at.is_none() {
                 continue;
             }
-            self.log(
-                LogLevel::Error,
-                "claude_code_stuck_detected",
-                log_attributes([
-                    ("session_id", json!(self.inner.session_id)),
-                    ("last_updated_at", json!(last_updated_at)),
-                    ("last_claude_code_activity", json!(last_activity)),
-                    (
-                        "threshold_seconds",
-                        json!(self.inner.claude_code_stuck_threshold.as_secs()),
-                    ),
-                ]),
-            );
+            tracing::error!("session_id" = ?(self.inner.session_id), "last_updated_at" = ?(last_updated_at), "last_claude_code_activity" = ?(last_activity), "threshold_seconds" = ?(self.inner.claude_code_stuck_threshold.as_secs()), "{}", "claude_code_stuck_detected");
             let cancellation = self.inner.cancellation.clone();
             if let Err(error) = self.call_stop_api(&cancellation, false).await {
-                self.log(
-                    LogLevel::Error,
-                    "failed_to_stop_stuck_session",
-                    log_attributes([
-                        ("session_id", json!(self.inner.session_id)),
-                        ("error", json!(error.to_string())),
-                    ]),
-                );
+                tracing::error!("session_id" = ?(self.inner.session_id), "error" = ?(error.to_string()), "{}", "failed_to_stop_stuck_session");
             }
             self.set_grace_period_and_cancel();
             return;
@@ -916,23 +747,12 @@ impl LeaseManager {
                 }
             },
             &config,
-            log_attributes([
-                ("session_id", json!(self.inner.session_id)),
-                ("force", json!(force)),
-            ]),
         )
         .await;
 
         match result {
             Ok(()) => {
-                self.log(
-                    LogLevel::Info,
-                    "Session terminated",
-                    log_attributes([
-                        ("session_id", json!(self.inner.session_id)),
-                        ("force", json!(force)),
-                    ]),
-                );
+                tracing::info!("session_id" = ?(self.inner.session_id), "force" = ?(force), "{}", "Session terminated");
                 Ok(())
             }
             Err(RetryError::InvalidMaxRetries) => Err(StopRequestError::Request(

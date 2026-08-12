@@ -8,17 +8,12 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use rand::Rng;
 use reqwest::header::AUTHORIZATION;
-use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::{
     OrchestratorError, OrchestratorResult, Poller, PollerInterface, RawMessage, WorkResponse,
-    log_attributes,
 };
-use crate::{
-    internal::logger::Logger,
-    internal::util::{claude_code_version, go_duration_nanoseconds, version},
-};
+use crate::internal::util::{claude_code_version, duration_nanoseconds, version};
 
 const ENVIRONMENTS_BETA: &str = "environments-2025-11-01";
 const POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -33,7 +28,6 @@ pub fn new_poller_with_worker_id(
     auth_token: impl Into<String>,
     worker_id: impl Into<String>,
     reclaim_older_than_ms: i64,
-    logger: Logger,
 ) -> Poller {
     let mut api_base_url = api_base_url.into();
     if !api_base_url.starts_with("http://") && !api_base_url.starts_with("https://") {
@@ -46,14 +40,6 @@ pub fn new_poller_with_worker_id(
         worker_id = local_hostname().unwrap_or_default();
     }
 
-    let mut attributes = log_attributes([
-        ("component", json!("poller")),
-        ("environment_id", json!(environment_id)),
-    ]);
-    if !worker_id.is_empty() {
-        attributes.insert("worker_id".to_owned(), json!(worker_id));
-    }
-
     Poller {
         api_base_url,
         environment_id,
@@ -61,7 +47,6 @@ pub fn new_poller_with_worker_id(
         worker_id,
         reclaim_older_than_ms,
         http_client: reqwest::Client::new(),
-        logger: logger.with_attrs(attributes),
     }
 }
 
@@ -74,8 +59,11 @@ impl Poller {
         &self,
         cancellation: &CancellationToken,
     ) -> OrchestratorResult<Option<RawMessage>> {
-        self.logger
-            .debug("sending poll request (non-blocking)", Default::default());
+        tracing::debug!(
+            environment_id = %self.environment_id,
+            worker_id = %self.worker_id,
+            "sending poll request (non-blocking)"
+        );
 
         let mut poll_url = format!(
             "{}/v1/environments/{}/work/poll",
@@ -117,13 +105,7 @@ impl Poller {
         };
         let poll_duration = started.elapsed();
         let response = response.map_err(|error| {
-            self.logger.error(
-                "poll request failed",
-                log_attributes([
-                    ("duration", json!(go_duration_nanoseconds(poll_duration))),
-                    ("error", json!(error.to_string())),
-                ]),
-            );
+            tracing::error!("duration" = ?(duration_nanoseconds(poll_duration)), "error" = ?(error.to_string()), "{}", "poll request failed");
             OrchestratorError::message(format!("poll request failed: {error}"))
         })?;
 
@@ -149,29 +131,12 @@ impl Poller {
         })?;
 
         if status == reqwest::StatusCode::OK && (body.is_empty() || body.as_ref() == b"null") {
-            self.logger.debug(
-                "queue empty",
-                log_attributes([
-                    (
-                        "poll_duration",
-                        json!(go_duration_nanoseconds(poll_duration)),
-                    ),
-                    ("request_id", json!(request_id)),
-                ]),
-            );
+            tracing::debug!("poll_duration" = ?(duration_nanoseconds(poll_duration)), "request_id" = ?(request_id), "{}", "queue empty");
             return Ok(None);
         }
 
         if status != reqwest::StatusCode::OK {
-            self.logger.error(
-                "poll request returned non-OK status",
-                log_attributes([
-                    ("status_code", json!(status.as_u16())),
-                    ("duration", json!(go_duration_nanoseconds(poll_duration))),
-                    ("request_id", json!(request_id)),
-                    ("response_body", json!(String::from_utf8_lossy(&body))),
-                ]),
-            );
+            tracing::error!("status_code" = ?(status.as_u16()), "duration" = ?(duration_nanoseconds(poll_duration)), "request_id" = ?(request_id), "response_body" = ?(String::from_utf8_lossy(&body)), "{}", "poll request returned non-OK status");
             return Err(OrchestratorError::message(format!(
                 "poll request returned status {} (request-id: {request_id})",
                 status.as_u16()
@@ -182,35 +147,14 @@ impl Poller {
             OrchestratorError::message(format!("failed to unmarshal work response: {error}"))
         })?;
         if work_response.r#type != "work" {
-            self.logger.warn(
-                "received unexpected response type",
-                log_attributes([
-                    (
-                        "poll_duration",
-                        json!(go_duration_nanoseconds(poll_duration)),
-                    ),
-                    ("type", json!(work_response.r#type)),
-                ]),
-            );
+            tracing::warn!("poll_duration" = ?(duration_nanoseconds(poll_duration)), "type" = ?(work_response.r#type), "{}", "received unexpected response type");
             return Err(OrchestratorError::message(format!(
                 "unexpected response type: {}",
                 work_response.r#type
             )));
         }
 
-        self.logger.info(
-            "received work task",
-            log_attributes([
-                (
-                    "poll_duration",
-                    json!(go_duration_nanoseconds(poll_duration)),
-                ),
-                ("request_id", json!(request_id)),
-                ("work_id", json!(work_response.id)),
-                ("work_type", json!(work_response.data.r#type)),
-                ("session_id", json!(work_response.data.id)),
-            ]),
-        );
+        tracing::info!("poll_duration" = ?(duration_nanoseconds(poll_duration)), "request_id" = ?(request_id), "work_id" = ?(work_response.id), "work_type" = ?(work_response.data.r#type), "session_id" = ?(work_response.data.id), "{}", "received work task");
         Ok(Some(body.to_vec()))
     }
 
@@ -224,13 +168,7 @@ impl Poller {
             rng.random_range(1_u64..=3)
         };
         let sleep_duration = Duration::from_secs(seconds);
-        self.logger.debug(
-            "sleeping with jitter after empty queue",
-            log_attributes([(
-                "sleep_duration",
-                json!(go_duration_nanoseconds(sleep_duration)),
-            )]),
-        );
+        tracing::debug!("sleep_duration" = ?(duration_nanoseconds(sleep_duration)), "{}", "sleeping with jitter after empty queue");
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(OrchestratorError::message(

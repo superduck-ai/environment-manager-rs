@@ -112,7 +112,7 @@ impl Action for FakeAction {
 
 #[tokio::test]
 async fn test_registry_execute_streams_progress_and_result() {
-    let registry = new_registry(test_logger());
+    let registry = new_registry();
     registry.register(Arc::new(FakeAction {
         name: "snapshot",
         timeout: Duration::ZERO,
@@ -153,7 +153,7 @@ async fn test_registry_execute_streams_progress_and_result() {
 
 #[tokio::test]
 async fn test_registry_execute_unknown_action_returns_json404() {
-    let registry = new_registry(test_logger());
+    let registry = new_registry();
     let sender = Arc::new(RecordingSender::default());
     registry
         .execute(
@@ -181,7 +181,7 @@ async fn test_registry_execute_unknown_action_returns_json404() {
 
 #[tokio::test]
 async fn test_registry_execute_rejects_concurrent_action() {
-    let registry = Arc::new(new_registry(test_logger()));
+    let registry = Arc::new(new_registry());
     let started = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
     registry.register(Arc::new(FakeAction {
@@ -232,7 +232,7 @@ async fn test_registry_execute_rejects_concurrent_action() {
 
 #[tokio::test]
 async fn test_registry_execute_converts_action_panic_to_final_chunk() {
-    let registry = new_registry(test_logger());
+    let registry = new_registry();
     registry.register(Arc::new(FakeAction {
         name: "panic",
         timeout: Duration::ZERO,
@@ -276,9 +276,4 @@ async fn test_sequenced_sender_wraps_send_errors() {
 /// 对应 Go：`decodeJSONChunk`，解析 Registry 产生的 NDJSON chunk。
 fn decode_json_chunk(chunk: &HttpTunnelResponseChunk) -> serde_json::Value {
     serde_json::from_slice(&chunk.data).expect("Registry chunk 应为 JSON")
-}
-
-/// 对应 Go：`testLogger`；`None` 是 Rust 对 discard logger 的结构等价。
-fn test_logger() -> Option<crate::internal::logger::Logger> {
-    None
 }

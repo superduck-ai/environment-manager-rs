@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use rand::Rng;
 use reqwest::{Request, Response, StatusCode};
-use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -100,22 +99,7 @@ impl HttpClient {
             })?;
             let error_context = GoRequestErrorContext::from_request(&attempt_request);
             let auto_gzip = prepare_go_transport_request(&mut attempt_request);
-            if let Some(logger) = &self.logger {
-                logger.debug(
-                    "Executing HTTP request",
-                    [
-                        ("attempt".to_owned(), json!(attempt)),
-                        ("max_retries".to_owned(), json!(config.max_retries)),
-                        (
-                            "method".to_owned(),
-                            json!(attempt_request.method().as_str()),
-                        ),
-                        ("url".to_owned(), json!(attempt_request.url().as_str())),
-                    ]
-                    .into_iter()
-                    .collect(),
-                );
-            }
+            tracing::debug!("attempt" = ?(attempt), "max_retries" = ?(config.max_retries), "method" = ?(attempt_request.method().as_str()), "url" = ?(attempt_request.url().as_str()), "{}", "Executing HTTP request");
 
             let result = tokio::select! {
                 biased;
@@ -153,18 +137,7 @@ impl HttpClient {
             }
 
             let backoff = calculate_backoff(attempt + 1, config);
-            if let Some(logger) = &self.logger {
-                logger.warn(
-                    "Request failed, retrying",
-                    [
-                        ("attempt".to_owned(), json!(attempt + 1)),
-                        ("backoff_ms".to_owned(), json!(backoff.as_millis())),
-                        ("error".to_owned(), json!(&last_error)),
-                    ]
-                    .into_iter()
-                    .collect(),
-                );
-            }
+            tracing::warn!("attempt" = ?(attempt + 1), "backoff_ms" = ?(backoff.as_millis()), "error" = ?(&last_error), "{}", "Request failed, retrying");
             // Go 先让当前 `http.Client.Do` 返回 context error，再在 retry backoff 的
             // select 中观察取消。因此只有“仍有下一次重试”时错误才是 retry
             // cancelled；最后一次 attempt 必须落入统一的 exhausted 包装。

@@ -11,15 +11,11 @@ use thiserror::Error;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::api::{ApiError, LogCategory, LogLevel, SessionError, SessionEvent};
-use crate::internal::logger::{
-    LogAttributes, LogHandler, LogHandlerError, LogLevel as SlogLevel, LogRecord, Logger,
-};
-
 use super::{
     ActivityRecorderError, EventPoster, NoopActivityRecorder, RecorderOptions,
     new_activity_recorder,
 };
+use crate::internal::api::{ApiError, LogCategory, LogLevel, SessionError, SessionEvent};
 
 const NEVER_FAIL: usize = usize::MAX;
 
@@ -82,34 +78,6 @@ fn new_recording_event_poster() -> Arc<RecordingEventPoster> {
     Arc::new(RecordingEventPoster::new())
 }
 
-/// 对应 Go：`testLogger`。
-///
-/// 测试专用丢弃 handler；调用路径仍经过正式 Logger facade 和 source 解析。
-struct DiscardHandler;
-
-impl LogHandler for DiscardHandler {
-    fn enabled(&self, _level: SlogLevel) -> bool {
-        false
-    }
-
-    fn handle(&self, _record: &LogRecord) -> Result<(), LogHandlerError> {
-        Ok(())
-    }
-
-    fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        Arc::new(Self)
-    }
-
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(Self)
-    }
-}
-
-/// 对应 Go：`testLogger`，返回不会写 stderr 的显式 logger。
-fn test_logger() -> Logger {
-    Logger::new(Arc::new(DiscardHandler))
-}
-
 #[async_trait]
 impl EventPoster for RecordingEventPoster {
     /// 保存事件，并在配置的调用上返回确定性错误。
@@ -163,13 +131,8 @@ impl SessionError for FakeSessionError {
 /// 验证构造器默认值、自定义值及逐字段零值回退。
 #[tokio::test]
 async fn test_new_activity_recorder_defaults_and_options() {
-    let logger = test_logger();
-    let default_recorder = new_activity_recorder(
-        CancellationToken::new(),
-        new_recording_event_poster(),
-        logger.clone(),
-        None,
-    );
+    let default_recorder =
+        new_activity_recorder(CancellationToken::new(), new_recording_event_poster(), None);
     assert_eq!(default_recorder.interval(), Duration::from_secs(30));
     assert_eq!(
         default_recorder.max_duration(),
@@ -179,7 +142,6 @@ async fn test_new_activity_recorder_defaults_and_options() {
     let custom_recorder = new_activity_recorder(
         CancellationToken::new(),
         new_recording_event_poster(),
-        logger.clone(),
         Some(RecorderOptions {
             interval: Duration::from_secs(1),
             max_duration: Duration::from_secs(2 * 60),
@@ -191,7 +153,6 @@ async fn test_new_activity_recorder_defaults_and_options() {
     let partial_recorder = new_activity_recorder(
         CancellationToken::new(),
         new_recording_event_poster(),
-        logger,
         Some(RecorderOptions {
             interval: Duration::ZERO,
             max_duration: Duration::from_secs(7),
@@ -205,12 +166,7 @@ async fn test_new_activity_recorder_defaults_and_options() {
 #[tokio::test]
 async fn test_record_activity_posts_env_manager_log_event() {
     let poster = new_recording_event_poster();
-    let recorder = new_activity_recorder(
-        CancellationToken::new(),
-        poster.clone(),
-        test_logger(),
-        None,
-    );
+    let recorder = new_activity_recorder(CancellationToken::new(), poster.clone(), None);
 
     recorder.record_activity(
         LogLevel::Info,
@@ -234,7 +190,7 @@ async fn test_record_failure_result_posts_assistant_and_result_events() {
     let parent_cancellation = CancellationToken::new();
     parent_cancellation.cancel();
     let poster = new_recording_event_poster();
-    let recorder = new_activity_recorder(parent_cancellation, poster.clone(), test_logger(), None);
+    let recorder = new_activity_recorder(parent_cancellation, poster.clone(), None);
     let session_error = FakeSessionError {
         message: "setup failed".to_owned(),
         fatal: true,
@@ -263,12 +219,7 @@ async fn test_record_failure_result_posts_assistant_and_result_events() {
 async fn test_record_failure_result_wraps_poster_errors() {
     let poster = new_recording_event_poster();
     poster.fail_on_call(1);
-    let recorder = new_activity_recorder(
-        CancellationToken::new(),
-        poster.clone(),
-        test_logger(),
-        None,
-    );
+    let recorder = new_activity_recorder(CancellationToken::new(), poster.clone(), None);
     let session_error = FakeSessionError {
         message: "failed".to_owned(),
         fatal: true,
@@ -288,12 +239,7 @@ async fn test_record_failure_result_wraps_poster_errors() {
     // 避免首个失败注入留下的事件计数影响 result 阶段断言。
     let poster = new_recording_event_poster();
     poster.fail_on_call(2);
-    let recorder = new_activity_recorder(
-        CancellationToken::new(),
-        poster.clone(),
-        test_logger(),
-        None,
-    );
+    let recorder = new_activity_recorder(CancellationToken::new(), poster.clone(), None);
     let error = recorder
         .record_failure_result(&session_error)
         .await
@@ -309,7 +255,6 @@ async fn test_record_long_running_activity_posts_progress_and_auto_stops() {
     let recorder = new_activity_recorder(
         CancellationToken::new(),
         poster.clone(),
-        test_logger(),
         Some(RecorderOptions {
             interval: Duration::from_secs(60 * 60),
             max_duration: Duration::from_millis(30),

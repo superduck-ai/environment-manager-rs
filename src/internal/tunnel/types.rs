@@ -1,6 +1,6 @@
 //! Tunnel HTTP/WebSocket 转发器的共享类型。
 //!
-//! 对应 Go `internal/tunnel/zz_recovered_types.go`。协议类型由 `gen/proto` 生成并在
+//! 协议类型由 `gen/proto` 生成并在
 //! `tunnel::mod` 重新导出；本文件保存运行时状态和统一错误边界。
 
 use std::collections::BTreeMap;
@@ -14,8 +14,6 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
 use super::actions::Registry;
-use crate::internal::logger::Logger;
-
 /// Tunnel 转发、协议发送或本地请求构造错误。
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
@@ -35,7 +33,6 @@ impl TunnelError {
 
 /// 本地 HTTP Tunnel 处理器。
 pub struct Handler {
-    pub(crate) logger: Option<Logger>,
     /// 等待响应 header 的超时；只在完整请求实际写入 socket 后启动。
     pub(crate) response_header_timeout: std::time::Duration,
     /// 差分探针使用的连接前延迟；正式构造恒为零，用于证明 header timer 不覆盖 dial。
@@ -86,7 +83,6 @@ pub(crate) struct WsTunnel {
 
 /// 本地 WebSocket Tunnel 管理器。
 pub struct WsHandler {
-    pub(crate) logger: Option<Logger>,
     /// 共享 map 使用异步读写锁，但任何网络 await 都在释放 map 锁后执行。
     pub(crate) tunnels: Arc<tokio::sync::RwLock<BTreeMap<String, Arc<WsTunnel>>>>,
 }
@@ -96,7 +92,6 @@ pub type ClientOption = Box<dyn Fn(&mut Client) + Send + Sync + 'static>;
 
 /// 后端 Tunnel 长连接客户端。
 pub struct Client {
-    pub(crate) logger: Option<Logger>,
     pub(crate) http_handler: Option<Arc<Handler>>,
     pub(crate) ws_handler: Option<Arc<WsHandler>>,
     pub(crate) session_id: String,

@@ -2,8 +2,7 @@
 //!
 //! 对应 Go：`internal/envtype/byoc/byoc.go` 中的配置、环境、认证 RoundTripper 和
 //! lease 创建参数。`SourceProcessor` 与 `LeaseManagerFactory` 是 Rust 为隔离测试
-//! 增加的最小接口；生产仍调用真实 clone/proxy 和 heartbeat 状态机，所有请求结构
-//! 显式携带同一个 session [`Logger`]，不引入新的全局日志通道。
+//! 增加的最小接口；生产仍调用真实 clone/proxy 和 heartbeat 状态机。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -19,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 use crate::internal::auth::AuthContext;
 use crate::internal::config::{SessionMode, Source, StartupContext};
 use crate::internal::envtype::LeaseManagerHandle;
-use crate::internal::logger::Logger;
 use crate::internal::session::ActivityRecorder;
 use crate::internal::util::BoxError;
 
@@ -215,12 +213,10 @@ pub struct SourceProcessRequest {
     pub mode: SourceProcessMode,
     /// 是否在处理 source 前校验 repository access。
     pub should_validate: bool,
-    /// 与 BYOC 环境共享 handler 和固定属性的 session logger。
-    pub logger: Logger,
 }
 
 impl fmt::Debug for SourceProcessRequest {
-    /// 输出 source 请求元数据，但不展开 logger handler 或认证凭据。
+    /// 输出 source 请求元数据，但不展开认证凭据。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SourceProcessRequest")
@@ -231,7 +227,6 @@ impl fmt::Debug for SourceProcessRequest {
             .field("sources", &self.sources)
             .field("mode", &self.mode)
             .field("should_validate", &self.should_validate)
-            .field("logger", &"configured")
             .finish()
     }
 }
@@ -314,12 +309,10 @@ pub struct LeaseManagerRequest {
     pub heartbeat_interval: Duration,
     /// lease 到期前的安全窗口。
     pub safety_window: Duration,
-    /// BYOC 环境保存的 session logger；HTTP client 与 podmonitor 必须共享此句柄。
-    pub logger: Logger,
 }
 
 impl fmt::Debug for LeaseManagerRequest {
-    /// 输出 lease 元数据，但不展开认证 transport、token 或 logger handler。
+    /// 输出 lease 元数据，但不展开认证 transport 或 token。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("LeaseManagerRequest")
@@ -329,7 +322,6 @@ impl fmt::Debug for LeaseManagerRequest {
             .field("organization_uuid", &self.organization_uuid)
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("safety_window", &self.safety_window)
-            .field("logger", &"configured")
             .finish_non_exhaustive()
     }
 }
@@ -345,8 +337,6 @@ pub trait LeaseManagerFactory: Send + Sync {
 pub struct ByocEnvironmentType {
     /// 后端下发并通过构造校验的 BYOC 配置。
     pub(crate) config: ByocConfig,
-    /// manager 注入的 session logger；所有生产子系统均从这里克隆同一 handler。
-    pub(crate) logger: Logger,
     /// 控制 setup 脚本与缓存仓库分支的 session 模式。
     pub(crate) session_mode: SessionMode,
     /// stdin 解码出的 source、outcome、API 地址和 entrypoint 上下文。
@@ -366,7 +356,6 @@ impl fmt::Debug for ByocEnvironmentType {
             .debug_struct("ByocEnvironmentType")
             .field("environment_type", &self.config.environment_type)
             .field("cwd", &self.config.cwd)
-            .field("logger", &"configured")
             .field(
                 "has_task_setup_script",
                 &!self.config.task_setup_script.is_empty(),

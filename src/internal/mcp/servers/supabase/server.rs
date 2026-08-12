@@ -22,7 +22,6 @@ use crate::internal::{
     mcp::{
         CallToolRequest, CallToolResult, MCPServer, McpError, McpResult, ServerConfig, Tool,
         ToolConfig, ToolHandler, new_tool_result_error, new_tool_result_text,
-        types::log_attributes,
     },
     util::go_path_escape,
 };
@@ -97,17 +96,11 @@ impl SupabaseMCPServer {
             Err(error) if is_permanent_error(&error) => {
                 let body = permanent_provisioning_err_body(&error.to_string());
                 self.state.write().await.provisioning_error = body;
-                self.base_server.logger.error(
-                    "Supabase provisioning permanently failed",
-                    log_attributes([("error", json!(error.to_string()))]),
-                );
+                tracing::error!("error" = ?(error.to_string()), "{}", "Supabase provisioning permanently failed");
                 return Err(error);
             }
             Err(error) => {
-                self.base_server.logger.warn(
-                    "Supabase credentials not yet available",
-                    log_attributes([("error", json!(error.to_string()))]),
-                );
+                tracing::warn!("error" = ?(error.to_string()), "{}", "Supabase credentials not yet available");
                 if self.lazy_mode {
                     return Err(McpError::message(
                         "no Supabase database has been provisioned for this session — if this app needs server-side persistence (user accounts, shared state, cross-device data), call the provision_database tool first; for client-side-only state, use localStorage instead",
@@ -133,10 +126,7 @@ impl SupabaseMCPServer {
         );
         self.write_env_files(&credentials);
         state.client = Some(Arc::clone(&client));
-        self.base_server.logger.info(
-            "Supabase credentials resolved via API",
-            log_attributes([("project_ref", json!(&credentials.project_ref))]),
-        );
+        tracing::info!("project_ref" = ?(&credentials.project_ref), "{}", "Supabase credentials resolved via API");
         Ok(client)
     }
 
@@ -217,20 +207,14 @@ impl SupabaseMCPServer {
         if let Err(error) =
             write_file_with_mode(&project_directory.join(".env"), env.as_bytes(), 0o600)
         {
-            self.base_server.logger.warn(
-                "Failed to write .env file",
-                log_attributes([("error", json!(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to write .env file");
         }
         if let Err(error) = write_file_with_mode(
             &project_directory.join(".env.local"),
             local_env.as_bytes(),
             0o600,
         ) {
-            self.base_server.logger.warn(
-                "Failed to write .env.local file",
-                log_attributes([("error", json!(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to write .env.local file");
         }
     }
 
@@ -360,31 +344,16 @@ impl SupabaseMCPServer {
                 "Migration name must contain only letters, numbers, and underscores",
             ));
         }
-        self.base_server.logger.info(
-            "Applying migration",
-            log_attributes([
-                ("migration_name", json!(&name)),
-                ("sql_length", json!(sql.len())),
-            ]),
-        );
+        tracing::info!("migration_name" = ?(&name), "sql_length" = ?(sql.len()), "{}", "Applying migration");
         if let Err(error) = client.apply_migration(cancellation, &name, &sql).await {
-            self.base_server.logger.error(
-                "Migration failed",
-                log_attributes([
-                    ("migration_name", json!(&name)),
-                    ("error", json!(error.to_string())),
-                ]),
-            );
+            tracing::error!("migration_name" = ?(&name), "error" = ?(error.to_string()), "{}", "Migration failed");
             return Ok(new_tool_result_error(format!("Migration failed: {error}")));
         }
 
         let mut migration_file_message = String::new();
         let migrations_directory = self.get_project_dir().join("supabase/migrations");
         if let Err(error) = create_dir_all_0755(&migrations_directory) {
-            self.base_server.logger.warn(
-                "Failed to create migrations dir",
-                log_attributes([("error", json!(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to create migrations dir");
             migration_file_message =
                 format!("\nWarning: could not create migrations directory: {error}");
         } else {
@@ -393,10 +362,7 @@ impl SupabaseMCPServer {
             if let Err(error) =
                 write_file_with_mode(&migration_path, format!("{sql}\n").as_bytes(), 0o644)
             {
-                self.base_server.logger.warn(
-                    "Failed to write migration file",
-                    log_attributes([("error", json!(error.to_string()))]),
-                );
+                tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to write migration file");
                 migration_file_message =
                     format!("\nWarning: migration applied but local file write failed: {error}");
             }
@@ -405,10 +371,7 @@ impl SupabaseMCPServer {
         let mut types_message = String::new();
         match client.generate_types(cancellation).await {
             Err(error) => {
-                self.base_server.logger.warn(
-                    "Type generation failed after migration (non-fatal)",
-                    log_attributes([("error", json!(error.to_string()))]),
-                );
+                tracing::warn!("error" = ?(error.to_string()), "{}", "Type generation failed after migration (non-fatal)");
                 types_message = format!("\nWarning: type generation failed: {error}");
             }
             Ok(types) => {
@@ -418,10 +381,7 @@ impl SupabaseMCPServer {
                 {
                     match write_file_with_mode(&types_path, types.as_bytes(), 0o644) {
                         Err(error) => {
-                            self.base_server.logger.warn(
-                                "Failed to write types file",
-                                log_attributes([("error", json!(error.to_string()))]),
-                            );
+                            tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to write types file");
                             types_message = "\nWarning: failed to write types file".to_owned();
                         }
                         Ok(()) => {
@@ -437,15 +397,9 @@ impl SupabaseMCPServer {
             .run_query(cancellation, "NOTIFY pgrst, 'reload schema'")
             .await
         {
-            self.base_server.logger.warn(
-                "PostgREST reload notification failed (non-fatal)",
-                log_attributes([("error", json!(error.to_string()))]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "PostgREST reload notification failed (non-fatal)");
         }
-        self.base_server.logger.info(
-            "Migration applied successfully",
-            log_attributes([("migration_name", json!(&name))]),
-        );
+        tracing::info!("migration_name" = ?(&name), "{}", "Migration applied successfully");
         Ok(new_tool_result_text(format!(
             "Migration '{name}' applied successfully.{migration_file_message}{types_message}"
         )))
@@ -470,10 +424,7 @@ impl SupabaseMCPServer {
         if sql.is_empty() {
             return Ok(new_tool_result_error("sql must not be empty"));
         }
-        self.base_server.logger.info(
-            "Executing query",
-            log_attributes([("sql_length", json!(sql.len()))]),
-        );
+        tracing::info!("sql_length" = ?(sql.len()), "{}", "Executing query");
         let mut result = match client.run_query(cancellation, &sql).await {
             Ok(result) => result,
             Err(error) => return Ok(new_tool_result_error(format!("Query failed: {error}"))),
@@ -584,13 +535,7 @@ impl SupabaseMCPServer {
                 "index.ts not found at supabase/functions/{slug}/ ({error}). Write the function source first."
             )));
         }
-        self.base_server.logger.info(
-            "Deploying Edge Function",
-            log_attributes([
-                ("slug", json!(&slug)),
-                ("func_dir", json!(function_directory.to_string_lossy())),
-            ]),
-        );
+        tracing::info!("slug" = ?(&slug), "func_dir" = ?(function_directory.to_string_lossy()), "{}", "Deploying Edge Function");
         let result = match client
             .deploy_function(
                 cancellation,
@@ -603,21 +548,11 @@ impl SupabaseMCPServer {
         {
             Ok(result) => result,
             Err(error) => {
-                self.base_server.logger.error(
-                    "Edge Function deploy failed",
-                    log_attributes([("slug", json!(&slug)), ("error", json!(error.to_string()))]),
-                );
+                tracing::error!("slug" = ?(&slug), "error" = ?(error.to_string()), "{}", "Edge Function deploy failed");
                 return Ok(new_tool_result_error(format!("Deploy failed: {error}")));
             }
         };
-        self.base_server.logger.info(
-            "Edge Function deployed",
-            log_attributes([
-                ("slug", json!(&slug)),
-                ("version", json!(result.version)),
-                ("status", json!(&result.status)),
-            ]),
-        );
+        tracing::info!("slug" = ?(&slug), "version" = ?(result.version), "status" = ?(&result.status), "{}", "Edge Function deployed");
         let function_url = format!(
             "https://{}.supabase.co/functions/v1/{slug}",
             client.project_ref()
@@ -699,17 +634,11 @@ impl SupabaseMCPServer {
             }
         }
 
-        self.base_server.logger.info(
-            "Triggering on-demand Supabase provisioning",
-            log_attributes([("session_id", json!(&self.session_id))]),
-        );
+        tracing::info!("session_id" = ?(&self.session_id), "{}", "Triggering on-demand Supabase provisioning");
         let status = match self.trigger_provision(cancellation).await {
             Ok(status) => status,
             Err(error) => {
-                self.base_server.logger.error(
-                    "Failed to trigger database provisioning",
-                    log_attributes([("error", json!(error.to_string()))]),
-                );
+                tracing::error!("error" = ?(error.to_string()), "{}", "Failed to trigger database provisioning");
                 if is_permanent_error(&error) {
                     let body = permanent_provisioning_err_body(&error.to_string());
                     self.state.write().await.provisioning_error = body.clone();
@@ -748,10 +677,7 @@ impl SupabaseMCPServer {
             }
             match self.ensure_configured(cancellation).await {
                 Ok(client) => {
-                    self.base_server.logger.info(
-                        "Supabase provisioning complete",
-                        log_attributes([("project_ref", json!(client.project_ref()))]),
-                    );
+                    tracing::info!("project_ref" = ?(client.project_ref()), "{}", "Supabase provisioning complete");
                     return Ok(new_tool_result_text(format!(
                         "Database provisioned successfully (project: {}). .env and .env.local written to project directory. Use the migrate tool to create your schema.",
                         client.project_ref()

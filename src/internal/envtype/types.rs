@@ -2,8 +2,7 @@
 //!
 //! 对应 Go：`internal/envtype/envtype.go` 中的 `EnvironmentType`、`Factory`、
 //! `Registration` 和 `EnvTypes` 声明，以及 manager 对 BYOC lease provider 的接口断言。
-//! Rust 使用 async trait 表达初始化与 lease 生命周期；Factory 额外把非 Optional
-//! [`Logger`] 作为显式参数，替代 Go 实现允许的 nil logger 与方法级默认值回退。
+//! Rust 使用 async trait 表达初始化与 lease 生命周期。
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -14,7 +13,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::internal::auth::AuthContext;
 use crate::internal::config::{SessionMode, StartupContext};
-use crate::internal::logger::Logger;
 use crate::internal::session::ActivityRecorder;
 use crate::internal::util::BoxError;
 
@@ -56,26 +54,19 @@ pub trait EnvironmentType: Send + Sync {
 
 /// 对应 Go：`internal/envtype/envtype.go` 中的 `Factory`。
 ///
-/// 环境工厂接收原始 JSON 配置和 manager 已经组装好的结构化 logger。`Logger`
-/// 是一个只克隆内部 `Arc` 的轻量句柄；按值传递可让新环境直接保存它，
-/// 同时保留可测试的注入边界。
-///
-/// # 参数
-/// - 第一个参数：后端返回的原始 JSON 字节，只在本次调用期间有效。
-/// - 第二个参数：本次 session 的 logger，所有权转入新环境。
+/// 环境工厂接收后端返回的原始 JSON 配置。
 ///
 /// # 返回
 /// 成功时返回可动态分发的环境；配置解析或校验失败时原样返回工厂错误。
-pub type Factory = Arc<
-    dyn Fn(&[u8], Logger) -> Result<Box<dyn EnvironmentType>, BoxError> + Send + Sync + 'static,
->;
+pub type Factory =
+    Arc<dyn Fn(&[u8]) -> Result<Box<dyn EnvironmentType>, BoxError> + Send + Sync + 'static>;
 
 /// 单个环境类型的注册信息。
 #[derive(Clone)]
 pub struct Registration {
     /// 配置中使用的稳定环境类型名称。
     pub type_name: String,
-    /// 从原始 JSON 和调用方 logger 创建实现；`None` 只用于保留 Go nil 校验语义。
+    /// 从原始 JSON 创建实现；`None` 只用于保留注册校验语义。
     pub factory: Option<Factory>,
     /// 面向用户的环境类型说明。
     pub description: String,

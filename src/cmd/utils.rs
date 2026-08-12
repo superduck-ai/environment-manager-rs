@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use clap::{Arg, ArgAction, ArgMatches};
 
-/// 与 Go `slog` 命令行取值一一对应的日志级别。
+/// 命令行支持的 tracing 日志级别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     /// 诊断级日志。
@@ -57,16 +57,13 @@ pub fn parse_log_level(value: &str) -> Result<LogLevel, String> {
     }
 }
 
-/// 将 CLI 日志级别映射为内部 logger 的等价级别。
-///
-/// 两个枚举刻意分离：CLI 只接受公开的日志级别，logger 层还包含
-/// `Trace`。集中转换可避免各命令在默认级别或大小写规则上出现漂移。
-pub(crate) const fn logger_level(level: LogLevel) -> crate::internal::logger::LogLevel {
+/// 将 CLI 日志级别映射为 `tracing` 级别。
+pub(crate) const fn tracing_level(level: LogLevel) -> tracing::Level {
     match level {
-        LogLevel::Debug => crate::internal::logger::LogLevel::Debug,
-        LogLevel::Info => crate::internal::logger::LogLevel::Info,
-        LogLevel::Warn => crate::internal::logger::LogLevel::Warn,
-        LogLevel::Error => crate::internal::logger::LogLevel::Error,
+        LogLevel::Debug => tracing::Level::DEBUG,
+        LogLevel::Info => tracing::Level::INFO,
+        LogLevel::Warn => tracing::Level::WARN,
+        LogLevel::Error => tracing::Level::ERROR,
     }
 }
 

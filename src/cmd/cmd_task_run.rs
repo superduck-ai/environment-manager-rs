@@ -34,7 +34,6 @@ use crate::internal::{
     claude::{self, ClaudeObservability, Executor, Outcomes},
     config::{self, SessionMode as ConfigSessionMode},
     envtype,
-    logger::{LogAttributes, Logger, create_logger},
     manager::{
         ClaudeExecutorFactory, Manager, ManagerApiClient, ManagerError, ManagerObservability,
         new_manager_with_executor_and_claude_config,
@@ -47,7 +46,7 @@ use crate::internal::{
 
 use super::error::{CliError, RuntimeError};
 use super::types::{StdinConfigClient, TaskContext};
-use super::utils::{LogLevel, bool_value, flag_arg, logger_level, parse_log_level};
+use super::utils::{LogLevel, bool_value, flag_arg, parse_log_level, tracing_level};
 
 const LONG_ABOUT: &str = r#"Connects directly to the API to execute an existing session id.
 
@@ -71,8 +70,6 @@ Provide a JSON object via stdin with the following structure:
   ]
 }"#;
 
-// 该资产由固定 Go 1.25.7 ARM64 oracle 的真实 CLI transcript 生成；文件只包含 panic
-// 起始处到 EOF，崩溃前的 logger 行仍由 Rust 正常执行路径产生。只有独立运行中
 /// `build_task_run_backend` 的后端选择结果。
 ///
 /// 普通调用只使用 `backend` trait object；code-session 还保留具体 CCR 实例，供注册后
@@ -103,7 +100,6 @@ impl EventPoster for BackendEventPoster {
 #[derive(Clone)]
 struct ApiSessionContextProvider {
     cancellation: CancellationToken,
-    logger: Logger,
 }
 
 impl crate::internal::input::SessionContextProvider for ApiSessionContextProvider {
@@ -121,13 +117,8 @@ impl crate::internal::input::SessionContextProvider for ApiSessionContextProvide
     > {
         Box::pin(async move {
             let http_client =
-                HttpClient::new(request.api_base_url, Some(self.logger.clone()), None)
-                    .map_err(|error| error.to_string())?;
-            let client = SessionsClient::new(
-                http_client,
-                request.session_ingress_token,
-                Some(self.logger.clone()),
-            );
+                HttpClient::new(request.api_base_url, None).map_err(|error| error.to_string())?;
+            let client = SessionsClient::new(http_client, request.session_ingress_token);
             let context = client
                 .get_session_context(&self.cancellation, request.session_id)
                 .await
@@ -466,26 +457,7 @@ impl ManagerApiClient for StdinConfigClient {
             .config
             .as_ref()
             .expect("stdin environment configuration is required");
-        self.logger.info(
-            "Using stdin-provided environment configuration",
-            [
-                (
-                    "allowed_tools".to_owned(),
-                    json!(&configuration.allowed_tools),
-                ),
-                (
-                    "environment_type".to_owned(),
-                    json!(&configuration.environment_type),
-                ),
-                (
-                    "has_allowed_tools".to_owned(),
-                    json!(!configuration.allowed_tools.is_empty()),
-                ),
-                ("session_id".to_owned(), json!(session_id)),
-            ]
-            .into_iter()
-            .collect(),
-        );
+        tracing::info!("allowed_tools" = ?(&configuration.allowed_tools), "environment_type" = ?(&configuration.environment_type), "has_allowed_tools" = ?(!configuration.allowed_tools.is_empty()), "session_id" = ?(session_id), "{}", "Using stdin-provided environment configuration");
         Ok(configuration.clone())
     }
 
@@ -507,16 +479,12 @@ impl ManagerApiClient for StdinConfigClient {
 /// worker；解析中的 V1 session-context 请求仍在异步运行时执行。
 async fn load_context_from_stdin(
     cancellation: &CancellationToken,
-    logger: &Logger,
     session_id: &str,
     input_format: InputFormat,
     working_directory: &std::path::Path,
 ) -> Result<TaskContext, RuntimeError> {
     let started = Instant::now();
-    logger.info(
-        "Starting to read and parse stdin",
-        log_attributes([("input_format", json!(input_format.to_string()))]),
-    );
+    tracing::info!("input_format" = ?(input_format.to_string()), "{}", "Starting to read and parse stdin");
     let data = tokio::task::spawn_blocking(|| {
         let mut data = Vec::new();
         std::io::stdin().lock().read_to_end(&mut data).map(|_| data)
@@ -524,47 +492,23 @@ async fn load_context_from_stdin(
     .await
     .map_err(|error| RuntimeError::message(format!("failed to read from stdin: {error}")))?
     .map_err(|error| RuntimeError::message(format!("failed to read from stdin: {error}")))?;
-    logger.info(
-        "Read stdin data",
-        [
-            ("size_bytes".to_owned(), json!(data.len())),
-            (
-                "read_duration_ms".to_owned(),
-                json!(duration_milliseconds(started)),
-            ),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    tracing::info!("size_bytes" = ?(data.len()), "read_duration_ms" = ?(duration_milliseconds(started)), "{}", "Read stdin data");
 
     let context = load_context_from_bytes(
         cancellation,
-        logger,
         session_id,
         input_format,
         working_directory,
         &data,
     )
     .await?;
-    logger.info(
-        "Completed parsing stdin context",
-        [
-            ("input_format".to_owned(), json!(input_format.to_string())),
-            (
-                "total_parse_duration_ms".to_owned(),
-                json!(duration_milliseconds(started)),
-            ),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    tracing::info!("input_format" = ?(input_format.to_string()), "total_parse_duration_ms" = ?(duration_milliseconds(started)), "{}", "Completed parsing stdin context");
     Ok(context)
 }
 
 /// 解析调用方提供的完整 stdin 字节，供运行时和无全局 stdin 的兼容测试共用。
 pub(super) async fn load_context_from_bytes(
     cancellation: &CancellationToken,
-    logger: &Logger,
     session_id: &str,
     input_format: InputFormat,
     working_directory: &std::path::Path,
@@ -574,18 +518,17 @@ pub(super) async fn load_context_from_bytes(
         InputFormat::V0 => crate::internal::input::V0Parser {
             session_id: session_id.to_owned(),
         }
-        .parse_with_logger_for_cli(data, logger)
+        .parse_for_cli(data)
         .map_err(|error| RuntimeError::message(format!("failed to parse stdin: {error}")))?,
         InputFormat::V1 => {
             let parser = crate::internal::input::V1Parser::new(
                 working_directory.to_string_lossy().into_owned(),
                 ApiSessionContextProvider {
                     cancellation: cancellation.clone(),
-                    logger: logger.clone(),
                 },
             );
             parser
-                .parse_with_logger(data, logger)
+                .parse(data)
                 .await
                 .map_err(|error| RuntimeError::message(format!("failed to parse stdin: {error}")))?
         }
@@ -636,7 +579,6 @@ pub(super) fn validate_api_base_url(api_base_url: &str) -> Result<(), String> {
 /// 对应 Go `acknowledgeWorkIfNeeded`，仅对完整 v1 work 发送一次 30 秒 ACK。
 pub(super) async fn acknowledge_work_if_needed(
     cancellation: &CancellationToken,
-    logger: &Logger,
     task_context: &TaskContext,
     work_id: &str,
     environment_id: &str,
@@ -662,22 +604,10 @@ pub(super) async fn acknowledge_work_if_needed(
         ));
     }
 
-    logger.info(
-        "Acknowledging work item",
-        [
-            ("environment_id".to_owned(), json!(environment_id)),
-            (
-                "is_healthcheck".to_owned(),
-                json!(task_context.is_healthcheck),
-            ),
-            ("work_id".to_owned(), json!(work_id)),
-        ]
-        .into_iter()
-        .collect(),
-    );
-    let http_client = HttpClient::new(&startup_context.api_base_url, Some(logger.clone()), None)
+    tracing::info!("environment_id" = ?(environment_id), "is_healthcheck" = ?(task_context.is_healthcheck), "work_id" = ?(work_id), "{}", "Acknowledging work item");
+    let http_client = HttpClient::new(&startup_context.api_base_url, None)
         .map_err(|error| format!("failed to acknowledge work: {error}"))?;
-    let client = WorkClient::new(http_client, token, Some(logger.clone()));
+    let client = WorkClient::new(http_client, token);
     let ack_cancellation = cancellation.child_token();
     let result = tokio::time::timeout(
         Duration::from_secs(30),
@@ -692,44 +622,27 @@ pub(super) async fn acknowledge_work_if_needed(
             return Err("failed to acknowledge work: context deadline exceeded".to_owned());
         }
     }
-    logger.info(
-        "Work item acknowledged successfully",
-        log_attributes([("work_id", json!(work_id))]),
-    );
+    tracing::info!("work_id" = ?(work_id), "{}", "Work item acknowledged successfully");
     Ok(())
 }
 
 /// 对应 Go `buildTaskRunBackend`，选择 Noop、SessionIngress 或 CCR v2。
 pub(super) async fn build_task_run_backend(
-    logger: &Logger,
     task_context: &TaskContext,
     session_id: &str,
     session_mode: ConfigSessionMode,
     skip_claude_code: bool,
 ) -> Result<TaskRunBackend, String> {
     if skip_claude_code {
-        logger.info(
-            "Skipping Claude Code installation and backend communication (ENVRUNNER_SKIP_CLAUDE_CODE=true)",
-            LogAttributes::new(),
+        tracing::info!(
+            "{}",
+            "Skipping Claude Code installation and backend communication (ENVRUNNER_SKIP_CLAUDE_CODE=true)"
         );
-        return selected_backend(
-            logger,
-            Arc::new(NoopBackend::new()),
-            None,
-            "*api.NoopBackend",
-        );
+        return selected_backend(Arc::new(NoopBackend::new()), None, "*api.NoopBackend");
     }
     if session_mode == ConfigSessionMode::SetupOnly {
-        logger.info(
-            "Using NoopBackend for setup-only session mode",
-            LogAttributes::new(),
-        );
-        return selected_backend(
-            logger,
-            Arc::new(NoopBackend::new()),
-            None,
-            "*api.NoopBackend",
-        );
+        tracing::info!("{}", "Using NoopBackend for setup-only session mode");
+        return selected_backend(Arc::new(NoopBackend::new()), None, "*api.NoopBackend");
     }
 
     let startup_context = task_context
@@ -744,7 +657,6 @@ pub(super) async fn build_task_run_backend(
     if startup_context.use_code_sessions {
         let http_client = HttpClient::with_options(
             &startup_context.api_base_url,
-            Some(logger.clone()),
             ClientOptions {
                 default_headers: BTreeMap::from([(
                     "anthropic-version".to_owned(),
@@ -754,12 +666,7 @@ pub(super) async fn build_task_run_backend(
             },
         )
         .map_err(|error| format!("failed to create CCR backend: {error}"))?;
-        let ccr = Arc::new(CCRBackend::new(
-            http_client,
-            ingress_token,
-            session_id,
-            Some(logger.clone()),
-        ));
+        let ccr = Arc::new(CCRBackend::new(http_client, ingress_token, session_id));
         let register_cancellation = CancellationToken::new();
         let result = tokio::time::timeout(
             Duration::from_secs(30),
@@ -779,35 +686,22 @@ pub(super) async fn build_task_run_backend(
             }
         }
         let backend: Arc<dyn SessionBackend> = ccr.clone();
-        return selected_backend(logger, backend, Some(ccr), "*api.CCRBackend");
+        return selected_backend(backend, Some(ccr), "*api.CCRBackend");
     }
 
-    let backend = SessionIngressBackend::new(
-        &startup_context.api_base_url,
-        ingress_token,
-        session_id,
-        Some(logger.clone()),
-    )
-    .map_err(|error| format!("failed to create session ingress backend: {error}"))?;
-    selected_backend(
-        logger,
-        Arc::new(backend),
-        None,
-        "*api.SessionIngressBackend",
-    )
+    let backend =
+        SessionIngressBackend::new(&startup_context.api_base_url, ingress_token, session_id)
+            .map_err(|error| format!("failed to create session ingress backend: {error}"))?;
+    selected_backend(Arc::new(backend), None, "*api.SessionIngressBackend")
 }
 
 /// 记录最终 backend 类型并构造统一返回值。
 fn selected_backend(
-    logger: &Logger,
     backend: Arc<dyn SessionBackend>,
     ccr_backend: Option<Arc<CCRBackend>>,
     backend_type: &str,
 ) -> Result<TaskRunBackend, String> {
-    logger.info(
-        "Selected session backend",
-        log_attributes([("backend_type", json!(backend_type))]),
-    );
+    tracing::info!("backend_type" = ?(backend_type), "{}", "Selected session backend");
     Ok(TaskRunBackend {
         backend,
         ccr_backend,
@@ -832,16 +726,10 @@ pub(super) fn apply_ccr_backend_claude_environment(
 }
 
 /// 对应 Go `taskRunClaudePath`，CLI flag 优先于 ambient 默认路径。
-pub(super) fn task_run_claude_path(
-    logger: &Logger,
-    claude_path_flag: Option<&std::path::Path>,
-) -> String {
+pub(super) fn task_run_claude_path(claude_path_flag: Option<&std::path::Path>) -> String {
     if let Some(path) = claude_path_flag {
         let path = path.to_string_lossy().into_owned();
-        logger.info(
-            "Using custom executable path from CLI flag",
-            log_attributes([("path", json!(&path))]),
-        );
+        tracing::info!("path" = ?(&path), "{}", "Using custom executable path from CLI flag");
         return path;
     }
     std::env::var("CLAUDE_DEFAULT_PATH")
@@ -853,13 +741,12 @@ pub(super) fn task_run_claude_path(
 /// 对应 Go `ensureClaudeCodeAvailableForTaskRun`，在共享 60 秒预算内安装或验证 Claude。
 async fn ensure_claude_code_available_for_task_run(
     cancellation: &CancellationToken,
-    logger: &Logger,
     claude_path_flag: Option<&std::path::Path>,
     claude_code_version: &str,
     skip_claude_code: bool,
     activity_recorder: &dyn ActivityRecorder,
 ) -> Result<Duration, RuntimeError> {
-    let claude_path = task_run_claude_path(logger, claude_path_flag);
+    let claude_path = task_run_claude_path(claude_path_flag);
     if skip_claude_code {
         return Ok(Duration::ZERO);
     }
@@ -870,7 +757,6 @@ async fn ensure_claude_code_available_for_task_run(
         Duration::from_secs(60),
         claude::install_or_update_claude_code(
             &install_cancellation,
-            logger,
             &claude_path,
             claude_code_version,
             activity_recorder,
@@ -891,7 +777,7 @@ async fn ensure_claude_code_available_for_task_run(
         }
     };
     util::set_claude_code_version(installed_version);
-    logger.info("Claude Code installation completed", LogAttributes::new());
+    tracing::info!("{}", "Claude Code installation completed");
     Ok(duration)
 }
 
@@ -910,18 +796,6 @@ pub(super) fn wrap_claude_code_availability_error(error: &claude::ClaudeError) -
 /// 把单调耗时安全转换为 Go `Duration.Milliseconds()` 对应的整数。
 fn duration_milliseconds(started: Instant) -> i64 {
     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
-}
-
-/// 按 Go `slog` 调用中的参数顺序构造日志属性。
-///
-/// `encoding/json` 文件 handler 会在自己的边界重新按 key 排序；stderr JSON handler
-/// 必须保留这里的插入顺序，因此不能复用本文件用于诊断字段和 HTTP header 的
-/// `BTreeMap`。
-fn log_attributes<const N: usize>(entries: [(&str, Value); N]) -> LogAttributes {
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }
 
 /// `task-run` 启动后需要按逆序关闭的诊断与 OTel 资源。
@@ -954,21 +828,20 @@ pub async fn run_task_run(arguments: &TaskRunArgs) -> Result<(), RuntimeError> {
         unsafe { std::env::set_var("SKIP_GIT_CONFIG", "true") };
     }
 
-    let logger = create_logger(logger_level(arguments.log_level));
+    crate::internal::logger::initialize(tracing_level(arguments.log_level));
     if arguments.stdin_was_set {
-        logger.warn(
-            "The --stdin flag is deprecated and will be removed in a future release. Stdin is now always used.",
-            LogAttributes::new(),
+        tracing::warn!(
+            "{}",
+            "The --stdin flag is deprecated and will be removed in a future release. Stdin is now always used."
         );
     }
-    let _session_lock = util::acquire_lock(&logger, &arguments.session_id)
+    let _session_lock = util::acquire_lock(&arguments.session_id)
         .map_err(|error| format!("failed to acquire lock: {error}"))?;
     let session_mode = config_session_mode(arguments.session_mode);
 
     let context_load_started = Instant::now();
     let mut task_context = load_context_from_stdin(
         &CancellationToken::new(),
-        &logger,
         &arguments.session_id,
         arguments.input_format,
         &arguments.working_directory,
@@ -990,7 +863,6 @@ pub async fn run_task_run(arguments: &TaskRunArgs) -> Result<(), RuntimeError> {
         auth_context.set_session_id(&session_id);
     }
     log_loaded_context_from_stdin(
-        &logger,
         &task_context,
         &session_id,
         &work_id,
@@ -1001,7 +873,6 @@ pub async fn run_task_run(arguments: &TaskRunArgs) -> Result<(), RuntimeError> {
     let cancellation = CancellationToken::new();
     acknowledge_work_if_needed(
         &cancellation,
-        &logger,
         &task_context,
         &work_id,
         &environment_id,
@@ -1010,7 +881,6 @@ pub async fn run_task_run(arguments: &TaskRunArgs) -> Result<(), RuntimeError> {
     .await?;
     if task_context.is_healthcheck {
         return run_task_run_healthcheck(
-            &logger,
             &session_id,
             context_load_started.elapsed(),
             process_started,
@@ -1019,26 +889,18 @@ pub async fn run_task_run(arguments: &TaskRunArgs) -> Result<(), RuntimeError> {
     }
 
     let skip_claude_code = std::env::var("ENVRUNNER_SKIP_CLAUDE_CODE").as_deref() == Ok("true");
-    let selected = build_task_run_backend(
-        &logger,
-        &task_context,
-        &session_id,
-        session_mode,
-        skip_claude_code,
-    )
-    .await?;
+    let selected =
+        build_task_run_backend(&task_context, &session_id, session_mode, skip_claude_code).await?;
     let event_poster: Arc<dyn EventPoster> = Arc::new(BackendEventPoster {
         backend: Arc::clone(&selected.backend),
     });
     let activity_recorder: Arc<dyn ActivityRecorder> = Arc::new(new_activity_recorder(
         cancellation.clone(),
         Arc::clone(&event_poster),
-        logger.clone(),
         None,
     ));
     let install_duration = ensure_claude_code_available_for_task_run(
         &cancellation,
-        &logger,
         arguments.claude_path.as_deref(),
         &arguments.claude_agent_version,
         skip_claude_code,
@@ -1049,7 +911,6 @@ pub async fn run_task_run(arguments: &TaskRunArgs) -> Result<(), RuntimeError> {
     let telemetry = initialize_task_run_telemetry(
         &cancellation,
         Arc::clone(&selected.backend),
-        &logger,
         session_mode,
         install_duration,
         skip_claude_code,
@@ -1058,7 +919,6 @@ pub async fn run_task_run(arguments: &TaskRunArgs) -> Result<(), RuntimeError> {
     let result = execute_task_run_manager(
         arguments,
         &cancellation,
-        &logger,
         task_context,
         session_id,
         work_id,
@@ -1072,7 +932,7 @@ pub async fn run_task_run(arguments: &TaskRunArgs) -> Result<(), RuntimeError> {
         context_load_started,
     )
     .await;
-    shutdown_task_run_telemetry(&logger, telemetry).await;
+    shutdown_task_run_telemetry(telemetry).await;
     result
 }
 
@@ -1089,7 +949,6 @@ pub async fn run_task_run(arguments: &TaskRunArgs) -> Result<(), RuntimeError> {
 async fn execute_task_run_manager(
     arguments: &TaskRunArgs,
     cancellation: &CancellationToken,
-    logger: &Logger,
     task_context: TaskContext,
     session_id: String,
     work_id: String,
@@ -1110,18 +969,17 @@ async fn execute_task_run_manager(
     session_config
         .validate()
         .map_err(|error| format!("invalid configuration: {error}"))?;
-    log_task_run_start(logger, &session_config);
+    log_task_run_start(&session_config);
 
     let mut environment_types = envtype::new_env_types();
     environment_types.register((*envtype::anthropic::REGISTRATION).clone());
     environment_types.register((*envtype::byoc::REGISTRATION).clone());
 
-    log_task_run_environment_from_stdin(logger, &task_context);
+    log_task_run_environment_from_stdin(&task_context);
     let config_client: Arc<dyn ManagerApiClient> = Arc::new(StdinConfigClient {
         config: task_context.environment.clone(),
         auth_context: task_context.auth_context.clone(),
         outcomes: task_context.outcomes.clone(),
-        logger: logger.clone(),
     });
 
     let mut claude_config = config::default_claude_config();
@@ -1146,14 +1004,12 @@ async fn execute_task_run_manager(
         &mut claude_config,
         selected_backend.ccr_backend.as_deref(),
     );
-    log_task_run_claude_config(logger, &claude_config);
+    log_task_run_claude_config(&claude_config);
 
-    let otel_log_handler = task_run_claude_log_handler(&observability);
     let executor_observability = Arc::clone(&observability);
     let target_version = arguments.claude_agent_version.clone();
     let executor_factory: ClaudeExecutorFactory = Arc::new(
-        move |logger,
-              configuration,
+        move |configuration,
               session_id,
               startup_context,
               auth_context,
@@ -1171,7 +1027,6 @@ async fn execute_task_run_manager(
                 })
                 .collect();
             let mut executor = claude::new_claude_code_executor(
-                logger,
                 Some(configuration),
                 session_id,
                 startup_context.unwrap_or_default(),
@@ -1179,7 +1034,6 @@ async fn execute_task_run_manager(
                 registrations,
                 Some(outcomes),
                 activity_recorder,
-                Arc::clone(&otel_log_handler),
                 lease_manager,
                 &target_version,
             )
@@ -1191,7 +1045,6 @@ async fn execute_task_run_manager(
 
     let mut manager = new_manager_with_executor_and_claude_config(
         config_client,
-        logger.clone(),
         Some(session_config),
         Arc::new(environment_types),
         executor_factory,
@@ -1205,24 +1058,9 @@ async fn execute_task_run_manager(
     );
     manager.set_observability(Some(observability.clone()));
 
-    logger.info(
-        "Setup completed, starting manager execution",
-        [
-            (
-                "setup_duration_ms".to_owned(),
-                json!(duration_milliseconds(context_load_started)),
-            ),
-            (
-                "total_elapsed_ms".to_owned(),
-                json!(duration_milliseconds(process_started)),
-            ),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    tracing::info!("setup_duration_ms" = ?(duration_milliseconds(context_load_started)), "total_elapsed_ms" = ?(duration_milliseconds(process_started)), "{}", "Setup completed, starting manager execution");
     run_task_run_manager(
         cancellation,
-        logger,
         &mut manager,
         session_mode,
         process_started,
@@ -1253,7 +1091,6 @@ impl TaskRunManager for Manager {
 /// 记录指标，其他错误添加 `environment manager failed` 前缀。
 pub(super) async fn run_task_run_manager(
     cancellation: &CancellationToken,
-    logger: &Logger,
     manager: &mut dyn TaskRunManager,
     session_mode: ConfigSessionMode,
     process_started: Instant,
@@ -1277,32 +1114,21 @@ pub(super) async fn run_task_run_manager(
     let run_result = tokio::select! {
         result = &mut manager_future => result,
         _ = interrupt.recv() => {
-            log_task_run_shutdown_signal(logger, "interrupt");
+            log_task_run_shutdown_signal("interrupt");
             manager_cancellation.cancel();
-            wait_for_task_run_manager_shutdown(logger, &mut manager_future).await
+            wait_for_task_run_manager_shutdown(&mut manager_future).await
         }
         _ = terminate.recv() => {
-            log_task_run_shutdown_signal(logger, "terminated");
+            log_task_run_shutdown_signal("terminated");
             manager_cancellation.cancel();
-            wait_for_task_run_manager_shutdown(logger, &mut manager_future).await
+            wait_for_task_run_manager_shutdown(&mut manager_future).await
         }
     };
 
     if let Err(error) = run_result
         && !is_task_run_cancellation_error(&error)
     {
-        logger.error(
-            "Environment manager execution failed",
-            [
-                ("error".to_owned(), json!(error.to_string())),
-                (
-                    "total_duration_ms".to_owned(),
-                    json!(duration_milliseconds(process_started)),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-        );
+        tracing::error!("error" = ?(error.to_string()), "total_duration_ms" = ?(duration_milliseconds(process_started)), "{}", "Environment manager execution failed");
         if let Some(metrics) = &observability.metrics {
             // 指标接口只接受标准 UTF-8 Error；这里使用 Go 风格替换视图，但下面返回
             // 给 CLI 的 RuntimeError 仍从原始字节构造，两条用途不能共用 String。
@@ -1320,43 +1146,28 @@ pub(super) async fn run_task_run_manager(
         o11y::increment_env_manager_end(metrics, session_mode, None);
     }
     observability.log_diag("end_task_run", None);
-    logger.info(
-        "Environment manager completed successfully",
-        log_attributes([(
-            "total_duration_ms",
-            json!(duration_milliseconds(process_started)),
-        )]),
-    );
+    tracing::info!("total_duration_ms" = ?(duration_milliseconds(process_started)), "{}", "Environment manager completed successfully");
     Ok(())
 }
 
 /// 对应 Go `runTaskRunManager` 收到 Unix signal 后的唯一日志调用点。
 ///
-/// Go 的 `select` 在一个 case 中记录动态 `sig.String()`；Tokio 需要两个 signal
-/// stream，但不能因此复制 logger callsite，否则 runtime source 和 Go oracle 不一致。
+/// Tokio 的两个 signal stream 汇合后记录统一的 shutdown tracing 事件。
 ///
 /// # 参数
-/// - `logger`：task-run 的结构化 logger。
 /// - `signal`：Go `os.Signal.String()` 对应的 `interrupt` 或 `terminated`。
-fn log_task_run_shutdown_signal(logger: &Logger, signal: &'static str) {
-    logger.info(
-        "Received signal, shutting down gracefully",
-        log_attributes([("signal", json!(signal))]),
-    );
+fn log_task_run_shutdown_signal(signal: &'static str) {
+    tracing::info!("signal" = ?(signal), "{}", "Received signal, shutting down gracefully");
 }
 
 /// 信号取消后继续 poll 同一个 manager future，避免重新执行状态机。
 async fn wait_for_task_run_manager_shutdown(
-    logger: &Logger,
     manager_future: &mut Pin<Box<dyn Future<Output = Result<(), ManagerError>> + Send + '_>>,
 ) -> Result<(), ManagerError> {
     match tokio::time::timeout(Duration::from_secs(10), manager_future).await {
         Ok(result) => result,
         Err(_) => {
-            logger.error(
-                "Manager shutdown timed out after 10 seconds",
-                LogAttributes::new(),
-            );
+            tracing::error!("{}", "Manager shutdown timed out after 10 seconds");
             Err(ManagerError::message(
                 "manager shutdown timed out after 10 seconds",
             ))
@@ -1376,72 +1187,42 @@ fn is_task_run_cancellation_error(error: &ManagerError) -> bool {
 }
 
 /// 对应 Go `logTaskRunStart`，只记录不含 secret 的 session 摘要。
-fn log_task_run_start(logger: &Logger, session_config: &config::Session) {
+fn log_task_run_start(session_config: &config::Session) {
     let sources_count = session_config
         .startup_context
         .as_ref()
         .map_or(0, |context| context.sources.len());
-    logger.info(
-        "Starting environment manager",
-        [
-            (
-                "has_startup_context".to_owned(),
-                json!(session_config.startup_context.is_some()),
-            ),
-            ("session_id".to_owned(), json!(&session_config.session_id)),
-            ("sources_count".to_owned(), json!(sources_count)),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    tracing::info!("has_startup_context" = ?(session_config.startup_context.is_some()), "session_id" = ?(&session_config.session_id), "sources_count" = ?(sources_count), "{}", "Starting environment manager");
 }
 
 /// 对应 Go `logTaskRunEnvironmentFromStdin`，避免记录 environment config 正文。
-fn log_task_run_environment_from_stdin(logger: &Logger, task_context: &TaskContext) {
+fn log_task_run_environment_from_stdin(task_context: &TaskContext) {
     let environment_type = task_context
         .environment
         .as_ref()
         .map_or("", |environment| environment.environment_type.as_str());
-    logger.info(
-        "Using environment configuration from stdin",
-        log_attributes([("environment_type", json!(environment_type))]),
-    );
+    tracing::info!("environment_type" = ?(environment_type), "{}", "Using environment configuration from stdin");
 }
 
 /// 对应 Go `logTaskRunClaudeConfig`，逐个复刻非敏感开关的条件日志。
-fn log_task_run_claude_config(logger: &Logger, claude_config: &config::ClaudeConfig) {
+fn log_task_run_claude_config(claude_config: &config::ClaudeConfig) {
     if !claude_config.allowed_tools.is_empty() {
-        logger.info(
-            "Configured allowed tools for Claude",
-            log_attributes([("tools", json!(&claude_config.allowed_tools))]),
-        );
+        tracing::info!("tools" = ?(&claude_config.allowed_tools), "{}", "Configured allowed tools for Claude");
     }
     if !claude_config.local_append_system_prompt.is_empty() {
-        logger.info(
-            "Configured local append system prompt",
-            log_attributes([(
-                "prompt_length",
-                json!(claude_config.local_append_system_prompt.len()),
-            )]),
-        );
+        tracing::info!("prompt_length" = ?(claude_config.local_append_system_prompt.len()), "{}", "Configured local append system prompt");
     }
     if claude_config.local_testing_mode {
-        logger.info(
-            "WebSocket disabled, Claude Code will run in standalone mode",
-            LogAttributes::new(),
+        tracing::info!(
+            "{}",
+            "WebSocket disabled, Claude Code will run in standalone mode"
         );
     }
     if claude_config.verbose_logging {
-        logger.info(
-            "Enabled verbose Claude Code logging to console",
-            LogAttributes::new(),
-        );
+        tracing::info!("{}", "Enabled verbose Claude Code logging to console");
     }
     if claude_config.print_code_logs {
-        logger.info(
-            "Enabled printing Claude Code logs on exit",
-            LogAttributes::new(),
-        );
+        tracing::info!("{}", "Enabled printing Claude Code logs on exit");
     }
 }
 
@@ -1457,7 +1238,6 @@ const fn config_session_mode(mode: SessionMode) -> ConfigSessionMode {
 
 /// 记录 stdin 中不含 secret 的上下文摘要。
 fn log_loaded_context_from_stdin(
-    logger: &Logger,
     task_context: &TaskContext,
     session_id: &str,
     work_id: &str,
@@ -1472,55 +1252,18 @@ fn log_loaded_context_from_stdin(
         .environment
         .as_ref()
         .map_or("", |environment| environment.environment_type.as_str());
-    logger.info(
-        "Loaded context from stdin",
-        [
-            ("environment_id".to_owned(), json!(environment_id)),
-            ("environment_type".to_owned(), json!(environment_type)),
-            (
-                "has_auth".to_owned(),
-                json!(task_context.auth_context.is_some()),
-            ),
-            ("session_id".to_owned(), json!(session_id)),
-            ("startup_sources_count".to_owned(), json!(source_count)),
-            (
-                "stdin_parse_duration_ms".to_owned(),
-                json!(duration.as_millis()),
-            ),
-            ("work_id".to_owned(), json!(work_id)),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    tracing::info!("environment_id" = ?(environment_id), "environment_type" = ?(environment_type), "has_auth" = ?(task_context.auth_context.is_some()), "session_id" = ?(session_id), "startup_sources_count" = ?(source_count), "stdin_parse_duration_ms" = ?(duration.as_millis()), "work_id" = ?(work_id), "{}", "Loaded context from stdin");
 }
 
 /// 对应 Go `runTaskRunHealthcheck`，仅记录成功且不创建 backend/manager。
 fn run_task_run_healthcheck(
-    logger: &Logger,
     session_id: &str,
     parse_duration: Duration,
     process_started: Instant,
 ) -> Result<(), String> {
-    logger.info(
-        "Running healthcheck",
-        [
-            (
-                "healthcheck_parse_duration_ms".to_owned(),
-                json!(parse_duration.as_millis()),
-            ),
-            ("session_id".to_owned(), json!(session_id)),
-        ]
-        .into_iter()
-        .collect(),
-    );
-    logger.info("Executing healthcheck", LogAttributes::new());
-    logger.info(
-        "Healthcheck completed successfully",
-        log_attributes([(
-            "total_duration_ms",
-            json!(duration_milliseconds(process_started)),
-        )]),
-    );
+    tracing::info!("healthcheck_parse_duration_ms" = ?(parse_duration.as_millis()), "session_id" = ?(session_id), "{}", "Running healthcheck");
+    tracing::info!("{}", "Executing healthcheck");
+    tracing::info!("total_duration_ms" = ?(duration_milliseconds(process_started)), "{}", "Healthcheck completed successfully");
     Ok(())
 }
 
@@ -1528,10 +1271,9 @@ fn run_task_run_healthcheck(
 pub(super) async fn init_diag_logging(
     cancellation: &CancellationToken,
     backend: Arc<dyn SessionBackend>,
-    logger: &Logger,
 ) -> Result<Option<(Arc<o11y::diag::DiagService>, o11y::diag::DiagContext)>, String> {
     if !o11y::diag::logs_enabled() {
-        logger.info("Diagnostic logs are disabled", LogAttributes::new());
+        tracing::info!("{}", "Diagnostic logs are disabled");
         return Ok(None);
     }
     o11y::diag::new_diag_service_with_backend(cancellation.clone(), backend)
@@ -1544,12 +1286,10 @@ pub(super) async fn init_diag_logging(
 fn init_task_run_o11y(
     cancellation: &CancellationToken,
     backend: &dyn SessionBackend,
-    logger: &Logger,
 ) -> Result<(Arc<O11yServiceImpl>, O11yContext), String> {
     let endpoints = backend.otlp_endpoints();
     o11y::new_o11y_service(
         Some(cancellation.clone()),
-        Some(logger.clone()),
         Some(&o11y::O11yConfig {
             metrics_endpoint: endpoints.metrics_endpoint,
             logs_endpoint: endpoints.logs_endpoint,
@@ -1565,7 +1305,6 @@ fn init_task_run_o11y(
 async fn initialize_task_run_telemetry(
     cancellation: &CancellationToken,
     backend: Arc<dyn SessionBackend>,
-    logger: &Logger,
     session_mode: ConfigSessionMode,
     install_duration: Duration,
     skip_claude_code: bool,
@@ -1577,16 +1316,16 @@ async fn initialize_task_run_telemetry(
             diag_service: None,
         });
     }
-    let diag = init_diag_logging(cancellation, Arc::clone(&backend), logger)
+    let diag = init_diag_logging(cancellation, Arc::clone(&backend))
         .await
         .map_err(|error| format!("failed to initialize diagnostic logging: {error}"))?;
     let diag_context = diag.as_ref().map(|(_, context)| context.clone());
     o11y::diag::log_env_manager_no_pii(diag_context.as_ref(), "start_task_run", None);
-    let (service, metrics) = match init_task_run_o11y(cancellation, backend.as_ref(), logger) {
+    let (service, metrics) = match init_task_run_o11y(cancellation, backend.as_ref()) {
         Ok(runtime) => runtime,
         Err(error) => {
             if let Some((service, _)) = &diag {
-                shutdown_diag_service(logger, service).await;
+                shutdown_diag_service(service).await;
             }
             return Err(error);
         }
@@ -1609,18 +1348,8 @@ async fn initialize_task_run_telemetry(
     })
 }
 
-/// 根据 `OTEL_LOGS_EXPORTER` 选择 Claude 结构化日志 handler。
-fn task_run_claude_log_handler(
-    observability: &TaskRunObservability,
-) -> Arc<dyn crate::internal::logger::LogHandler> {
-    if std::env::var("OTEL_LOGS_EXPORTER").as_deref() == Ok("otlp") {
-        return o11y::get_o11y_service(observability.metrics.as_ref()).log_handler();
-    }
-    o11y::get_o11y_service(None).log_handler()
-}
-
 /// 关闭 OTel 服务；关闭失败只记录日志，不覆盖 manager 的主结果。
-async fn shutdown_task_run_o11y(logger: &Logger, service: &Arc<O11yServiceImpl>) {
+async fn shutdown_task_run_o11y(service: &Arc<O11yServiceImpl>) {
     let shutdown_cancellation = CancellationToken::new();
     let result = tokio::time::timeout(
         Duration::from_secs(10),
@@ -1634,17 +1363,13 @@ async fn shutdown_task_run_o11y(logger: &Logger, service: &Arc<O11yServiceImpl>)
         Err(_) => Some("context deadline exceeded".to_owned()),
     };
     if let Some(error) = error {
-        // Go 无论 service 自身返错还是 shutdown context 超时，都只经过
-        // `service.Shutdown` 后的这一个 logger callsite。
-        logger.error(
-            "Failed to shutdown observability",
-            log_attributes([("error", json!(error))]),
-        );
+        // service 自身返错和 shutdown 超时都写同一个 tracing 事件。
+        tracing::error!("error" = ?(error), "{}", "Failed to shutdown observability");
     }
 }
 
 /// 在独立十秒窗口内关闭诊断 collector、最终 flush 和两个文件描述符。
-async fn shutdown_diag_service(logger: &Logger, service: &Arc<o11y::diag::DiagService>) {
+async fn shutdown_diag_service(service: &Arc<o11y::diag::DiagService>) {
     let shutdown_cancellation = CancellationToken::new();
     let result = tokio::time::timeout(
         Duration::from_secs(10),
@@ -1660,19 +1385,16 @@ async fn shutdown_diag_service(logger: &Logger, service: &Arc<o11y::diag::DiagSe
     if let Some(error) = error {
         // 与 Go cleanup closure 一样，超时只是 `Shutdown` 的一种 error，不创建
         // 第二个日志 source。
-        logger.error(
-            "Failed to shutdown diagnostic logging service",
-            log_attributes([("error", json!(error))]),
-        );
+        tracing::error!("error" = ?(error), "{}", "Failed to shutdown diagnostic logging service");
     }
 }
 
 /// 按 Go defer 的 LIFO 顺序先关 OTel，再关诊断服务。
-async fn shutdown_task_run_telemetry(logger: &Logger, telemetry: TaskRunTelemetry) {
+async fn shutdown_task_run_telemetry(telemetry: TaskRunTelemetry) {
     if let Some(service) = &telemetry.o11y_service {
-        shutdown_task_run_o11y(logger, service).await;
+        shutdown_task_run_o11y(service).await;
     }
     if let Some(service) = &telemetry.diag_service {
-        shutdown_diag_service(logger, service).await;
+        shutdown_diag_service(service).await;
     }
 }

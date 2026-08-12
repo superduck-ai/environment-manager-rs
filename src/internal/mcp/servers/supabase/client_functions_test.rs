@@ -107,7 +107,7 @@ fn read_multipart_deploy_request(
 }
 
 #[tokio::test]
-async fn test_client_methods_use_recovered_management_api_paths() {
+async fn test_client_methods_use_management_api_paths() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/projects/project-ref/database/migrations"))
@@ -207,7 +207,7 @@ async fn test_client_do_request_surfaces_api_error_messages() {
 }
 
 #[tokio::test]
-async fn test_deploy_function_builds_recovered_multipart_request() {
+async fn test_deploy_function_builds_multipart_request() {
     let project = tempdir().expect("project");
     let function = project.path().join("supabase/functions/hello_fn");
     let shared = project.path().join("supabase/functions/_shared");

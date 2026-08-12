@@ -11,7 +11,6 @@ use std::{
 };
 
 use nix::{fcntl::OFlag, unistd::pipe2};
-use serde_json::json;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
@@ -21,12 +20,10 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     CommandOutcome, Hook, OrchestratorError, OrchestratorResult, SandboxRequest, SessionData,
-    log_attributes,
 };
 use crate::internal::{
-    logger::Logger,
     process::{go_spawn_error, resolve_go_command},
-    util::{format_go_duration, go_duration_nanoseconds},
+    util::{duration_nanoseconds, format_go_duration},
 };
 
 impl Hook {
@@ -34,20 +31,12 @@ impl Hook {
     ///
     /// 空命令是显式 no-op。非零退出、启动失败、取消与超时都包含 Hook 名、耗时和
     /// 已捕获输出，便于保持原命令行错误的诊断密度。
-    pub async fn execute(
-        &self,
-        cancellation: &CancellationToken,
-        logger: &Logger,
-    ) -> OrchestratorResult<()> {
+    pub async fn execute(&self, cancellation: &CancellationToken) -> OrchestratorResult<()> {
         if self.command.is_empty() {
             return Ok(());
         }
 
-        let hook_logger = logger.with_attrs(log_attributes([
-            ("hook", json!(self.name)),
-            ("command", json!(self.command)),
-        ]));
-        hook_logger.info("executing hook", Default::default());
+        tracing::info!(hook = %self.name, command = %self.command, "executing hook");
 
         let outcome = run_command_combined_capture(
             cancellation,
@@ -57,7 +46,7 @@ impl Hook {
             duration_timeout(self.timeout),
         )
         .await;
-        self.finish_execution(&hook_logger, outcome)
+        self.finish_execution(outcome)
     }
 
     /// 对应 Go `(*Hook).ExecuteWithStdin`，向 execute Hook 传入原始 work JSON。
@@ -68,35 +57,30 @@ impl Hook {
     pub async fn execute_with_stdin(
         &self,
         cancellation: &CancellationToken,
-        logger: &Logger,
         stdin_data: &[u8],
     ) -> OrchestratorResult<()> {
         if self.command.is_empty() {
             return Ok(());
         }
 
-        let hook_logger = logger.with_attrs(log_attributes([
-            ("hook", json!(self.name)),
-            ("command", json!(self.command)),
-            ("sandbox_enabled", json!(self.sandbox_enabled)),
-        ]));
-        hook_logger.info("executing hook with stdin", Default::default());
+        tracing::info!(
+            hook = %self.name,
+            command = %self.command,
+            sandbox_enabled = self.sandbox_enabled,
+            "executing hook with stdin"
+        );
 
         let mut args = self.args.clone();
         match serde_json::from_slice::<SessionData>(stdin_data) {
             Ok(session) if !session.id.is_empty() => {
-                hook_logger.info(
-                    "injecting session ID into args",
-                    log_attributes([("session_id", json!(session.id))]),
-                );
+                tracing::info!("session_id" = ?(session.id), "{}", "injecting session ID into args");
                 args.push("--session".to_owned());
                 args.push(session.id);
             }
             Ok(_) => {}
-            Err(error) => hook_logger.warn(
-                "failed to parse session ID from stdin",
-                log_attributes([("error", json!(error.to_string()))]),
-            ),
+            Err(error) => {
+                tracing::warn!("error" = ?(error.to_string()), "{}", "failed to parse session ID from stdin")
+            }
         }
 
         let timeout = duration_timeout(self.timeout);
@@ -114,7 +98,6 @@ impl Hook {
                             command: self.command.clone(),
                             args,
                             timeout,
-                            logger: hook_logger.clone(),
                         })
                         .await
                 }
@@ -127,10 +110,7 @@ impl Hook {
             match adapter_result {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    hook_logger.error(
-                        "sandbox initialization failed",
-                        log_attributes([("error", json!(error.to_string()))]),
-                    );
+                    tracing::error!("error" = ?(error.to_string()), "{}", "sandbox initialization failed");
                     return Err(OrchestratorError::message(format!(
                         "sandbox initialization failed: {error}"
                     )));
@@ -147,68 +127,36 @@ impl Hook {
             .await
         };
 
-        self.finish_execution(&hook_logger, outcome)
+        self.finish_execution(outcome)
     }
 
     /// 统一记录成功/失败并生成与 Go Hook 相同结构的错误。
-    fn finish_execution(
-        &self,
-        hook_logger: &Logger,
-        outcome: CommandOutcome,
-    ) -> OrchestratorResult<()> {
+    fn finish_execution(&self, outcome: CommandOutcome) -> OrchestratorResult<()> {
         let output = String::from_utf8_lossy(&outcome.combined_output()).into_owned();
         let duration = format_go_duration(outcome.duration);
         if let Some(error) = outcome.error {
-            hook_logger.error(
-                "hook execution failed",
-                log_attributes([
-                    ("duration", json!(go_duration_nanoseconds(outcome.duration))),
-                    ("output", json!(output)),
-                    ("error", json!(error)),
-                ]),
-            );
+            tracing::error!(hook = %self.name, command = %self.command, "duration" = ?(duration_nanoseconds(outcome.duration)), "output" = ?(output), "error" = ?(error), "hook execution failed");
             return Err(OrchestratorError::message(format!(
                 "hook {} failed after {duration}: {error}\nOutput: {output}",
                 self.name
             )));
         }
 
-        hook_logger.info(
-            "hook execution completed",
-            log_attributes([
-                ("duration", json!(go_duration_nanoseconds(outcome.duration))),
-                ("output", json!(output)),
-            ]),
-        );
+        tracing::info!(hook = %self.name, command = %self.command, "duration" = ?(duration_nanoseconds(outcome.duration)), "output" = ?(output), "hook execution completed");
         Ok(())
     }
 }
 
 /// 对应 Go `(*Hook).ExecuteWithStdin` 中 sandbox command 包装成功日志。
 ///
-/// 该 helper 刻意不使用 `#[track_caller]`：生产 adapter 位于 `cmd` 镜像文件，但 Go
-/// 日志调用点属于 `internal/orchestrator/hooks.go`。固定在本文件调用 Logger 才能让
-/// JSON `source` 仍指向正确的 Go 文件和行号。
-///
 /// # 参数
-/// - `logger`：已绑定 hook、command、sandbox_enabled 属性的 Hook logger。
 /// - `command`：SRT 包装后的可执行文件路径。
 /// - `arguments`：SRT 包装后的完整参数，按原顺序写入 `wrapped_args`。
 ///
 /// # 副作用
 /// 同步写出一条 INFO 日志；handler 写入失败不会改变 Hook 结果。
-pub(crate) fn log_command_wrapped_with_sandbox(
-    logger: &Logger,
-    command: &str,
-    arguments: &[String],
-) {
-    logger.info(
-        "command wrapped with sandbox",
-        log_attributes([
-            ("wrapped_command", json!(command)),
-            ("wrapped_args", json!(arguments)),
-        ]),
-    );
+pub(crate) fn log_command_wrapped_with_sandbox(command: &str, arguments: &[String]) {
+    tracing::info!("wrapped_command" = ?(command), "wrapped_args" = ?(arguments), "{}", "command wrapped with sandbox");
 }
 
 /// 对应 Go `(*Hook).ExecuteWithStdin.func1` 中 sandbox cleanup 失败日志。
@@ -217,16 +165,12 @@ pub(crate) fn log_command_wrapped_with_sandbox(
 /// 失败只记录 warning，绝不覆盖已经得到的命令执行结果。
 ///
 /// # 参数
-/// - `logger`：已绑定 Hook 固定属性的 logger。
 /// - `error`：sandbox runtime 返回的清理错误文本。
 ///
 /// # 副作用
 /// 同步写出一条 WARN 日志。
-pub(crate) fn log_sandbox_cleanup_failed(logger: &Logger, error: &str) {
-    logger.warn(
-        "sandbox cleanup failed",
-        log_attributes([("error", json!(error))]),
-    );
+pub(crate) fn log_sandbox_cleanup_failed(error: &str) {
+    tracing::warn!("error" = ?(error), "{}", "sandbox cleanup failed");
 }
 
 /// 把 Hook 的 Go 零值超时映射为“不设置独立 deadline”。

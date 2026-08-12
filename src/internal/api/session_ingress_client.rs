@@ -8,10 +8,9 @@ use chrono::SecondsFormat;
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use reqwest::{Method, StatusCode};
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::Logger;
 use crate::internal::util::go_path_escape;
 
 use super::client::{
@@ -25,25 +24,17 @@ use super::{ApiError, DiagLogEntry, HttpClient, SessionEvent};
 pub struct HttpSessionIngressClient {
     http_client: HttpClient,
     auth_token: String,
-    logger: Option<Logger>,
     use_v1: bool,
 }
 
 impl HttpSessionIngressClient {
     /// 构造 SessionIngress 客户端；`use_v1` 只影响路径版本段。
     ///
-    /// logger 与嵌入的 HTTP client 分别保存，与 Go 结构中的两个字段一致：前者记录
-    /// 事件/诊断上传阶段，后者记录每个网络 attempt 与 retry backoff。
-    pub fn new(
-        http_client: HttpClient,
-        auth_token: impl Into<String>,
-        logger: Option<Logger>,
-        use_v1: bool,
-    ) -> Self {
+    /// 事件上传与网络重试均直接写入进程 tracing subscriber。
+    pub fn new(http_client: HttpClient, auth_token: impl Into<String>, use_v1: bool) -> Self {
         Self {
             http_client,
             auth_token: auth_token.into(),
-            logger,
             use_v1,
         }
     }
@@ -119,16 +110,8 @@ impl HttpSessionIngressClient {
             }
         };
         // 与 Go defer 一样，Close warning 晚于业务结果计算，且不会替换 501 sentinel。
-        if let (Some(logger), Some(error)) = (&self.logger, close_error) {
-            logger.warn(
-                "Failed to close response body",
-                [
-                    ("error".to_owned(), json!(error)),
-                    ("endpoint".to_owned(), json!(endpoint)),
-                ]
-                .into_iter()
-                .collect(),
-            );
+        if let Some(error) = close_error {
+            tracing::warn!("error" = ?(error), "endpoint" = ?(endpoint), "{}", "Failed to close response body");
         }
         result
     }
@@ -141,19 +124,7 @@ impl HttpSessionIngressClient {
         event: &SessionEvent,
     ) -> Result<(), ApiError> {
         let endpoint = self.session_endpoint(session_id, "events");
-        if let Some(logger) = &self.logger {
-            logger.info(
-                "Posting session event",
-                [
-                    ("endpoint".to_owned(), json!(&endpoint)),
-                    ("session_id".to_owned(), json!(session_id)),
-                    ("event_type".to_owned(), json!(&event.event_type)),
-                    ("event_uuid".to_owned(), json!(&event.uuid)),
-                ]
-                .into_iter()
-                .collect(),
-            );
-        }
+        tracing::info!("endpoint" = ?(&endpoint), "session_id" = ?(session_id), "event_type" = ?(&event.event_type), "event_uuid" = ?(&event.uuid), "{}", "Posting session event");
         self.post_json(
             cancellation,
             &endpoint,
@@ -161,18 +132,7 @@ impl HttpSessionIngressClient {
             "session event",
         )
         .await?;
-        if let Some(logger) = &self.logger {
-            logger.debug(
-                "Successfully posted session event",
-                [
-                    ("session_id".to_owned(), json!(session_id)),
-                    ("event_type".to_owned(), json!(&event.event_type)),
-                    ("event_uuid".to_owned(), json!(&event.uuid)),
-                ]
-                .into_iter()
-                .collect(),
-            );
-        }
+        tracing::debug!("session_id" = ?(session_id), "event_type" = ?(&event.event_type), "event_uuid" = ?(&event.uuid), "{}", "Successfully posted session event");
         Ok(())
     }
 
@@ -187,18 +147,7 @@ impl HttpSessionIngressClient {
             return Ok(());
         }
         let endpoint = self.session_endpoint(session_id, "diag_logs");
-        if let Some(logger) = &self.logger {
-            logger.debug(
-                "Posting diag logs",
-                [
-                    ("endpoint".to_owned(), json!(&endpoint)),
-                    ("session_id".to_owned(), json!(session_id)),
-                    ("count".to_owned(), json!(logs.len())),
-                ]
-                .into_iter()
-                .collect(),
-            );
-        }
+        tracing::debug!("endpoint" = ?(&endpoint), "session_id" = ?(session_id), "count" = ?(logs.len()), "{}", "Posting diag logs");
         self.post_json(
             cancellation,
             &endpoint,
@@ -206,17 +155,7 @@ impl HttpSessionIngressClient {
             "diag logs",
         )
         .await?;
-        if let Some(logger) = &self.logger {
-            logger.debug(
-                "Successfully posted diag logs",
-                [
-                    ("session_id".to_owned(), json!(session_id)),
-                    ("count".to_owned(), json!(logs.len())),
-                ]
-                .into_iter()
-                .collect(),
-            );
-        }
+        tracing::debug!("session_id" = ?(session_id), "count" = ?(logs.len()), "{}", "Successfully posted diag logs");
         Ok(())
     }
 }

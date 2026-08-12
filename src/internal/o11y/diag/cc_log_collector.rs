@@ -14,7 +14,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::internal::{
     api::DiagLogEntry,
-    logger::{LogAttributes, Logger},
     util::{TailLine, Tailer},
 };
 
@@ -76,12 +75,8 @@ impl CcLogCollector {
     ///
     /// 空行和 tailer 错误行静默跳过；JSON 解析失败时按 `error`、`line` 顺序写 WARN。
     /// 有效对象会移除可解析的 RFC3339Nano `timestamp`、覆盖 `source=cc`，最后在 mutex
-    /// 内追加。logger 按值移入任务，保证整个异步生命周期内 handler 始终有效。
-    async fn collect(
-        mut lines: mpsc::Receiver<TailLine>,
-        buffer: Arc<Mutex<Vec<DiagLogEntry>>>,
-        logger: Logger,
-    ) {
+    /// 内追加。日志直接发送到进程级 tracing subscriber。
+    async fn collect(mut lines: mpsc::Receiver<TailLine>, buffer: Arc<Mutex<Vec<DiagLogEntry>>>) {
         while let Some(line) = lines.recv().await {
             if line.error.is_some() || line.text.is_empty() {
                 continue;
@@ -90,10 +85,7 @@ impl CcLogCollector {
             let mut fields = match serde_json::from_str::<BTreeMap<String, Value>>(&line.text) {
                 Ok(fields) => fields,
                 Err(error) => {
-                    let mut attributes = LogAttributes::new();
-                    attributes.insert("error".to_owned(), serde_json::json!(error.to_string()));
-                    attributes.insert("line".to_owned(), serde_json::json!(line.text));
-                    logger.warn("Failed to parse CC log line as JSON", attributes);
+                    tracing::warn!(error = %error, line = %line.text, "Failed to parse CC log line as JSON");
                     continue;
                 }
             };
@@ -110,7 +102,7 @@ impl CcLogCollector {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let existing = std::mem::take(&mut *buffered);
-            *buffered = append_and_cap_logs(&logger, existing, vec![entry]);
+            *buffered = append_and_cap_logs(existing, vec![entry]);
         }
     }
 }
@@ -120,8 +112,6 @@ impl CcLogCollector {
 /// # 参数
 /// - `cancellation`：父会话取消 token，负责结束 tailer。
 /// - `log_file_path`：Claude Code 持续追加 JSONL 的文件路径。
-/// - `logger`：解析错误与 buffer cap 告警使用的 concrete logger。
-///
 /// # 返回
 /// 成功时返回带后台 consumer task 的共享 collector；tailer 创建、channel 获取或启动
 /// 失败时返回统一的 `failed to start tailing claude-code log file` 前缀。
@@ -131,7 +121,6 @@ impl CcLogCollector {
 pub(super) async fn new_cc_log_collector(
     cancellation: CancellationToken,
     log_file_path: impl AsRef<Path>,
-    logger: Logger,
 ) -> Result<Arc<CcLogCollector>, DiagError> {
     let tail = Arc::new(
         Tailer::new(log_file_path.as_ref(), Duration::ZERO).map_err(|error| {
@@ -153,9 +142,8 @@ pub(super) async fn new_cc_log_collector(
 
     let buffer = Arc::new(Mutex::new(Vec::new()));
     let collector_buffer = Arc::clone(&buffer);
-    let collector_logger = logger.clone();
     let task = tokio::spawn(async move {
-        CcLogCollector::collect(lines, collector_buffer, collector_logger).await;
+        CcLogCollector::collect(lines, collector_buffer).await;
     });
     Ok(Arc::new(CcLogCollector {
         tail,

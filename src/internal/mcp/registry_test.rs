@@ -14,12 +14,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::internal::{
     config::StartupContext,
-    logger::Logger,
     mcp::{
         MCPServer, MCPServerConfigurator, McpError, McpResult, ServerConfig, Tool, ToolConfig,
         ToolHandler,
     },
-    o11y::{DiscardO11yService, O11yService},
     session::NoopActivityRecorder,
 };
 
@@ -98,11 +96,6 @@ fn reset_registry_for_test() -> RegistryReset {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     clear_registry_for_test();
     RegistryReset { _guard: guard }
-}
-
-/// 对应 Go `mcpTestLogger`；测试不观察日志，但仍显式构造 concrete discard logger。
-fn mcp_test_logger() -> Logger {
-    Logger::new(DiscardO11yService.log_handler())
 }
 
 /// 临时 Claude 可执行文件及其环境变量恢复守卫。
@@ -250,7 +243,6 @@ async fn test_new_registration_factory_starts_server_and_caches_allowed_tools() 
     assert!((registration.get_tools)().is_empty());
     let configured = (registration.factory)(
         CancellationToken::new(),
-        mcp_test_logger(),
         None,
         PathBuf::from("/workspace"),
         Some(Arc::new(StartupContext::default())),
@@ -298,7 +290,6 @@ async fn test_new_registration_factory_reports_configuration_errors() {
     );
     let error = match (nil_configurator.factory)(
         CancellationToken::new(),
-        mcp_test_logger(),
         None,
         PathBuf::new(),
         Some(Arc::new(StartupContext::default())),
@@ -332,7 +323,6 @@ async fn test_new_registration_factory_reports_configuration_errors() {
     );
     let error = match (registration.factory)(
         CancellationToken::new(),
-        mcp_test_logger(),
         None,
         PathBuf::new(),
         Some(Arc::new(StartupContext::default())),
@@ -371,7 +361,6 @@ exit 0
 
     register_with_claude(
         &CancellationToken::new(),
-        &mcp_test_logger(),
         "demo",
         Some(&ServerConfig {
             port: 1234,
@@ -400,7 +389,7 @@ async fn test_register_with_claude_reports_nil_config_and_add_failure() {
     )) {
         return;
     }
-    let error = register_with_claude(&CancellationToken::new(), &mcp_test_logger(), "demo", None)
+    let error = register_with_claude(&CancellationToken::new(), "demo", None)
         .await
         .expect_err("nil config 必须失败");
     assert_eq!(
@@ -420,7 +409,6 @@ exit 0
     );
     let error = register_with_claude(
         &CancellationToken::new(),
-        &mcp_test_logger(),
         "demo",
         Some(&ServerConfig {
             port: 1234,

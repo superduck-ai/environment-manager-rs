@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use http::header::SEC_WEBSOCKET_PROTOCOL;
-use serde_json::Value;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use tokio_tungstenite::tungstenite::error::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::error::ProtocolError;
@@ -19,9 +18,6 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 use tokio_util::sync::CancellationToken;
 
 use super::client::{connect_websocket_with_config, gorilla_websocket_config};
-use super::helpers::ws_logger;
-use crate::internal::logger::{LogAttributes, Logger};
-
 use super::{
     TunnelError, WsHandler, WsResponseSender, WsTunnel, WsTunnelClose, WsTunnelError,
     WsTunnelMessage, WsTunnelOpen, WsTunnelOpened, apply_websocket_tunnel_headers,
@@ -34,11 +30,10 @@ const WEBSOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 对应 Go `WSHandler` 的默认构造过程。
 ///
-/// `logger` 为空时不产生结构化日志；连接管理和协议行为不受影响。
+/// 日志直接写入进程 tracing subscriber；连接管理和协议行为不受影响。
 #[must_use]
-pub fn new_ws_handler(logger: Option<Logger>) -> WsHandler {
+pub fn new_ws_handler() -> WsHandler {
     WsHandler {
-        logger,
         tunnels: Arc::new(tokio::sync::RwLock::new(BTreeMap::new())),
     }
 }
@@ -174,9 +169,8 @@ impl WsHandler {
 
         self.log_opened(&request, &selected_protocol);
         let tunnels = Arc::clone(&self.tunnels);
-        let logger = self.logger.clone();
         tokio::spawn(async move {
-            WsHandler::read_loop(tunnels, logger, tunnel, stream).await;
+            WsHandler::read_loop(tunnels, tunnel, stream).await;
         });
         Ok(())
     }
@@ -319,23 +313,13 @@ impl WsHandler {
         }
     }
 
-    /// 记录本地 WebSocket 成功建立事件，字段名与 Go slog 调用保持一致。
+    /// 记录本地 WebSocket 成功建立事件。
     fn log_opened(&self, request: &WsTunnelOpen, protocol: &str) {
-        let logger = ws_logger(self);
-        logger.info(
-            "ws_tunnel_opened",
-            log_attributes([
-                ("path", Value::String(request.path.clone())),
-                ("port", Value::from(request.port)),
-                ("protocol", Value::String(protocol.to_owned())),
-                ("tunnel_id", Value::String(request.tunnel_id.clone())),
-            ]),
-        );
+        tracing::info!("path" = ?(request.path.clone()), "port" = ?(request.port), "protocol" = ?(protocol.to_owned()), "tunnel_id" = ?(request.tunnel_id.clone()), "{}", "ws_tunnel_opened");
     }
     /// 持续读取本地 WebSocket，把 text/binary/close/error 消息发送给后端。
     async fn read_loop(
         tunnels: Arc<tokio::sync::RwLock<BTreeMap<String, Arc<WsTunnel>>>>,
-        logger: Option<Logger>,
         tunnel: Arc<WsTunnel>,
         mut stream: futures_util::stream::SplitStream<super::LocalWebSocket>,
     ) {
@@ -361,7 +345,7 @@ impl WsHandler {
                         })
                         .await
                     {
-                        log_send_failure(logger.as_ref(), &tunnel.tunnel_id, &error.to_string());
+                        log_send_failure(&tunnel.tunnel_id, &error.to_string());
                         break;
                     }
                 }
@@ -375,7 +359,7 @@ impl WsHandler {
                         })
                         .await
                     {
-                        log_send_failure(logger.as_ref(), &tunnel.tunnel_id, &error.to_string());
+                        log_send_failure(&tunnel.tunnel_id, &error.to_string());
                         break;
                     }
                 }
@@ -524,24 +508,7 @@ async fn send_ws_error(
         .map_err(|error| TunnelError::message(format!("send websocket error: {error}")))
 }
 
-/// 构造确定顺序的结构化日志属性。
-fn log_attributes<const N: usize>(pairs: [(&str, Value); N]) -> LogAttributes {
-    pairs
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
-}
-
 /// 记录本地消息向后端发送失败；失败本身会终止该 tunnel 的读循环。
-fn log_send_failure(logger: Option<&Logger>, tunnel_id: &str, error: &str) {
-    let Some(logger) = logger else {
-        return;
-    };
-    logger.error(
-        "ws_tunnel_send_message_failed",
-        log_attributes([
-            ("error", Value::String(error.to_owned())),
-            ("tunnel_id", Value::String(tunnel_id.to_owned())),
-        ]),
-    );
+fn log_send_failure(tunnel_id: &str, error: &str) {
+    tracing::error!("error" = ?(error.to_owned()), "tunnel_id" = ?(tunnel_id.to_owned()), "{}", "ws_tunnel_send_message_failed");
 }

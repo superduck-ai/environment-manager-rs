@@ -8,11 +8,6 @@ use std::sync::{
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::internal::{
-    logger::Logger,
-    o11y::{DiscardO11yService, O11yService},
-};
-
 use super::server::{
     HttpHeaderTerminator, HttpRequestEvent, HttpRequestTracker, MCP_READ_HEADER_TIMEOUT,
     MCP_READ_TIMEOUT, MCP_WRITE_TIMEOUT, McpDeadlineState, McpReadDeadlineStage,
@@ -33,11 +28,6 @@ struct FailingResponseWriter {
     write_error: String,
     headers: http::HeaderMap,
     status: Option<http::StatusCode>,
-}
-
-/// 对应 Go 测试中的 discard slog handler，显式满足 BaseServer 的 concrete logger。
-fn server_test_logger() -> Logger {
-    Logger::new(DiscardO11yService.log_handler())
 }
 
 impl FailingResponseWriter {
@@ -135,7 +125,7 @@ async fn read_raw_http_response(stream: &mut tokio::net::TcpStream) -> (u16, Vec
 
 #[tokio::test]
 async fn test_response_writer_tracks_first_status() {
-    let base = Arc::new(BaseServer::new(server_test_logger(), "status", "0.0.1"));
+    let base = Arc::new(BaseServer::new("status", "0.0.1"));
     let config = base.start(Vec::new()).await.expect("server 启动");
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/mcp", config.port);
@@ -179,7 +169,7 @@ async fn test_response_writer_write_defaults_to_ok_and_wraps_errors() {
         tool: Tool::new("fail", "fail", json!({"type": "object"})),
         handler: ToolHandler::new(|_, _| async { Err(McpError::message("write failed")) }),
     };
-    let base = Arc::new(BaseServer::new(server_test_logger(), "writer", "0.0.1"));
+    let base = Arc::new(BaseServer::new("writer", "0.0.1"));
     let config = base.start(vec![failing]).await.expect("server 启动");
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/mcp", config.port);
@@ -217,7 +207,7 @@ async fn test_base_server_start_serves_authenticated_mcp() {
             }
         }),
     };
-    let base = Arc::new(BaseServer::new(server_test_logger(), "demo", "1.2.3"));
+    let base = Arc::new(BaseServer::new("demo", "1.2.3"));
     let config = base.start(vec![tool]).await.expect("server 启动");
     assert_ne!(config.port, 0);
     assert_eq!(base.port(), config.port);
@@ -272,7 +262,7 @@ async fn test_base_server_start_serves_authenticated_mcp() {
 /// 第二条请求 header 分片不会沿用首请求已经过期的 header deadline 状态。
 #[tokio::test]
 async fn test_base_server_serves_two_posts_on_same_tcp_connection() {
-    let base = Arc::new(BaseServer::new(server_test_logger(), "keep-alive", "0.0.1"));
+    let base = Arc::new(BaseServer::new("keep-alive", "0.0.1"));
     let config = base.start(Vec::new()).await.expect("server 启动");
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", config.port))
         .await
@@ -323,7 +313,7 @@ async fn test_base_server_serves_two_posts_on_same_tcp_connection() {
 
 #[tokio::test]
 async fn test_base_server_start_honors_debug_bearer_token() {
-    let mut base = BaseServer::new(server_test_logger(), "debug", "test");
+    let mut base = BaseServer::new("debug", "test");
     base.set_debug_hardcoded_token(true);
     base.set_bearer_token("fixed-token");
     let base = Arc::new(base);
@@ -354,7 +344,7 @@ async fn test_base_server_stop_cancels_active_tool_request() {
             }
         }),
     };
-    let base = Arc::new(BaseServer::new(server_test_logger(), "cancel", "0.0.1"));
+    let base = Arc::new(BaseServer::new("cancel", "0.0.1"));
     let config = base.start(vec![tool]).await.expect("server 启动");
     let url = format!("http://127.0.0.1:{}/mcp", config.port);
     let token = config.bearer_token.clone();
@@ -378,7 +368,7 @@ async fn test_base_server_stop_cancels_active_tool_request() {
 
 #[test]
 fn test_base_server_accessors() {
-    let server = Arc::new(BaseServer::new(server_test_logger(), "demo", "0.0.1"));
+    let server = Arc::new(BaseServer::new("demo", "0.0.1"));
     assert_eq!(server.get_name(), "demo");
     assert!(Arc::clone(&server).get_tools().is_empty());
     assert!(server.should_register_with_claude());

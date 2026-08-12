@@ -19,14 +19,13 @@ pub(crate) use hooks::{
 pub use orchestrator::new_orchestrator;
 pub use poll_hook::new_poll_hook;
 pub use poller::new_poller_with_worker_id;
+pub(crate) use types::SessionData;
 pub use types::{
     CommandOutcome, Hook, NoopOrchestratorObserver, Orchestrator, OrchestratorConfig,
     OrchestratorError, OrchestratorEvent, OrchestratorObserver, OrchestratorResult, PollHook,
     PollHookContext, Poller, PollerInterface, RawMessage, SandboxAdapter, SandboxRequest,
     SessionOutput, StdoutSessionOutput, WhoamiClient, WhoamiResponse, WorkData, WorkResponse,
-    default_orchestrator_logger,
 };
-pub(crate) use types::{SessionData, log_attributes};
 pub use whoami::new_whoami_client;
 
 #[cfg(test)]

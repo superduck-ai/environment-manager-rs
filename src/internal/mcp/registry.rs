@@ -14,21 +14,19 @@ use std::{
 };
 
 use nix::{fcntl::OFlag, unistd::pipe2};
-use serde_json::json;
 use tokio::{io::AsyncReadExt as _, process::Command};
 use tokio_util::sync::CancellationToken;
 
 use crate::internal::{
     auth::AuthContext,
     config::{ClaudeConfig, StartupContext},
-    logger::Logger,
     process::{go_spawn_error, resolve_go_command},
     session::ActivityRecorder,
 };
 
 use super::types::{
     AllowedTools, BaseServer, MCPServerConfigurator, MCPServerRegistration, McpError, McpResult,
-    RegistrationStore, ServerConfig, ShouldRegister, log_attributes,
+    RegistrationStore, ServerConfig, ShouldRegister,
 };
 
 static REGISTRY: OnceLock<RegistrationStore> = OnceLock::new();
@@ -74,7 +72,6 @@ pub fn new_registration(
     let factory_allowed_tools = Arc::clone(&allowed_tools);
     let factory = Arc::new(
         move |cancellation: CancellationToken,
-              logger: Logger,
               auth_context: Option<Arc<AuthContext>>,
               working_dir: PathBuf,
               startup_context: Option<Arc<StartupContext>>,
@@ -89,7 +86,7 @@ pub fn new_registration(
                     )));
                 };
 
-                let base_server = Arc::new(BaseServer::new(logger.clone(), name.clone(), "0.0.1"));
+                let base_server = Arc::new(BaseServer::new(name.clone(), "0.0.1"));
                 let server = configurator(
                     base_server,
                     auth_context,
@@ -119,27 +116,16 @@ pub fn new_registration(
                     McpError::message(format!("failed to start {name} server: {error}"))
                 })?;
                 if server.should_register_with_claude() {
-                    register_with_claude(
-                        &cancellation,
-                        &logger,
-                        &server.get_name(),
-                        Some(&server_config),
-                    )
-                    .await
-                    .map_err(|error| {
-                        McpError::message(format!(
-                            "failed to register {name} server with Claude: {error}"
-                        ))
-                    })?;
-                    logger.info(
-                        "MCP server started and registered",
-                        log_attributes([("server_name", json!(&name))]),
-                    );
+                    register_with_claude(&cancellation, &server.get_name(), Some(&server_config))
+                        .await
+                        .map_err(|error| {
+                            McpError::message(format!(
+                                "failed to register {name} server with Claude: {error}"
+                            ))
+                        })?;
+                    tracing::info!("server_name" = ?(&name), "{}", "MCP server started and registered");
                 } else {
-                    logger.info(
-                        "MCP server started",
-                        log_attributes([("server_name", json!(&name))]),
-                    );
+                    tracing::info!("server_name" = ?(&name), "{}", "MCP server started");
                 }
                 Ok(server)
             }) as super::types::FactoryFuture
@@ -185,7 +171,6 @@ pub fn get_mcp_registrations(
 /// argv 与 Go 完全一致，URL 固定为 loopback `/mcp`，header 使用精确 Bearer 文本。
 pub async fn register_with_claude(
     cancellation: &CancellationToken,
-    logger: &Logger,
     server_name: &str,
     server_config: Option<&ServerConfig>,
 ) -> McpResult<()> {
@@ -207,27 +192,18 @@ pub async fn register_with_claude(
         Err(error) => (None, Some(error.to_string())),
     };
     if let Some(error) = list_error {
-        logger.warn(
-            "Failed to list MCP servers, proceeding with add",
-            log_attributes([("error", json!(error)), ("server_name", json!(server_name))]),
-        );
+        tracing::warn!("error" = ?(error), "server_name" = ?(server_name), "{}", "Failed to list MCP servers, proceeding with add");
     }
     if listed.as_ref().is_some_and(|output| {
         String::from_utf8_lossy(&output.combined).contains(&format!("{server_name}:"))
     }) {
-        logger.info(
-            "MCP server already registered, removing and re-adding",
-            log_attributes([("server_name", json!(server_name))]),
-        );
+        tracing::info!("server_name" = ?(server_name), "{}", "MCP server already registered, removing and re-adding");
 
         // remove 失败与 Go 一致只记录诊断，随后仍然执行 add。失败结果先统一成
         // `(error, output)`，以便所有失败共享唯一日志源位置。
         let remove_failure = match run_claude(cancellation, ["mcp", "remove", server_name]).await {
             Ok(output) if output.status.success() => {
-                logger.info(
-                    "Removed existing MCP server",
-                    log_attributes([("server_name", json!(server_name))]),
-                );
+                tracing::info!("server_name" = ?(server_name), "{}", "Removed existing MCP server");
                 None
             }
             Ok(output) => Some((
@@ -237,14 +213,7 @@ pub async fn register_with_claude(
             Err(error) => Some((error.to_string(), String::new())),
         };
         if let Some((error, output)) = remove_failure {
-            logger.warn(
-                "Failed to remove existing MCP server",
-                log_attributes([
-                    ("error", json!(error)),
-                    ("output", json!(output)),
-                    ("server_name", json!(server_name)),
-                ]),
-            );
+            tracing::warn!("error" = ?(error), "output" = ?(output), "server_name" = ?(server_name), "{}", "Failed to remove existing MCP server");
         }
     }
 
@@ -273,27 +242,11 @@ pub async fn register_with_claude(
         Err(error) => Some((error.to_string(), String::new())),
     };
     if let Some((error, output)) = add_failure {
-        logger.warn(
-            "Failed to register MCP server with claude",
-            log_attributes([
-                ("error", json!(&error)),
-                ("output", json!(output)),
-                ("url", json!(&url)),
-                ("server_name", json!(server_name)),
-                ("duration_ms", json!(duration_ms)),
-            ]),
-        );
+        tracing::warn!("error" = ?(&error), "output" = ?(output), "url" = ?(&url), "server_name" = ?(server_name), "duration_ms" = ?(duration_ms), "{}", "Failed to register MCP server with claude");
         return Err(McpError::message(format!("claude mcp add failed: {error}")));
     }
 
-    logger.info(
-        "Successfully registered MCP server with claude",
-        log_attributes([
-            ("url", json!(url)),
-            ("server_name", json!(server_name)),
-            ("duration_ms", json!(duration_ms)),
-        ]),
-    );
+    tracing::info!("url" = ?(url), "server_name" = ?(server_name), "duration_ms" = ?(duration_ms), "{}", "Successfully registered MCP server with claude");
     Ok(())
 }
 

@@ -8,12 +8,11 @@ use std::path::PathBuf;
 
 use clap::builder::ValueParser;
 use clap::{Arg, ArgMatches, Command, value_parser};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::error::CliError;
-use super::utils::{LogLevel, logger_level, parse_log_level};
-use crate::internal::logger::create_logger;
+use super::utils::{LogLevel, parse_log_level, tracing_level};
 use crate::internal::orchestrator::{new_poller_with_worker_id, new_whoami_client};
 
 const LONG_ABOUT: &str = r#"The poll command makes a single non-blocking request to the API for work.
@@ -117,7 +116,7 @@ pub async fn run_poll(
     cancellation: &CancellationToken,
     output: &mut dyn Write,
 ) -> Result<(), String> {
-    let logger = create_logger(logger_level(arguments.log_level));
+    crate::internal::logger::initialize(tracing_level(arguments.log_level));
     let service_key = if let Some(path) = &arguments.service_key_file {
         let bytes = std::fs::read(path).map_err(|error| {
             format!(
@@ -139,7 +138,7 @@ pub async fn run_poll(
 
     let mut organization_id = arguments.organization_id.clone().unwrap_or_default();
     let mut environment_id = arguments.environment_id.clone().unwrap_or_default();
-    let whoami = new_whoami_client(&arguments.api_url, &service_key, logger.clone());
+    let whoami = new_whoami_client(&arguments.api_url, &service_key);
     match whoami.get_identity(cancellation).await {
         Ok(identity) => {
             if !organization_id.is_empty() && organization_id != identity.organization_uuid {
@@ -156,15 +155,7 @@ pub async fn run_poll(
             }
             organization_id = identity.organization_uuid;
             environment_id = identity.environment_id;
-            logger.info(
-                "environment identity confirmed via whoami",
-                [
-                    ("organization_id".to_owned(), json!(organization_id)),
-                    ("environment_id".to_owned(), json!(environment_id)),
-                ]
-                .into_iter()
-                .collect(),
-            );
+            tracing::info!("organization_id" = ?(organization_id), "environment_id" = ?(environment_id), "{}", "environment identity confirmed via whoami");
         }
         Err(error) => {
             if organization_id.is_empty() || environment_id.is_empty() {
@@ -172,16 +163,7 @@ pub async fn run_poll(
                     "failed to get environment identity from whoami (provide --organization-id and --environment-id to use fallback): {error}"
                 ));
             }
-            logger.warn(
-                "whoami failed, using CLI-provided identity",
-                [
-                    ("error".to_owned(), json!(error.to_string())),
-                    ("organization_id".to_owned(), json!(organization_id)),
-                    ("environment_id".to_owned(), json!(environment_id)),
-                ]
-                .into_iter()
-                .collect(),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "organization_id" = ?(organization_id), "environment_id" = ?(environment_id), "{}", "whoami failed, using CLI-provided identity");
         }
     }
 
@@ -191,7 +173,6 @@ pub async fn run_poll(
         service_key,
         arguments.worker_id.clone().unwrap_or_default(),
         arguments.reclaim_older_than_ms,
-        logger,
     );
     let Some(work_json) = poller
         .poll(cancellation)
@@ -205,7 +186,7 @@ pub async fn run_poll(
     // Poller 已经验证 work envelope；这里仍按 Go 命令重新解码为动态 JSON，只为
     // 复刻 `json.MarshalIndent` 的人类可读 stdout，而不改变请求校验的职责边界。
     // 不能直接调用 `serde_json::to_vec_pretty`：本 crate 为其他协议启用了
-    // `preserve_order`，而 Go 把对象解到 `map[string]any` 后会递归按 key 排序，并把
+    // 对象会递归按 key 排序，并把
     // 所有数字先转换成 float64。下面的专用 formatter 保留这些可观察差异。
     let payload: Value = match serde_json::from_slice(&work_json) {
         Ok(payload) => payload,

@@ -19,9 +19,6 @@ use crate::internal::config::{
     StartupContext,
 };
 use crate::internal::envtype::{EnvironmentType, LeaseManagerHandle};
-use crate::internal::logger::{
-    LogAttributes, LogHandler, LogHandlerError, LogLevel as LoggerLevel, LogRecord, Logger,
-};
 use crate::internal::session::{ActivityRecorder, ActivityRecorderError, NoopStopper};
 use crate::internal::util::{BoxError, Stopper};
 
@@ -37,7 +34,7 @@ fn test_new_validates_config_and_setters() {
         "task_setup_script": "echo setup",
         "environment": {"FOO": "bar"}
     }));
-    let mut environment = new(&raw, byoc_test_logger()).expect("valid BYOC config should parse");
+    let mut environment = new(&raw).expect("valid BYOC config should parse");
     assert_eq!(
         environment.get_cwd(),
         cwd.to_str().expect("temp path is UTF-8")
@@ -67,19 +64,12 @@ fn test_new_validates_config_and_setters() {
     );
     environment.set_session_mode(SessionMode::ResumeCached);
     assert_eq!(environment.session_mode, SessionMode::ResumeCached);
-
-    // Rust 与 Go 一样把构造器收到的 logger 保存进环境；fixture 使用可记录但无输出
-    // 的 handler，避免测试依赖全局 tracing subscriber。
-    assert!(environment.logger.enabled(LoggerLevel::Debug));
-    environment
-        .logger
-        .debug("BYOC fixture probe", Default::default());
 }
 
 /// 验证 JSON、类型、绝对路径、路径 clean 与 1 MiB 字节上限。
 #[test]
 fn new_rejects_invalid_config() {
-    let error = new(b"{bad json", byoc_test_logger()).expect_err("bad JSON must fail");
+    let error = new(b"{bad json").expect_err("bad JSON must fail");
     assert!(error.to_string().contains("failed to unmarshal"));
 
     let wrong_type = serde_json::to_vec(&serde_json::json!({
@@ -87,7 +77,7 @@ fn new_rejects_invalid_config() {
     }))
     .unwrap();
     assert!(
-        new(&wrong_type, byoc_test_logger())
+        new(&wrong_type)
             .expect_err("wrong environment type must fail")
             .to_string()
             .contains("invalid environment_type")
@@ -99,7 +89,7 @@ fn new_rejects_invalid_config() {
             "cwd": cwd
         }))
         .unwrap();
-        let message = new(&raw, byoc_test_logger())
+        let message = new(&raw)
             .expect_err("non-absolute or non-clean CWD must fail")
             .to_string();
         if cwd == "relative" {
@@ -116,7 +106,7 @@ fn new_rejects_invalid_config() {
     }))
     .unwrap();
     assert!(
-        new(&raw, byoc_test_logger())
+        new(&raw)
             .expect_err("oversized setup script must fail")
             .to_string()
             .contains("too large")
@@ -126,15 +116,12 @@ fn new_rejects_invalid_config() {
 /// Go encoding/json 对 null string/map 保留零值，Rust 配置应保留该兼容性。
 #[test]
 fn accepts_go_compatible_null_zero_values() {
-    let environment = new(
-        br#"{
+    let environment = new(br#"{
             "environment_type":"byoc",
             "cwd":null,
             "task_setup_script":null,
             "environment":{"EMPTY":null}
-        }"#,
-        byoc_test_logger(),
-    )
+        }"#)
     .expect("Go-compatible null values should parse");
     assert_eq!(environment.get_cwd(), "");
     assert_eq!(environment.config.task_setup_script, "");
@@ -147,11 +134,8 @@ fn accepts_go_compatible_null_zero_values() {
         Some("")
     );
 
-    let environment = new(
-        br#"{"environment_type":"byoc","environment":null}"#,
-        byoc_test_logger(),
-    )
-    .expect("null environment map should become empty");
+    let environment = new(br#"{"environment_type":"byoc","environment":null}"#)
+        .expect("null environment map should become empty");
     assert!(environment.config.environment.is_empty());
 }
 
@@ -419,7 +403,6 @@ async fn default_source_processor_delegates_to_sources_manager() {
         sources: Vec::new(),
         mode: SourceProcessMode::AllowPrefetched,
         should_validate: true,
-        logger: byoc_test_logger(),
     };
     let error = processor
         .process_sources(&CancellationToken::new(), &request, None)
@@ -509,7 +492,6 @@ async fn branch_checkout_uses_replaceable_source_processor() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].mode, SourceProcessMode::AllowPrefetched);
     assert!(requests[0].should_validate);
-    assert!(requests[0].logger.enabled(LoggerLevel::Debug));
     assert_eq!(
         requests[0]
             .repo_branches
@@ -611,10 +593,6 @@ async fn lease_manager_delegates_without_copying_podmonitor_state_machine() {
     assert_eq!(request.organization_uuid, "org-1");
     assert_eq!(request.heartbeat_interval, Duration::from_secs(30));
     assert_eq!(request.safety_window, Duration::from_secs(30));
-    assert!(
-        request.logger.enabled(LoggerLevel::Debug),
-        "lease request 必须保留 BYOC 环境的 concrete logger"
-    );
     let mut authenticated = reqwest::Client::new()
         .get("https://example.test")
         .build()
@@ -724,8 +702,7 @@ fn must_json(value: Value) -> Vec<u8> {
 
 /// 创建一份不触碰文件系统的最小 BYOC 环境。
 fn minimal_environment() -> ByocEnvironmentType {
-    new(br#"{"environment_type":"byoc"}"#, byoc_test_logger())
-        .expect("minimal BYOC config is valid")
+    new(br#"{"environment_type":"byoc"}"#).expect("minimal BYOC config is valid")
 }
 
 /// 为初始化测试创建指定 CWD 和 setup 脚本的环境。
@@ -736,7 +713,7 @@ fn environment_for_cwd(cwd: &Path, script: &str) -> ByocEnvironmentType {
         "task_setup_script": script
     }))
     .unwrap();
-    new(&raw, byoc_test_logger()).expect("test CWD should be an absolute clean path")
+    new(&raw).expect("test CWD should be an absolute clean path")
 }
 
 /// 构造 Git outcome。
@@ -769,39 +746,6 @@ fn startup_with_source_and_outcome() -> StartupContext {
 /// 使 shell 路径作为单个字面量参数。
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\"'\"'"))
-}
-
-/// 丢弃 BYOC fixture 产生的全部日志。
-#[derive(Clone, Default)]
-struct ByocTestLogHandler;
-
-impl LogHandler for ByocTestLogHandler {
-    /// discard logger 允许构造所有级别的记录，以复刻 Go `slog` fixture。
-    fn enabled(&self, _level: LoggerLevel) -> bool {
-        true
-    }
-
-    /// 消费记录但不写 stdout、stderr 或文件。
-    fn handle(&self, _record: &LogRecord) -> Result<(), LogHandlerError> {
-        Ok(())
-    }
-
-    /// 绑定属性后仍返回一个独立的 discard handler。
-    fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-
-    /// 进入日志 group 后仍返回一个独立的 discard handler。
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-}
-
-/// 对应 Go：`byocTestLogger`。
-///
-/// 构造可接受全部日志但没有输出副作用的测试 logger。
-fn byoc_test_logger() -> Logger {
-    Logger::new(Arc::new(ByocTestLogHandler))
 }
 
 /// 串行测试期间替换一个环境变量，并在 drop 时还原。

@@ -33,7 +33,6 @@ use crate::internal::{
     api::LogCategory,
     auth::{AuthContext, Permission, SourceAuthProvider, new_github_source_auth_provider},
     config::{GitInfo, GitRepositorySource},
-    logger::{LogAttributes, LogLevel, Logger, default_logger},
     session::ActivityRecorder,
     util::{Stopper, update_remote_tracking_branch},
 };
@@ -43,20 +42,6 @@ use super::types::SharedAuthProvider;
 
 const GIT_HTTP_PROXY_AUTH_CONFIG: &str = "http.proxyAuthMethod=basic";
 
-// 结构化属性必须按 Go `slog` 调用中的键顺序插入。`serde_json::Map` 已启用
-// `preserve_order`，这个小宏只消除 77 个日志调用点中容易出错的样板代码；它不会
-// 排序、合并或过滤属性，因此 JSON handler 仍能逐字复刻 Go 输出顺序。
-macro_rules! log_attributes {
-    () => {
-        LogAttributes::new()
-    };
-    ($($key:literal => $value:expr),+ $(,)?) => {{
-        let mut attributes = LogAttributes::new();
-        $(attributes.insert($key.to_owned(), serde_json::json!($value));)+
-        attributes
-    }};
-}
-
 /// 对应 Go `NewGitHandler`，保存全部配置并读取 post-clone Hook 环境变量。
 ///
 /// `POST_CLONE_HOOK_PATH` 只在构造时读取一次；之后修改进程环境不会改变已创建
@@ -64,7 +49,6 @@ macro_rules! log_attributes {
 /// 不能比 recorder 活得更久，因此局部初始化 recorder 无需伪装成 `'static`。
 #[allow(clippy::too_many_arguments)]
 pub fn new_git_handler<'recorder>(
-    logger: Option<Logger>,
     base_dir: impl Into<PathBuf>,
     auth_context: Option<Arc<AuthContext>>,
     sdk_base_url: impl Into<String>,
@@ -75,18 +59,11 @@ pub fn new_git_handler<'recorder>(
 ) -> GitHandler<'recorder> {
     let post_clone_hook_path = std::env::var("POST_CLONE_HOOK_PATH").unwrap_or_default();
     if !post_clone_hook_path.is_empty() {
-        log_with_logger(
-            logger.as_ref(),
-            LogLevel::Info,
-            "Using post-clone hook from environment",
-            log_attributes!("hook_path" => &post_clone_hook_path),
-        );
+        tracing::info!(hook_path = %post_clone_hook_path, "Using post-clone hook from environment");
     }
 
-    let git_proxy_factory: Arc<dyn GitProxyFactory> =
-        Arc::new(ProductionGitProxyFactory::new(logger.clone()));
+    let git_proxy_factory: Arc<dyn GitProxyFactory> = Arc::new(ProductionGitProxyFactory::new());
     GitHandler {
-        logger,
         base_dir: base_dir.into(),
         auth_context,
         sdk_base_url: sdk_base_url.into(),
@@ -139,17 +116,7 @@ impl GitHandler<'_> {
             "fetch"
         };
 
-        self.log(
-            LogLevel::Info,
-            format!("Starting repository {operation}"),
-            log_attributes!(
-                "source_type" => &git_source.base.source_type,
-                "repo" => &git_source.git_info.repo,
-                "host" => &git_source.git_info.host,
-                "has_auth" => git_source.git_info.auth.is_some(),
-                "process_mode" => process_mode,
-            ),
-        );
+        tracing::info!("source_type" = ?(&git_source.base.source_type), "repo" = ?(&git_source.git_info.repo), "host" = ?(&git_source.git_info.host), "has_auth" = ?(git_source.git_info.auth.is_some()), "process_mode" = ?(process_mode), "{}", format!("Starting repository {operation}"));
 
         let activity_guard = if process_mode != "allow-prefetched" {
             self.activity_recorder.as_ref().map(|recorder| {
@@ -176,14 +143,7 @@ impl GitHandler<'_> {
             .as_ref()
             .is_some_and(|url| !url.is_empty())
         {
-            self.log(
-                LogLevel::Info,
-                "Using custom git URL",
-                log_attributes!(
-                    "repo_url" => &git_url,
-                    "repo" => &git_source.git_info.repo,
-                ),
-            );
+            tracing::info!("repo_url" = ?(&git_url), "repo" = ?(&git_source.git_info.repo), "{}", "Using custom git URL");
         }
         let repo_path = git_source.get_directory(&self.base_dir);
         if repo_path.as_os_str().is_empty() {
@@ -202,11 +162,7 @@ impl GitHandler<'_> {
                     ))
                 })?;
                 if tokio::fs::metadata(&repo_path).await.is_ok() {
-                    self.log(
-                        LogLevel::Warn,
-                        "Repository directory already exists, removing it",
-                        log_attributes!("repo_path" => repo_path.to_string_lossy()),
-                    );
+                    tracing::warn!("repo_path" = ?(repo_path.to_string_lossy()), "{}", "Repository directory already exists, removing it");
                     remove_all(&repo_path).await.map_err(|error| {
                         SourcesError::message(format!(
                             "failed to remove existing directory: {error}"
@@ -219,14 +175,7 @@ impl GitHandler<'_> {
                     tokio::fs::metadata(&repo_path).await,
                     Err(error) if error.kind() == io::ErrorKind::NotFound
                 ) {
-                    self.log(
-                        LogLevel::Info,
-                        "Repository directory does not exist in allow-prefetched mode, will fall back to fresh clone",
-                        log_attributes!(
-                            "repo_path" => repo_path.to_string_lossy(),
-                            "repo" => &git_source.git_info.repo,
-                        ),
-                    );
+                    tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "repo" = ?(&git_source.git_info.repo), "{}", "Repository directory does not exist in allow-prefetched mode, will fall back to fresh clone");
                     create_dir_all_0755(&self.base_dir).await.map_err(|error| {
                         SourcesError::message(format!(
                             "failed to create base directory {}: {error}",
@@ -283,11 +232,7 @@ impl GitHandler<'_> {
             } else {
                 None
             };
-            self.log(
-                LogLevel::Info,
-                "Validating repository access",
-                log_attributes!("repo" => &git_source.git_info.repo),
-            );
+            tracing::info!("repo" = ?(&git_source.git_info.repo), "{}", "Validating repository access");
             let validation_result = self
                 .validate_repository_access(
                     cancellation,
@@ -305,11 +250,7 @@ impl GitHandler<'_> {
                     "repository access validation failed: {error}"
                 )));
             }
-            self.log(
-                LogLevel::Info,
-                "Repository access validated successfully",
-                log_attributes!("repo" => &git_source.git_info.repo),
-            );
+            tracing::info!("repo" = ?(&git_source.git_info.repo), "{}", "Repository access validated successfully");
         }
 
         let clone_error = self
@@ -328,27 +269,14 @@ impl GitHandler<'_> {
 
         if let Some(error) = &clone_error {
             let duration_ms = elapsed_milliseconds(process_started);
-            self.log(
-                LogLevel::Error,
-                "Failed to clone repository",
-                log_attributes!(
-                    "repo" => &git_source.git_info.repo,
-                    "repo_path" => repo_path.to_string_lossy(),
-                    "duration_ms" => duration_ms,
-                    "error" => error,
-                ),
-            );
+            tracing::error!("repo" = ?(&git_source.git_info.repo), "repo_path" = ?(repo_path.to_string_lossy()), "duration_ms" = ?(duration_ms), "error" = ?(error), "{}", "Failed to clone repository");
             if process_mode != "resume" {
                 let _error_type = classify_git_error(Some(error));
                 return Err(SourcesError::message(format!(
                     "failed to clone repository: {error}"
                 )));
             }
-            self.log(
-                LogLevel::Info,
-                "Continuing to branch setup despite clone failure in resume mode",
-                log_attributes!("repo" => &git_source.git_info.repo),
-            );
+            tracing::info!("repo" = ?(&git_source.git_info.repo), "{}", "Continuing to branch setup despite clone failure in resume mode");
         }
 
         if let Err(error) = self
@@ -374,31 +302,12 @@ impl GitHandler<'_> {
 
         let duration_ms = elapsed_milliseconds(process_started);
         if let Some(error) = clone_error {
-            self.log(
-                LogLevel::Warn,
-                "Repository branch setup succeeded but clone/fetch had errors",
-                log_attributes!(
-                    "host" => &git_source.git_info.host,
-                    "repo" => &git_source.git_info.repo,
-                    "repo_path" => repo_path.to_string_lossy(),
-                    "duration_ms" => duration_ms,
-                    "error" => &error,
-                ),
-            );
+            tracing::warn!("host" = ?(&git_source.git_info.host), "repo" = ?(&git_source.git_info.repo), "repo_path" = ?(repo_path.to_string_lossy()), "duration_ms" = ?(duration_ms), "error" = ?(&error), "{}", "Repository branch setup succeeded but clone/fetch had errors");
             return Err(SourcesError::message(format!(
                 "clone/fetch failed in resume mode: {error}"
             )));
         }
-        self.log(
-            LogLevel::Info,
-            "Git repository cloned successfully",
-            log_attributes!(
-                "host" => &git_source.git_info.host,
-                "repo" => &git_source.git_info.repo,
-                "repo_path" => repo_path.to_string_lossy(),
-                "duration_ms" => duration_ms,
-            ),
-        );
+        tracing::info!("host" = ?(&git_source.git_info.host), "repo" = ?(&git_source.git_info.repo), "repo_path" = ?(repo_path.to_string_lossy()), "duration_ms" = ?(duration_ms), "{}", "Git repository cloned successfully");
             Ok(())
         }
         .await;
@@ -427,9 +336,6 @@ impl GitHandler<'_> {
     fn create_source_auth_provider(&self, git_info: &GitInfo) -> Option<SharedAuthProvider> {
         let auth = git_info.auth.as_ref()?;
         Some(Arc::new(new_github_source_auth_provider(
-            self.logger
-                .clone()
-                .unwrap_or_else(|| default_logger().clone()),
             auth.token.clone(),
         )))
     }
@@ -472,16 +378,7 @@ impl GitHandler<'_> {
             if attempt > 0 {
                 let multiplier = 1_u64 << (attempt - 1);
                 let delay = Duration::from_secs(multiplier * base_delay_seconds);
-                self.log(
-                    LogLevel::Info,
-                    "Retrying git fetch after failure",
-                    log_attributes!(
-                        "attempt" => attempt + 1,
-                        "max_attempts" => MAX_ATTEMPTS,
-                        "delay_seconds" => delay.as_secs(),
-                        "base_delay_seconds" => base_delay_seconds,
-                    ),
-                );
+                tracing::info!("attempt" = ?(attempt + 1), "max_attempts" = ?(MAX_ATTEMPTS), "delay_seconds" = ?(delay.as_secs()), "base_delay_seconds" = ?(base_delay_seconds), "{}", "Retrying git fetch after failure");
                 tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => {
@@ -496,18 +393,10 @@ impl GitHandler<'_> {
             let mut attempt_args = args.to_vec();
             let mut environment = Vec::new();
             if attempt >= 3 {
-                self.log(
-                    LogLevel::Info,
-                    "Using HTTP/1.1 for this attempt",
-                    log_attributes!("attempt" => attempt + 1),
-                );
+                tracing::info!("attempt" = ?(attempt + 1), "{}", "Using HTTP/1.1 for this attempt");
                 attempt_args.splice(0..0, ["-c".to_owned(), "http.version=HTTP/1.1".to_owned()]);
                 if attempt == MAX_ATTEMPTS - 1 {
-                    self.log(
-                        LogLevel::Info,
-                        "Enabling GIT_TRACE_PACKET for debugging",
-                        log_attributes!("attempt" => attempt + 1),
-                    );
+                    tracing::info!("attempt" = ?(attempt + 1), "{}", "Enabling GIT_TRACE_PACKET for debugging");
                     environment.push(("GIT_TRACE_PACKET".to_owned(), "1".to_owned()));
                 }
             }
@@ -526,29 +415,14 @@ impl GitHandler<'_> {
             {
                 Ok(()) => {
                     if attempt > 0 {
-                        self.log(
-                            LogLevel::Info,
-                            "Git fetch succeeded after retry",
-                            log_attributes!(
-                                "attempt" => attempt + 1,
-                                "max_attempts" => MAX_ATTEMPTS,
-                            ),
-                        );
+                        tracing::info!("attempt" = ?(attempt + 1), "max_attempts" = ?(MAX_ATTEMPTS), "{}", "Git fetch succeeded after retry");
                     }
                     return Ok(());
                 }
                 Err(error) => {
                     last_error = Some(error.to_string());
                     if attempt < MAX_ATTEMPTS - 1 {
-                        self.log(
-                            LogLevel::Warn,
-                            "Git fetch failed, will retry",
-                            log_attributes!(
-                                "attempt" => attempt + 1,
-                                "max_attempts" => MAX_ATTEMPTS,
-                                "error" => error.to_string(),
-                            ),
-                        );
+                        tracing::warn!("attempt" = ?(attempt + 1), "max_attempts" = ?(MAX_ATTEMPTS), "error" = ?(error.to_string()), "{}", "Git fetch failed, will retry");
                     }
                 }
             }
@@ -556,14 +430,7 @@ impl GitHandler<'_> {
 
         let last_error = last_error.unwrap_or_default();
         let _error_type = classify_git_error(Some(&last_error));
-        self.log(
-            LogLevel::Error,
-            "Git fetch failed after all retries",
-            log_attributes!(
-                "attempts" => MAX_ATTEMPTS,
-                "error" => &last_error,
-            ),
-        );
+        tracing::error!("attempts" = ?(MAX_ATTEMPTS), "error" = ?(&last_error), "{}", "Git fetch failed after all retries");
         Err(SourcesError::message(format!(
             "git fetch failed after {MAX_ATTEMPTS} attempts: {last_error}"
         )))
@@ -581,29 +448,14 @@ impl GitHandler<'_> {
         let base_delay_seconds = 2 + unix_nanos_mod(3);
         let mut last_error = None;
 
-        self.log(
-            LogLevel::Info,
-            "Validating repository access via git proxy",
-            log_attributes!(
-                "repo_url" => git_url,
-                "max_attempts" => MAX_ATTEMPTS,
-            ),
-        );
+        tracing::info!("repo_url" = ?(git_url), "max_attempts" = ?(MAX_ATTEMPTS), "{}", "Validating repository access via git proxy");
 
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
                 let delay = Duration::from_secs(
                     (1_u64 << (attempt - 1)).saturating_mul(base_delay_seconds),
                 );
-                self.log(
-                    LogLevel::Info,
-                    "Retrying git proxy validation",
-                    log_attributes!(
-                        "attempt" => attempt + 1,
-                        "max_attempts" => MAX_ATTEMPTS,
-                        "delay_seconds" => delay.as_secs(),
-                    ),
-                );
+                tracing::info!("attempt" = ?(attempt + 1), "max_attempts" = ?(MAX_ATTEMPTS), "delay_seconds" = ?(delay.as_secs()), "{}", "Retrying git proxy validation");
                 tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => {
@@ -635,51 +487,23 @@ impl GitHandler<'_> {
             {
                 Ok(()) => {
                     if attempt > 0 {
-                        self.log(
-                            LogLevel::Info,
-                            "Git proxy validation succeeded after retry",
-                            log_attributes!(
-                                "attempt" => attempt + 1,
-                                "repo_url" => git_url,
-                            ),
-                        );
+                        tracing::info!("attempt" = ?(attempt + 1), "repo_url" = ?(git_url), "{}", "Git proxy validation succeeded after retry");
                     } else {
-                        self.log(
-                            LogLevel::Info,
-                            "Git proxy validation succeeded",
-                            log_attributes!("repo_url" => git_url),
-                        );
+                        tracing::info!("repo_url" = ?(git_url), "{}", "Git proxy validation succeeded");
                     }
                     return Ok(());
                 }
                 Err(error) => {
                     last_error = Some(error.to_string());
                     if attempt < MAX_ATTEMPTS - 1 {
-                        self.log(
-                            LogLevel::Warn,
-                            "Git proxy validation failed, will retry",
-                            log_attributes!(
-                                "attempt" => attempt + 1,
-                                "max_attempts" => MAX_ATTEMPTS,
-                                "repo_url" => git_url,
-                                "error" => error.to_string(),
-                            ),
-                        );
+                        tracing::warn!("attempt" = ?(attempt + 1), "max_attempts" = ?(MAX_ATTEMPTS), "repo_url" = ?(git_url), "error" = ?(error.to_string()), "{}", "Git proxy validation failed, will retry");
                     }
                 }
             }
         }
 
         let last_error = last_error.unwrap_or_default();
-        self.log(
-            LogLevel::Error,
-            "Git proxy validation failed after all retries",
-            log_attributes!(
-                "max_attempts" => MAX_ATTEMPTS,
-                "repo_url" => git_url,
-                "error" => &last_error,
-            ),
-        );
+        tracing::error!("max_attempts" = ?(MAX_ATTEMPTS), "repo_url" = ?(git_url), "error" = ?(&last_error), "{}", "Git proxy validation failed after all retries");
         Err(SourcesError::message(format!(
             "git proxy validation failed after {MAX_ATTEMPTS} attempts: {}",
             last_error
@@ -720,14 +544,7 @@ impl GitHandler<'_> {
             })
             .collect::<Vec<_>>();
         let command = sanitized_args.join(" ");
-        self.log(
-            LogLevel::Info,
-            "Executing git command",
-            log_attributes!(
-                "command" => format!("git {command}"),
-                "dir" => dir.map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
-            ),
-        );
+        tracing::info!("command" = ?(format!("git {command}")), "dir" = ?(dir.map_or_else(String::new, |path| path.to_string_lossy().into_owned())), "{}", "Executing git command");
 
         // Go 的 `CombinedOutput` 让两个输出流共享一个 pipe；错误日志和返回错误都能
         // 观察真实交错顺序，因此这里不能再分别读取 stdout/stderr 后拼接。
@@ -739,29 +556,12 @@ impl GitHandler<'_> {
             if let Some(provider) = auth_provider {
                 output = provider.sanitize_output(&output, git_url, authenticated_url);
             }
-            self.log(
-                LogLevel::Error,
-                "Git command failed",
-                log_attributes!(
-                    "command" => &sanitized_args,
-                    "error" => error,
-                    "output" => &output,
-                    "duration_ms" => duration_ms,
-                ),
-            );
+            tracing::error!("command" = ?(&sanitized_args), "error" = ?(error), "output" = ?(&output), "duration_ms" = ?(duration_ms), "{}", "Git command failed");
             return Err(SourcesError::message(format!(
                 "git {command} failed: {error}\nOutput: {output}"
             )));
         }
-        self.log(
-            LogLevel::Info,
-            "Git command succeeded",
-            log_attributes!(
-                "command" => format!("git {command}"),
-                "duration_ms" => duration_ms,
-                "output_size" => outcome.combined_output().len(),
-            ),
-        );
+        tracing::info!("command" = ?(format!("git {command}")), "duration_ms" = ?(duration_ms), "output_size" = ?(outcome.combined_output().len()), "{}", "Git command succeeded");
         Ok(())
     }
 
@@ -781,16 +581,7 @@ impl GitHandler<'_> {
         repo_name: &str,
     ) -> SourcesResult<()> {
         let using_authenticated_url = git_url != authenticated_url;
-        self.log(
-            LogLevel::Info,
-            "Cloning repository",
-            log_attributes!(
-                "repo_path" => repo_path.to_string_lossy(),
-                "repo_url" => git_url,
-                "repo_name" => repo_name,
-                "authenticated" => using_authenticated_url,
-            ),
-        );
+        tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "repo_url" = ?(git_url), "repo_name" = ?(repo_name), "authenticated" = ?(using_authenticated_url), "{}", "Cloning repository");
         let result = self
             .clone_repository_inner(
                 cancellation,
@@ -804,11 +595,7 @@ impl GitHandler<'_> {
             .await;
 
         if using_authenticated_url {
-            self.log(
-                LogLevel::Debug,
-                "Resetting origin URL to non-authenticated URL",
-                log_attributes!(),
-            );
+            tracing::debug!("{}", "Resetting origin URL to non-authenticated URL");
             let reset_args = vec![
                 "remote".to_owned(),
                 "set-url".to_owned(),
@@ -827,11 +614,7 @@ impl GitHandler<'_> {
                 )
                 .await
             {
-                self.log(
-                    LogLevel::Warn,
-                    "Failed to reset origin URL",
-                    log_attributes!("error" => error.to_string()),
-                );
+                tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to reset origin URL");
             }
         }
         result
@@ -855,11 +638,7 @@ impl GitHandler<'_> {
         let prefetched_repo_exists =
             allow_prefetched && tokio::fs::metadata(repo_path.join(".git")).await.is_ok();
         if prefetched_repo_exists {
-            self.log(
-                LogLevel::Info,
-                "Repository already exists in allow-prefetched mode, using existing clone",
-                log_attributes!("repo_path" => repo_path.to_string_lossy()),
-            );
+            tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "{}", "Repository already exists in allow-prefetched mode, using existing clone");
         }
 
         match (process_mode, prefetched_repo_exists) {
@@ -911,15 +690,7 @@ impl GitHandler<'_> {
                     .and_then(|branches| branches.get(repo_name))
                     .filter(|branch| !branch.is_empty())
                 {
-                    self.log(
-                        LogLevel::Info,
-                        "BYOC resume: checking if task branch exists on remote",
-                        log_attributes!(
-                            "repo_path" => repo_path.to_string_lossy(),
-                            "target_branch" => target_branch,
-                            "ref" => ref_name,
-                        ),
-                    );
+                    tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "target_branch" = ?(target_branch), "ref" = ?(ref_name), "{}", "BYOC resume: checking if task branch exists on remote");
                     if self
                         .branch_exists_on_remote(
                             cancellation,
@@ -929,11 +700,7 @@ impl GitHandler<'_> {
                         )
                         .await
                     {
-                        self.log(
-                            LogLevel::Info,
-                            "BYOC resume: task branch exists on remote, fetching it",
-                            log_attributes!("target_branch" => target_branch),
-                        );
+                        tracing::info!("target_branch" = ?(target_branch), "{}", "BYOC resume: task branch exists on remote, fetching it");
                         self.fetch_and_checkout_remote_branch(
                             cancellation,
                             repo_path,
@@ -948,25 +715,10 @@ impl GitHandler<'_> {
                                 "failed to fetch/checkout task branch: {error}"
                             ))
                         })?;
-                        self.log(
-                            LogLevel::Info,
-                            "Repository resumed successfully with task branch",
-                            log_attributes!(
-                                "repo_path" => repo_path.to_string_lossy(),
-                                "repo_url" => git_url,
-                                "target_branch" => target_branch,
-                            ),
-                        );
+                        tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "repo_url" = ?(git_url), "target_branch" = ?(target_branch), "{}", "Repository resumed successfully with task branch");
                         return Ok(());
                     }
-                    self.log(
-                        LogLevel::Info,
-                        "BYOC resume: task branch not found on remote, falling back to original ref",
-                        log_attributes!(
-                            "target_branch" => target_branch,
-                            "ref" => ref_name,
-                        ),
-                    );
+                    tracing::info!("target_branch" = ?(target_branch), "ref" = ?(ref_name), "{}", "BYOC resume: task branch not found on remote, falling back to original ref");
                 }
 
                 let local_ref_args = vec![
@@ -981,11 +733,7 @@ impl GitHandler<'_> {
                     .error
                     .is_none()
                 {
-                    self.log(
-                        LogLevel::Info,
-                        "Ref already exists locally in prefetched repo, skipping fetch",
-                        log_attributes!("ref" => ref_name),
-                    );
+                    tracing::info!("ref" = ?(ref_name), "{}", "Ref already exists locally in prefetched repo, skipping fetch");
                     let checkout_args = vec![
                         "-c".to_owned(),
                         "core.hooksPath=/dev/null".to_owned(),
@@ -1008,28 +756,13 @@ impl GitHandler<'_> {
                             "failed to checkout local ref {ref_name}: {error}"
                         ))
                     })?;
-                    self.log(
-                        LogLevel::Info,
-                        "Repository cloned successfully",
-                        log_attributes!(
-                            "repo_path" => repo_path.to_string_lossy(),
-                            "repo_url" => git_url,
-                        ),
-                    );
+                    tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "repo_url" = ?(git_url), "{}", "Repository cloned successfully");
                     return Ok(());
                 }
-                self.log(
-                    LogLevel::Info,
-                    "Ref not found locally, will fetch from remote",
-                    log_attributes!("ref" => ref_name),
-                );
+                tracing::info!("ref" = ?(ref_name), "{}", "Ref not found locally, will fetch from remote");
             }
 
-            self.log(
-                LogLevel::Info,
-                "Fetching specific ref",
-                log_attributes!("ref" => ref_name),
-            );
+            tracing::info!("ref" = ?(ref_name), "{}", "Fetching specific ref");
             let fetch_args = vec![
                 "fetch".to_owned(),
                 "--no-progress".to_owned(),
@@ -1053,34 +786,15 @@ impl GitHandler<'_> {
                     .is_empty_repository(cancellation, repo_path, authenticated_url)
                     .await
                 {
-                    self.log(
-                        LogLevel::Info,
-                        "Repository is empty (no commits), skipping checkout",
-                        log_attributes!(
-                            "repo_path" => repo_path.to_string_lossy(),
-                            "repo_url" => git_url,
-                            "ref" => ref_name,
-                        ),
-                    );
+                    tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "repo_url" = ?(git_url), "ref" = ?(ref_name), "{}", "Repository is empty (no commits), skipping checkout");
                     return Ok(());
                 }
                 return Err(error);
             }
         } else {
             if allow_prefetched && prefetched_repo_exists {
-                self.log(
-                    LogLevel::Info,
-                    "Allow-prefetched mode with existing repo - using existing repository state",
-                    log_attributes!("repo_path" => repo_path.to_string_lossy()),
-                );
-                self.log(
-                    LogLevel::Info,
-                    "Repository cloned successfully",
-                    log_attributes!(
-                        "repo_path" => repo_path.to_string_lossy(),
-                        "repo_url" => git_url,
-                    ),
-                );
+                tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "{}", "Allow-prefetched mode with existing repo - using existing repository state");
+                tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "repo_url" = ?(git_url), "{}", "Repository cloned successfully");
                 return Ok(());
             }
 
@@ -1093,7 +807,7 @@ impl GitHandler<'_> {
                 "HEAD".to_owned(),
             ];
             if process_mode == "fresh" || allow_prefetched {
-                self.log(LogLevel::Info, "Cloning default branch", log_attributes!());
+                tracing::info!("{}", "Cloning default branch");
                 if let Err(error) = self
                     .run_git_fetch_with_retry(
                         cancellation,
@@ -1109,24 +823,13 @@ impl GitHandler<'_> {
                         .is_empty_repository(cancellation, repo_path, authenticated_url)
                         .await
                     {
-                        self.log(
-                            LogLevel::Info,
-                            "Repository is empty (no commits), skipping checkout",
-                            log_attributes!(
-                                "repo_path" => repo_path.to_string_lossy(),
-                                "repo_url" => git_url,
-                            ),
-                        );
+                        tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "repo_url" = ?(git_url), "{}", "Repository is empty (no commits), skipping checkout");
                         return Ok(());
                     }
                     return Err(error);
                 }
             } else if process_mode == "resume" {
-                self.log(
-                    LogLevel::Info,
-                    "Fetching latest HEAD for resume",
-                    log_attributes!(),
-                );
+                tracing::info!("{}", "Fetching latest HEAD for resume");
                 if let Err(error) = self
                     .run_git_fetch_with_retry(
                         cancellation,
@@ -1138,17 +841,9 @@ impl GitHandler<'_> {
                     )
                     .await
                 {
-                    self.log(
-                        LogLevel::Warn,
-                        "Failed to fetch latest HEAD, continuing with existing state",
-                        log_attributes!("error" => error.to_string()),
-                    );
+                    tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to fetch latest HEAD, continuing with existing state");
                 } else {
-                    self.log(
-                        LogLevel::Info,
-                        "Successfully fetched latest HEAD",
-                        log_attributes!("repo_path" => repo_path.to_string_lossy()),
-                    );
+                    tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "{}", "Successfully fetched latest HEAD");
                 }
             }
         }
@@ -1207,24 +902,10 @@ impl GitHandler<'_> {
         if let Some(error) = pack_error {
             // Go 只有一个 `result.err != nil` 日志调用点；即便 Tokio worker 自身异常，
             // 也汇入同一调用点，避免 Rust 分支凭空增加一条记录。
-            self.log(
-                LogLevel::Warn,
-                "Failed to calculate repo size",
-                log_attributes!("error" => error),
-            );
+            tracing::warn!("error" = ?(error), "{}", "Failed to calculate repo size");
             pack_size_bytes = -1;
         }
-        self.log(
-            LogLevel::Info,
-            "Repository cloned successfully",
-            log_attributes!(
-                "repo_path" => repo_path.to_string_lossy(),
-                "repo_url" => git_url,
-                "duration_ms" => clone_duration_ms,
-                "pack_size_bytes" => pack_size_bytes,
-                "pack_size_duration_ms" => pack_duration_ms,
-            ),
-        );
+        tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "repo_url" = ?(git_url), "duration_ms" = ?(clone_duration_ms), "pack_size_bytes" = ?(pack_size_bytes), "pack_size_duration_ms" = ?(pack_duration_ms), "{}", "Repository cloned successfully");
         Ok(())
     }
 
@@ -1262,11 +943,7 @@ impl GitHandler<'_> {
             )
             .await
         {
-            self.log(
-                LogLevel::Warn,
-                "Failed to disable auto gc",
-                log_attributes!("error" => error.to_string()),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to disable auto gc");
         }
 
         let remote_args = vec![
@@ -1296,14 +973,7 @@ impl GitHandler<'_> {
             return;
         }
 
-        self.log(
-            LogLevel::Info,
-            "Running post-clone hook",
-            log_attributes!(
-                "hook_path" => &self.post_clone_hook_path,
-                "repo_path" => repo_path.to_string_lossy(),
-            ),
-        );
+        tracing::info!("hook_path" = ?(&self.post_clone_hook_path), "repo_path" = ?(repo_path.to_string_lossy()), "{}", "Running post-clone hook");
 
         let args = vec![
             self.post_clone_hook_path.clone(),
@@ -1314,32 +984,12 @@ impl GitHandler<'_> {
         if let Err(error) =
             write_file_0644(Path::new("/tmp/post-clone-hook.out"), output.clone()).await
         {
-            self.log(
-                LogLevel::Warn,
-                "Failed to write post-clone hook output to file",
-                log_attributes!("error" => error.to_string()),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to write post-clone hook output to file");
         }
         if let Some(error) = outcome.error.as_ref() {
-            self.log(
-                LogLevel::Warn,
-                "Post-clone hook failed, continuing anyway",
-                log_attributes!(
-                    "error" => error,
-                    "output" => String::from_utf8_lossy(&output),
-                    "repo_path" => repo_path.to_string_lossy(),
-                    "hook_path" => &self.post_clone_hook_path,
-                ),
-            );
+            tracing::warn!("error" = ?(error), "output" = ?(String::from_utf8_lossy(&output)), "repo_path" = ?(repo_path.to_string_lossy()), "hook_path" = ?(&self.post_clone_hook_path), "{}", "Post-clone hook failed, continuing anyway");
         } else {
-            self.log(
-                LogLevel::Info,
-                "Post-clone hook completed successfully",
-                log_attributes!(
-                    "repo_path" => repo_path.to_string_lossy(),
-                    "hook_path" => &self.post_clone_hook_path,
-                ),
-            );
+            tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "hook_path" = ?(&self.post_clone_hook_path), "{}", "Post-clone hook completed successfully");
         }
     }
 
@@ -1350,11 +1000,7 @@ impl GitHandler<'_> {
         repo_path: &Path,
         authenticated_url: &str,
     ) -> bool {
-        self.log(
-            LogLevel::Info,
-            "Checking if repository is empty",
-            log_attributes!("repo_path" => repo_path.to_string_lossy()),
-        );
+        tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "{}", "Checking if repository is empty");
         let args = vec![
             "-c".to_owned(),
             GIT_HTTP_PROXY_AUTH_CONFIG.to_owned(),
@@ -1366,23 +1012,11 @@ impl GitHandler<'_> {
         let outcome = run_external_command(cancellation, "git", &args, Some(repo_path), &[]).await;
         let trimmed_output = String::from_utf8_lossy(&outcome.stdout).trim().to_owned();
         if outcome.error.is_none() && trimmed_output.is_empty() {
-            self.log(
-                LogLevel::Info,
-                "Repository confirmed empty - no commits",
-                log_attributes!("repo_path" => repo_path.to_string_lossy()),
-            );
+            tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "{}", "Repository confirmed empty - no commits");
             return true;
         }
         if let Some(error) = outcome.error.as_ref() {
-            self.log(
-                LogLevel::Debug,
-                "Failed to check if repository is empty",
-                log_attributes!(
-                    "repo_path" => repo_path.to_string_lossy(),
-                    "error" => error,
-                    "output" => &trimmed_output,
-                ),
-            );
+            tracing::debug!("repo_path" = ?(repo_path.to_string_lossy()), "error" = ?(error), "output" = ?(&trimmed_output), "{}", "Failed to check if repository is empty");
         }
         false
     }
@@ -1430,11 +1064,7 @@ impl GitHandler<'_> {
         authenticated_url: &str,
         branch: &str,
     ) -> bool {
-        self.log(
-            LogLevel::Debug,
-            "Checking if branch exists on remote",
-            log_attributes!("branch" => branch),
-        );
+        tracing::debug!("branch" = ?(branch), "{}", "Checking if branch exists on remote");
         let args = vec![
             "-c".to_owned(),
             GIT_HTTP_PROXY_AUTH_CONFIG.to_owned(),
@@ -1490,11 +1120,7 @@ impl GitHandler<'_> {
         git_url: &str,
         auth_provider: Option<&(dyn SourceAuthProvider + Send + Sync)>,
     ) -> SourcesResult<()> {
-        self.log(
-            LogLevel::Info,
-            "Branch exists on remote, fetching and checking out",
-            log_attributes!("target_branch" => target_branch),
-        );
+        tracing::info!("target_branch" = ?(target_branch), "{}", "Branch exists on remote, fetching and checking out");
         if authenticated_url != git_url {
             let set_args = vec![
                 "remote".to_owned(),
@@ -1514,11 +1140,7 @@ impl GitHandler<'_> {
                 )
                 .await
             {
-                self.log(
-                    LogLevel::Error,
-                    "Failed to set authenticated URL for fetch",
-                    log_attributes!("error" => error.to_string()),
-                );
+                tracing::error!("error" = ?(error.to_string()), "{}", "Failed to set authenticated URL for fetch");
             }
         }
 
@@ -1583,11 +1205,7 @@ impl GitHandler<'_> {
                 )
                 .await
             {
-                self.log(
-                    LogLevel::Error,
-                    "Failed to reset origin URL",
-                    log_attributes!("error" => error.to_string()),
-                );
+                tracing::error!("error" = ?(error.to_string()), "{}", "Failed to reset origin URL");
             }
         }
         result
@@ -1617,14 +1235,9 @@ impl GitHandler<'_> {
         repo_path: &Path,
         target_branch: &str,
     ) -> SourcesResult<()> {
-        let logger = match self.logger.as_ref() {
-            Some(logger) => logger,
-            None => default_logger(),
-        };
-        let starting_attributes = log_attributes!("target_branch" => target_branch);
-        logger.info(
-            "Branch doesn't exist on remote, creating new branch locally from current HEAD",
-            starting_attributes,
+        tracing::info!(
+            target_branch,
+            "Branch doesn't exist on remote, creating new branch locally from current HEAD"
         );
 
         let checkout_args = vec![
@@ -1643,33 +1256,22 @@ impl GitHandler<'_> {
         )
         .await;
         if let Some(error) = checkout.error.as_ref() {
-            let failure_attributes = log_attributes!(
-                "target_branch" => target_branch,
-                "error" => error,
-                "output" => String::from_utf8_lossy(&checkout.combined_output()),
+            tracing::error!(
+                target_branch,
+                error = %error,
+                output = %String::from_utf8_lossy(&checkout.combined_output()),
+                "Failed to create new branch"
             );
-            logger.error("Failed to create new branch", failure_attributes);
             return Err(SourcesError::message(format!(
                 "failed to create branch {target_branch}: {error}"
             )));
         }
 
-        update_remote_tracking_branch(
-            cancellation,
-            self.logger.as_ref(),
-            repo_path,
-            "origin",
-            target_branch,
-            "HEAD",
-        )
-        .await
-        .map_err(|error| SourcesError::message(error.to_string()))?;
+        update_remote_tracking_branch(cancellation, repo_path, "origin", target_branch, "HEAD")
+            .await
+            .map_err(|error| SourcesError::message(error.to_string()))?;
 
-        let success_attributes = log_attributes!("target_branch" => target_branch);
-        logger.info(
-            "Successfully created new branch locally",
-            success_attributes,
-        );
+        tracing::info!(target_branch, "Successfully created new branch locally");
         Ok(())
     }
 
@@ -1693,15 +1295,7 @@ impl GitHandler<'_> {
             return Ok(());
         };
 
-        self.log(
-            LogLevel::Info,
-            "Processing branch from outcomes",
-            log_attributes!(
-                "repo" => &git_source.git_info.repo,
-                "target_branch" => target_branch,
-                "process_mode" => self.process_mode.as_str(),
-            ),
-        );
+        tracing::info!("repo" = ?(&git_source.git_info.repo), "target_branch" = ?(target_branch), "process_mode" = ?(self.process_mode.as_str()), "{}", "Processing branch from outcomes");
 
         let current_args = vec!["branch".to_owned(), "--show-current".to_owned()];
         let current =
@@ -1709,20 +1303,12 @@ impl GitHandler<'_> {
         if current.error.is_none()
             && String::from_utf8_lossy(&current.stdout).trim() == target_branch
         {
-            self.log(
-                LogLevel::Info,
-                "Already on target branch, skipping checkout",
-                log_attributes!("target_branch" => target_branch),
-            );
+            tracing::info!("target_branch" = ?(target_branch), "{}", "Already on target branch, skipping checkout");
             return Ok(());
         }
 
         if self.process_mode.as_str() == "resume" {
-            self.log(
-                LogLevel::Info,
-                "Resume mode: creating local branch directly",
-                log_attributes!("target_branch" => target_branch),
-            );
+            tracing::info!("target_branch" = ?(target_branch), "{}", "Resume mode: creating local branch directly");
             self.create_local_branch(cancellation, repo_path, target_branch)
                 .await
                 .map_err(|error| {
@@ -1746,11 +1332,7 @@ impl GitHandler<'_> {
                 ))
             })?;
         }
-        self.log(
-            LogLevel::Info,
-            "Successfully processed branch",
-            log_attributes!("target_branch" => target_branch),
-        );
+        tracing::info!("target_branch" = ?(target_branch), "{}", "Successfully processed branch");
         Ok(())
     }
 
@@ -1769,11 +1351,7 @@ impl GitHandler<'_> {
             .as_ref()
             .filter(|url| !url.is_empty())
         else {
-            self.log(
-                LogLevel::Debug,
-                "No custom URL specified, skipping remote URL update",
-                log_attributes!("repo" => &git_source.git_info.repo),
-            );
+            tracing::debug!("repo" = ?(&git_source.git_info.repo), "{}", "No custom URL specified, skipping remote URL update");
             return Ok(());
         };
 
@@ -1785,25 +1363,11 @@ impl GitHandler<'_> {
             )));
         }
         if tokio::fs::metadata(&repo_path).await.is_err() {
-            self.log(
-                LogLevel::Debug,
-                "Repository directory does not exist, skipping remote URL update",
-                log_attributes!(
-                    "repo_path" => repo_path.to_string_lossy(),
-                    "repo" => &git_source.git_info.repo,
-                ),
-            );
+            tracing::debug!("repo_path" = ?(repo_path.to_string_lossy()), "repo" = ?(&git_source.git_info.repo), "{}", "Repository directory does not exist, skipping remote URL update");
             return Ok(());
         }
 
-        self.log(
-            LogLevel::Info,
-            "Updating to custom git URL",
-            log_attributes!(
-                "repo" => &git_source.git_info.repo,
-                "custom_url" => custom_url,
-            ),
-        );
+        tracing::info!("repo" = ?(&git_source.git_info.repo), "custom_url" = ?(custom_url), "{}", "Updating to custom git URL");
 
         let args = vec![
             "remote".to_owned(),
@@ -1814,30 +1378,13 @@ impl GitHandler<'_> {
         let outcome =
             run_combined_external_command(cancellation, "git", &args, Some(&repo_path), &[]).await;
         if let Some(error) = outcome.error.as_ref() {
-            self.log(
-                LogLevel::Error,
-                "Failed to update remote URL",
-                log_attributes!(
-                    "repo" => &git_source.git_info.repo,
-                    "repo_path" => repo_path.to_string_lossy(),
-                    "error" => error,
-                    "output" => String::from_utf8_lossy(&outcome.combined_output()),
-                ),
-            );
+            tracing::error!("repo" = ?(&git_source.git_info.repo), "repo_path" = ?(repo_path.to_string_lossy()), "error" = ?(error), "output" = ?(String::from_utf8_lossy(&outcome.combined_output())), "{}", "Failed to update remote URL");
             return Err(SourcesError::message(format!(
                 "failed to update remote URL for {}: {error}",
                 git_source.git_info.repo
             )));
         }
-        self.log(
-            LogLevel::Info,
-            "Successfully updated git remote URL",
-            log_attributes!(
-                "repo" => &git_source.git_info.repo,
-                "repo_path" => repo_path.to_string_lossy(),
-                "custom_url" => custom_url,
-            ),
-        );
+        tracing::info!("repo" = ?(&git_source.git_info.repo), "repo_path" = ?(repo_path.to_string_lossy()), "custom_url" = ?(custom_url), "{}", "Successfully updated git remote URL");
         Ok(())
     }
 
@@ -1864,11 +1411,7 @@ impl GitHandler<'_> {
                 .as_ref()
                 .filter(|auth| !auth.token.is_empty())
             else {
-                self.log(
-                    LogLevel::Debug,
-                    "Skipping repo without auth",
-                    log_attributes!("repo" => &git_source.git_info.repo),
-                );
+                tracing::debug!("repo" = ?(&git_source.git_info.repo), "{}", "Skipping repo without auth");
                 continue;
             };
             repo_auths.push(RepoAuth {
@@ -1879,11 +1422,7 @@ impl GitHandler<'_> {
         }
 
         if repo_auths.is_empty() {
-            self.log(
-                LogLevel::Info,
-                "No repositories configured for git proxy",
-                log_attributes!(),
-            );
+            tracing::info!("{}", "No repositories configured for git proxy");
             return Ok(());
         }
         let session_id = self
@@ -1928,14 +1467,7 @@ impl GitHandler<'_> {
             .git_proxy_manager
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&manager));
-        self.log(
-            LogLevel::Info,
-            "Local git proxy started for all repositories",
-            log_attributes!(
-                "proxy_url" => &proxy_url,
-                "repo_count" => repo_count,
-            ),
-        );
+        tracing::info!("proxy_url" = ?(&proxy_url), "repo_count" = ?(repo_count), "{}", "Local git proxy started for all repositories");
 
         for source in sources.iter().flatten() {
             if source.get_type() != "git_repository" {
@@ -1954,25 +1486,14 @@ impl GitHandler<'_> {
             }
             let repo_path = git_source.get_directory(&self.base_dir);
             if repo_path.as_os_str().is_empty() {
-                self.log(
-                    LogLevel::Warn,
-                    "Could not determine repo path for proxy setup",
-                    log_attributes!("repo" => &git_source.git_info.repo),
-                );
+                tracing::warn!("repo" = ?(&git_source.git_info.repo), "{}", "Could not determine repo path for proxy setup");
                 continue;
             }
             if let Err(error) = self
                 .setup_local_git_proxy(cancellation, git_source, &repo_path)
                 .await
             {
-                self.log(
-                    LogLevel::Warn,
-                    "Failed to setup local git proxy for repo",
-                    log_attributes!(
-                        "repo" => &git_source.git_info.repo,
-                        "error" => error.to_string(),
-                    ),
-                );
+                tracing::warn!("repo" = ?(&git_source.git_info.repo), "error" = ?(error.to_string()), "{}", "Failed to setup local git proxy for repo");
             }
         }
         Ok(())
@@ -2008,22 +1529,8 @@ impl GitHandler<'_> {
                 "failed to update git remote to use proxy: {error}, output: {output}"
             )));
         }
-        self.log(
-            LogLevel::Info,
-            "Git remote updated to use local proxy",
-            log_attributes!(
-                "repo" => &git_source.git_info.repo,
-                "proxy_url" => &proxy_url,
-            ),
-        );
+        tracing::info!("repo" = ?(&git_source.git_info.repo), "proxy_url" = ?(&proxy_url), "{}", "Git remote updated to use local proxy");
         Ok(())
-    }
-
-    /// 统一把 Git handler 日志写入显式 logger；未注入时使用进程级
-    /// tracing logger。`track_caller` 保留具体 Rust 业务调用位置。
-    #[track_caller]
-    fn log(&self, level: LogLevel, message: impl Into<String>, attributes: LogAttributes) {
-        log_with_logger(self.logger.as_ref(), level, message, attributes);
     }
 }
 
@@ -2516,30 +2023,6 @@ fn unix_nanos_mod(modulus: u64) -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| u64::from(duration.subsec_nanos()) % modulus)
-}
-
-/// 把包内日志写入显式 logger；未注入时使用进程级 tracing logger。
-///
-/// # 参数
-/// - `logger`：调用方注入的 logger；`None` 只用于旧调用点与测试。
-/// - `level`：事件级别。
-/// - `message`：静态或动态生成的 Go 原始消息。
-/// - `attributes`：已经按 Go 参数顺序插入的结构化属性。
-///
-/// # 副作用
-/// 同步调用 logger handler；handler 自身的写文件或 stderr 副作用由其实现决定。
-#[track_caller]
-fn log_with_logger(
-    logger: Option<&Logger>,
-    level: LogLevel,
-    message: impl Into<String>,
-    attributes: LogAttributes,
-) {
-    let logger = match logger {
-        Some(logger) => logger,
-        None => default_logger(),
-    };
-    logger.log(level, message, attributes);
 }
 
 /// 把单调时钟经过的时长转换成 Go `time.Duration.Milliseconds()` 的 `int64`。

@@ -1,6 +1,6 @@
 //! Deploy action 的数据模型与客户端状态。
 //!
-//! 字段对应 Go `internal/tunnel/actions/deploy/zz_recovered_types.go`。HTTP wire 类型显式
+//! Deploy action 的 HTTP wire 类型显式
 //! 标注 serde 字段名；其中 `aliases` 使用 `Option<Vec<_>>`，用于保留 Go 中未出现的
 //! `[]string` 会在最终 JSON 中编码为 `null`、而显式空数组仍编码为 `[]` 的差异。
 
@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::internal::logger::Logger;
 use crate::internal::tunnel::actions::ProgressReporter;
 
 /// Antspace control plane 客户端。
@@ -20,7 +19,6 @@ pub struct AntspaceClient {
     pub(crate) control_plane_url: String,
     pub(crate) auth_token: String,
     pub(crate) http_client: reqwest::Client,
-    pub(crate) logger: Option<Logger>,
 }
 
 /// Antspace 成功响应中由调用方使用的两个字段。
@@ -34,7 +32,6 @@ pub struct AntspaceDeployResult {
 
 /// `deploy` action 的配置和可选 Antspace 客户端。
 pub struct DeployAction {
-    pub(crate) logger: Option<Logger>,
     pub(crate) vercel_token: String,
     pub(crate) vercel_team_id: String,
     pub(crate) antspace_client: Option<AntspaceClient>,

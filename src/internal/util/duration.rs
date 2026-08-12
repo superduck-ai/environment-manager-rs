@@ -1,7 +1,7 @@
-//! Go `time.Duration` 的日志数值与文本兼容工具。
+//! Duration 的日志数值与文本格式化工具。
 //!
 //! 本文件对应 Go 标准库 `src/time/time.go` 中 `Duration.String` 的正数路径，同时为
-//! 项目中所有 `slog.Duration` 属性提供统一的纳秒整数编码。Rust 使用无符号的
+//! 项目中的 tracing duration 字段使用统一的纳秒整数编码。Rust 使用无符号的
 //! [`std::time::Duration`]，因此这里覆盖项目实际可产生的非负时长；超过 Go
 //! `time.Duration` 上限的 Rust 值按 `int64` 上限饱和，避免 JSON 数值发生回绕。
 
@@ -57,10 +57,9 @@ pub(crate) fn format_go_duration(duration: Duration) -> String {
     }
 }
 
-/// 把 Rust 时长编码为 Go `slog.Duration` 的 JSON 纳秒整数。
+/// 把 Rust 时长编码为 tracing 使用的有符号纳秒整数。
 ///
-/// Go 的 `slog.Duration` 底层是有符号 `int64` 纳秒。项目正常输入已经受 Go duration
-/// 范围约束；饱和分支只保护 Rust 内部意外构造的超大值，防止强制转换回绕为负数。
+/// 饱和分支保护意外构造的超大值，防止强制转换回绕为负数。
 ///
 /// # 参数
 /// - `duration`：需要写入结构化日志的非负时长。
@@ -68,7 +67,7 @@ pub(crate) fn format_go_duration(duration: Duration) -> String {
 /// # 返回
 /// 纳秒整数；超过 `i64::MAX` 纳秒时返回 `i64::MAX`。
 #[must_use]
-pub(crate) fn go_duration_nanoseconds(duration: Duration) -> i64 {
+pub(crate) fn duration_nanoseconds(duration: Duration) -> i64 {
     i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
 }
 

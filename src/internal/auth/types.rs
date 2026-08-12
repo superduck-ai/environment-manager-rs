@@ -1,12 +1,10 @@
 //! 认证子系统的数据类型。
 //!
-//! 类型源自恢复后的 Go `zz_recovered_types.go`。敏感字段不会通过 `Debug`
+//! 认证 provider 与上下文类型。敏感字段不会通过 `Debug`
 //! 输出，避免错误链或诊断日志意外泄漏令牌。
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
-
-use crate::internal::logger::Logger;
 
 /// 一条来自 stdin 或 work secret 的认证配置。
 #[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -195,7 +193,6 @@ pub enum GitHubAuthType {
 pub struct GitHubSourceAuthProvider {
     pub(crate) auth_type: GitHubAuthType,
     pub(crate) token: String,
-    pub(crate) logger: Logger,
 }
 
 impl fmt::Debug for GitHubSourceAuthProvider {

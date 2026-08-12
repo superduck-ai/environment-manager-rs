@@ -6,33 +6,24 @@
 
 use std::io::{self, Write};
 
-use super::{LogAttributes, LogLevel, Logger};
+use tracing::Level;
 
 /// 无换行单行允许保留的最大字节数，与 Go 实现一致为 1 MiB。
 pub const MAX_LOG_WRITER_BUFFERED_LINE: usize = 1 << 20;
 
 /// 面向字节流的逐行日志 writer。
 pub struct LogWriter {
-    logger: Logger,
-    level: LogLevel,
+    level: Level,
     prefix: String,
-    attributes: LogAttributes,
     buffer: Vec<u8>,
 }
 
 impl LogWriter {
     /// 创建逐行 writer；prefix 会添加到每一条完整或截断消息前。
-    pub fn new(
-        logger: Logger,
-        level: LogLevel,
-        prefix: impl Into<String>,
-        attributes: LogAttributes,
-    ) -> Self {
+    pub fn new(level: Level, prefix: impl Into<String>) -> Self {
         Self {
-            logger,
             level,
             prefix: prefix.into(),
-            attributes,
             buffer: Vec::new(),
         }
     }
@@ -50,8 +41,13 @@ impl LogWriter {
         if truncated {
             message.push_str(" [line truncated - no newline]");
         }
-        self.logger
-            .log(self.level, message, self.attributes.clone());
+        match self.level {
+            Level::TRACE => tracing::trace!(%message),
+            Level::DEBUG => tracing::debug!(%message),
+            Level::INFO => tracing::info!(%message),
+            Level::WARN => tracing::warn!(%message),
+            Level::ERROR => tracing::error!(%message),
+        }
     }
 
     /// 返回测试可见的半行缓冲长度，用于验证超长行发送后已经清空状态。

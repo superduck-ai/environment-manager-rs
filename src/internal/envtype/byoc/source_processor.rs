@@ -5,8 +5,6 @@
 //!
 //! BYOC 保留 [`SourceProcessor`] trait 以便单元测试替换外部 Git 副作用；生产构造
 //! 则通过本适配器直接创建 `SourceHandlerManager`，不要求上层 manager 再手工注入。
-//! 请求携带的 session logger 会原样克隆给每个临时 sources manager，确保 clone、
-//! branch checkout 和 Git proxy 事件不会落入该子系统的 tracing fallback。
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -92,9 +90,6 @@ fn build_manager<'recorder>(
     };
 
     new_source_handler_manager(
-        // Go 把 `byocEnvironmentType.logger` 原样传给每个临时 sources manager；
-        // clone 只共享 handler，不会创建新的日志目的地或丢失绑定属性。
-        Some(request.logger.clone()),
         request.cwd.clone(),
         request.auth_context.clone().map(Arc::new),
         request.api_base_url.clone(),

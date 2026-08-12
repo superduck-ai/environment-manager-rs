@@ -23,7 +23,7 @@ impl ProgressReporter for NoopProgress {
 
 /// 对应 Go：`newTestStatusAction`，构造无日志副作用的 status action。
 fn new_test_status_action() -> StatusAction {
-    new_status_action(None)
+    new_status_action()
 }
 
 /// 对应 Go：`listenOnLocalhost`，监听 Linux loopback 随机端口。

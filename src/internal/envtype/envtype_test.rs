@@ -8,8 +8,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::internal::auth::AuthContext;
 use crate::internal::config::{SessionMode, StartupContext};
-use crate::internal::logger::{LogLevel, Logger};
-use crate::internal::o11y::{DiscardO11yService, O11yService};
 use crate::internal::session::ActivityRecorder;
 use crate::internal::util::BoxError;
 
@@ -55,24 +53,17 @@ impl EnvironmentType for FakeEnvironmentType {
 /// 验证注册、工厂原始 JSON 透传以及未知类型错误。
 #[test]
 fn test_env_types_register_and_create() {
-    let logger = envtype_test_logger();
     let mut registry = new_env_types();
     assert!(registry.is_empty());
 
     let captured_raw = Arc::new(Mutex::new(Vec::new()));
     let factory_capture = Arc::clone(&captured_raw);
-    let captured_logger = Arc::new(Mutex::new(false));
-    let logger_capture = Arc::clone(&captured_logger);
     registry.register(Registration {
         type_name: "fake".to_owned(),
-        factory: Some(Arc::new(move |raw, factory_logger| {
+        factory: Some(Arc::new(move |raw| {
             *factory_capture
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = raw.to_vec();
-            *logger_capture
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                factory_logger.enabled(LogLevel::Info);
             Ok(Box::new(FakeEnvironmentType {
                 cwd: "/workspace".to_owned(),
             }))
@@ -81,7 +72,7 @@ fn test_env_types_register_and_create() {
     });
 
     let environment = registry
-        .create("fake", br#"{"hello":"world"}"#, logger.clone())
+        .create("fake", br#"{"hello":"world"}"#)
         .expect("已注册环境应创建成功");
     assert_eq!(environment.get_cwd(), "/workspace");
     assert_eq!(
@@ -90,27 +81,20 @@ fn test_env_types_register_and_create() {
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
         br#"{"hello":"world"}"#
     );
-    assert!(
-        *captured_logger
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        "Factory 必须收到 EnvTypes::create 传入的具体 logger"
-    );
-
     let error = registry
-        .create("missing", &[], logger.clone())
+        .create("missing", &[])
         .err()
         .expect("未知环境类型应返回错误");
     assert_eq!(error.to_string(), "environment type \"missing\" not found");
 
     registry.register(Registration {
         type_name: "broken".to_owned(),
-        factory: Some(Arc::new(|_, _logger| {
+        factory: Some(Arc::new(|_| {
             Err(Box::new(std::io::Error::other("factory failed")) as BoxError)
         })),
         description: String::new(),
     });
-    let Err(error) = registry.create("broken", &[], logger) else {
+    let Err(error) = registry.create("broken", &[]) else {
         panic!("工厂错误应直接透传");
     };
     assert_eq!(error.to_string(), "factory failed");
@@ -123,7 +107,7 @@ fn test_env_types_register_panics_for_invalid_registration() {
         let mut registry = new_env_types();
         registry.register(Registration {
             type_name: String::new(),
-            factory: Some(Arc::new(|_, _logger| {
+            factory: Some(Arc::new(|_| {
                 Ok(Box::new(FakeEnvironmentType { cwd: String::new() }))
             })),
             description: String::new(),
@@ -152,11 +136,4 @@ fn panic_text(result: Result<(), Box<dyn std::any::Any + Send>>) -> String {
             Err(_) => "unknown panic payload".to_owned(),
         },
     }
-}
-
-/// 对应 Go：`envtypeTestLogger`。
-///
-/// 返回显式 discard logger，使测试既覆盖 Go Factory 的 logger 参数，又不产生输出。
-fn envtype_test_logger() -> Logger {
-    Logger::new(DiscardO11yService.log_handler())
 }

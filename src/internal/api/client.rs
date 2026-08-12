@@ -20,7 +20,6 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::Logger;
 use crate::internal::util::{claude_code_version, version};
 
 use super::RetryConfig;
@@ -43,7 +42,7 @@ struct AutoGzipResponse;
 /// Reqwest 的标准响应 body 通过 Drop 释放连接，Drop 不返回错误；Go 的标准
 /// `net/http.Transport` 在本项目这些读取/提前关闭路径上也通常返回 `nil`。不过 Go
 /// API 允许测试或嵌入方提供自定义 `RoundTripper` 与会失败的 `io.ReadCloser`，三个
-/// 调用点会把该失败写入业务 logger。扩展标记为这一可观察边界保留等价注入通道，
+/// 调用点会把该失败写入 tracing。扩展标记为这一可观察边界保留等价注入通道，
 /// 同时避免把 body 的读取错误错误地伪装成 Close 错误。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GoResponseCloseError {
@@ -65,7 +64,7 @@ impl GoResponseCloseError {
         }
     }
 
-    /// 返回与 Go `slog` 的 `error` 属性相同的错误文本。
+    /// 返回用于 `error` tracing 字段的错误文本。
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
@@ -174,8 +173,6 @@ pub struct HttpClient {
     pub(crate) http_client: reqwest::Client,
     /// 默认重试配置。
     pub(crate) retry_config: RetryConfig,
-    /// 所有重试事件共享的 logger。
-    pub(crate) logger: Option<Logger>,
     /// 已验证的默认 header。
     default_headers: HeaderMap,
     /// 单元测试专用的 Go `Body.Close` 故障；生产构建不包含该状态。
@@ -184,20 +181,15 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    /// 对应 Go `NewHttpClient`，缺少 scheme 时补 `https://` 并保存调用方 logger。
+    /// 缺少 scheme 时补 `https://` 并创建 HTTP client。
     ///
     /// # 参数
     /// - `base_url`：后端根 URL；未显式提供 HTTP(S) scheme 时按 Go 行为补 HTTPS。
-    /// - `logger`：生产路径传入的结构化 logger；测试可以传 `None` 关闭事件输出。
     /// - `retry_config`：可选重试策略；为空时使用 Go 的三次指数退避默认值。
     ///
     /// # 返回
     /// 成功时返回共享连接池；HTTP client 配置失败时返回稳定的 API 错误。
-    pub fn new(
-        base_url: &str,
-        logger: Option<Logger>,
-        retry_config: Option<RetryConfig>,
-    ) -> Result<Self, ApiError> {
+    pub fn new(base_url: &str, retry_config: Option<RetryConfig>) -> Result<Self, ApiError> {
         let normalized = if base_url.starts_with("http://") || base_url.starts_with("https://") {
             base_url.to_owned()
         } else {
@@ -205,7 +197,6 @@ impl HttpClient {
         };
         Self::with_options(
             &normalized,
-            logger,
             ClientOptions {
                 retry_config,
                 ..ClientOptions::default()
@@ -215,13 +206,8 @@ impl HttpClient {
 
     /// 对应 Go `NewHttpClientWithOptions`，创建带 30 秒连接超时的连接池。
     ///
-    /// `logger` 与返回 client 绑定，确保 `RetryableHTTPDo` 的 attempt/backoff 日志
-    /// 使用调用链原有接收端和绑定属性。
-    pub fn with_options(
-        base_url: &str,
-        logger: Option<Logger>,
-        options: ClientOptions,
-    ) -> Result<Self, ApiError> {
+    /// 重试 attempt/backoff 事件直接写入进程 tracing subscriber。
+    pub fn with_options(base_url: &str, options: ClientOptions) -> Result<Self, ApiError> {
         // Go 把 `ClientOptions.Timeout == 0` 当作未配置，而不是“立即超时”。Rust 用
         // Option 表达缺省，但调用方仍可能显式传入 Duration::ZERO，必须合并处理。
         let timeout = options
@@ -249,7 +235,6 @@ impl HttpClient {
             base_url: base_url.trim_end_matches('/').to_owned(),
             http_client,
             retry_config: options.retry_config.unwrap_or_default(),
-            logger,
             default_headers,
             #[cfg(test)]
             response_close_error_for_test: None,
@@ -265,7 +250,6 @@ impl HttpClient {
     /// # 参数
     /// - `base_url`：后端 API 根地址，保持原 scheme/path，仅移除全部尾随斜杠。
     /// - `http_client`：所有权转入返回值的已配置 Reqwest client；clone 仍共享连接池。
-    /// - `logger`：沿用上层结构化 logger；测试可传 `None` 静默。
     /// - `retry_config`：通用 JSON API 的可选重试参数；为空时采用默认值。
     ///
     /// # 兼容性
@@ -275,14 +259,12 @@ impl HttpClient {
     pub(crate) fn from_reqwest_client(
         base_url: &str,
         http_client: reqwest::Client,
-        logger: Option<Logger>,
         retry_config: Option<RetryConfig>,
     ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_owned(),
             http_client,
             retry_config: retry_config.unwrap_or_default(),
-            logger,
             default_headers: HeaderMap::new(),
             #[cfg(test)]
             response_close_error_for_test: None,

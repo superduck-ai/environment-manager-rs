@@ -20,7 +20,7 @@ use std::{
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     net::TcpStream,
@@ -34,7 +34,6 @@ use crate::internal::{
     auth::AuthContext,
     config::{SessionMode, StartupContext},
     envtype::{EnvironmentType, Registration, shared},
-    logger::{LogAttributes, LogLevel, Logger},
     process::execute_script,
     session::{ActivityRecorder, ActivityRecorderError, NoopActivityRecorder},
     sources::{ProcessMode, new_source_handler_manager},
@@ -98,8 +97,8 @@ impl Drop for InitActivityStopGuard {
 /// Anthropic 环境在注册表中的静态元数据。
 pub static REGISTRATION: LazyLock<Registration> = LazyLock::new(|| Registration {
     type_name: "anthropic".to_owned(),
-    factory: Some(Arc::new(|data, logger| {
-        new(data, logger)
+    factory: Some(Arc::new(|data| {
+        new(data)
             .map(|environment| Box::new(environment) as Box<dyn EnvironmentType>)
             .map_err(boxed)
     })),
@@ -108,20 +107,16 @@ pub static REGISTRATION: LazyLock<Registration> = LazyLock::new(|| Registration 
 
 /// 对应 Go：`internal/envtype/anthropic/anthropic.go` 中的 `New`。
 ///
-/// 从后端 JSON 创建 Anthropic 环境，并保存 manager 传入的 logger。Rust 的
-/// 生产 Factory 总能拿到 manager logger，因此通过非 Optional 类型在构造期
-/// 消除 nil 分支。测试若不关心日志，应显式传入 discard logger。
+/// 从后端 JSON 创建 Anthropic 环境。
 ///
 /// # 参数
 /// - `data`：Anthropic 环境原始 JSON；函数只在解码期间借用。
-/// - `logger`：本次 session 的结构化 logger，所有权保存到返回环境。
 ///
 /// # 返回
 /// 配置有效时返回环境；JSON 解码失败时返回带 Go 兼容文本的 `AnthropicError`。
-pub fn new(data: &[u8], logger: Logger) -> Result<AnthropicEnvironmentType, AnthropicError> {
+pub fn new(data: &[u8]) -> Result<AnthropicEnvironmentType, AnthropicError> {
     Ok(AnthropicEnvironmentType {
         config: Some(decode_config(data)?),
-        logger,
         startup_context: None,
         auth_context: None,
         session_mode: SessionMode::New,
@@ -239,39 +234,27 @@ impl AnthropicEnvironmentType {
         let should_run_setup =
             matches!(self.session_mode, SessionMode::New | SessionMode::SetupOnly);
 
-        self.logger.info(
-            "Initializing Anthropic environment",
-            attributes([
-                ("session_mode", json!(self.session_mode.as_str())),
-                ("has_sources", json!(has_sources)),
-                (
-                    "language_count",
-                    json!(
-                        self.config
-                            .as_ref()
-                            .map_or(0, |config| config.languages.len())
-                    ),
-                ),
-                ("has_init_script", json!(has_init_script)),
-                ("has_cwd", json!(has_cwd)),
-                ("is_baku", json!(is_baku)),
-            ]),
+        tracing::info!(
+            session_mode = %self.session_mode.as_str(),
+            has_sources,
+            language_count = self
+                .config
+                .as_ref()
+                .map_or(0, |config| config.languages.len()),
+            has_init_script,
+            has_cwd,
+            is_baku,
+            "Initializing Anthropic environment"
         );
 
         if has_sources {
             let mode = if should_run_setup {
                 Some(ProcessMode::from("fresh"))
             } else if self.session_mode == SessionMode::ResumeCached {
-                self.logger.info(
-                    "Fast resume: Using existing repository clones",
-                    LogAttributes::new(),
-                );
+                tracing::info!("Fast resume: Using existing repository clones");
                 Some(ProcessMode::from("allow-prefetched"))
             } else {
-                self.logger.info(
-                    "Fast resume: Environment already configured",
-                    LogAttributes::new(),
-                );
+                tracing::info!("Fast resume: Environment already configured");
                 None
             };
             if let Some(mode) = mode {
@@ -295,25 +278,18 @@ impl AnthropicEnvironmentType {
                         })?;
                 if !project_dir.is_empty() {
                     self.config_mut().cwd.clone_from(&project_dir);
-                    self.logger.info(
-                        "Initial project from Baku templates",
-                        attributes([("project_dir", json!(project_dir))]),
-                    );
+                    tracing::info!(project_dir = %project_dir, "Initial project from Baku templates");
                 }
             } else {
                 match self.find_existing_baku_project() {
                     Ok(project_dir) if !project_dir.is_empty() => {
                         self.config_mut().cwd.clone_from(&project_dir);
-                        self.logger.info(
-                            "Baku environment detected",
-                            attributes([("project_dir", json!(project_dir))]),
-                        );
+                        tracing::info!(project_dir = %project_dir, "Baku environment detected");
                     }
                     Ok(_) => {}
-                    Err(error) => self.logger.warn(
-                        "Baku environment detected",
-                        attributes([("error", json!(error.to_string()))]),
-                    ),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "Baku environment detected")
+                    }
                 }
             }
 
@@ -324,20 +300,14 @@ impl AnthropicEnvironmentType {
             {
                 let cwd = self.config_ref().cwd.clone();
                 if let Err(error) = self.write_supabase_env_files(cancellation, &cwd).await {
-                    self.logger.warn(
-                        "Failed to write .env.local file",
-                        attributes([("error", json!(error.to_string()))]),
-                    );
+                    tracing::warn!(error = %error, "Failed to write .env.local file");
                 }
             }
         }
 
         let cwd = self.config_ref().cwd.clone();
         if !cwd.is_empty() {
-            self.logger.info(
-                "Setting working directory",
-                attributes([("cwd", json!(cwd))]),
-            );
+            tracing::info!(cwd = %cwd, "Setting working directory");
             create_dir_all_with_mode(&cwd, 0o755).map_err(|error| {
                 AnthropicError::formatted_with_source(
                     format!("failed to create directory {cwd}: {error}"),
@@ -350,10 +320,7 @@ impl AnthropicEnvironmentType {
                     error,
                 )
             })?;
-            self.logger.info(
-                "Working directory set successfully",
-                attributes([("cwd", json!(cwd))]),
-            );
+            tracing::info!(cwd = %cwd, "Working directory set successfully");
         }
 
         let hooks = if is_baku {
@@ -370,24 +337,19 @@ impl AnthropicEnvironmentType {
             }
         };
         if let Err(error) = self.bootstrap_hooks_in_all_dirs(cancellation, hooks).await {
-            self.logger.warn(
-                if is_baku {
-                    "Failed to bootstrap Baku settings"
-                } else {
-                    "Failed to bootstrap Claude settings"
-                },
-                attributes([("error", json!(error.to_string()))]),
-            );
+            if is_baku {
+                tracing::warn!(error = %error, "Failed to bootstrap Baku settings");
+            } else {
+                tracing::warn!(error = %error, "Failed to bootstrap Claude settings");
+            }
         }
 
         if !self.config_ref().languages.is_empty() {
             if should_run_setup {
-                // Go 在 Initialize 和 installLanguages 内有两个文案完全相同的
-                // callsite；这里保留独立 facade 调用，使 runtime source 能按出现
-                // 顺序一对一对照 Go oracle。
-                self.logger.info(
-                    "Installing languages",
-                    attributes([("language_count", json!(self.config_ref().languages.len()))]),
+                // 初始化和语言安装保留独立事件，便于定位所处阶段。
+                tracing::info!(
+                    language_count = self.config_ref().languages.len(),
+                    "Installing languages"
                 );
                 self.install_languages(cancellation)
                     .await
@@ -395,9 +357,9 @@ impl AnthropicEnvironmentType {
                         AnthropicError::with_source("failed to install languages", error)
                     })?;
             } else {
-                self.logger.info(
-                    "Fast resume: Skipping language installation",
-                    attributes([("language_count", json!(self.config_ref().languages.len()))]),
+                tracing::info!(
+                    language_count = self.config_ref().languages.len(),
+                    "Fast resume: Skipping language installation"
                 );
             }
         }
@@ -409,8 +371,7 @@ impl AnthropicEnvironmentType {
         let initialization_result = async {
             if has_init_script {
                 if should_run_setup {
-                    self.logger
-                        .info("Running init script", LogAttributes::new());
+                    tracing::info!("Running init script");
                     init_activity_guard.set(activity_recorder.record_long_running_activity(
                         LogCategory::Init,
                         "Running task setup script".to_owned(),
@@ -436,27 +397,18 @@ impl AnthropicEnvironmentType {
                         ));
                     }
                 } else {
-                    self.logger.info(
-                        "Fast resume: Skipping task setup script",
-                        LogAttributes::new(),
-                    );
+                    tracing::info!("Fast resume: Skipping task setup script");
                 }
             }
 
             if is_baku && !has_sources {
                 let cwd = self.config_ref().cwd.clone();
                 if let Err(error) = self.start_dev_server(cancellation, &cwd).await {
-                    self.logger.warn(
-                        "Failed to start dev server",
-                        attributes([("error", json!(error.to_string()))]),
-                    );
+                    tracing::warn!(error = %error, "Failed to start dev server");
                 }
             }
 
-            self.logger.info(
-                "Anthropic environment initialization completed",
-                LogAttributes::new(),
-            );
+            tracing::info!("Anthropic environment initialization completed");
             Ok(())
         }
         .await;
@@ -484,7 +436,6 @@ impl AnthropicEnvironmentType {
             inner: activity_recorder,
         });
         let manager = new_source_handler_manager(
-            Some(self.logger.clone()),
             self.config_ref().cwd.clone(),
             self.auth_context.clone().map(Arc::new),
             context.api_base_url.clone(),
@@ -509,9 +460,9 @@ impl AnthropicEnvironmentType {
                 error,
             ));
         }
-        self.logger.info(
-            "Sources processed successfully",
-            attributes([("source_count", json!(context.sources.len()))]),
+        tracing::info!(
+            source_count = context.sources.len(),
+            "Sources processed successfully"
         );
 
         if self.session_mode != SessionMode::SetupOnly {
@@ -519,14 +470,11 @@ impl AnthropicEnvironmentType {
                 .setup_git_proxy_after_sources_processed(cancellation, &context.sources)
                 .await
             {
-                self.logger.warn(
-                    "Failed to setup git proxy",
-                    attributes([("error", json!(error.to_string()))]),
-                );
+                tracing::warn!(error = %error, "Failed to setup git proxy");
             } else {
-                self.logger.info(
-                    "Git proxy setup completed",
-                    attributes([("source_count", json!(context.sources.len()))]),
+                tracing::info!(
+                    source_count = context.sources.len(),
+                    "Git proxy setup completed"
                 );
             }
         }
@@ -542,29 +490,20 @@ impl AnthropicEnvironmentType {
         cancellation: &CancellationToken,
         script_content: &str,
     ) -> Result<String, RunScriptError> {
-        self.logger.info(
-            "Running initialization script",
-            attributes([("script_length", json!(script_content.len()))]),
+        tracing::info!(
+            script_length = script_content.len(),
+            "Running initialization script"
         );
         let output = Arc::new(Mutex::new(Vec::<u8>::new()));
         let captured = Arc::clone(&output);
-        let logger = self.logger.clone();
         let streamer = output_streamer(move |stream, data| {
-            logger.log(
-                LogLevel::Debug,
-                "Init script output",
-                attributes([
-                    ("stream", json!(stream.to_string())),
-                    ("data", json!(String::from_utf8_lossy(data))),
-                ]),
-            );
+            tracing::debug!(stream = %stream, data = %String::from_utf8_lossy(data), "Init script output");
             append_tail(&captured, data);
             Ok::<(), io::Error>(())
         });
 
         let result = match execute_script(
             cancellation,
-            self.logger.clone(),
             script_content,
             "init-script-*.sh",
             streamer,
@@ -590,8 +529,7 @@ impl AnthropicEnvironmentType {
             });
         }
 
-        self.logger
-            .info("Successfully executed init script", LogAttributes::new());
+        tracing::info!("Successfully executed init script");
         Ok(tail_to_string(&output))
     }
 
@@ -603,22 +541,13 @@ impl AnthropicEnvironmentType {
         let languages = self.config_ref().languages.clone();
         // 该日志与 Initialize 外层日志同文案、同属性，保留第二个独立
         // runtime caller 以区分 installLanguages 阶段。
-        self.logger.info(
-            "Installing languages",
-            attributes([("language_count", json!(languages.len()))]),
-        );
+        tracing::info!(language_count = languages.len(), "Installing languages");
         let started = Instant::now();
         let mut futures = FuturesUnordered::new();
         for language in languages.clone() {
             futures.push(async move {
                 let language_started = Instant::now();
-                self.logger.info(
-                    "Installing language in parallel",
-                    attributes([
-                        ("language", json!(language.name)),
-                        ("version", json!(language.version)),
-                    ]),
-                );
+                tracing::info!(language = %language.name, version = %language.version, "Installing language in parallel");
                 let result = self.install_language(cancellation, &language).await;
                 (language, language_started.elapsed(), result)
             });
@@ -627,14 +556,12 @@ impl AnthropicEnvironmentType {
         let mut errors = Vec::new();
         while let Some((language, duration, result)) = futures.next().await {
             if let Err(error) = result {
-                self.logger.error(
-                    "Failed to install language",
-                    attributes([
-                        ("language", json!(language.name)),
-                        ("version", json!(language.version)),
-                        ("duration", json!(format_go_duration(duration))),
-                        ("error", json!(error.to_string())),
-                    ]),
+                tracing::error!(
+                    language = %language.name,
+                    version = %language.version,
+                    duration = %format_go_duration(duration),
+                    error = %error,
+                    "Failed to install language"
                 );
                 errors.push(format!(
                     "failed to install {} {}: {error}",
@@ -643,37 +570,31 @@ impl AnthropicEnvironmentType {
             } else {
                 // installLanguage 自身成功时还会记录同文案日志；此处保留
                 // installLanguages goroutine 完成点的独立 runtime source。
-                self.logger.info(
-                    "Successfully installed language",
-                    attributes([
-                        ("language", json!(language.name)),
-                        ("version", json!(language.version)),
-                        ("duration", json!(format_go_duration(duration))),
-                    ]),
+                tracing::info!(
+                    language = %language.name,
+                    version = %language.version,
+                    duration = %format_go_duration(duration),
+                    "Successfully installed language"
                 );
             }
         }
         if !errors.is_empty() {
-            self.logger.error(
-                "Failed to install some languages",
-                attributes([
-                    ("error_count", json!(errors.len())),
-                    ("total_count", json!(languages.len())),
-                    ("duration", json!(format_go_duration(started.elapsed()))),
-                    ("errors", json!(errors.join(", "))),
-                ]),
+            tracing::error!(
+                error_count = errors.len(),
+                total_count = languages.len(),
+                duration = %format_go_duration(started.elapsed()),
+                errors = %errors.join(", "),
+                "Failed to install some languages"
             );
             return Err(AnthropicError::message(format!(
                 "failed to install languages: {}",
                 errors.join(", ")
             )));
         }
-        self.logger.info(
-            "Successfully installed all languages in parallel",
-            attributes([
-                ("language_count", json!(languages.len())),
-                ("duration", json!(format_go_duration(started.elapsed()))),
-            ]),
+        tracing::info!(
+            language_count = languages.len(),
+            duration = %format_go_duration(started.elapsed()),
+            "Successfully installed all languages in parallel"
         );
         Ok(())
     }
@@ -684,71 +605,45 @@ impl AnthropicEnvironmentType {
         cancellation: &CancellationToken,
         language: &Language,
     ) -> Result<(), AnthropicError> {
-        self.logger.info(
-            "Installing language",
-            attributes([
-                ("language", json!(language.name)),
-                ("version", json!(language.version)),
-            ]),
-        );
+        tracing::info!(language = %language.name, version = %language.version, "Installing language");
         let script = match language.name.as_str() {
             "python" => install_scripts::python(&language.version),
             "node" | "nodejs" => install_scripts::node(&language.version),
             "go" | "golang" => install_scripts::go(&language.version),
             _ => {
-                self.logger.warn(
-                    "Unsupported language, skipping installation",
-                    attributes([
-                        ("language", json!(language.name)),
-                        ("version", json!(language.version)),
-                    ]),
-                );
+                tracing::warn!(language = %language.name, version = %language.version, "Unsupported language, skipping installation");
                 return Ok(());
             }
         };
 
         let output = Arc::new(Mutex::new(Vec::<u8>::new()));
         let captured = Arc::clone(&output);
-        let logger = self.logger.clone();
         let name = language.name.clone();
         let version = language.version.clone();
         let streamer = output_streamer(move |stream, data| {
-            logger.log(
-                LogLevel::Debug,
-                "Installation script output",
-                attributes([
-                    ("language", json!(name)),
-                    ("version", json!(version)),
-                    ("stream", json!(stream.to_string())),
-                    ("data", json!(String::from_utf8_lossy(data))),
-                ]),
+            tracing::debug!(
+                language = %name,
+                version = %version,
+                stream = %stream,
+                data = %String::from_utf8_lossy(data),
+                "Installation script output"
             );
             append_tail(&captured, data);
             Ok::<(), io::Error>(())
         });
         let pattern = format!("install-{}-{}-*.sh", language.name, language.version);
-        let result = match execute_script(
-            cancellation,
-            self.logger.clone(),
-            &script,
-            &pattern,
-            streamer,
-        )
-        .await
-        {
+        let result = match execute_script(cancellation, &script, &pattern, streamer).await {
             Ok(result) => result,
             Err(error) => {
-                // Go 在给错误追加上下文前记录当前 4 KiB 尾部，不能用 trim 改变
-                // `output` 属性；错误对象按 slog 文本值写入 JSON。
+                // 在给错误追加上下文前记录当前 4 KiB 尾部，不能用 trim 改变
+                // `output` 字段。
                 let captured = tail_to_string(&output);
-                self.logger.error(
-                    "Failed to execute installation script",
-                    attributes([
-                        ("language", json!(language.name)),
-                        ("version", json!(language.version)),
-                        ("error", json!(error.to_string())),
-                        ("output", json!(captured)),
-                    ]),
+                tracing::error!(
+                    language = %language.name,
+                    version = %language.version,
+                    error = %error,
+                    output = %captured,
+                    "Failed to execute installation script"
                 );
                 return Err(AnthropicError::with_source(
                     "failed to execute installation script",
@@ -758,15 +653,13 @@ impl AnthropicEnvironmentType {
         };
 
         let success = result.error.is_none();
-        self.logger.info(
-            "Installation script completed",
-            attributes([
-                ("language", json!(language.name)),
-                ("version", json!(language.version)),
-                ("exit_code", json!(result.exit_code)),
-                ("duration", json!(format_go_duration(result.duration))),
-                ("success", json!(success)),
-            ]),
+        tracing::info!(
+            language = %language.name,
+            version = %language.version,
+            exit_code = result.exit_code,
+            duration = %format_go_duration(result.duration),
+            success,
+            "Installation script completed"
         );
 
         if let Some(error) = result.error {
@@ -776,16 +669,14 @@ impl AnthropicEnvironmentType {
             } else {
                 output.trim().to_owned()
             };
-            self.logger.error(
-                "Installation script failed",
-                attributes([
-                    ("language", json!(language.name)),
-                    ("version", json!(language.version)),
-                    ("exit_code", json!(result.exit_code)),
-                    ("duration", json!(format_go_duration(result.duration))),
-                    ("error", json!(error.to_string())),
-                    ("output", json!(captured)),
-                ]),
+            tracing::error!(
+                language = %language.name,
+                version = %language.version,
+                exit_code = result.exit_code,
+                duration = %format_go_duration(result.duration),
+                error = %error,
+                output = %captured,
+                "Installation script failed"
             );
             return Err(AnthropicError::message(format!(
                 "failed to install {} {}: {} (exit code: {})",
@@ -796,25 +687,16 @@ impl AnthropicEnvironmentType {
         for line in tail_to_string(&output).lines() {
             let line = line.trim();
             if should_log_install_output_line(line, language) {
-                self.logger.info(
-                    "Installation output",
-                    attributes([
-                        ("language", json!(language.name)),
-                        ("version", json!(language.version)),
-                        ("line", json!(line)),
-                    ]),
-                );
+                tracing::info!(language = %language.name, version = %language.version, line = %line, "Installation output");
             }
         }
         // 这是 installLanguage 内部的成功点，与并发调度层的同文案日志是
         // 两个 Go callsite，不能合并到通用 wrapper caller。
-        self.logger.info(
-            "Successfully installed language",
-            attributes([
-                ("language", json!(language.name)),
-                ("version", json!(language.version)),
-                ("duration", json!(format_go_duration(result.duration))),
-            ]),
+        tracing::info!(
+            language = %language.name,
+            version = %language.version,
+            duration = %format_go_duration(result.duration),
+            "Successfully installed language"
         );
         Ok(())
     }
@@ -859,33 +741,21 @@ impl AnthropicEnvironmentType {
         })?;
 
         if fs::metadata(&settings_path).is_ok() {
-            self.logger.info(
-                "Claude settings file already exists",
-                attributes([("path", json!(settings_path))]),
-            );
+            tracing::info!(path = %settings_path.display(), "Claude settings file already exists");
         } else {
             write_file_with_mode(&settings_path, &config.settings_data, 0o600).map_err(
                 |error| AnthropicError::with_source("failed to write settings file", error),
             )?;
-            self.logger.info(
-                "Successfully created settings file",
-                attributes([("path", json!(settings_path))]),
-            );
+            tracing::info!(path = %settings_path.display(), "Successfully created settings file");
         }
 
         if fs::metadata(&stop_hook_path).is_ok() {
-            self.logger.info(
-                "Stop hook script already exists",
-                attributes([("path", json!(stop_hook_path))]),
-            );
+            tracing::info!(path = %stop_hook_path.display(), "Stop hook script already exists");
         } else {
             write_file_with_mode(&stop_hook_path, &config.hook_data, 0o755).map_err(|error| {
                 AnthropicError::with_source("failed to write stop hook script", error)
             })?;
-            self.logger.info(
-                "Successfully created stop hook script",
-                attributes([("path", json!(stop_hook_path))]),
-            );
+            tracing::info!(path = %stop_hook_path.display(), "Successfully created stop hook script");
         }
         Ok(())
     }
@@ -895,12 +765,10 @@ impl AnthropicEnvironmentType {
         &self,
         cancellation: &CancellationToken,
     ) -> Result<String, AnthropicError> {
-        self.logger.info(
-            "Initializing Baku project",
-            attributes([
-                ("source_dir", json!(BAKU_TEMPLATE_DIR)),
-                ("project_dir", json!(BAKU_PROJECT_DIR)),
-            ]),
+        tracing::info!(
+            source_dir = BAKU_TEMPLATE_DIR,
+            project_dir = BAKU_PROJECT_DIR,
+            "Initializing Baku project"
         );
         copy_dir(Path::new(BAKU_TEMPLATE_DIR), Path::new(BAKU_PROJECT_DIR))
             .map_err(|error| AnthropicError::with_source("failed to copy Baku template", error))?;
@@ -922,10 +790,7 @@ impl AnthropicEnvironmentType {
             .start_dev_server(cancellation, Path::new(BAKU_PROJECT_DIR))
             .await
         {
-            self.logger.warn(
-                "Failed to start dev server (non-fatal)",
-                attributes([("error", json!(error.to_string()))]),
-            );
+            tracing::warn!(error = %error, "Failed to start dev server (non-fatal)");
         }
         Ok(BAKU_PROJECT_DIR.to_owned())
     }
@@ -964,10 +829,7 @@ impl AnthropicEnvironmentType {
             0o600,
         )
         .map_err(|error| AnthropicError::with_source("write .env.local", error))?;
-        self.logger.info(
-            "supabase_env_files_written",
-            attributes([("project_ref", json!(auth.get_supabase_project_ref()))]),
-        );
+        tracing::info!(project_ref = %auth.get_supabase_project_ref(), "supabase_env_files_written");
         Ok(())
     }
 
@@ -1009,10 +871,7 @@ impl AnthropicEnvironmentType {
                 ));
             }
         }
-        self.logger.info(
-            "Git repository initialized",
-            attributes([("project_dir", json!(directory))]),
-        );
+        tracing::info!(project_dir = %directory.display(), "Git repository initialized");
         Ok(())
     }
 
@@ -1023,10 +882,7 @@ impl AnthropicEnvironmentType {
         directory: impl AsRef<Path>,
     ) -> Result<(), AnthropicError> {
         if self.is_supervisord_running().await {
-            self.logger.info(
-                "supervisord already running, skipping start",
-                LogAttributes::new(),
-            );
+            tracing::info!("supervisord already running, skipping start");
             return Ok(());
         }
         let mut command = Command::new("supervisord");
@@ -1040,11 +896,7 @@ impl AnthropicEnvironmentType {
             .map_err(|error| AnthropicError::with_source("failed to start supervisord", error))?;
         let pid = child.id().unwrap_or_default();
         let directory = directory.as_ref().to_path_buf();
-        self.logger.info(
-            "supervisord started for dev server",
-            attributes([("project_dir", json!(directory)), ("pid", json!(pid))]),
-        );
-        let logger = self.logger.clone();
+        tracing::info!(project_dir = %directory.display(), pid, "supervisord started for dev server");
         tokio::spawn(async move {
             let error = match child.wait().await {
                 Ok(status) if status.success() => None,
@@ -1052,11 +904,7 @@ impl AnthropicEnvironmentType {
                 Err(error) => Some(error.to_string()),
             };
             if let Some(error) = error {
-                logger.log(
-                    LogLevel::Warn,
-                    "supervisord exited with error",
-                    attributes([("project_dir", json!(directory)), ("error", json!(error))]),
-                );
+                tracing::warn!(project_dir = %directory.display(), error = %error, "supervisord exited with error");
             }
         });
         Ok(())
@@ -1177,14 +1025,6 @@ fn tail_to_string(output: &Mutex<Vec<u8>>) -> String {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     String::from_utf8_lossy(&output).into_owned()
-}
-
-/// 生成稳定排序的结构化日志属性。
-fn attributes<const N: usize>(pairs: [(&str, Value); N]) -> LogAttributes {
-    pairs
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }
 
 /// 返回 Go `os.UserHomeDir` 在 Linux 上读取的 `$HOME`。

@@ -15,46 +15,7 @@ use std::{
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::{
-    LogAttributes, LogHandler, LogHandlerError, LogLevel, LogRecord, Logger,
-};
-
 use super::{PeriodicInvoker, PeriodicInvokerError, RetryConfig, RetryError, retry_operation};
-
-/// 对应 Go：`periodic_retry_test.go` 中的 `utilTestLogger`。
-///
-/// 不写任何输出的测试 handler。
-struct DiscardHandler;
-
-impl LogHandler for DiscardHandler {
-    fn enabled(&self, _level: LogLevel) -> bool {
-        false
-    }
-
-    fn handle(&self, _record: &LogRecord) -> Result<(), LogHandlerError> {
-        Ok(())
-    }
-
-    fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        Arc::new(Self)
-    }
-
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(Self)
-    }
-}
-
-/// 对应 Go `utilTestLogger`，保留显式 logger 参数但丢弃测试日志。
-fn util_test_logger() -> Logger {
-    Logger::new(Arc::new(DiscardHandler))
-}
-
-/// 构造与 Go 重试测试相同的固定 `operation=test` 日志属性。
-fn retry_test_attributes() -> LogAttributes {
-    [("operation".to_owned(), serde_json::json!("test"))]
-        .into_iter()
-        .collect()
-}
 
 /// 等待异步计数达到目标；一秒未完成即视为后台任务时序错误。
 async fn wait_until(calls: &AtomicUsize, target: usize) {
@@ -69,13 +30,11 @@ async fn wait_until(calls: &AtomicUsize, target: usize) {
 
 /// 对应 Go：`periodic_retry_test.go` 中的 `TestPeriodicInvokerValidationPanics`。
 ///
-/// Rust 版本不接受可空 logger/函数，并将唯一可由运行时输入触发的零间隔错误改为
+/// Rust 版本将唯一可由运行时输入触发的零间隔错误改为
 /// `Result`；这里验证错误文本仍与 Go panic 文本逐字一致。
 #[test]
 fn test_periodic_invoker_validation_panics() {
-    let error = match PeriodicInvoker::new(util_test_logger(), Duration::ZERO, || async {
-        Ok::<_, io::Error>(())
-    }) {
+    let error = match PeriodicInvoker::new(Duration::ZERO, || async { Ok::<_, io::Error>(()) }) {
         Err(error) => error,
         Ok(_) => panic!("零间隔必须被拒绝"),
     };
@@ -89,7 +48,7 @@ fn test_periodic_invoker_validation_panics() {
 async fn test_periodic_invoker_start_stop_and_double_start() {
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&calls);
-    let invoker = PeriodicInvoker::new(util_test_logger(), Duration::from_millis(1), move || {
+    let invoker = PeriodicInvoker::new(Duration::from_millis(1), move || {
         let calls = Arc::clone(&observed);
         async move {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -119,7 +78,7 @@ async fn test_periodic_invoker_start_stop_and_double_start() {
 async fn test_periodic_invoker_continues_after_function_error() {
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&calls);
-    let invoker = PeriodicInvoker::new(util_test_logger(), Duration::from_millis(1), move || {
+    let invoker = PeriodicInvoker::new(Duration::from_millis(1), move || {
         let calls = Arc::clone(&observed);
         async move {
             let call = calls.fetch_add(1, Ordering::SeqCst);
@@ -149,7 +108,7 @@ async fn periodic_invoker_stop_waits_for_in_flight_callback() {
     let callback_release = Arc::clone(&release);
     let callback_completed = Arc::clone(&completed);
     let invoker = Arc::new(
-        PeriodicInvoker::new(util_test_logger(), Duration::from_secs(60), move || {
+        PeriodicInvoker::new(Duration::from_secs(60), move || {
             let entered = Arc::clone(&callback_entered);
             let release = Arc::clone(&callback_release);
             let completed = Arc::clone(&callback_completed);
@@ -211,7 +170,6 @@ async fn test_retry_operation_succeeds_after_retry() {
             }
         },
         &RetryConfig::new(3, Duration::ZERO),
-        retry_test_attributes(),
     )
     .await
     .unwrap();
@@ -232,7 +190,6 @@ async fn test_retry_operation_stops_for_non_retriable_error() {
             async { Err::<(), _>(io::Error::other("fatal")) }
         },
         &config,
-        retry_test_attributes(),
     )
     .await
     .unwrap_err();
@@ -252,7 +209,6 @@ async fn test_retry_operation_returns_last_error_after_exhaustion() {
             async { Err::<(), _>(io::Error::other("last")) }
         },
         &RetryConfig::new(2, Duration::ZERO),
-        retry_test_attributes(),
     )
     .await
     .unwrap_err();
@@ -298,7 +254,6 @@ async fn cancellation_during_backoff_still_invokes_operation_and_classifier() {
             }
         },
         &config,
-        retry_test_attributes(),
     )
     .await
     .unwrap_err();

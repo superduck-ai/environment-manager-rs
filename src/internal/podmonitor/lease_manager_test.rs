@@ -17,10 +17,7 @@ use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
-use crate::internal::{
-    api::{ClientOptions, HttpClient},
-    logger::Logger,
-};
+use crate::internal::api::{ClientOptions, HttpClient};
 
 use super::get_default_health_file_path;
 use super::lease_manager::{
@@ -37,7 +34,6 @@ use super::types::{
 fn test_client(base_url: &str) -> HttpClient {
     HttpClient::with_options(
         base_url,
-        None,
         ClientOptions {
             timeout: Some(Duration::from_secs(2)),
             ..ClientOptions::default()
@@ -60,7 +56,6 @@ fn test_manager(
         "env-1",
         "org-1",
         test_client(base_url),
-        podmonitor_test_logger(),
         interval,
         safety_window,
         health_file_path,
@@ -676,12 +671,4 @@ async fn test_update_health_file() {
     manager.update_health_file().await.unwrap();
     let content = tokio::fs::read_to_string(health_file).await.unwrap();
     DateTime::parse_from_rfc3339(content.trim()).unwrap();
-}
-
-/// 对应 Go：`podmonitorTestLogger`。
-///
-/// Rust lease manager 以 `Option<Logger>` 表示 Go discard logger；测试返回 `None`
-/// 以保证 heartbeat 错误注入不会写入 stderr 或文件。
-fn podmonitor_test_logger() -> Option<Logger> {
-    None
 }

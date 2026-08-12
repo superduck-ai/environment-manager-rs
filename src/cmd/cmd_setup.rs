@@ -7,14 +7,12 @@ use std::path::PathBuf;
 
 use clap::builder::ValueParser;
 use clap::{Arg, ArgMatches, Command, value_parser};
-use serde_json::json;
 use tokio::process::Command as TokioCommand;
 use tokio_util::sync::CancellationToken;
 
 use super::error::CliError;
-use super::utils::{LogLevel, bool_value, flag_arg, logger_level, parse_log_level};
+use super::utils::{LogLevel, bool_value, flag_arg, parse_log_level, tracing_level};
 use crate::internal::claude::install_or_update_claude_code;
-use crate::internal::logger::{LogAttributes, Logger, create_logger};
 use crate::internal::orchestrator::new_whoami_client;
 use crate::internal::sandbox::install_sandbox_runtime as install_sandbox_runtime_package;
 use crate::internal::session::NoopActivityRecorder;
@@ -140,34 +138,22 @@ pub(super) fn load_service_key(
 /// 会中断请求；失败时保留 whoami 的状态码或解析原因，并增加 setup 层上下文。
 pub(super) async fn run_api_healthcheck(
     cancellation: &CancellationToken,
-    logger: &Logger,
     api_url: &str,
     service_key: &str,
 ) -> Result<(), String> {
-    logger.info("Running API connectivity healthcheck", LogAttributes::new());
-    let client = new_whoami_client(api_url, service_key, logger.clone());
+    tracing::info!("{}", "Running API connectivity healthcheck");
+    let client = new_whoami_client(api_url, service_key);
     let identity = client
         .get_identity(cancellation)
         .await
         .map_err(|error| format!("API connectivity healthcheck failed: {error}"))?;
-    logger.info(
-        "API connectivity verified",
-        [
-            ("environment_id".to_owned(), json!(identity.environment_id)),
-            (
-                "organization_uuid".to_owned(),
-                json!(identity.organization_uuid),
-            ),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    tracing::info!("environment_id" = ?(identity.environment_id), "organization_uuid" = ?(identity.organization_uuid), "{}", "API connectivity verified");
     Ok(())
 }
 
 /// 对应 Go：`cmd/cmd_setup.go` 中的 `runSetup`。
 ///
-/// 严格按“创建 logger → npm 预检 → 可选 API 健康检查 → Claude → SRT”的顺序执行。
+/// 严格按“初始化 tracing → npm 预检 → 可选 API 健康检查 → Claude → SRT”的顺序执行。
 /// 两个安装都跳过时不会要求 npm；没有 service key 时健康检查也只记录跳过信息。
 ///
 /// # 副作用
@@ -177,66 +163,41 @@ pub async fn run_setup(
     arguments: &SetupArgs,
     cancellation: &CancellationToken,
 ) -> Result<(), String> {
-    let logger = create_logger(logger_level(arguments.log_level));
-    logger.info(
-        "Starting setup",
-        [
-            (
-                "claude_code_version".to_owned(),
-                json!(arguments.claude_code_version),
-            ),
-            (
-                "sandbox_runtime_version".to_owned(),
-                json!(arguments.sandbox_runtime_version),
-            ),
-            (
-                "skip_claude_code".to_owned(),
-                json!(arguments.skip_claude_code),
-            ),
-            (
-                "skip_sandbox_runtime".to_owned(),
-                json!(arguments.skip_sandbox_runtime),
-            ),
-        ]
-        .into_iter()
-        .collect(),
-    );
+    crate::internal::logger::initialize(tracing_level(arguments.log_level));
+    tracing::info!("claude_code_version" = ?(arguments.claude_code_version), "sandbox_runtime_version" = ?(arguments.sandbox_runtime_version), "skip_claude_code" = ?(arguments.skip_claude_code), "skip_sandbox_runtime" = ?(arguments.skip_sandbox_runtime), "{}", "Starting setup");
 
     if !arguments.skip_claude_code || !arguments.skip_sandbox_runtime {
-        run_preflight_checks(cancellation, &logger).await?;
+        run_preflight_checks(cancellation).await?;
     }
 
     let service_key = load_service_key(arguments.service_key_file.as_deref())?;
     if service_key.is_empty() {
-        logger.info(
-            "Skipping API healthcheck (no service key provided)",
-            LogAttributes::new(),
-        );
+        tracing::info!("{}", "Skipping API healthcheck (no service key provided)");
     } else {
-        run_api_healthcheck(cancellation, &logger, &arguments.api_url, &service_key).await?;
+        run_api_healthcheck(cancellation, &arguments.api_url, &service_key).await?;
     }
 
     if arguments.skip_claude_code {
-        logger.info(
-            "Skipping Claude Code installation (--skip-claude-code)",
-            LogAttributes::new(),
+        tracing::info!(
+            "{}",
+            "Skipping Claude Code installation (--skip-claude-code)"
         );
     } else {
-        install_claude_code(cancellation, &logger, &arguments.claude_code_version).await?;
+        install_claude_code(cancellation, &arguments.claude_code_version).await?;
     }
 
     if arguments.skip_sandbox_runtime {
-        logger.info(
-            "Skipping sandbox-runtime installation (--skip-sandbox-runtime)",
-            LogAttributes::new(),
+        tracing::info!(
+            "{}",
+            "Skipping sandbox-runtime installation (--skip-sandbox-runtime)"
         );
     } else {
-        install_sandbox_runtime(cancellation, &logger, &arguments.sandbox_runtime_version).await?;
+        install_sandbox_runtime(cancellation, &arguments.sandbox_runtime_version).await?;
     }
 
-    logger.info(
-        "Setup complete. Worker image is ready for orchestrator mode.",
-        LogAttributes::new(),
+    tracing::info!(
+        "{}",
+        "Setup complete. Worker image is ready for orchestrator mode."
     );
     Ok(())
 }
@@ -245,13 +206,10 @@ pub async fn run_setup(
 ///
 /// 当前预检只有 npm，但保留单独编排函数和日志顺序，方便后续与 Go 差分时准确定位
 /// 是预检框架还是 npm 探测发生变化。
-async fn run_preflight_checks(
-    cancellation: &CancellationToken,
-    logger: &Logger,
-) -> Result<(), String> {
-    logger.info("Running pre-flight checks", LogAttributes::new());
-    check_npm_available(cancellation, logger).await?;
-    logger.info("Pre-flight checks passed", LogAttributes::new());
+async fn run_preflight_checks(cancellation: &CancellationToken) -> Result<(), String> {
+    tracing::info!("{}", "Running pre-flight checks");
+    check_npm_available(cancellation).await?;
+    tracing::info!("{}", "Pre-flight checks passed");
     Ok(())
 }
 
@@ -259,11 +217,8 @@ async fn run_preflight_checks(
 ///
 /// 通过 `PATH` 启动 `npm --version`，只在退出成功时视为可用。为兼容 Go，错误包含
 /// 多行安装提示；取消只终止 npm 这个直接子进程，不操作进程组。
-pub(super) async fn check_npm_available(
-    cancellation: &CancellationToken,
-    logger: &Logger,
-) -> Result<(), String> {
-    logger.debug("Checking npm availability", LogAttributes::new());
+pub(super) async fn check_npm_available(cancellation: &CancellationToken) -> Result<(), String> {
+    tracing::debug!("{}", "Checking npm availability");
     let mut command = TokioCommand::new("npm");
     command.arg("--version").kill_on_drop(true);
     let output = tokio::select! {
@@ -282,15 +237,7 @@ pub(super) async fn check_npm_available(
     if !output.status.success() {
         return Err(npm_preflight_error(&exit_status_text(output.status)));
     }
-    logger.debug(
-        "npm is available",
-        [(
-            "version".to_owned(),
-            json!(String::from_utf8_lossy(&output.stdout)),
-        )]
-        .into_iter()
-        .collect(),
-    );
+    tracing::debug!("version" = ?(String::from_utf8_lossy(&output.stdout)), "{}", "npm is available");
     Ok(())
 }
 
@@ -317,29 +264,17 @@ fn exit_status_text(status: std::process::ExitStatus) -> String {
 /// 安装器会根据版本决定安装或升级；这里仅增加 setup 命令的稳定错误上下文。
 async fn install_claude_code(
     cancellation: &CancellationToken,
-    logger: &Logger,
     version: &str,
 ) -> Result<(), String> {
-    logger.info(
-        "Installing Claude Code",
-        [("version".to_owned(), json!(version))]
-            .into_iter()
-            .collect(),
-    );
+    tracing::info!("version" = ?(version), "{}", "Installing Claude Code");
     let claude_path = std::env::var("CLAUDE_DEFAULT_PATH")
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "claude".to_owned());
-    install_or_update_claude_code(
-        cancellation,
-        logger,
-        &claude_path,
-        version,
-        &NoopActivityRecorder,
-    )
-    .await
-    .map_err(|error| format!("failed to install Claude Code: {error}"))?;
-    logger.info("Claude Code installation completed", LogAttributes::new());
+    install_or_update_claude_code(cancellation, &claude_path, version, &NoopActivityRecorder)
+        .await
+        .map_err(|error| format!("failed to install Claude Code: {error}"))?;
+    tracing::info!("{}", "Claude Code installation completed");
     Ok(())
 }
 
@@ -349,21 +284,12 @@ async fn install_claude_code(
 /// 文件时继续使用旧版本，`current` 则完全跳过 npm。
 pub(super) async fn install_sandbox_runtime(
     cancellation: &CancellationToken,
-    logger: &Logger,
     version: &str,
 ) -> Result<(), String> {
-    logger.info(
-        "Installing sandbox-runtime",
-        [("version".to_owned(), json!(version))]
-            .into_iter()
-            .collect(),
-    );
-    install_sandbox_runtime_package(cancellation, logger, version)
+    tracing::info!("version" = ?(version), "{}", "Installing sandbox-runtime");
+    install_sandbox_runtime_package(cancellation, version)
         .await
         .map_err(|error| format!("failed to install sandbox-runtime: {error}"))?;
-    logger.info(
-        "sandbox-runtime installation completed",
-        LogAttributes::new(),
-    );
+    tracing::info!("{}", "sandbox-runtime installation completed");
     Ok(())
 }

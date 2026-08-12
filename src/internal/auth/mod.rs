@@ -7,9 +7,7 @@ pub mod context;
 pub mod github_source_provider;
 pub mod types;
 
-pub use context::{
-    AuthError, new_auth_context_with_session_id, new_auth_context_with_session_id_and_logger,
-};
+pub use context::{AuthError, new_auth_context_with_session_id};
 pub use github_source_provider::new_github_source_auth_provider;
 pub use types::{
     AuthConfig, AuthContext, GitHubAuthType, GitHubSourceAuthProvider, Permission,

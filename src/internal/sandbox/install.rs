@@ -13,12 +13,9 @@ use std::{
 use std::os::unix::{ffi::OsStrExt as _, fs::PermissionsExt, process::ExitStatusExt as _};
 
 use nix::{fcntl::OFlag, unistd::pipe2};
-use serde_json::json;
 use thiserror::Error;
 use tokio::{io::AsyncReadExt as _, process::Command};
 use tokio_util::sync::CancellationToken;
-
-use crate::internal::logger::{LogAttributes, Logger};
 
 const PACKAGE_NAME: &str = "@anthropic-ai/sandbox-runtime";
 
@@ -62,7 +59,6 @@ struct CombinedCommandError {
 ///
 /// # 参数
 /// - `cancellation`：与 Go `context.Context` 对应；取消只终止 npm 的直接子进程。
-/// - `logger`：调用方提供的业务 logger；Go 实现会无条件解引用，所以这里同样必填。
 /// - `target_version`：npm 版本或 tag；空字符串解释为 `latest`。
 ///
 /// # 返回
@@ -70,10 +66,9 @@ struct CombinedCommandError {
 /// npm 合并输出或 `exec.LookPath` 文本的错误。
 ///
 /// # 副作用
-/// 查询 PATH、执行 `npm install -g`，并按 Go 的消息、级别和属性顺序写日志。
+/// 查询 PATH、执行 `npm install -g`，并写入结构化 tracing 事件。
 pub async fn install_sandbox_runtime(
     cancellation: &CancellationToken,
-    logger: &Logger,
     target_version: &str,
 ) -> Result<(), SandboxInstallError> {
     let target_version = if target_version.is_empty() {
@@ -82,9 +77,9 @@ pub async fn install_sandbox_runtime(
         target_version
     };
     if target_version == "current" {
-        logger.debug(
-            "Skipping sandbox-runtime installation (version=current)",
-            LogAttributes::new(),
+        tracing::debug!(
+            "{}",
+            "Skipping sandbox-runtime installation (version=current)"
         );
         return Ok(());
     }
@@ -95,85 +90,50 @@ pub async fn install_sandbox_runtime(
         .unwrap_or_else(|| "srt".to_owned());
     let existing = find_executable(&srt_binary);
     if let Some(path) = &existing {
-        logger.debug(
-            "Found existing sandbox-runtime installation",
-            log_attributes([("path", json!(path.to_string_lossy()))]),
-        );
+        tracing::debug!("path" = ?(path.to_string_lossy()), "{}", "Found existing sandbox-runtime installation");
     } else {
-        logger.debug(
-            "No existing sandbox-runtime installation found",
-            LogAttributes::new(),
-        );
+        tracing::debug!("{}", "No existing sandbox-runtime installation found");
     }
 
     let install_target = format!("{PACKAGE_NAME}@{target_version}");
-    logger.info(
-        "Installing sandbox-runtime via npm",
-        log_attributes([
-            ("package", json!(PACKAGE_NAME)),
-            ("version", json!(target_version)),
-        ]),
-    );
+    tracing::info!("package" = ?(PACKAGE_NAME), "version" = ?(target_version), "{}", "Installing sandbox-runtime via npm");
     let install_arguments = [
         OsStr::new("install"),
         OsStr::new("-g"),
         OsStr::new(&install_target),
     ];
-    let combined_output =
-        match run_combined_command(cancellation, OsStr::new("npm"), &install_arguments).await {
-            Ok(output) => output,
-            Err(failure) if existing.is_some() => {
-                logger.warn(
-                    "sandbox-runtime upgrade failed, continuing with existing installation",
-                    log_attributes([
-                        ("error", json!(failure.error)),
-                        ("output", json!(String::from_utf8_lossy(&failure.output))),
-                    ]),
-                );
-                return Ok(());
-            }
-            Err(failure) => {
-                return Err(SandboxInstallError::NpmFailed {
-                    error: failure.error,
-                    output: String::from_utf8_lossy(&failure.output).into_owned(),
-                });
-            }
-        };
-    logger.debug(
-        "npm install completed",
-        log_attributes([("output", json!(String::from_utf8_lossy(&combined_output)))]),
-    );
+    let combined_output = match run_combined_command(
+        cancellation,
+        OsStr::new("npm"),
+        &install_arguments,
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(failure) if existing.is_some() => {
+            tracing::warn!("error" = ?(failure.error), "output" = ?(String::from_utf8_lossy(&failure.output)), "{}", "sandbox-runtime upgrade failed, continuing with existing installation");
+            return Ok(());
+        }
+        Err(failure) => {
+            return Err(SandboxInstallError::NpmFailed {
+                error: failure.error,
+                output: String::from_utf8_lossy(&failure.output).into_owned(),
+            });
+        }
+    };
+    tracing::debug!("output" = ?(String::from_utf8_lossy(&combined_output)), "{}", "npm install completed");
 
     match find_executable(&srt_binary) {
         Some(path) => {
-            logger.info(
-                "sandbox-runtime installation completed",
-                log_attributes([
-                    ("version", json!(target_version)),
-                    ("path", json!(path.to_string_lossy())),
-                ]),
-            );
+            tracing::info!("version" = ?(target_version), "path" = ?(path.to_string_lossy()), "{}", "sandbox-runtime installation completed");
             Ok(())
         }
         None if existing.is_some() => {
-            logger.warn(
-                "srt not found after install, using existing installation",
-                log_attributes([("error", json!(look_path_not_found_error(&srt_binary)))]),
-            );
+            tracing::warn!("error" = ?(look_path_not_found_error(&srt_binary)), "{}", "srt not found after install, using existing installation");
             Ok(())
         }
         None => Err(SandboxInstallError::BinaryNotFound { binary: srt_binary }),
     }
-}
-
-/// 创建保持传入顺序的日志属性，避免 Go `slog` JSON 字段顺序在 Rust 中漂移。
-fn log_attributes(
-    entries: impl IntoIterator<Item = (impl Into<String>, serde_json::Value)>,
-) -> LogAttributes {
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.into(), value))
-        .collect()
 }
 
 /// 为安装后的第二次 PATH 查询生成 Go `exec.LookPath` 的缺失错误文本。
@@ -363,13 +323,9 @@ mod tests {
     /// 验证 `current` 不触碰 npm 或 PATH 即成功返回。
     #[tokio::test]
     async fn current_version_skips_installation() {
-        install_sandbox_runtime(
-            &CancellationToken::new(),
-            crate::internal::logger::default_logger(),
-            "current",
-        )
-        .await
-        .unwrap();
+        install_sandbox_runtime(&CancellationToken::new(), "current")
+            .await
+            .unwrap();
     }
 
     /// 验证 stdout/stderr 使用共享 pipe，不人为插入换行。

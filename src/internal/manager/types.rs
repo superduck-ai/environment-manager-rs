@@ -1,6 +1,6 @@
 //! Manager 生命周期编排所需的类型与窄适配边界。
 //!
-//! 这些声明对应 Go `internal/manager/zz_recovered_types.go`。Rust 版本把同步
+//! Manager 的配置、错误和运行时依赖类型。Rust 版本把同步
 //! function/interface 改为可共享闭包和 async trait；API 附加上下文、o11y 诊断及
 //! environment lease 的动态能力通过局部 adapter 暴露，避免 manager 反向依赖具体实现。
 
@@ -22,7 +22,6 @@ use crate::internal::{
     claude::{Executor, Outcomes},
     config::{ClaudeConfig, Session, SessionMode, StartupContext},
     envtype::{EnvTypes, EnvironmentType, LeaseManagerHandle},
-    logger::Logger,
     mcp::{MCPServer, MCPServerRegistration},
     session::{ActivityRecorder, EventPoster},
     util::BoxError,
@@ -195,7 +194,6 @@ impl ManagerApiClient for ManagerApiClientAdapter {
 /// 借用 manager。Lease 采用最小 handle，因为具体 podmonitor 类型属于 envtype adapter。
 pub type ClaudeExecutorFactory = Arc<
     dyn Fn(
-            Logger,
             ClaudeConfig,
             String,
             Option<StartupContext>,
@@ -324,7 +322,6 @@ pub trait ManagerObservability: Send + Sync {
 #[derive(Clone)]
 pub struct Manager {
     pub(super) api_client: Arc<dyn ManagerApiClient>,
-    pub(super) logger: Logger,
     pub(super) session_config: Option<Session>,
     pub(super) env_types: Arc<EnvTypes>,
     pub(super) executor_factory: ClaudeExecutorFactory,

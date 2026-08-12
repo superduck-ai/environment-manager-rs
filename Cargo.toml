@@ -41,7 +41,7 @@ rmcp = { version = "1.8.0", default-features = false }
 rustix = { version = "1.1.2", features = ["fs", "process", "stdio", "system", "thread"] }
 secrecy = { version = "0.10.3", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.145", features = ["preserve_order"] }
+serde_json = "1.0.145"
 sha1 = "0.10.6"
 tar = "0.4.44"
 tempfile = "3.23.0"

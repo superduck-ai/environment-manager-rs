@@ -18,7 +18,9 @@ mod ws_handler_test;
 
 pub(crate) use client::connect_websocket_with_config;
 pub use client::{add_jitter, new_client, with_action_registry};
-pub use handler::{HTTP_TUNNEL_CHUNK_SIZE, new_handler, new_handler_with_timing_for_probe};
+#[cfg(test)]
+pub(crate) use handler::new_handler_with_timing_for_test;
+pub use handler::{HTTP_TUNNEL_CHUNK_SIZE, new_handler};
 pub use helpers::{
     apply_tunnel_headers, apply_websocket_tunnel_headers, flatten_http_headers, marshal_protojson,
 };

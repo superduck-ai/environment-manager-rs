@@ -18,9 +18,6 @@ use tokio_util::sync::CancellationToken;
 use crate::internal::{
     api::{LogCategory, LogLevel, SessionError},
     config::ClaudeConfig,
-    logger::{
-        LogAttributes, LogHandler, LogHandlerError, LogLevel as LoggerLevel, LogRecord, Logger,
-    },
     session::{ActivityRecorder, ActivityRecorderError},
     util::Stopper,
 };
@@ -31,73 +28,6 @@ use super::{
     install_or_update_claude_code, run_init,
     types::run_combined_command,
 };
-
-/// 丢弃全部日志的 handler。
-#[derive(Clone, Default)]
-struct DiscardHandler;
-
-impl LogHandler for DiscardHandler {
-    /// 测试中允许 logger 构造记录。
-    fn enabled(&self, _level: LoggerLevel) -> bool {
-        true
-    }
-
-    /// 丢弃记录并成功返回。
-    fn handle(&self, _record: &LogRecord) -> Result<(), LogHandlerError> {
-        Ok(())
-    }
-
-    /// 派生 handler 仍丢弃属性与记录。
-    fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-
-    /// 派生 group handler 仍丢弃记录。
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-}
-
-/// 返回无输出 logger。
-fn logger() -> Logger {
-    Logger::new(Arc::new(DiscardHandler))
-}
-
-/// 保存 outcome 验证日志的 handler，用于同时断言消息、级别和有序属性。
-#[derive(Clone, Default)]
-struct RecordingOutcomeHandler {
-    records: Arc<Mutex<Vec<LogRecord>>>,
-}
-
-impl LogHandler for RecordingOutcomeHandler {
-    /// DEBUG 与 WARN 都必须进入记录槽，否则会漏掉空分支兼容日志。
-    fn enabled(&self, _level: LoggerLevel) -> bool {
-        true
-    }
-
-    /// 克隆完整记录；测试随后需要检查属性插入顺序。
-    fn handle(&self, record: &LogRecord) -> Result<(), LogHandlerError> {
-        self.records.lock().unwrap().push(record.clone());
-        Ok(())
-    }
-
-    /// outcome logger 不派生固定属性；仍返回共享记录槽以满足 handler 契约。
-    fn with_attrs(&self, _attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-
-    /// outcome logger 不使用 group；派生 handler 继续写入同一记录槽。
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-}
-
-/// 创建 outcome 专用收集 logger，并返回可在调用后读取的共享记录槽。
-fn recording_outcome_logger() -> (Logger, Arc<Mutex<Vec<LogRecord>>>) {
-    let handler = RecordingOutcomeHandler::default();
-    let records = Arc::clone(&handler.records);
-    (Logger::new(Arc::new(handler)), records)
-}
 
 /// 一条测试活动记录。
 #[derive(Clone, Debug)]
@@ -266,10 +196,10 @@ async fn test_get_installed_version() {
 /// 生产 helper 是 `install` 子模块私有函数；测试通过完整公共安装流程观察 fake npm
 /// 收到的 argv，同时让 fake Claude 提供安装后版本，因而覆盖真实调用而非复制算法。
 #[tokio::test]
-async fn test_install_via_npm_uses_recovered_package_target() {
+async fn test_install_via_npm_uses_package_target() {
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::test_install_via_npm_uses_recovered_package_target"
+        "::test_install_via_npm_uses_package_target"
     )) {
         return;
     }
@@ -311,7 +241,6 @@ async fn test_install_via_npm_uses_recovered_package_target() {
         let _ = fs::remove_file(&state);
         let installed = install_or_update_claude_code(
             &CancellationToken::new(),
-            &logger(),
             claude.to_str().unwrap(),
             target,
             &recorder,
@@ -346,7 +275,6 @@ async fn test_upgrade_via_cli() {
 
     let installed = install_or_update_claude_code(
         &CancellationToken::new(),
-        &logger(),
         claude.to_str().unwrap(),
         "stable",
         &RecordingActivityRecorder::default(),
@@ -366,26 +294,15 @@ async fn test_install_or_update_claude_code_skip_current_and_already_installed()
     let recorder = RecordingActivityRecorder::default();
     let cancellation = CancellationToken::new();
     assert_eq!(
-        install_or_update_claude_code(
-            &cancellation,
-            &logger(),
-            "/missing/claude",
-            "skip",
-            &recorder,
-        )
-        .await
-        .unwrap(),
+        install_or_update_claude_code(&cancellation, "/missing/claude", "skip", &recorder)
+            .await
+            .unwrap(),
         ""
     );
-    let error = install_or_update_claude_code(
-        &cancellation,
-        &logger(),
-        "/missing/claude",
-        "current",
-        &recorder,
-    )
-    .await
-    .unwrap_err();
+    let error =
+        install_or_update_claude_code(&cancellation, "/missing/claude", "current", &recorder)
+            .await
+            .unwrap_err();
     assert!(error.to_string().contains("version=current"));
     {
         let activities = recorder.activities.lock().unwrap();
@@ -404,10 +321,9 @@ async fn test_install_or_update_claude_code_skip_current_and_already_installed()
         assert_eq!(
             install_or_update_claude_code(
                 &cancellation,
-                &logger(),
                 claude.to_str().unwrap(),
                 target,
-                &recorder,
+                &recorder
             )
             .await
             .unwrap(),
@@ -448,7 +364,6 @@ async fn test_install_or_update_claude_code_installs_via_npm_and_verifies() {
     let recorder = RecordingActivityRecorder::default();
     let installed = install_or_update_claude_code(
         &CancellationToken::new(),
-        &logger(),
         claude.to_str().unwrap(),
         "1.2.3",
         &recorder,
@@ -483,10 +398,9 @@ async fn test_install_or_update_claude_code_upgrades_via_cli_and_falls_back_on_f
     assert_eq!(
         install_or_update_claude_code(
             &CancellationToken::new(),
-            &logger(),
             claude.to_str().unwrap(),
             "latest",
-            &recorder,
+            &recorder
         )
         .await
         .unwrap(),
@@ -505,10 +419,9 @@ async fn test_install_or_update_claude_code_upgrades_via_cli_and_falls_back_on_f
     assert_eq!(
         install_or_update_claude_code(
             &CancellationToken::new(),
-            &logger(),
             failing.to_str().unwrap(),
             "latest",
-            &recorder,
+            &recorder
         )
         .await
         .unwrap(),
@@ -539,7 +452,6 @@ async fn test_handle_install_error() {
     let nonfatal_recorder = RecordingActivityRecorder::default();
     let installed = install_or_update_claude_code(
         &CancellationToken::new(),
-        &logger(),
         failing_claude.to_str().unwrap(),
         "latest",
         &nonfatal_recorder,
@@ -569,7 +481,6 @@ async fn test_handle_install_error() {
     let fatal_recorder = RecordingActivityRecorder::default();
     let error = install_or_update_claude_code(
         &CancellationToken::new(),
-        &logger(),
         "/missing/claude",
         "latest",
         &fatal_recorder,
@@ -611,7 +522,6 @@ async fn npm_install_error_preserves_raw_combined_output_bytes() {
     let recorder = RecordingActivityRecorder::default();
     let error = install_or_update_claude_code(
         &CancellationToken::new(),
-        &logger(),
         "/missing/claude",
         "latest",
         &recorder,
@@ -650,7 +560,6 @@ async fn npm_spawn_error_preserves_non_utf8_resolved_path_bytes() {
     let recorder = RecordingActivityRecorder::default();
     let error = install_or_update_claude_code(
         &CancellationToken::new(),
-        &logger(),
         "/missing/claude",
         "latest",
         &recorder,
@@ -680,7 +589,6 @@ async fn npm_missing_from_path_uses_go_look_path_error() {
     let recorder = RecordingActivityRecorder::default();
     let error = install_or_update_claude_code(
         &CancellationToken::new(),
-        &logger(),
         "/missing/claude",
         "latest",
         &recorder,
@@ -780,14 +688,9 @@ async fn init_hook_runs_with_filtered_environment_and_reports_exit_code() {
     ]
     .into_iter()
     .collect();
-    run_init(
-        &CancellationToken::new(),
-        &logger(),
-        Some(&cfg),
-        temp.path(),
-    )
-    .await
-    .unwrap();
+    run_init(&CancellationToken::new(), Some(&cfg), temp.path())
+        .await
+        .unwrap();
     assert_eq!(
         fs::read_to_string(capture).unwrap(),
         "--init-only|configured|unset"
@@ -795,14 +698,9 @@ async fn init_hook_runs_with_filtered_environment_and_reports_exit_code() {
 
     let failing = write_script(&temp, "claude-fail", "#!/bin/sh\nexit 7\n");
     cfg.claude_path = failing.to_string_lossy().into_owned();
-    let error = run_init(
-        &CancellationToken::new(),
-        &logger(),
-        Some(&cfg),
-        temp.path(),
-    )
-    .await
-    .unwrap_err();
+    let error = run_init(&CancellationToken::new(), Some(&cfg), temp.path())
+        .await
+        .unwrap_err();
     assert_eq!(
         error.to_string(),
         "claude --init-only failed with exit code 7: exit status 7"
@@ -826,67 +724,4 @@ fn test_outcomes_helpers() {
     let mut copied = outcomes.as_map().unwrap();
     copied.get_mut("anthropic/demo").unwrap()[0] = "mutated".to_owned();
     assert_eq!(outcomes.get_first("anthropic/demo"), "main");
-}
-
-/// 验证空 branch 保留、多 branch 截断到第一项、单 branch 不变。
-#[test]
-fn test_outcomes_validate() {
-    let mut outcomes = Outcomes::new();
-    outcomes.add("empty/repo", Vec::new());
-    outcomes.add("multi/repo", vec!["one".to_owned(), "two".to_owned()]);
-    outcomes.add("single/repo", vec!["only".to_owned()]);
-    let (outcome_logger, records) = recording_outcome_logger();
-    let validated = outcomes.validate_with_logger(&outcome_logger);
-    assert!(validated.get("empty/repo").is_none());
-    assert_eq!(
-        validated.get("multi/repo"),
-        Some(["one".to_owned()].as_slice())
-    );
-    assert_eq!(
-        validated.get("single/repo"),
-        Some(["only".to_owned()].as_slice())
-    );
-
-    // HashMap 遍历顺序不稳定，因此按消息定位记录；各记录内部的属性顺序仍须与
-    // Go `slog.Logger` 调用参数完全一致。
-    let records = records.lock().unwrap();
-    assert_eq!(records.len(), 2);
-    let empty = records
-        .iter()
-        .find(|record| {
-            record.message == "Repository has no branches specified, preserving empty list"
-        })
-        .unwrap();
-    assert_eq!(empty.level, LoggerLevel::Debug);
-    assert_eq!(
-        empty
-            .attributes
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["repository"]
-    );
-    assert_eq!(empty.attributes["repository"], "empty/repo");
-
-    let multiple = records
-        .iter()
-        .find(|record| {
-            record.message == "Repository has multiple branches, using only the first one"
-        })
-        .unwrap();
-    assert_eq!(multiple.level, LoggerLevel::Warn);
-    assert_eq!(
-        multiple
-            .attributes
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>(),
-        ["repository", "branch_used", "branches_ignored"]
-    );
-    assert_eq!(multiple.attributes["repository"], "multi/repo");
-    assert_eq!(multiple.attributes["branch_used"], "one");
-    assert_eq!(
-        multiple.attributes["branches_ignored"],
-        serde_json::json!(["two"])
-    );
 }

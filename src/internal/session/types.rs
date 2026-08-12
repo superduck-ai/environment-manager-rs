@@ -1,6 +1,6 @@
 //! session 活动记录器的数据类型与接口。
 //!
-//! 类型源自 Go 的 `zz_recovered_types.go`。Go 的同步 `EventPoster` 在调用点
+//! 会话事件与活动记录器的公共类型。同步 `EventPoster` 在调用点
 //! 实际执行网络 I/O，因此 Rust 接口使用 async trait，避免阻塞 Tokio worker。
 
 use std::collections::BTreeMap;
@@ -15,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 use crate::internal::api::{
     ApiError, LogCategory, LogLevel, SessionBackend, SessionError, SessionEvent,
 };
-use crate::internal::logger::Logger;
 use crate::internal::util::Stopper;
 
 /// 负责把单个 session event 发送到后端的最小异步接口。
@@ -111,7 +110,6 @@ pub struct NoopActivityRecorder;
 pub struct SessionActivityRecorder {
     pub(crate) cancellation: CancellationToken,
     pub(crate) poster: Arc<dyn EventPoster>,
-    pub(crate) logger: Logger,
     pub(crate) interval: Duration,
     pub(crate) max_duration: Duration,
 }

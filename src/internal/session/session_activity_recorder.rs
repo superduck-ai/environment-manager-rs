@@ -16,7 +16,6 @@ use crate::internal::api::{
     LogCategory, LogLevel, SessionError, new_env_manager_log_event, new_env_manager_log_event_data,
     new_result_event, new_synthetic_assistant_message,
 };
-use crate::internal::logger::{LogAttributes, Logger};
 use crate::internal::util::{PeriodicInvoker, Stopper};
 
 use super::{
@@ -33,7 +32,6 @@ const FAILURE_RESULT_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn new_activity_recorder(
     cancellation: CancellationToken,
     poster: Arc<dyn EventPoster>,
-    logger: Logger,
     options: Option<RecorderOptions>,
 ) -> SessionActivityRecorder {
     let options = options.unwrap_or_default();
@@ -51,7 +49,6 @@ pub fn new_activity_recorder(
     SessionActivityRecorder {
         cancellation,
         poster,
-        logger,
         interval,
         max_duration,
     }
@@ -86,8 +83,6 @@ impl SessionActivityRecorder {
         ));
         let poster = Arc::clone(&self.poster);
         let cancellation = self.cancellation.clone();
-        let logger = self.logger.clone();
-
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             // 正常入口始终位于 Tokio runtime。这里没有对应的 Go 日志调用点，
             // 因此不能为 Rust 结构性误用额外制造一条外部可见日志。
@@ -95,7 +90,7 @@ impl SessionActivityRecorder {
         };
         runtime.spawn(async move {
             if let Err(error) = poster.post_event(&cancellation, &event).await {
-                logger.error("Failed to post log event", error_attributes(&error));
+                tracing::error!(error = %error, "Failed to post log event");
             }
         });
     }
@@ -107,8 +102,6 @@ impl SessionActivityRecorder {
     ) -> Result<(), ActivityRecorderError> {
         let user_message = session_error.get_user_message();
         let poster = Arc::clone(&self.poster);
-        let logger = self.logger.clone();
-
         // 新 token 不继承父 token 的已取消状态，对应 Go 的 context.WithoutCancel。
         let detached_cancellation = CancellationToken::new();
         let operation = async {
@@ -117,10 +110,7 @@ impl SessionActivityRecorder {
                 .post_event(&detached_cancellation, &assistant_event)
                 .await
                 .map_err(|error| {
-                    logger.error(
-                        "Failed to post synthetic assistant event",
-                        error_attributes(&error),
-                    );
+                    tracing::error!(error = %error, "Failed to post synthetic assistant event");
                     ActivityRecorderError::SyntheticAssistant(error)
                 })?;
 
@@ -131,7 +121,7 @@ impl SessionActivityRecorder {
                 .post_event(&detached_cancellation, &result_event)
                 .await
                 .map_err(|error| {
-                    logger.error("Failed to post result event", error_attributes(&error));
+                    tracing::error!(error = %error, "Failed to post result event");
                     ActivityRecorderError::ResultEvent(error)
                 })
         };
@@ -156,16 +146,13 @@ impl SessionActivityRecorder {
         let callback_category = category.clone();
         let callback_message = Arc::clone(&message);
         let callback_state = Arc::clone(&state);
-        let callback_logger = self.logger.clone();
-
         let invoker = Arc::new(
-            PeriodicInvoker::new(self.logger.clone(), self.interval, move || {
+            PeriodicInvoker::new(self.interval, move || {
                 let poster = Arc::clone(&callback_poster);
                 let cancellation = callback_cancellation.clone();
                 let category = callback_category.clone();
                 let message = Arc::clone(&callback_message);
                 let state = Arc::clone(&callback_state);
-                let logger = callback_logger.clone();
                 async move {
                     // 在任何 await 之前推进状态，防止慢请求使后续调用重复首条文案。
                     let content = state.next_content(message.as_str());
@@ -176,7 +163,7 @@ impl SessionActivityRecorder {
                         None,
                     ));
                     if let Err(error) = poster.post_event(&cancellation, &event).await {
-                        logger.error("Failed to post event", error_attributes(&error));
+                        tracing::error!(error = %error, "Failed to post event");
                         return Err(std::io::Error::other(format!(
                             "failed to post event: {error}"
                         )));
@@ -197,7 +184,6 @@ impl SessionActivityRecorder {
         let timer_poster = Arc::clone(&self.poster);
         let timer_cancellation = self.cancellation.clone();
         let max_duration = self.max_duration;
-        let timer_logger = self.logger.clone();
         tokio::spawn(async move {
             tokio::time::sleep(max_duration).await;
 
@@ -220,21 +206,10 @@ impl SessionActivityRecorder {
             ));
             // Go 明确忽略最后一次发送错误；无论后端结果如何都必须停止周期任务。
             let _ = timer_poster.post_event(&timer_cancellation, &event).await;
-            timer_logger.warn(
-                format!(
-                    "Automatically stopping logging long-running activity after {elapsed_minutes} minutes"
-                ),
-                [
-                    (
-                        "category".to_owned(),
-                        serde_json::to_value(&category)
-                            .expect("LogCategory always serializes as a string"),
-                    ),
-                    ("content".to_owned(), serde_json::json!(content)),
-                ]
-                .into_iter()
-                .collect(),
-            );
+            tracing::warn!("category" = ?(serde_json::to_value(&category)
+                        .expect("LogCategory always serializes as a string")), "content" = ?(content), "{}", format!(
+                "Automatically stopping logging long-running activity after {elapsed_minutes} minutes"
+            ));
             // Go `Stop` 会等待 invoker goroutine 完全退出；定时器任务本身可以异步
             // 等待，因此这里不能只发送 cancellation 后提前结束。
             timer_invoker.stop().await;
@@ -242,13 +217,6 @@ impl SessionActivityRecorder {
 
         invoker
     }
-}
-
-/// 构造 Go session logger 使用的单一 `error` 属性。
-fn error_attributes(error: &impl std::fmt::Display) -> LogAttributes {
-    [("error".to_owned(), serde_json::json!(error.to_string()))]
-        .into_iter()
-        .collect()
 }
 
 #[async_trait]

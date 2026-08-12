@@ -12,14 +12,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use clap::builder::ValueParser;
 use clap::{Arg, ArgMatches, Command, value_parser};
-use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::error::CliError;
 use super::utils::{
-    LogLevel, bool_value, flag_arg, logger_level, parse_go_duration, parse_log_level,
+    LogLevel, bool_value, flag_arg, parse_go_duration, parse_log_level, tracing_level,
 };
-use crate::internal::logger::{LogAttributes, Logger, create_logger};
 use crate::internal::orchestrator::{
     CommandOutcome, Hook, OrchestratorConfig, OrchestratorError, OrchestratorResult,
     PollerInterface, SandboxAdapter, SandboxRequest, log_command_wrapped_with_sandbox,
@@ -27,7 +25,7 @@ use crate::internal::orchestrator::{
     new_whoami_client,
 };
 use crate::internal::sandbox::{install_sandbox_runtime, new_sandbox_runtime_with_config};
-use crate::internal::util::{acquire_container_lock, go_duration_nanoseconds};
+use crate::internal::util::acquire_container_lock;
 
 const LONG_ABOUT: &str = r#"The orchestrator command polls the API for session tasks and handing off work to be executed.
 
@@ -284,15 +282,11 @@ impl SandboxAdapter for SandboxRuntimeAdapter {
             .then(|| Path::new(&request.sandbox_config_path));
         let working_directory =
             (!request.working_dir.is_empty()).then(|| Path::new(&request.working_dir));
-        let mut runtime = new_sandbox_runtime_with_config(
-            &request.stdin_data,
-            Some(&request.logger),
-            custom_config,
-            working_directory,
-        )
-        .map_err(|error| OrchestratorError::message(error.to_string()))?;
+        let mut runtime =
+            new_sandbox_runtime_with_config(&request.stdin_data, custom_config, working_directory)
+                .map_err(|error| OrchestratorError::message(error.to_string()))?;
         let (command, arguments) = runtime.wrap_command(&request.command, &request.args);
-        log_command_wrapped_with_sandbox(&request.logger, &command, &arguments);
+        log_command_wrapped_with_sandbox(&command, &arguments);
         let outcome = crate::internal::orchestrator::run_command_combined_capture(
             &request.cancellation,
             &command,
@@ -302,46 +296,10 @@ impl SandboxAdapter for SandboxRuntimeAdapter {
         )
         .await;
         if let Err(error) = runtime.cleanup() {
-            log_sandbox_cleanup_failed(&request.logger, &error.to_string());
+            log_sandbox_cleanup_failed(&error.to_string());
         }
         Ok(outcome)
     }
-}
-
-/// 构造 Go `AddOrchestratorCommand.RunE` 的首条结构化配置日志属性。
-///
-/// # 参数
-/// - `arguments`：已经由 CLI 层完成默认值和 Go duration 解析的 orchestrator 参数。
-///
-/// # 返回
-/// 返回交给 JSON logger 的有序属性。两个 duration 必须编码为 `slog.Duration` 使用的
-/// 纳秒整数，不能使用 Rust `Debug` 文本，否则日志采集端看到的类型和单位都会变化。
-#[must_use]
-pub(super) fn orchestrator_configured_attributes(arguments: &OrchestratorArgs) -> LogAttributes {
-    attributes([
-        ("api_url", json!(arguments.api_url)),
-        (
-            "organization_id",
-            json!(arguments.organization_id.as_deref().unwrap_or_default()),
-        ),
-        (
-            "environment_id",
-            json!(arguments.environment_id.as_deref().unwrap_or_default()),
-        ),
-        (
-            "client_id",
-            json!(arguments.client_id.as_deref().unwrap_or_default()),
-        ),
-        (
-            "poll_timeout",
-            json!(go_duration_nanoseconds(arguments.poll_timeout)),
-        ),
-        (
-            "loop_timeout",
-            json!(go_duration_nanoseconds(arguments.loop_timeout)),
-        ),
-        ("skip_container_lock", json!(arguments.skip_container_lock)),
-    ])
 }
 
 /// 对应 Go：`cmd/cmd_orchestrator.go` 中 `AddOrchestratorCommand` 的 `RunE`。
@@ -361,21 +319,27 @@ pub async fn run_orchestrator(
     arguments: &OrchestratorArgs,
     executable: &std::ffi::OsStr,
 ) -> Result<(), String> {
-    let logger = create_logger(logger_level(arguments.log_level));
-    logger.info(
-        "orchestrator configured",
-        orchestrator_configured_attributes(arguments),
+    crate::internal::logger::initialize(tracing_level(arguments.log_level));
+    tracing::info!(
+        api_url = %arguments.api_url,
+        organization_id = arguments.organization_id.as_deref().unwrap_or_default(),
+        environment_id = arguments.environment_id.as_deref().unwrap_or_default(),
+        client_id = arguments.client_id.as_deref().unwrap_or_default(),
+        poll_timeout_ms = arguments.poll_timeout.as_millis(),
+        loop_timeout_ms = arguments.loop_timeout.as_millis(),
+        skip_container_lock = arguments.skip_container_lock,
+        "orchestrator configured"
     );
 
     let _container_lock = if arguments.skip_container_lock {
-        logger.warn(
-            "SECURITY WARNING: Container lock is disabled. Multiple sessions may run concurrently on this container, which could allow cross-session access to git proxies. Only use --skip-container-lock for development/testing.",
-            LogAttributes::new(),
+        tracing::warn!(
+            "{}",
+            "SECURITY WARNING: Container lock is disabled. Multiple sessions may run concurrently on this container, which could allow cross-session access to git proxies. Only use --skip-container-lock for development/testing."
         );
         None
     } else {
         Some(
-            acquire_container_lock(&logger)
+            acquire_container_lock()
                 .map_err(|error| format!("failed to acquire container lock: {error}"))?,
         )
     };
@@ -391,7 +355,7 @@ pub async fn run_orchestrator(
     let setup_cancellation = CancellationToken::new();
     let mut organization_id = arguments.organization_id.clone().unwrap_or_default();
     let mut environment_id = arguments.environment_id.clone().unwrap_or_default();
-    let whoami = new_whoami_client(&arguments.api_url, &service_key, logger.clone());
+    let whoami = new_whoami_client(&arguments.api_url, &service_key);
     match whoami.get_identity(&setup_cancellation).await {
         Ok(identity) => {
             if !organization_id.is_empty() && organization_id != identity.organization_uuid {
@@ -408,13 +372,7 @@ pub async fn run_orchestrator(
             }
             organization_id = identity.organization_uuid;
             environment_id = identity.environment_id;
-            logger.info(
-                "environment identity confirmed via whoami",
-                attributes([
-                    ("organization_id", json!(organization_id)),
-                    ("environment_id", json!(environment_id)),
-                ]),
-            );
+            tracing::info!("organization_id" = ?(organization_id), "environment_id" = ?(environment_id), "{}", "environment identity confirmed via whoami");
         }
         Err(error) => {
             if organization_id.is_empty() || environment_id.is_empty() {
@@ -422,32 +380,18 @@ pub async fn run_orchestrator(
                     "failed to get environment identity from whoami (provide --organization-id and --environment-id to use fallback): {error}"
                 ));
             }
-            logger.warn(
-                "whoami failed, using CLI-provided identity",
-                attributes([
-                    ("error", json!(error.to_string())),
-                    ("organization_id", json!(organization_id)),
-                    ("environment_id", json!(environment_id)),
-                ]),
-            );
+            tracing::warn!("error" = ?(error.to_string()), "organization_id" = ?(organization_id), "environment_id" = ?(environment_id), "{}", "whoami failed, using CLI-provided identity");
         }
     }
 
     let poller: Arc<dyn PollerInterface> = if let Some(poll_hook) = &arguments.poll_hook {
-        logger.info(
-            "using poll-hook for polling",
-            attributes([
-                ("poll_hook", json!(poll_hook)),
-                ("environment_id", json!(environment_id)),
-            ]),
-        );
+        tracing::info!("poll_hook" = ?(poll_hook), "environment_id" = ?(environment_id), "{}", "using poll-hook for polling");
         Arc::new(new_poll_hook(
             poll_hook,
             arguments.poll_hook_timeout,
             &organization_id,
             &environment_id,
             arguments.client_id.as_deref().unwrap_or_default(),
-            logger.clone(),
         ))
     } else {
         Arc::new(new_poller_with_worker_id(
@@ -456,7 +400,6 @@ pub async fn run_orchestrator(
             &service_key,
             arguments.client_id.as_deref().unwrap_or_default(),
             arguments.reclaim_older_than_ms,
-            logger.clone(),
         ))
     };
 
@@ -471,43 +414,23 @@ pub async fn run_orchestrator(
 
     let sandbox_enabled = arguments.sandbox_backend == SandboxBackend::SandboxRuntime;
     if arguments.sandbox_settings.is_some() && !sandbox_enabled {
-        logger.warn(
-            "--sandbox-settings provided but sandbox not enabled; settings will be ignored",
-            attributes([
-                (
-                    "sandbox_backend",
-                    json!(arguments.sandbox_backend.to_string()),
-                ),
-                (
-                    "sandbox_settings",
-                    json!(
-                        arguments
+        tracing::warn!("sandbox_backend" = ?(arguments.sandbox_backend.to_string()), "sandbox_settings" = ?(arguments
                             .sandbox_settings
                             .as_deref()
                             .map(Path::display)
                             .map(|path| path.to_string())
-                            .unwrap_or_default()
-                    ),
-                ),
-            ]),
-        );
+                            .unwrap_or_default()), "{}", "--sandbox-settings provided but sandbox not enabled; settings will be ignored");
     }
     if sandbox_enabled {
         let target_version = std::env::var("SANDBOX_RUNTIME_VERSION").unwrap_or_default();
-        install_sandbox_runtime(&setup_cancellation, &logger, &target_version)
+        install_sandbox_runtime(&setup_cancellation, &target_version)
             .await
             .map_err(|error| format!("failed to install sandbox-runtime: {error}"))?;
     }
 
     let working_directory = std::env::current_dir()
         .map_err(|error| format!("failed to get current working directory: {error}"))?;
-    logger.info(
-        "using current working directory for sandbox",
-        attributes([(
-            "working_dir",
-            json!(working_directory.display().to_string()),
-        )]),
-    );
+    tracing::info!("working_dir" = ?(working_directory.display().to_string()), "{}", "using current working directory for sandbox");
 
     let (execute_command, execute_arguments) = match &arguments.execute_hook {
         Some(command) => (command.clone(), Vec::new()),
@@ -529,24 +452,12 @@ pub async fn run_orchestrator(
                 execute_arguments.push("--skip-git-config".to_owned());
             }
             let command = executable.to_string_lossy().into_owned();
-            logger.info(
-                "no execute-hook provided, using self-invocation",
-                attributes([
-                    ("command", json!(command)),
-                    ("sandbox_enabled", json!(sandbox_enabled)),
-                ]),
-            );
+            tracing::info!("command" = ?(command), "sandbox_enabled" = ?(sandbox_enabled), "{}", "no execute-hook provided, using self-invocation");
             (command, execute_arguments)
         }
     };
     if !sandbox_enabled {
-        logger.warn(
-            "sandbox is disabled - commands will run without sandboxing",
-            attributes([(
-                "sandbox_backend",
-                json!(arguments.sandbox_backend.to_string()),
-            )]),
-        );
+        tracing::warn!("sandbox_backend" = ?(arguments.sandbox_backend.to_string()), "{}", "sandbox is disabled - commands will run without sandboxing");
     }
 
     let execute_hook = Arc::new(Hook {
@@ -572,12 +483,12 @@ pub async fn run_orchestrator(
         poll_timeout: arguments.poll_timeout,
         loop_timeout: arguments.loop_timeout,
         max_poll_failures: arguments.max_poll_failures,
-        logger: Some(logger.clone()),
+
         ..OrchestratorConfig::default()
     })
     .map_err(|error| format!("failed to create orchestrator: {error}"))?;
 
-    run_orchestrator_until_signal(&orchestrator, &logger).await
+    run_orchestrator_until_signal(&orchestrator).await
 }
 
 /// 读取 orchestrator service key；空文件与 setup 一样继续回退环境变量。
@@ -604,7 +515,6 @@ fn load_orchestrator_service_key(service_key_file: Option<&Path>) -> Result<Stri
 /// 命令为了容器编排器正常停止而采用的退出码策略一致。
 async fn run_orchestrator_until_signal(
     orchestrator: &crate::internal::orchestrator::Orchestrator,
-    logger: &Logger,
 ) -> Result<(), String> {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -618,14 +528,11 @@ async fn run_orchestrator_until_signal(
         result = &mut run => {
             return match result {
                 Ok(()) => {
-                    logger.info("orchestrator exited normally", LogAttributes::new());
+                    tracing::info!("{}", "orchestrator exited normally");
                     Ok(())
                 }
                 Err(error) => {
-                    logger.error(
-                        "orchestrator failed",
-                        attributes([("error", json!(error.to_string()))]),
-                    );
+                    tracing::error!("error" = ?(error.to_string()), "{}", "orchestrator failed");
                     Err(error.to_string())
                 }
             };
@@ -633,29 +540,14 @@ async fn run_orchestrator_until_signal(
         _ = interrupt.recv() => "interrupt",
         _ = terminate.recv() => "terminated",
     };
-    logger.info(
-        "received signal, shutting down gracefully",
-        attributes([("signal", json!(signal_name))]),
-    );
+    tracing::info!("signal" = ?(signal_name), "{}", "received signal, shutting down gracefully");
     cancellation.cancel();
     match tokio::time::timeout(Duration::from_secs(30), &mut run).await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => logger.warn(
-            "orchestrator exited with error during shutdown",
-            attributes([("error", json!(error.to_string()))]),
-        ),
-        Err(_) => logger.warn(
-            "orchestrator shutdown timed out after 30 seconds",
-            LogAttributes::new(),
-        ),
+        Ok(Err(error)) => {
+            tracing::warn!("error" = ?(error.to_string()), "{}", "orchestrator exited with error during shutdown")
+        }
+        Err(_) => tracing::warn!("{}", "orchestrator shutdown timed out after 30 seconds"),
     }
     Ok(())
-}
-
-/// 从静态键名和值构造稳定排序的 logger 属性。
-fn attributes<const N: usize>(entries: [(&str, Value); N]) -> LogAttributes {
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }

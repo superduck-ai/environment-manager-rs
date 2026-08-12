@@ -10,7 +10,7 @@ pub use super::stopper::Stopper;
 pub use super::stream::{OutputStreamer, StreamType};
 pub use super::tailer::{TailLine, Tailer};
 
-/// 对应 Go：`zz_recovered_types.go` 中的 `Line`。
+/// 按行解析的文本片段。
 ///
 /// Rust 使用更明确的 `TailLine` 名称避免与文本行等通用概念混淆；别名保持恢复
 /// 类型的对照入口以及完全相同的所有权和字段布局。

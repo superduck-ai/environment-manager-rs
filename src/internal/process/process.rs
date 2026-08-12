@@ -12,17 +12,13 @@ use std::{
 };
 
 use nix::unistd::close;
-use serde_json::{Value, json};
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{ChildStderr, ChildStdout, Command},
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::{
-    logger::{LogAttributes, Logger},
-    util::{OutputStreamer, StreamType},
-};
+use crate::internal::util::{OutputStreamer, StreamType};
 
 use super::types::{
     ProcessError, ProcessExitError, ProcessResult, go_errno_text, go_spawn_error,
@@ -42,8 +38,6 @@ const STREAM_BUFFER_SIZE: usize = 32 * 1024;
 ///
 /// # 参数
 /// - `cancellation`：上层 context 的取消令牌，只终止 direct child。
-/// - `logger`：manager 注入的具体 session logger；克隆后分别交给 stdout/stderr
-///   reader，共享同一个 tracing 接收端。
 /// - `path`：不带参数的 executable 名称或路径，允许 Unix 非 UTF-8 字节。
 /// - `streamer`：每次管道读取后同步调用的输出处理器；错误会停止对应 reader。
 ///
@@ -52,7 +46,6 @@ const STREAM_BUFFER_SIZE: usize = 32 * 1024;
 /// 退出原因写入结果。函数会等待两个 reader 和 direct child，不清理孙进程。
 pub async fn execute(
     cancellation: &CancellationToken,
-    logger: Logger,
     path: impl AsRef<Path>,
     streamer: OutputStreamer,
 ) -> Result<ProcessResult, ProcessError> {
@@ -87,12 +80,11 @@ pub async fn execute(
     let stdout = child.stdout.take().expect("stdout was configured as piped");
     let stderr = child.stderr.take().expect("stderr was configured as piped");
     let stdout_streamer = streamer.clone();
-    let stdout_logger = logger.clone();
     let stdout_task = tokio::spawn(async move {
-        stream_pipe(stdout_logger, stdout, StreamType::Stdout, stdout_streamer).await;
+        stream_pipe(stdout, StreamType::Stdout, stdout_streamer).await;
     });
     let stderr_task = tokio::spawn(async move {
-        stream_pipe(logger, stderr, StreamType::Stderr, streamer).await;
+        stream_pipe(stderr, StreamType::Stderr, streamer).await;
     });
 
     // Go `Execute` 先等待两个 `streamPipe` goroutine，再调用 `cmd.Wait`。这个顺序
@@ -222,16 +214,11 @@ impl ProcessPipe for tokio::io::DuplexStream {
 /// 阻塞；这是 Go `streamPipe` 的可观察行为，兼容迁移不能自行改成后台排空。
 ///
 /// # 参数
-/// - `logger`：与 `execute` 共享 handler 的具体 logger，所有错误使用 Go 原始大小写。
 /// - `pipe`：stdout 或 stderr 的异步 reader；函数结束前总会显式 close。
 /// - `stream_type`：写入 `stream` 属性的 `stdout`/`stderr` 稳定值。
 /// - `streamer`：接收每个最多 32 KiB chunk 的同步回调。
-pub(super) async fn stream_pipe<R>(
-    logger: Logger,
-    mut pipe: R,
-    stream_type: StreamType,
-    streamer: OutputStreamer,
-) where
+pub(super) async fn stream_pipe<R>(mut pipe: R, stream_type: StreamType, streamer: OutputStreamer)
+where
     R: ProcessPipe,
 {
     let mut buffer = vec![0_u8; STREAM_BUFFER_SIZE];
@@ -239,44 +226,23 @@ pub(super) async fn stream_pipe<R>(
         match pipe.read(&mut buffer).await {
             Ok(0) if pipe.zero_read_is_eof() => break,
             Ok(0) => {
-                logger.warn(
-                    "Unexpected zero read without error",
-                    attributes([("stream", json!(stream_type.to_string()))]),
-                );
+                tracing::warn!("stream" = ?(stream_type.to_string()), "{}", "Unexpected zero read without error");
                 break;
             }
             Ok(read) => {
                 if let Err(error) = streamer(stream_type, &buffer[..read]) {
-                    logger.error(
-                        "Streamer requested stop",
-                        attributes([
-                            ("stream", json!(stream_type.to_string())),
-                            ("error", json!(error.to_string())),
-                        ]),
-                    );
+                    tracing::error!("stream" = ?(stream_type.to_string()), "error" = ?(error.to_string()), "{}", "Streamer requested stop");
                     break;
                 }
             }
             Err(error) => {
-                logger.warn(
-                    "Error reading from pipe",
-                    attributes([
-                        ("stream", json!(stream_type.to_string())),
-                        ("error", json!(error.to_string())),
-                    ]),
-                );
+                tracing::warn!("stream" = ?(stream_type.to_string()), "error" = ?(error.to_string()), "{}", "Error reading from pipe");
                 break;
             }
         }
     }
     if let Err(error) = pipe.close() {
-        logger.warn(
-            "Failed to close pipe",
-            attributes([
-                ("stream", json!(stream_type.to_string())),
-                ("error", json!(error.to_string())),
-            ]),
-        );
+        tracing::warn!("stream" = ?(stream_type.to_string()), "error" = ?(error.to_string()), "{}", "Failed to close pipe");
     }
 }
 
@@ -287,12 +253,4 @@ fn close_owned_pipe(pipe: OwnedFd) -> io::Result<()> {
         let error = io::Error::from(error);
         io::Error::other(format!("close |0: {}", go_errno_text(&error)))
     })
-}
-
-/// 按调用顺序构造结构化日志属性。
-pub(super) fn attributes<const N: usize>(pairs: [(&str, Value); N]) -> LogAttributes {
-    pairs
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }

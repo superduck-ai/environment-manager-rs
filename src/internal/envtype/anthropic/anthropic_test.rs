@@ -32,8 +32,6 @@ use crate::internal::{
     api::{LogCategory, LogLevel, SessionError},
     auth::new_auth_context_with_session_id,
     config::{SessionMode, StartupContext},
-    logger::{LogLevel as LoggerLevel, Logger},
-    o11y::{DiscardO11yService, O11yService},
     session::{ActivityRecorder, ActivityRecorderError},
     util::Stopper,
 };
@@ -214,20 +212,15 @@ impl Drop for ProcessStateGuard {
     }
 }
 
-/// 构造带显式 discard logger、无上下文的测试环境。
+/// 构造无上下文的测试环境。
 fn environment(config: Option<Config>) -> AnthropicEnvironmentType {
     AnthropicEnvironmentType {
         config,
-        logger: test_logger(),
+
         startup_context: None,
         auth_context: None,
         session_mode: SessionMode::New,
     }
-}
-
-/// 创建无输出副作用的测试 logger，机械对应 Go fixture 的 discard slog handler。
-fn test_logger() -> Logger {
-    Logger::new(DiscardO11yService.log_handler())
 }
 
 /// 验证完整配置字段解码。
@@ -308,10 +301,8 @@ fn test_decode_config_errors() {
 fn test_new_and_accessors() {
     let mut environment = super::new(
         br#"{"environment_type":"anthropic","cwd":"/workspace/project","environment":{"FOO":"bar"}}"#,
-        test_logger(),
     )
     .unwrap();
-    assert!(environment.logger.enabled(LoggerLevel::Info));
     assert_eq!(environment.get_cwd(), "/workspace/project");
     let mut copied = environment.get_claude_environment_variables();
     copied.insert("FOO".to_owned(), "changed".to_owned());

@@ -9,7 +9,7 @@ use std::{
     },
     path::PathBuf,
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
@@ -24,7 +24,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::internal::{
     config::{ClaudeConfig, McpConfigFile, StartupContext},
-    logger::{LogAttributes, LogHandler, LogHandlerError, LogLevel, LogRecord, Logger},
     session::NoopActivityRecorder,
 };
 
@@ -35,43 +34,6 @@ use super::{
         new_claude_code_executor, tail_string, write_ccr_upstream_proxy_token,
     },
 };
-
-/// 线程安全收集 handler 收到的结构化记录。
-#[derive(Clone, Default)]
-struct RecordingSlogHandler {
-    records: Arc<Mutex<Vec<LogRecord>>>,
-    attributes: LogAttributes,
-}
-
-impl LogHandler for RecordingSlogHandler {
-    /// 测试 handler 接收全部级别。
-    fn enabled(&self, _level: LogLevel) -> bool {
-        true
-    }
-
-    /// 克隆记录并合并派生属性。
-    fn handle(&self, record: &LogRecord) -> Result<(), LogHandlerError> {
-        let mut record = record.clone();
-        record.attributes.extend(self.attributes.clone());
-        self.records.lock().unwrap().push(record);
-        Ok(())
-    }
-
-    /// 创建共享记录缓冲且附加固定属性的派生 handler。
-    fn with_attrs(&self, attributes: LogAttributes) -> Arc<dyn LogHandler> {
-        let mut combined = self.attributes.clone();
-        combined.extend(attributes);
-        Arc::new(Self {
-            records: Arc::clone(&self.records),
-            attributes: combined,
-        })
-    }
-
-    /// 测试不依赖 group 编码，仍返回共享记录缓冲的克隆。
-    fn with_group(&self, _name: &str) -> Arc<dyn LogHandler> {
-        Arc::new(self.clone())
-    }
-}
 
 /// 创建全部 Go 零值字段的 Claude config。
 fn empty_config() -> ClaudeConfig {
@@ -101,14 +63,8 @@ fn script(temp: &TempDir, name: &str, body: &str) -> PathBuf {
 }
 
 /// 构造测试执行器并返回独立的 OTEL 记录缓冲。
-fn make_executor(
-    cfg: ClaudeConfig,
-    startup: StartupContext,
-) -> (super::ClaudeCodeExecutor, RecordingSlogHandler) {
-    let app_handler = Arc::new(RecordingSlogHandler::default());
-    let otel_handler = RecordingSlogHandler::default();
-    let executor = new_claude_code_executor(
-        Logger::new(app_handler),
+fn make_executor(cfg: ClaudeConfig, startup: StartupContext) -> super::ClaudeCodeExecutor {
+    new_claude_code_executor(
         Some(cfg),
         "session-123",
         startup,
@@ -116,12 +72,10 @@ fn make_executor(
         Vec::new(),
         None,
         Arc::new(NoopActivityRecorder),
-        Arc::new(otel_handler.clone()),
         None,
         "latest",
     )
-    .unwrap();
-    (executor, otel_handler)
+    .unwrap()
 }
 
 /// 对应 Go：`TestWriteMCPConfigFileFromGateway`。
@@ -142,7 +96,7 @@ async fn test_write_mcp_config_file_from_gateway() {
         }),
         ..StartupContext::default()
     };
-    let (executor, _) = make_executor(empty_config(), startup);
+    let executor = make_executor(empty_config(), startup);
     assert_eq!(
         executor.write_mcp_config_file_from_gateway().await.unwrap(),
         path.to_string_lossy()
@@ -159,10 +113,8 @@ async fn test_write_mcp_config_file_from_gateway() {
 /// 验证首个 token 获得 FD 3，pipe 内容带唯一换行。
 #[test]
 fn test_add_token_via_file_descriptor() {
-    let logger = discard_logger();
     let mut descriptors = Vec::new();
-    let fd = add_token_via_file_descriptor(&logger, "secret-token", "test token", &mut descriptors)
-        .unwrap();
+    let fd = add_token_via_file_descriptor("secret-token", "test token", &mut descriptors).unwrap();
     assert_eq!(fd, 3);
     assert_eq!(descriptors.len(), 1);
     assert_eq!(descriptors[0].target, 3);
@@ -187,18 +139,17 @@ fn stderr_tail_matches_go_invalid_utf8_rules() {
 /// 已被 runtime 内部 FD 使用的情况；生产映射必须随后用 `dup2` 正确覆盖它们。
 #[tokio::test]
 async fn token_descriptors_survive_exec_without_leaking_source_fds() {
-    let logger = discard_logger();
     let mut descriptors = Vec::new();
     assert_eq!(
-        add_token_via_file_descriptor(&logger, "first-token", "first", &mut descriptors).unwrap(),
+        add_token_via_file_descriptor("first-token", "first", &mut descriptors).unwrap(),
         3
     );
     assert_eq!(
-        add_token_via_file_descriptor(&logger, "second-token", "second", &mut descriptors).unwrap(),
+        add_token_via_file_descriptor("second-token", "second", &mut descriptors).unwrap(),
         4
     );
     assert_eq!(
-        add_token_via_file_descriptor(&logger, "third-token", "third", &mut descriptors).unwrap(),
+        add_token_via_file_descriptor("third-token", "third", &mut descriptors).unwrap(),
         5
     );
     let source_fds = descriptors
@@ -280,7 +231,7 @@ fn test_should_prepare_ccr_upstream_proxy_token() {
                 .environment_variables
                 .insert("CCR_UPSTREAM_PROXY_ENABLED".to_owned(), value.to_owned());
         }
-        let (executor, _) = make_executor(cfg, startup);
+        let executor = make_executor(cfg, startup);
         assert_eq!(
             executor.should_start_agent_proxy(local_testing),
             expected,
@@ -305,7 +256,7 @@ fn agent_proxy_uses_final_api_base_url_priority() {
         "ANTHROPIC_BASE_URL".to_owned(),
         "https://startup.example.test".to_owned(),
     );
-    let (executor, _) = make_executor(cfg, startup);
+    let executor = make_executor(cfg, startup);
     let environment = executor.build_child_environment();
     let final_value = environment
         .iter()
@@ -330,7 +281,7 @@ async fn enabled_agent_proxy_requires_session_ingress_token() {
         use_code_sessions: true,
         ..StartupContext::default()
     };
-    let (executor, _) = make_executor(cfg, startup);
+    let executor = make_executor(cfg, startup);
     let error = executor
         .execute(&CancellationToken::new())
         .await
@@ -349,7 +300,7 @@ fn test_write_ccr_upstream_proxy_token() {
     let temp = TempDir::new().unwrap();
     let token = temp.path().join("session_token");
     fs::write(&token, "old-token").unwrap();
-    let (executor, _) = make_executor(empty_config(), StartupContext::default());
+    let executor = make_executor(empty_config(), StartupContext::default());
     executor.remove_stale_agent_proxy_token(&token).unwrap();
     assert!(!token.exists());
     executor.remove_stale_agent_proxy_token(&token).unwrap();
@@ -364,7 +315,7 @@ fn test_write_ccr_upstream_proxy_token_rejects_empty_inputs() {
     assert!(write_ccr_upstream_proxy_token(&token, "token").is_err());
     assert!(!token.exists());
 
-    let (executor, _) = make_executor(empty_config(), StartupContext::default());
+    let executor = make_executor(empty_config(), StartupContext::default());
     let directory = temp.path().join("directory");
     fs::create_dir(&directory).unwrap();
     assert!(executor.remove_stale_agent_proxy_token(&directory).is_err());
@@ -390,7 +341,7 @@ async fn test_build_args_from_gateway_config_merges_append_system_prompt() {
         .collect(),
         ..StartupContext::default()
     };
-    let (executor, _) = make_executor(cfg, startup);
+    let executor = make_executor(cfg, startup);
     let args = executor
         .build_args_from_gateway_config(vec!["--base".to_owned()])
         .await
@@ -417,7 +368,7 @@ async fn test_build_args_from_gateway_config_appends_local_prompt() {
             .collect(),
         ..StartupContext::default()
     };
-    let (executor, _) = make_executor(cfg, startup);
+    let executor = make_executor(cfg, startup);
     let args = executor
         .build_args_from_gateway_config(vec!["--base".to_owned()])
         .await
@@ -449,7 +400,7 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 
 /// 验证本地模式参数、cwd、环境覆盖、stderr OTEL 行与原始 NDJSON 落盘。
 #[tokio::test]
-async fn test_execute_runs_claude_command_with_recovered_args_and_env() {
+async fn test_execute_runs_claude_command_with_expected_args_and_env() {
     let temp = TempDir::new().unwrap();
     let capture = temp.path().join("capture.txt");
     let fake = script(
@@ -477,7 +428,7 @@ async fn test_execute_runs_claude_command_with_recovered_args_and_env() {
             .collect(),
         ..StartupContext::default()
     };
-    let (executor, otel) = make_executor(cfg, startup);
+    let executor = make_executor(cfg, startup);
     executor.execute(&CancellationToken::new()).await.unwrap();
 
     let captured = fs::read_to_string(capture).unwrap();
@@ -496,12 +447,6 @@ async fn test_execute_runs_claude_command_with_recovered_args_and_env() {
         );
     }
     assert!(!captured.contains("--sdk-url"));
-    assert!(has_record(
-        &otel.records.lock().unwrap(),
-        "[claude] stderr-marker",
-        "process",
-        "claude",
-    ));
     assert!(
         fs::read(CLAUDE_LOG_PATH_FOR_TEST)
             .unwrap()
@@ -511,23 +456,6 @@ async fn test_execute_runs_claude_command_with_recovered_args_and_env() {
 }
 
 const CLAUDE_LOG_PATH_FOR_TEST: &str = "/tmp/claude-code.log";
-
-/// 对应 Go：`discardLogger`，创建没有外部输出副作用的测试 logger。
-fn discard_logger() -> Logger {
-    Logger::new(Arc::new(RecordingSlogHandler::default()))
-}
-
-/// 对应 Go：`hasRecord`，查找 message 与指定字符串属性同时匹配的记录。
-fn has_record(records: &[LogRecord], message: &str, key: &str, value: &str) -> bool {
-    records.iter().any(|record| {
-        record.message == message
-            && record
-                .attributes
-                .get(key)
-                .and_then(|attribute| attribute.as_str())
-                == Some(value)
-    })
-}
 
 /// 验证取消只杀 shell direct child，已脱离 stdio 的孙进程仍存活。
 #[tokio::test]
@@ -552,7 +480,7 @@ async fn cancellation_does_not_kill_process_group() {
         "GRANDCHILD_PID_FILE".to_owned(),
         pid_file.to_string_lossy().into_owned(),
     );
-    let (executor, _) = make_executor(cfg, StartupContext::default());
+    let executor = make_executor(cfg, StartupContext::default());
     let cancellation = CancellationToken::new();
     let execution = tokio::spawn({
         let cancellation = cancellation.clone();
@@ -599,7 +527,7 @@ async fn claude_cancellation_waits_for_descendant_pipe_eof() {
         "GRANDCHILD_PID_FILE".to_owned(),
         pid_file.to_string_lossy().into_owned(),
     );
-    let (executor, _) = make_executor(cfg, StartupContext::default());
+    let executor = make_executor(cfg, StartupContext::default());
     let cancellation = CancellationToken::new();
     let mut execution = tokio::spawn({
         let cancellation = cancellation.clone();

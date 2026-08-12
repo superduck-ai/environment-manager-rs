@@ -1,6 +1,6 @@
 //! Git proxy 的数据类型、异步接口与稳定错误边界。
 //!
-//! 这些声明对应 Go `zz_recovered_types.go`：配置和仓库认证字段保持同名的
+//! Git proxy 配置与仓库认证类型：配置和认证字段保持同名的
 //! snake_case 映射，`context.Context` 映射为 `CancellationToken`，同步接口则改为
 //! 可在线程间共享的异步 trait。认证 token 的 `Debug` 实现始终脱敏，避免诊断日志
 //! 偶然暴露仓库凭据。
@@ -9,8 +9,6 @@ use std::{fmt, sync::Arc};
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
-
-use crate::internal::logger::Logger;
 
 /// Git proxy 子系统的稳定文本错误。
 ///
@@ -71,8 +69,6 @@ pub struct Config {
     pub port: i64,
     /// 空字符串使用默认 token 后端，`tvs` 显式选择 TVS。
     pub token_backend: String,
-    /// 可选结构化 logger；缺省时在构造器中捕获进程级 tracing logger。
-    pub logger: Option<Logger>,
 }
 
 impl fmt::Debug for Config {
@@ -85,7 +81,6 @@ impl fmt::Debug for Config {
             .field("repo_auths", &self.repo_auths)
             .field("port", &self.port)
             .field("token_backend", &self.token_backend)
-            .field("logger", &self.logger.as_ref().map(|_| "Logger"))
             .finish()
     }
 }

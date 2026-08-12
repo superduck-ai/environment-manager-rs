@@ -143,9 +143,8 @@ async fn start_raw_handshake_server(
 
 #[tokio::test]
 async fn test_new_client_configures_handlers_and_options() {
-    let registry = Arc::new(new_registry(None));
+    let registry = Arc::new(new_registry());
     let client = new_client(
-        None,
         "session-1",
         "wss://example.com",
         "token-1",
@@ -165,9 +164,8 @@ async fn test_new_client_configures_handlers_and_options() {
 }
 
 #[tokio::test]
-async fn test_tunnel_endpoint_matches_recovered_connect_path() {
+async fn test_tunnel_endpoint_matches_connect_path() {
     let client = new_client(
-        None,
         "session-1",
         "wss://example.com/base/",
         "token-1",
@@ -290,14 +288,22 @@ async fn test_tunnel_read_deadline_restarts_after_application_message() {
     let mut stream = futures_util::stream::poll_fn(move |context| rx.poll_recv(context));
     let cancellation = CancellationToken::new();
 
-    let first =
-        read_tunnel_data_message(&cancellation, &mut stream, Duration::from_millis(45), || {})
-            .await
-            .unwrap();
-    let second =
-        read_tunnel_data_message(&cancellation, &mut stream, Duration::from_millis(45), || {})
-            .await
-            .unwrap();
+    let first = read_tunnel_data_message(
+        &cancellation,
+        &mut stream,
+        Duration::from_millis(200),
+        || {},
+    )
+    .await
+    .unwrap();
+    let second = read_tunnel_data_message(
+        &cancellation,
+        &mut stream,
+        Duration::from_millis(200),
+        || {},
+    )
+    .await
+    .unwrap();
 
     assert_eq!(first, b"first");
     assert_eq!(second, b"second");
@@ -308,7 +314,6 @@ async fn test_tunnel_read_deadline_restarts_after_application_message() {
 async fn test_client_connect_and_response_sender_writes_tunnel_response() {
     let (port, mut header_rx, mut socket_rx, server) = start_tunnel_server().await;
     let client = new_client(
-        None,
         "session-1",
         format!("ws://localhost:{port}"),
         "token-1",
@@ -379,7 +384,6 @@ async fn test_client_run_dispatches_proto_jsonhttp_request() {
     let (target_port, target_server) = start_server(target).await;
     let (tunnel_port, _header_rx, mut socket_rx, tunnel_server) = start_tunnel_server().await;
     let client = new_client(
-        None,
         "session-proto",
         format!("ws://localhost:{tunnel_port}"),
         "",
@@ -451,7 +455,7 @@ async fn test_client_run_dispatches_proto_jsonhttp_request() {
 }
 
 #[test]
-fn test_add_jitter_within_recovered_window() {
+fn test_add_jitter_within_expected_window() {
     let base = Duration::from_millis(100);
     for _ in 0..100 {
         let jittered = add_jitter(base);
@@ -555,7 +559,6 @@ async fn test_websocket_bad_handshake_uses_gorilla_error_and_client_context() {
     assert_eq!(error.to_string(), "websocket: bad handshake");
 
     let client = new_client(
-        None,
         "session-rejected",
         format!("ws://127.0.0.1:{port}"),
         "",

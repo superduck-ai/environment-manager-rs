@@ -5,17 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::internal::logger::Logger;
+/// Status action。
+pub struct StatusAction {}
 
-/// 对应 Go：`zz_recovered_types.go` 中的 `StatusAction`。
-///
-/// logger 只记录探测属性，不参与返回值或错误判断。
-pub struct StatusAction {
-    /// 可选结构化 logger；缺省时 status action 保持静默。
-    pub(super) logger: Option<Logger>,
-}
-
-/// 对应 Go：`zz_recovered_types.go` 中的 `statusRequest`。
+/// Status 请求。
 ///
 /// `port == 0` 的默认值在执行阶段应用，避免反序列化时改变显式零值语义。
 #[derive(Debug, Default, Deserialize)]
@@ -24,7 +17,7 @@ pub(super) struct StatusRequest {
     pub(super) port: i32,
 }
 
-/// 对应 Go：`zz_recovered_types.go` 中的 `statusResult`。
+/// Status 结果。
 ///
 /// 字段声明顺序固定为 `listening,port`，以保持 serde_json 的输出字节顺序。
 #[derive(Debug, Serialize)]

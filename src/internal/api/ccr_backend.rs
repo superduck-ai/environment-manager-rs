@@ -12,7 +12,6 @@ use serde::{Deserialize, Deserializer, de};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::Logger;
 use crate::internal::util::go_path_escape;
 
 use super::client::marshal_go_dynamic_json;
@@ -23,7 +22,6 @@ pub struct CCRBackend {
     http_client: HttpClient,
     auth_token: String,
     session_id: String,
-    logger: Option<Logger>,
     worker_epoch: AtomicI64,
 }
 
@@ -65,19 +63,16 @@ where
 impl CCRBackend {
     /// 对应 Go `NewCCRBackend`，初始 worker epoch 为零，必须在发送事件前 register。
     ///
-    /// logger 保存为 backend 自身字段，保证 register 成功事件使用 Go CCR 调用点，
-    /// 而 HTTP attempt 日志仍由共享 `HttpClient` 发出。
+    /// register 事件与 HTTP attempt 均写入进程 tracing subscriber。
     pub fn new(
         http_client: HttpClient,
         auth_token: impl Into<String>,
         session_id: impl Into<String>,
-        logger: Option<Logger>,
     ) -> Self {
         Self {
             http_client,
             auth_token: auth_token.into(),
             session_id: session_id.into(),
-            logger,
             worker_epoch: AtomicI64::new(0),
         }
     }
@@ -102,20 +97,7 @@ impl CCRBackend {
             .map_err(|error| ApiError::message(format!("failed to register worker: {error}")))?;
         let epoch = response.worker_epoch;
         self.worker_epoch.store(epoch, Ordering::Release);
-        if let Some(logger) = &self.logger {
-            logger.info(
-                "worker_registered",
-                [
-                    (
-                        "session_id".to_owned(),
-                        Value::String(self.session_id.clone()),
-                    ),
-                    ("worker_epoch".to_owned(), Value::from(epoch)),
-                ]
-                .into_iter()
-                .collect(),
-            );
-        }
+        tracing::info!("session_id" = ?(self.session_id.clone()), "worker_epoch" = ?(epoch), "{}", "worker_registered");
         Ok(epoch)
     }
 
@@ -152,7 +134,7 @@ impl SessionBackend for CCRBackend {
         // Go 先把 SessionEvent marshal 后 unmarshal 到 map[string]any，因此 payload
         // 的键递归排序、数字按 float64 编码；worker_epoch 则是外层 map 中直接放入
         // 的 int64，不能一并转成 float64。手工拼接固定的外层 map 顺序能同时保留
-        // 这两种数值语义，而不会依赖 serde_json preserve_order。
+        // 这两种数值语义，而不会依赖 JSON 对象的插入顺序。
         let mut request_body = b"{\"events\":[{\"payload\":".to_vec();
         request_body.extend_from_slice(&payload);
         request_body.extend_from_slice(b"}],\"worker_epoch\":");

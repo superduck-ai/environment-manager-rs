@@ -24,13 +24,11 @@ use super::code_sign::{
     calculate_backoff, do_attempts_with_retry, do_single_attempt, read_code_sign_config,
     scan_positive_integer,
 };
-use super::orchestrator::orchestrator_configured_attributes;
 use super::setup::{
     check_npm_available, install_sandbox_runtime, load_service_key, run_api_healthcheck,
 };
 use super::types::RetryConfig;
 use super::*;
-use crate::internal::orchestrator::default_orchestrator_logger;
 
 /// 根命令应注册全部公开命令，并从普通帮助中隐藏 code-sign。
 #[test]
@@ -147,18 +145,6 @@ fn orchestrator_defaults_match_go_command() {
     assert_eq!(args.reclaim_older_than_ms, 0);
     assert!(!args.skip_git_config);
     assert!(!args.skip_container_lock);
-
-    let configured = orchestrator_configured_attributes(&args);
-    assert_eq!(
-        configured.get("poll_timeout"),
-        Some(&json!(300_000_000_000_i64))
-    );
-    assert_eq!(
-        configured.get("loop_timeout"),
-        Some(&json!(300_000_000_000_i64))
-    );
-    assert!(configured["poll_timeout"].is_i64());
-    assert!(configured["loop_timeout"].is_i64());
 }
 
 /// orchestrator 的路径、hook、整数、duration 和 bool flag 应完整落入类型模型。
@@ -484,15 +470,9 @@ async fn TestRunAPIHealthcheck() {
         .expect(1)
         .mount(&server)
         .await;
-    let logger = cmd_test_logger();
-    run_api_healthcheck(
-        &CancellationToken::new(),
-        &logger,
-        &server.uri(),
-        "service-key",
-    )
-    .await
-    .expect("healthy whoami response must pass");
+    run_api_healthcheck(&CancellationToken::new(), &server.uri(), "service-key")
+        .await
+        .expect("healthy whoami response must pass");
     server.verify().await;
 
     let failing = MockServer::start().await;
@@ -502,14 +482,9 @@ async fn TestRunAPIHealthcheck() {
         .expect(1)
         .mount(&failing)
         .await;
-    let error = run_api_healthcheck(
-        &CancellationToken::new(),
-        &default_orchestrator_logger(),
-        &failing.uri(),
-        "service-key",
-    )
-    .await
-    .expect_err("non-200 whoami response must fail");
+    let error = run_api_healthcheck(&CancellationToken::new(), &failing.uri(), "service-key")
+        .await
+        .expect_err("non-200 whoami response must fail");
     assert!(error.contains("API connectivity healthcheck failed"));
     failing.verify().await;
 }
@@ -580,13 +555,13 @@ async fn TestCheckNpmAvailableUsesPath() {
 
     let mut environment = ScopedEnvironment::new();
     environment.set("PATH", directory.path().as_os_str());
-    check_npm_available(&CancellationToken::new(), &default_orchestrator_logger())
+    check_npm_available(&CancellationToken::new())
         .await
         .expect("fake npm on PATH must pass");
 
     let missing_path = TempDir::new().unwrap();
     environment.set("PATH", missing_path.path().as_os_str());
-    let error = check_npm_available(&CancellationToken::new(), &default_orchestrator_logger())
+    let error = check_npm_available(&CancellationToken::new())
         .await
         .expect_err("PATH without npm must fail");
     assert!(error.contains("npm not found in PATH"));
@@ -597,7 +572,7 @@ async fn TestCheckNpmAvailableUsesPath() {
 async fn TestInstallSandboxRuntimeCurrentSkipsInstallation() {
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    install_sandbox_runtime(&cancellation, &default_orchestrator_logger(), "current")
+    install_sandbox_runtime(&cancellation, "current")
         .await
         .expect("current must skip npm even when already cancelled");
 }
@@ -1186,11 +1161,6 @@ fn write_service_key(directory: &TempDir, contents: &str) -> PathBuf {
 /// helper 统一执行 UTF-8 校验，确保测试不会用有损转换掩盖字节差异。
 fn execute_command_with_stdout(output: Vec<u8>) -> String {
     String::from_utf8(output).expect("command stdout must be UTF-8")
-}
-
-/// 对应 Go `cmdTestLogger`，创建与生产 orchestrator 相同的确定性测试 logger。
-fn cmd_test_logger() -> crate::internal::logger::Logger {
-    default_orchestrator_logger()
 }
 
 /// 构造最小 poll 参数，测试按需覆盖身份、worker 和 reclaim 字段。

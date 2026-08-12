@@ -8,18 +8,13 @@ use std::{pin::Pin, time::Instant};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::internal::auth::{
-    AuthContext, AuthError, new_auth_context_with_session_id,
-    new_auth_context_with_session_id_and_logger,
-};
-use crate::internal::config::{ConfigError, McpConfig, OutcomeField, StartupContext};
-use crate::internal::logger::{LogAttributes, Logger};
-
 use super::secret::{SecretError, decode_work_secret, parse_v1_work_response};
 use super::types::{
     EnvironmentConfigResponse, InputParser, Outcomes, ParsedContext, SessionContext,
     SessionContextProvider, SessionContextRequest, V1Parser, V1WorkResponse, WorkSecret,
 };
+use crate::internal::auth::{AuthContext, AuthError, new_auth_context_with_session_id};
+use crate::internal::config::{ConfigError, McpConfig, OutcomeField, StartupContext};
 
 /// V1 work parser 失败。
 #[derive(Debug, Error)]
@@ -56,58 +51,27 @@ where
 {
     /// 解析 V1 work，按 secret 模式选择是否获取 session context。
     pub async fn parse(&self, data: &[u8]) -> Result<ParsedContext, V1ParseError> {
-        self.parse_with_optional_logger(data, None).await
+        self.parse_internal(data).await
     }
 
-    /// 使用生产 logger 解析 V1 work，并复刻 Go 的阶段日志及属性顺序。
-    pub async fn parse_with_logger(
-        &self,
-        data: &[u8],
-        logger: &Logger,
-    ) -> Result<ParsedContext, V1ParseError> {
-        self.parse_with_optional_logger(data, Some(logger)).await
-    }
-
-    /// 执行 V1 共享解析状态机；测试入口可关闭日志而不伪造全局 logger。
-    async fn parse_with_optional_logger(
-        &self,
-        data: &[u8],
-        logger: Option<&Logger>,
-    ) -> Result<ParsedContext, V1ParseError> {
+    /// 执行 V1 共享解析状态机。
+    async fn parse_internal(&self, data: &[u8]) -> Result<ParsedContext, V1ParseError> {
         let started = Instant::now();
-        if let Some(logger) = logger {
-            logger.debug(
-                "Parsing V1 input format",
-                log_attributes([("data_size_bytes", json!(data.len()))]),
-            );
-        }
+        tracing::debug!("data_size_bytes" = ?(data.len()), "{}", "Parsing V1 input format");
         let work_response = parse_v1_work_response(data).map_err(V1ParseError::WorkResponse)?;
-        if let Some(logger) = logger {
-            logger.debug(
-                "Parsed V1 work response",
-                log_attributes([
-                    ("id", json!(&work_response.id)),
-                    ("type", json!(&work_response.work_type)),
-                    ("environment_id", json!(&work_response.environment_id)),
-                    ("state", json!(&work_response.state)),
-                    ("data_type", json!(&work_response.data.data_type)),
-                ]),
-            );
-        }
+        tracing::debug!("id" = ?(&work_response.id), "type" = ?(&work_response.work_type), "environment_id" = ?(&work_response.environment_id), "state" = ?(&work_response.state), "data_type" = ?(&work_response.data.data_type), "{}", "Parsed V1 work response");
         let secret = decode_work_secret(&work_response.secret).map_err(V1ParseError::Secret)?;
-        let auth_context =
-            self.build_auth_context(&secret, work_response.get_session_id(), logger)?;
+        let auth_context = self.build_auth_context(&secret, work_response.get_session_id())?;
 
         if work_response.is_healthcheck() {
             return Ok(self.build_healthcheck_result(
                 &work_response,
                 &secret,
                 auth_context,
-                logger,
                 started,
             ));
         }
-        self.build_session_result(&work_response, &secret, auth_context, logger, started)
+        self.build_session_result(&work_response, &secret, auth_context, started)
             .await
     }
 
@@ -117,22 +81,10 @@ where
         work_response: &V1WorkResponse,
         secret: &WorkSecret,
         auth_context: AuthContext,
-        logger: Option<&Logger>,
         started: Instant,
     ) -> ParsedContext {
-        if let Some(logger) = logger {
-            logger.info(
-                "Processing healthcheck work type",
-                log_attributes([
-                    ("work_id", json!(&work_response.id)),
-                    ("environment_id", json!(&work_response.environment_id)),
-                ]),
-            );
-            logger.debug(
-                "Completed parsing V1 healthcheck input",
-                log_attributes([("parse_duration_ms", json!(duration_milliseconds(started)))]),
-            );
-        }
+        tracing::info!("work_id" = ?(&work_response.id), "environment_id" = ?(&work_response.environment_id), "{}", "Processing healthcheck work type");
+        tracing::debug!("parse_duration_ms" = ?(duration_milliseconds(started)), "{}", "Completed parsing V1 healthcheck input");
         ParsedContext {
             startup_context: StartupContext {
                 api_base_url: normalize_api_base_url(&secret.api_base_url),
@@ -154,31 +106,10 @@ where
         work_response: &V1WorkResponse,
         secret: &WorkSecret,
         auth_context: AuthContext,
-        logger: Option<&Logger>,
         started: Instant,
     ) -> Result<ParsedContext, V1ParseError> {
         let session_id = work_response.get_session_id();
-        if let Some(logger) = logger {
-            logger.debug(
-                "Decoded work secret",
-                log_attributes([
-                    ("version", json!(secret.version)),
-                    ("api_base_url", json!(&secret.api_base_url)),
-                    ("source_count", json!(secret.sources.len())),
-                    ("auth_count", json!(secret.auth.len())),
-                    (
-                        "has_claude_code_args",
-                        json!(secret.claude_code_args.is_some()),
-                    ),
-                    ("has_mcp_config", json!(secret.mcp_config.is_some())),
-                    (
-                        "has_environment_variables",
-                        json!(secret.environment_variables.is_some()),
-                    ),
-                    ("use_code_sessions", json!(secret.use_code_sessions)),
-                ]),
-            );
-        }
+        tracing::debug!("version" = ?(secret.version), "api_base_url" = ?(&secret.api_base_url), "source_count" = ?(secret.sources.len()), "auth_count" = ?(secret.auth.len()), "has_claude_code_args" = ?(secret.claude_code_args.is_some()), "has_mcp_config" = ?(secret.mcp_config.is_some()), "has_environment_variables" = ?(secret.environment_variables.is_some()), "use_code_sessions" = ?(secret.use_code_sessions), "{}", "Decoded work secret");
         let session_context = if secret.use_code_sessions {
             SessionContext::default()
         } else {
@@ -194,14 +125,9 @@ where
 
         let startup_context = self.build_startup_context(secret, &session_context)?;
         let environment = self.build_environment_response(&session_context);
-        let outcomes = self.build_outcomes(&session_context, logger);
+        let outcomes = self.build_outcomes(&session_context);
 
-        if let Some(logger) = logger {
-            logger.debug(
-                "Completed parsing V1 input",
-                log_attributes([("parse_duration_ms", json!(duration_milliseconds(started)))]),
-            );
-        }
+        tracing::debug!("parse_duration_ms" = ?(duration_milliseconds(started)), "{}", "Completed parsing V1 input");
 
         Ok(ParsedContext {
             startup_context,
@@ -282,26 +208,16 @@ where
         &self,
         secret: &WorkSecret,
         session_id: &str,
-        logger: Option<&Logger>,
     ) -> Result<AuthContext, V1ParseError> {
         let auth_json = serde_json::to_vec(&secret.auth).map_err(V1ParseError::AuthEncoding)?;
-        let mut auth_context = match logger {
-            Some(logger) => {
-                new_auth_context_with_session_id_and_logger(&auth_json, session_id, logger)
-            }
-            None => new_auth_context_with_session_id(&auth_json, session_id),
-        }
-        .map_err(V1ParseError::Auth)?;
+        let mut auth_context =
+            new_auth_context_with_session_id(&auth_json, session_id).map_err(V1ParseError::Auth)?;
         auth_context.set_session_ingress_token(secret.session_ingress_token.clone());
         Ok(auth_context)
     }
 
     /// 将有效单分支 git_repository outcomes 转成运行时映射。
-    fn build_outcomes(
-        &self,
-        session_context: &SessionContext,
-        logger: Option<&Logger>,
-    ) -> Outcomes {
+    fn build_outcomes(&self, session_context: &SessionContext) -> Outcomes {
         let Some(value) = session_context.outcomes.as_ref() else {
             return Outcomes::new();
         };
@@ -311,12 +227,7 @@ where
             match serde_json::from_value::<Vec<OutcomeField>>(value.clone()) {
                 Ok(fields) => fields,
                 Err(error) => {
-                    if let Some(logger) = logger {
-                        logger.warn(
-                            "Failed to parse outcomes for git push info",
-                            log_attributes([("error", json!(error.to_string()))]),
-                        );
-                    }
+                    tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to parse outcomes for git push info");
                     return Outcomes::new();
                 }
             }
@@ -328,40 +239,16 @@ where
                 continue;
             }
             if outcome.git_info.branches.len() != 1 {
-                if let Some(logger) = logger {
-                    logger.warn(
-                        "Outcome skipped: exactly one branch must be specified",
-                        log_attributes([
-                            ("repo", json!(&outcome.git_info.repo)),
-                            ("branch_count", json!(outcome.git_info.branches.len())),
-                        ]),
-                    );
-                }
+                tracing::warn!("repo" = ?(&outcome.git_info.repo), "branch_count" = ?(outcome.git_info.branches.len()), "{}", "Outcome skipped: exactly one branch must be specified");
                 continue;
             }
             outcomes.add(outcome.git_info.repo, &outcome.git_info.branches);
         }
         let validated = outcomes.validate();
-        if let Some(logger) = logger {
-            let outcome_count = value.as_array().map_or(0, Vec::len);
-            logger.info(
-                "Parsed outcomes from V1 session context",
-                log_attributes([
-                    ("outcome_count", json!(outcome_count)),
-                    ("repo_count", json!(validated.len())),
-                ]),
-            );
-        }
+        let outcome_count = value.as_array().map_or(0, Vec::len);
+        tracing::info!("outcome_count" = ?(outcome_count), "repo_count" = ?(validated.len()), "{}", "Parsed outcomes from V1 session context");
         validated
     }
-}
-
-/// 按 Go slog 参数顺序创建 V1 parser 日志属性。
-fn log_attributes<const N: usize>(entries: [(&str, Value); N]) -> LogAttributes {
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }
 
 /// 将 parser 单调耗时转换为 Go `Duration.Milliseconds()` 的截断毫秒数。

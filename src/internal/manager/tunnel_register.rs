@@ -52,10 +52,9 @@ pub(super) fn create_tunnel_client(
         _ => {}
     }
 
-    let logger = manager.logger.clone();
-    let registry = Arc::new(new_registry(Some(logger.clone())));
-    registry.register(Arc::new(new_status_action(None)));
-    registry.register(Arc::new(new_snapshot_action(Some(logger.clone()))));
+    let registry = Arc::new(new_registry());
+    registry.register(Arc::new(new_status_action()));
+    registry.register(Arc::new(new_snapshot_action()));
 
     let environment_sub_type = manager
         .session_config
@@ -73,11 +72,7 @@ pub(super) fn create_tunnel_client(
             if control_plane_url.is_empty() || antspace_auth_token.is_empty() {
                 return None;
             }
-            Some(new_antspace_client(
-                control_plane_url,
-                antspace_auth_token,
-                Some(logger.clone()),
-            ))
+            Some(new_antspace_client(control_plane_url, antspace_auth_token))
         });
         let default_target = if vercel_token.is_empty() && antspace_client.is_some() {
             "antspace"
@@ -87,22 +82,13 @@ pub(super) fn create_tunnel_client(
 
         if !vercel_token.is_empty() || antspace_client.is_some() {
             registry.register(Arc::new(new_deploy_action(
-                Some(logger.clone()),
                 vercel_token,
                 &manager.organization_uuid,
                 antspace_client,
                 default_target,
             )));
         } else {
-            manager.logger.info(
-                "deploy action disabled",
-                [(
-                    "environment_sub_type".to_owned(),
-                    serde_json::Value::String(environment_sub_type.to_owned()),
-                )]
-                .into_iter()
-                .collect(),
-            );
+            tracing::info!("environment_sub_type" = ?(environment_sub_type.to_owned()), "{}", "deploy action disabled");
         }
     }
 
@@ -111,7 +97,6 @@ pub(super) fn create_tunnel_client(
         .as_ref()
         .map_or("", |session| session.session_id.as_str());
     let client = tunnel::new_client(
-        Some(logger),
         session_id,
         parsed.to_string(),
         auth_token,

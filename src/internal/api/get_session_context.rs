@@ -5,10 +5,8 @@
 
 use reqwest::header::HeaderValue;
 use reqwest::{Method, StatusCode};
-use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::logger::Logger;
 use crate::internal::util::go_path_escape;
 
 use super::client::{go_response_close_error, read_go_response_body};
@@ -19,23 +17,14 @@ use super::{ApiError, HttpClient, SessionContext, SessionContextResponse};
 pub struct SessionsClient {
     http_client: HttpClient,
     auth_token: String,
-    logger: Option<Logger>,
 }
 
 impl SessionsClient {
-    /// 对应 Go 内联的 `NewSessionsClient` helper，保存 HTTP client、token 与 logger。
-    ///
-    /// token 只用于 Authorization header；logger 单独保存是为了让 session 级事件
-    /// 对应 Go `SessionsClient.logger`，而重试事件继续使用 `HttpClient.logger`。
-    pub fn new(
-        http_client: HttpClient,
-        auth_token: impl Into<String>,
-        logger: Option<Logger>,
-    ) -> Self {
+    /// 保存 HTTP client 与仅用于 Authorization header 的 token。
+    pub fn new(http_client: HttpClient, auth_token: impl Into<String>) -> Self {
         Self {
             http_client,
             auth_token: auth_token.into(),
-            logger,
         }
     }
 
@@ -68,17 +57,7 @@ impl SessionsClient {
             HeaderValue::from_static("ccr-byoc-2025-07-29"),
         );
 
-        if let Some(logger) = &self.logger {
-            logger.debug(
-                "Fetching session context",
-                [
-                    ("endpoint".to_owned(), json!(&endpoint)),
-                    ("session_id".to_owned(), json!(session_id)),
-                ]
-                .into_iter()
-                .collect(),
-            );
-        }
+        tracing::debug!("endpoint" = ?(&endpoint), "session_id" = ?(session_id), "{}", "Fetching session context");
         let response = self
             .http_client
             .retryable_http_do(cancellation, &request, None)
@@ -100,16 +79,8 @@ impl SessionsClient {
             Ok(body) => self.parse_session_context_response(status, &body, session_id),
             Err(error) => Err(error),
         };
-        if let (Some(logger), Some(error)) = (&self.logger, close_error) {
-            logger.warn(
-                "Failed to close response body",
-                [
-                    ("error".to_owned(), json!(error)),
-                    ("endpoint".to_owned(), json!(endpoint)),
-                ]
-                .into_iter()
-                .collect(),
-            );
+        if let Some(error) = close_error {
+            tracing::warn!("error" = ?(error), "endpoint" = ?(endpoint), "{}", "Failed to close response body");
         }
         result
     }
@@ -140,25 +111,7 @@ impl SessionsClient {
                 // Go 把顶层 JSON null 解进预先分配的 response struct 后保留零值；
                 // serde 对 struct 的默认行为会报错，因此这里显式恢复该兼容语义。
                 let response = response.unwrap_or_default();
-                if let Some(logger) = &self.logger {
-                    logger.debug(
-                        "Successfully fetched session context",
-                        [
-                            ("session_id".to_owned(), json!(session_id)),
-                            ("cwd".to_owned(), json!(&response.session_context.cwd)),
-                            (
-                                "has_outcomes".to_owned(),
-                                json!(response.session_context.outcomes.is_some()),
-                            ),
-                            (
-                                "has_mcp_config".to_owned(),
-                                json!(response.session_context.mcp_config.is_some()),
-                            ),
-                        ]
-                        .into_iter()
-                        .collect(),
-                    );
-                }
+                tracing::debug!("session_id" = ?(session_id), "cwd" = ?(&response.session_context.cwd), "has_outcomes" = ?(response.session_context.outcomes.is_some()), "has_mcp_config" = ?(response.session_context.mcp_config.is_some()), "{}", "Successfully fetched session context");
                 Ok(response.session_context)
             }
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(ApiError::message(format!(

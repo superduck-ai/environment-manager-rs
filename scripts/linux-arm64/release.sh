@@ -8,9 +8,7 @@ source "${script_dir}/container-images.env"
 readonly machine="${ORB_MACHINE:-ubuntu-2404}"
 readonly user="${ORB_USER:-arthur}"
 readonly target="/home/${user}/environment-manager"
-readonly go_root="${VM_GO_SOURCE_ROOT:-/mnt/mac/Users/${user}/GolandProjects/environment-manager}"
 readonly rust_image="${RUST_RELEASE_IMAGE:-${DEFAULT_RUST_RELEASE_IMAGE}}"
-readonly go_image="${GO_ORACLE_IMAGE:-${DEFAULT_GO_ORACLE_IMAGE}}"
 readonly approved_sha256="${STAGING_E2E_ARTIFACT_SHA256:-}"
 
 if (($# != 0)); then
@@ -29,26 +27,18 @@ if ! is_audited_container_image rust "${rust_image}"; then
   echo "RUST_RELEASE_IMAGE 不在审核清单 ${CONTAINER_IMAGE_ALLOWLIST_VERSION} 中" >&2
   exit 1
 fi
-if ! is_audited_container_image go "${go_image}"; then
-  echo "GO_ORACLE_IMAGE 不在审核清单 ${CONTAINER_IMAGE_ALLOWLIST_VERSION} 中" >&2
-  exit 1
-fi
-
-# 同步最新源码并重新执行全部本地门禁。verify 固定运行 canonical 差分 runner，
-# 不读取可替换 runner 的参数。它完成后，远端步骤再复算源码清单，确保候选与
+# 同步最新源码并重新执行全部本地门禁；随后复算源码清单，确保候选与
 # 此次通过门禁的源码仍完全相同。
 "${script_dir}/verify.sh"
 
 orb -m "${machine}" -u "${user}" -w "${target}" bash -s -- \
-  "${target}" "${go_root}" "${approved_sha256}" "${rust_image}" \
-  "${go_image}" "${CONTAINER_IMAGE_ALLOWLIST_VERSION}" <<'REMOTE'
+  "${target}" "${approved_sha256}" "${rust_image}" \
+  "${CONTAINER_IMAGE_ALLOWLIST_VERSION}" <<'REMOTE'
 set -euo pipefail
 target="$1"
-go_root="$2"
-approved_sha256="$3"
-expected_rust_image="$4"
-go_image="$5"
-image_allowlist_version="$6"
+approved_sha256="$2"
+expected_rust_image="$3"
+image_allowlist_version="$4"
 artifact_name="environment-manager_linux_arm64"
 candidate_directory="dist/preflight"
 candidate="${candidate_directory}/${artifact_name}"
@@ -133,50 +123,6 @@ if ! cmp -s "${source_manifest}" "${recomputed_source}"; then
 fi
 scripts/linux-arm64/verify-release-artifact.sh "${candidate}"
 
-# 使用统一 helper 从同一只读 Go 基线构建正式 rollback。该 helper 对齐未跟踪
-# Makefile 的静态 ARM64 构建定义；任何失败都会发生在 Rust 候选提升之前。
-scripts/linux-arm64/verify-go-baseline.sh "${go_root}"
-rollback_directory="${promotion}/rollback"
-rollback_name="environment-manager_go_linux_arm64"
-rollback="${rollback_directory}/${rollback_name}"
-install -d -m 0755 "${rollback_directory}"
-GO_ORACLE_IMAGE="${go_image}" \
-  scripts/linux-arm64/build-go-oracle.sh "${go_root}" "${rollback}"
-scripts/linux-arm64/verify-go-baseline.sh "${go_root}"
-# build helper 已在安装前后验证一次；release 再对即将提升的最终路径独立复核，避免
-# 后续重构 helper 时静态链接和启动烟测被意外移出正式发布门禁。
-scripts/linux-arm64/verify-go-rollback-artifact.sh "${rollback}"
-rollback_sha256="$(sha256sum "${rollback}" | awk '{print $1}')"
-if [[ "$(cat "${rollback}.sha256")" \
-  != "${rollback_sha256}  ${rollback_name}" ]]; then
-  echo "Go rollback SHA 文件与实际字节不一致" >&2
-  exit 1
-fi
-
-go_head="$(git -C "${go_root}" rev-parse HEAD)"
-go_diff_sha256="$(LC_ALL=C git -C "${go_root}" diff --binary HEAD \
-  | sha256sum | awk '{print $1}')"
-go_build_version="$(git -C "${go_root}" describe --tags --always --dirty \
-  2>/dev/null || printf dev)"
-{
-  printf 'schema=environment-manager-go-rollback-v1\n'
-  printf 'artifact_name=%s\n' "${rollback_name}"
-  printf 'artifact_sha256=%s\n' "${rollback_sha256}"
-  printf 'target=aarch64-unknown-linux-gnu\n'
-  printf 'go_toolchain=1.25.7\n'
-  printf 'go_build_version=%s\n' "${go_build_version}"
-  printf 'go_head=%s\n' "${go_head}"
-  printf 'go_diff_sha256=%s\n' "${go_diff_sha256}"
-  printf 'go_untracked_paths_baseline_sha256=%s\n' \
-    "$(sha256sum compat/go-untracked-paths.txt | awk '{print $1}')"
-  printf 'go_untracked_build_inputs_sha256=%s\n' \
-    "$(sha256sum compat/go-untracked-build-inputs.sha256 | awk '{print $1}')"
-  printf 'go_image_allowlist=%s\n' "${image_allowlist_version}"
-  printf 'go_image=%s\n' "${go_image}"
-  printf 'builder=scripts/linux-arm64/build-go-oracle.sh\n'
-} >"${rollback}.manifest"
-chmod 0644 "${rollback}.manifest" "${rollback}.sha256"
-
 # 将 preflight 候选原字节复制到 promotion 暂存区，并用 cmp 和 SHA 双重确认。
 # 这里只复制，不调用 cargo；因此正式产物就是 staging E2E 验证过的同一二进制。
 cp --reflink=auto --preserve=mode "${candidate}" "${promotion}/${artifact_name}"
@@ -189,10 +135,8 @@ if ! cmp -s "${candidate}" "${promotion}/${artifact_name}" \
   exit 1
 fi
 
-# promotion 全部准备成功后才替换正式路径。Rust 可执行文件最后移动，作为本次
+# promotion 全部准备成功后才替换正式路径。可执行文件最后移动，作为本次
 # 提升完成的提交点；preflight 证据保留，便于事后核对 staging SHA。
-rm -rf -- dist/rollback
-mv "${rollback_directory}" dist/rollback
 rm -f -- \
   "dist/${artifact_name}.sha256" \
   "dist/${artifact_name}.manifest" \
@@ -206,6 +150,4 @@ mv -f "${promotion}/${artifact_name}" "dist/${artifact_name}"
 
 echo "正式 Rust 产物: ${target}/dist/${artifact_name}"
 echo "正式 Rust SHA-256: ${approved_sha256}"
-echo "Go rollback: ${target}/dist/rollback/${rollback_name}"
-echo "Go rollback SHA-256: ${rollback_sha256}"
 REMOTE

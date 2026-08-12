@@ -21,28 +21,11 @@ use crate::internal::{
     auth::AuthContext,
     config::{ClaudeConfig, StartupContext},
     envtype::LeaseManagerHandle,
-    logger::{LogHandler, Logger},
     process::{go_spawn_error, resolve_go_command},
     session::ActivityRecorder,
 };
 
 use super::Outcomes;
-
-/// 构造常用结构化日志属性，保留 Go `slog` 调用时的参数顺序。
-///
-/// `LogAttributes` 使用启用 `preserve_order` 的 JSON map；这里按宏参数顺序
-/// 插入，避免 `BTreeMap` 的字典序改写可观察的 JSONL 字段顺序。
-macro_rules! claude_attrs {
-    ($($key:expr => $value:expr),* $(,)?) => {{
-        [$(
-            (($key).to_owned(), ::serde_json::json!($value)),
-        )*]
-        .into_iter()
-        .collect()
-    }};
-}
-
-pub(super) use claude_attrs;
 
 /// Claude 子系统对外返回的稳定文本错误。
 ///
@@ -167,7 +150,6 @@ pub trait Executor: Send + Sync {
 
 /// Claude Code 单会话执行器。
 pub struct ClaudeCodeExecutor {
-    pub(super) logger: Logger,
     pub(super) cfg: Option<ClaudeConfig>,
     pub(super) session_id: String,
     pub(super) claude_path: String,
@@ -177,7 +159,6 @@ pub struct ClaudeCodeExecutor {
     pub(super) _outcomes: Option<Outcomes>,
     pub(super) _mcp_registrations: Vec<Arc<dyn McpServerRegistration>>,
     pub(super) activity_recorder: Arc<dyn ActivityRecorder>,
-    pub(super) otel_log_handler: Arc<dyn LogHandler>,
     pub(super) _lease_manager: Option<Arc<dyn LeaseManagerHandle>>,
     pub(super) observability: Option<Arc<dyn ClaudeObservability>>,
 }

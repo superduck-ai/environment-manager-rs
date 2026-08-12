@@ -13,21 +13,11 @@ use super::{
 /// 验证新服务被安装到返回上下文并可干净关闭。
 #[tokio::test]
 async fn test_new_o11y_service_installs_service_in_context() {
-    let (service, context) = new_o11y_service(None, None, None).expect("create o11y service");
+    let (service, context) = new_o11y_service(None, None).expect("create o11y service");
     assert!(Arc::ptr_eq(
         &(service.clone() as Arc<dyn O11yService>),
         &get_o11y_service(Some(&context))
     ));
-    assert!(
-        service
-            .log_handler()
-            .enabled(crate::internal::logger::LogLevel::Info)
-    );
-    assert!(
-        !service
-            .log_handler()
-            .enabled(crate::internal::logger::LogLevel::Debug)
-    );
     service
         .shutdown(&CancellationToken::new())
         .await
@@ -38,11 +28,6 @@ async fn test_new_o11y_service_installs_service_in_context() {
 #[tokio::test]
 async fn test_get_o11y_service_falls_back_to_discard() {
     let service = get_o11y_service(None);
-    assert!(
-        service
-            .log_handler()
-            .enabled(crate::internal::logger::LogLevel::Info)
-    );
     service
         .shutdown(&CancellationToken::new())
         .await

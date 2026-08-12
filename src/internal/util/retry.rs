@@ -6,7 +6,6 @@
 
 use std::{sync::Arc, time::Duration};
 
-use crate::internal::logger::{LogAttributes, default_logger};
 use thiserror::Error;
 
 /// 判断某个具体错误是否允许重试的线程安全分类器。
@@ -55,13 +54,12 @@ pub enum RetryError<E> {
 
 /// 执行异步操作，直到成功、不可重试或耗尽次数。
 ///
-/// `log_attributes` 对应 Go 的 `[]interface{}` 固定日志属性；本函数会在其后按原始
-/// 顺序追加 attempt、delay、error 等字段。取消不是通用重试器的控制信号：需要取消
+/// 取消不是通用重试器的控制信号：需要取消
 /// 网络请求的调用方必须在 `operation` 内观察自己的 token，并把取消转换为普通错误，
 /// 让同一错误分类器和日志路径处理它。
 ///
 /// # 兼容性
-/// 四类重试事件使用进程级 tracing logger。退避 sleep 故意不可被取消打断，
+/// 四类重试事件使用进程级 tracing subscriber。退避 sleep 故意不可被取消打断，
 /// 与 Go
 /// `time.Sleep` 一致。即使调用方在退避期间取消，sleep 完成后仍必须调用一次
 /// `operation`；这复刻 Go 闭包在 `time.Sleep` 后创建带 context 的 HTTP 请求，并
@@ -69,7 +67,6 @@ pub enum RetryError<E> {
 pub async fn retry_operation<T, E, F, Fut>(
     mut operation: F,
     config: &RetryConfig<E>,
-    log_attributes: LogAttributes,
 ) -> Result<T, RetryError<E>>
 where
     F: FnMut(usize) -> Fut,
@@ -85,13 +82,11 @@ where
             let shift = u32::try_from(attempt - 1).unwrap_or(u32::MAX);
             let multiplier = 1_u32.checked_shl(shift).unwrap_or(u32::MAX);
             let delay = config.base_delay.saturating_mul(multiplier);
-            let mut attributes = log_attributes.clone();
-            attributes.insert("attempt".to_owned(), serde_json::json!(attempt + 1));
-            attributes.insert(
-                "delay_ms".to_owned(),
-                serde_json::json!(duration_milliseconds(delay)),
+            tracing::info!(
+                attempt = attempt + 1,
+                delay_ms = duration_milliseconds(delay),
+                "retrying_operation"
             );
-            default_logger().info("retrying_operation", attributes);
             // Go 使用不可取消的 time.Sleep。即使 context 已取消，也要先完成本轮
             // backoff，之后才由操作等待分支观察取消，不能提前改变返回时序。
             tokio::time::sleep(delay).await;
@@ -108,22 +103,12 @@ where
                     .as_ref()
                     .is_none_or(|classifier| classifier(&error));
                 if !retryable {
-                    let mut attributes = log_attributes.clone();
-                    attributes.insert("attempt".to_owned(), serde_json::json!(attempt + 1));
-                    attributes.insert("error".to_owned(), serde_json::json!(error.to_string()));
-                    attributes.insert("attempts".to_owned(), serde_json::json!(config.max_retries));
-                    default_logger().info("error_not_retryable", attributes);
+                    tracing::info!(attempt = attempt + 1, error = %error, attempts = config.max_retries, "error_not_retryable");
                     return Err(RetryError::Operation(error));
                 }
-                let mut attributes = log_attributes.clone();
-                attributes.insert("attempt".to_owned(), serde_json::json!(attempt + 1));
-                attributes.insert("error".to_owned(), serde_json::json!(error.to_string()));
-                default_logger().warn("operation_attempt_failed", attributes);
+                tracing::warn!(attempt = attempt + 1, error = %error, "operation_attempt_failed");
                 if attempt + 1 == config.max_retries {
-                    let mut attributes = log_attributes.clone();
-                    attributes.insert("attempts".to_owned(), serde_json::json!(config.max_retries));
-                    attributes.insert("error".to_owned(), serde_json::json!(error.to_string()));
-                    default_logger().error("operation_failed_after_retries", attributes);
+                    tracing::error!(attempts = config.max_retries, error = %error, "operation_failed_after_retries");
                     return Err(RetryError::Operation(error));
                 }
             }

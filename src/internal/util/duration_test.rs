@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use super::{format_go_duration, go_duration_nanoseconds};
+use super::{duration_nanoseconds, format_go_duration};
 
 /// 覆盖 Go `time.Duration.String()` 的全部单位切换和复合时长边界。
 #[test]
@@ -38,20 +38,20 @@ fn format_go_duration_matches_go_positive_duration_strings() {
     }
 }
 
-/// 验证 `slog.Duration` 数值使用纳秒，超出 Go 范围时不会回绕。
+/// 验证 tracing duration 数值使用纳秒，超出有符号范围时不会回绕。
 #[test]
-fn go_duration_nanoseconds_uses_int64_nanoseconds() {
-    assert_eq!(go_duration_nanoseconds(Duration::ZERO), 0);
+fn duration_nanoseconds_uses_int64_nanoseconds() {
+    assert_eq!(duration_nanoseconds(Duration::ZERO), 0);
     assert_eq!(
-        go_duration_nanoseconds(Duration::from_millis(1_500)),
+        duration_nanoseconds(Duration::from_millis(1_500)),
         1_500_000_000
     );
     assert_eq!(
-        go_duration_nanoseconds(Duration::from_nanos(i64::MAX as u64)),
+        duration_nanoseconds(Duration::from_nanos(i64::MAX as u64)),
         i64::MAX
     );
     assert_eq!(
-        go_duration_nanoseconds(Duration::from_nanos(i64::MAX as u64 + 1)),
+        duration_nanoseconds(Duration::from_nanos(i64::MAX as u64 + 1)),
         i64::MAX
     );
 }

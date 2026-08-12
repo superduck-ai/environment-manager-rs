@@ -22,10 +22,15 @@ fn tool_declaration_preserves_go_extensions() {
 
     assert_eq!(value[0]["futureField"], json!(7));
     assert_eq!(value[0]["inputSchema"]["type"], json!("object"));
-    let encoded = serde_json::to_string(&value[0]).unwrap();
     assert_eq!(
-        encoded,
-        r#"{"annotations":{},"description":"检查环境","futureField":7,"inputSchema":{"type":"object","properties":{}},"name":"inspect"}"#
+        value[0],
+        json!({
+            "annotations": {},
+            "description": "检查环境",
+            "futureField": 7,
+            "inputSchema": {"type": "object", "properties": {}},
+            "name": "inspect"
+        })
     );
 }
 

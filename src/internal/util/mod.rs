@@ -16,7 +16,7 @@ mod tailer;
 mod types;
 mod version;
 
-pub(crate) use duration::{format_go_duration, go_duration_nanoseconds};
+pub(crate) use duration::{duration_nanoseconds, format_go_duration};
 pub use git::{GitRefError, update_remote_tracking_branch};
 pub use lockfile::{FileLockGuard, LockError, acquire_container_lock, acquire_lock};
 pub(crate) use path_escape::go_path_escape;
