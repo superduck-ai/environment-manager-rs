@@ -18,7 +18,10 @@ use httparse::{EMPTY_HEADER, Request, Status};
 use nix::sys::prctl::set_dumpable;
 use tokio::{
     io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
-    net::{TcpListener, TcpStream},
+    net::{
+        TcpListener, TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
     sync::oneshot,
     task::{JoinHandle, JoinSet},
     time::{Instant, interval_at},
@@ -30,7 +33,9 @@ use tokio_tungstenite::tungstenite::{
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::internal::tunnel::{LocalWebSocketSink, connect_websocket_with_config};
+use crate::internal::tunnel::{
+    LocalWebSocketSink, LocalWebSocketStream, connect_websocket_with_config,
+};
 
 use super::zz_recovered_types::ClaudeError;
 
@@ -374,7 +379,7 @@ async fn handle_connection(
             ));
         }
     };
-    let (mut websocket_writer, mut websocket_reader) = websocket.split();
+    let (mut websocket_writer, websocket_reader) = websocket.split();
 
     // 送给服务端的首个 WebSocket chunk 是：
     // CONNECT api.example.com:443 HTTP/1.1
@@ -392,13 +397,34 @@ async fn handle_connection(
         return Err(error);
     }
 
-    let (mut client_reader, mut client_writer) = client_stream.into_split();
-    let mut established = false;
+    let (client_reader, client_writer) = client_stream.into_split();
+    let mut directions = JoinSet::new();
+    directions.spawn(relay_tcp_to_websocket(
+        client_reader,
+        websocket_writer,
+        cancellation.clone(),
+    ));
+    directions.spawn(relay_websocket_to_tcp(websocket_reader, client_writer));
+
+    // 任一方向结束后，通过 JoinSet::shutdown() 中止并回收另一方向
+    let result = directions
+        .join_next()
+        .await
+        .ok_or_else(|| anyhow!("agent proxy relay has no direction tasks"))?;
+    directions.shutdown().await;
+    result.context("agent proxy relay task failed")?
+}
+
+/// 独立推进本地 TCP 到上游 WebSocket 的传输、keepalive 和连接关闭。
+async fn relay_tcp_to_websocket(
+    mut client_reader: OwnedReadHalf,
+    mut websocket_writer: LocalWebSocketSink,
+    cancellation: CancellationToken,
+) -> Result<()> {
     let mut tcp_buffer = vec![0_u8; TCP_BUFFER_BYTES];
     let mut keepalive = interval_at(Instant::now() + KEEPALIVE_INTERVAL, KEEPALIVE_INTERVAL);
     loop {
         tokio::select! {
-            biased;
             () = cancellation.cancelled() => {
                 let _ = websocket_writer.close().await;
                 return Ok(());
@@ -411,39 +437,48 @@ async fn handle_connection(
                 }
                 send_chunked(&mut websocket_writer, &tcp_buffer[..read]).await?;
             }
-            message = websocket_reader.next() => {
-                match message {
-                    Some(Ok(Message::Binary(message))) => {
-                        let payload = decode_chunk(&message)?;
-                        if !payload.is_empty() {
-                            established = true;
-                            client_writer.write_all(payload).await.context("failed to write local CONNECT socket")?;
-                        }
-                    }
-                    Some(Ok(Message::Ping(payload))) => {
-                        websocket_writer.send(Message::Pong(payload)).await.context("failed to send upstream proxy pong")?;
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Close(_))) | None => return Ok(()),
-                    Some(Ok(Message::Text(_) | Message::Frame(_))) => {
-                        if !established {
-                            write_bad_gateway(&mut client_writer).await;
-                        }
-                        bail!("upstream proxy WebSocket sent a non-binary data frame");
-                    }
-                    Some(Err(error)) => {
-                        if !established {
-                            write_bad_gateway(&mut client_writer).await;
-                        }
-                        return Err(error).context("failed to read upstream proxy WebSocket");
-                    }
-                }
-            }
             _ = keepalive.tick() => {
                 websocket_writer
                     .send(Message::Binary(encode_chunk(&[])?.into()))
                     .await
                     .context("failed to send upstream proxy keepalive")?;
+            }
+        }
+    }
+}
+
+/// 独立推进上游 WebSocket 到本地 TCP 的传输。
+async fn relay_websocket_to_tcp(
+    mut websocket_reader: LocalWebSocketStream,
+    mut client_writer: OwnedWriteHalf,
+) -> Result<()> {
+    let mut established = false;
+    loop {
+        match websocket_reader.next().await {
+            Some(Ok(Message::Binary(message))) => {
+                let payload = decode_chunk(&message)?;
+                if !payload.is_empty() {
+                    established = true;
+                    client_writer
+                        .write_all(payload)
+                        .await
+                        .context("failed to write local CONNECT socket")?;
+                }
+            }
+            // Tungstenite 会自动排队 Pong，并在下一次 read 时将其 flush。
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            Some(Ok(Message::Close(_))) | None => return Ok(()),
+            Some(Ok(Message::Text(_) | Message::Frame(_))) => {
+                if !established {
+                    write_bad_gateway(&mut client_writer).await;
+                }
+                bail!("upstream proxy WebSocket sent a non-binary data frame");
+            }
+            Some(Err(error)) => {
+                if !established {
+                    write_bad_gateway(&mut client_writer).await;
+                }
+                return Err(error).context("failed to read upstream proxy WebSocket");
             }
         }
     }
@@ -827,13 +862,30 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            let keepalive = tokio::time::timeout(Duration::from_secs(1), websocket.next())
+            websocket
+                .send(Message::Ping(b"ping".as_slice().into()))
                 .await
-                .unwrap()
-                .unwrap()
-                .unwrap()
-                .into_data();
-            assert!(decode_chunk(&keepalive).unwrap().is_empty());
+                .unwrap();
+            let mut saw_pong = false;
+            let mut saw_keepalive = false;
+            while !saw_pong || !saw_keepalive {
+                let message = tokio::time::timeout(Duration::from_secs(1), websocket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                match message {
+                    Message::Pong(payload) => {
+                        assert_eq!(payload, b"ping".as_slice());
+                        saw_pong = true;
+                    }
+                    Message::Binary(payload) => {
+                        assert!(decode_chunk(&payload).unwrap().is_empty());
+                        saw_keepalive = true;
+                    }
+                    message => panic!("unexpected relay message: {message:?}"),
+                }
+            }
         });
 
         let relay_config = Arc::new(RelayConfig {
