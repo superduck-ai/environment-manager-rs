@@ -17,7 +17,7 @@ use http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use httparse::{EMPTY_HEADER, Request, Status};
 use nix::sys::prctl::set_dumpable;
 use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::{JoinHandle, JoinSet},
@@ -332,11 +332,11 @@ async fn run_listener(
             }
             _ = connections.join_next(), if !connections.is_empty() => {}
             accepted = listener.accept() => {
-                let (socket, _) = accepted.context("local relay accept failed")?;
+                let (client_stream, _) = accepted.context("local relay accept failed")?;
                 let config = config.clone();
                 let cancellation = cancellation.clone();
                 connections.spawn(async move {
-                    let _ = handle_connection(socket, &config, &cancellation).await;
+                    let _ = handle_connection(client_stream, &config, &cancellation).await;
                 });
             }
         }
@@ -345,7 +345,7 @@ async fn run_listener(
 
 /// 把一条本地 CONNECT 流量双向转发到 CCR WebSocket。
 async fn handle_connection(
-    mut socket: TcpStream,
+    mut client_stream: TcpStream,
     config: &RelayConfig,
     cancellation: &CancellationToken,
 ) -> Result<()> {
@@ -354,7 +354,7 @@ async fn handle_connection(
     // Proxy-Authorization: xx
     // 核心流程： 只解析 CONNECT 行，不解析原始 CONNECT 的 Host、User-Agent 等 header。除了请求行，其余原始 header 都被忽略。
     // WebSocket 建立后，它会重新构造一个 CONNECT 请求，只保留原始 CONNECT 行并注入 Proxy-Authorization
-    let Some(request) = read_connect_request(&mut socket, cancellation).await? else {
+    let Some(request) = read_connect_request(&mut client_stream, cancellation).await? else {
         return Ok(());
     };
     // websocket_url: wss://api.example.com/v1/code/upstreamproxy/ws
@@ -368,7 +368,7 @@ async fn handle_connection(
     } {
         Ok(connection) => connection,
         Err(error) => {
-            write_bad_gateway(&mut socket).await;
+            write_bad_gateway(&mut client_stream).await;
             return Err(anyhow!(
                 "upstream proxy WebSocket handshake failed: {error}"
             ));
@@ -384,14 +384,15 @@ async fn handle_connection(
         request.first_line, config.proxy_authorization
     );
     if let Err(error) = send_chunked(&mut websocket_writer, connect_head.as_bytes()).await {
-        write_bad_gateway(&mut socket).await;
+        write_bad_gateway(&mut client_stream).await;
         return Err(error);
     }
     if let Err(error) = send_chunked(&mut websocket_writer, &request.trailing).await {
-        write_bad_gateway(&mut socket).await;
+        write_bad_gateway(&mut client_stream).await;
         return Err(error);
     }
 
+    let (mut client_reader, mut client_writer) = client_stream.into_split();
     let mut established = false;
     let mut tcp_buffer = vec![0_u8; TCP_BUFFER_BYTES];
     let mut keepalive = interval_at(Instant::now() + KEEPALIVE_INTERVAL, KEEPALIVE_INTERVAL);
@@ -402,7 +403,7 @@ async fn handle_connection(
                 let _ = websocket_writer.close().await;
                 return Ok(());
             }
-            read = socket.read(&mut tcp_buffer) => {
+            read = client_reader.read(&mut tcp_buffer) => {
                 let read = read.context("failed to read local CONNECT socket")?;
                 if read == 0 {
                     let _ = websocket_writer.close().await;
@@ -416,7 +417,7 @@ async fn handle_connection(
                         let payload = decode_chunk(&message)?;
                         if !payload.is_empty() {
                             established = true;
-                            socket.write_all(payload).await.context("failed to write local CONNECT socket")?;
+                            client_writer.write_all(payload).await.context("failed to write local CONNECT socket")?;
                         }
                     }
                     Some(Ok(Message::Ping(payload))) => {
@@ -426,13 +427,13 @@ async fn handle_connection(
                     Some(Ok(Message::Close(_))) | None => return Ok(()),
                     Some(Ok(Message::Text(_) | Message::Frame(_))) => {
                         if !established {
-                            write_bad_gateway(&mut socket).await;
+                            write_bad_gateway(&mut client_writer).await;
                         }
                         bail!("upstream proxy WebSocket sent a non-binary data frame");
                     }
                     Some(Err(error)) => {
                         if !established {
-                            write_bad_gateway(&mut socket).await;
+                            write_bad_gateway(&mut client_writer).await;
                         }
                         return Err(error).context("failed to read upstream proxy WebSocket");
                     }
@@ -450,7 +451,7 @@ async fn handle_connection(
 
 /// 分片读取并校验最大 8 KiB 的本地 CONNECT 请求头。
 async fn read_connect_request(
-    socket: &mut TcpStream,
+    client_stream: &mut TcpStream,
     cancellation: &CancellationToken,
 ) -> Result<Option<ConnectRequest>> {
     let mut buffer = Vec::new();
@@ -460,14 +461,14 @@ async fn read_connect_request(
             ConnectParse::Incomplete => {}
             ConnectParse::Request(request) => return Ok(Some(request)),
             ConnectParse::Reject(response) => {
-                socket.write_all(response).await.ok();
-                socket.shutdown().await.ok();
+                client_stream.write_all(response).await.ok();
+                client_stream.shutdown().await.ok();
                 return Ok(None);
             }
         }
         let read = tokio::select! {
             () = cancellation.cancelled() => return Ok(None),
-            read = socket.read(&mut chunk) => read.context("failed to read CONNECT request")?,
+            read = client_stream.read(&mut chunk) => read.context("failed to read CONNECT request")?,
         };
         if read == 0 {
             return Ok(None);
@@ -571,9 +572,11 @@ fn decode_chunk(encoded: &[u8]) -> Result<&[u8]> {
 }
 
 /// 在隧道建立前向本地 CONNECT 客户端返回固定 502。
-async fn write_bad_gateway(socket: &mut TcpStream) {
-    let _ = socket.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
-    let _ = socket.shutdown().await;
+async fn write_bad_gateway(client_writer: &mut (impl AsyncWrite + Unpin)) {
+    let _ = client_writer
+        .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+        .await;
+    let _ = client_writer.shutdown().await;
 }
 
 /// 让没有 relay 的执行路径提供一个永不完成的健康信号。

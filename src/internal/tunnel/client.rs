@@ -59,6 +59,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// 代理 CONNECT 响应 header 的最大尺寸，防止错误代理无界占用内存。
 const MAX_PROXY_RESPONSE_HEADER: usize = 64 * 1024;
+/// `httparse` 需要调用方提供 header 槽位；代理握手不使用这些字段，只需设置合理上限。
+const MAX_PROXY_RESPONSE_HEADERS: usize = 128;
 
 /// Go `http.ProxyFromEnvironment` 第一次使用时捕获的进程级代理配置。
 static ENVIRONMENT_PROXY_CONFIG: OnceLock<EnvironmentProxyConfig> = OnceLock::new();
@@ -1360,8 +1362,6 @@ async fn connect_via_http_proxy(
         .await
         .map_err(WebSocketError::Io)?;
 
-    // `http.Request.Write` 会在 Host 后自动写这一 UA；代理或差分
-    // probe 可观测到 CONNECT 原始字节，顺序不能省略。
     let mut connect_request = format!(
         "CONNECT {target_authority} HTTP/1.1\r\nHost: {target_authority}\r\nUser-Agent: Go-http-client/1.1\r\n"
     );
@@ -1381,27 +1381,13 @@ async fn connect_via_http_proxy(
         .await
         .map_err(WebSocketError::Io)?;
 
-    let response_header = read_proxy_response_header(&mut stream).await?;
-    let status_line = response_header
-        .split(|byte| *byte == b'\n')
-        .next()
-        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-        .ok_or_else(|| WebSocketError::Io(io::Error::other("malformed proxy response")))?;
-    let status_line = std::str::from_utf8(status_line)
-        .map_err(|_| WebSocketError::Io(io::Error::other("malformed proxy response")))?;
-    let mut fields = status_line.splitn(3, ' ');
-    let _http_version = fields.next();
-    let status_code = fields
-        .next()
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| WebSocketError::Io(io::Error::other("malformed proxy response")))?;
-    let reason = fields.next().unwrap_or_default();
+    let (status_code, reason) = read_proxy_response(&mut stream).await?;
     if status_code != 200 {
         // Gorilla 对非 200 返回 `resp.Status` 中第一个空格后的 reason。
         let message = if reason.is_empty() {
             status_code.to_string()
         } else {
-            reason.to_owned()
+            reason
         };
         return Err(WebSocketError::Io(io::Error::other(message)));
     }
@@ -1674,26 +1660,74 @@ async fn read_socks5_connect_response(
     Ok(())
 }
 
-/// 读取到完整 `\r\n\r\n`，并限制代理响应 header 的内存使用。
-async fn read_proxy_response_header(stream: &mut TcpStream) -> Result<Vec<u8>, WebSocketError> {
-    let mut header = Vec::with_capacity(1024);
-    let mut byte = [0_u8; 1];
-    while header.len() < MAX_PROXY_RESPONSE_HEADER {
-        let read = stream.read(&mut byte).await.map_err(WebSocketError::Io)?;
+/// 批量读取并解析代理响应，同时避免消费 header 后的隧道数据。
+pub(super) async fn read_proxy_response(
+    stream: &mut TcpStream,
+) -> Result<(u16, String), WebSocketError> {
+    const READ_CHUNK_SIZE: usize = 4096;
+
+    let mut response_bytes = Vec::with_capacity(1024);
+    let mut peek_buf = [0_u8; READ_CHUNK_SIZE];
+    while response_bytes.len() < MAX_PROXY_RESPONSE_HEADER {
+        let remaining = MAX_PROXY_RESPONSE_HEADER - response_bytes.len();
+        let read = stream
+            .peek(&mut peek_buf[..remaining.min(READ_CHUNK_SIZE)])
+            .await
+            .map_err(WebSocketError::Io)?;
         if read == 0 {
-            return Err(WebSocketError::Io(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "unexpected EOF reading proxy response",
-            )));
+            return Err(WebSocketError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "unexpected EOF reading proxy response")));
         }
-        header.push(byte[0]);
-        if header.ends_with(b"\r\n\r\n") {
-            return Ok(header);
+
+        // previous_len: 本轮 peek 之前，已经累计并消费的响应 header 字节数
+        let previous_len = response_bytes.len();
+        response_bytes.extend_from_slice(&peek_buf[..read]);
+        let parsed = {
+            let mut headers = [httparse::EMPTY_HEADER; MAX_PROXY_RESPONSE_HEADERS];
+            let mut response = httparse::Response::new(&mut headers);
+            match response.parse(&response_bytes) {
+                Ok(httparse::Status::Complete(header_end)) => Some((
+                    header_end,
+                    response.code.ok_or_else(malformed_proxy_response)?,
+                    response.reason.unwrap_or_default().to_owned(),
+                )),
+                Ok(httparse::Status::Partial) => None,
+                Err(_) => return Err(malformed_proxy_response()),
+            }
+        };
+        match parsed {
+            // None 消费本次全部 peek 数据，继续循环。
+            None => {
+                stream
+                    .read_exact(&mut peek_buf[..read])
+                    .await
+                    .map_err(WebSocketError::Io)?;
+            }
+            // 只消费到 header 边界，保留本次 peek 到的隧道数据。
+            Some((header_end, status_code, reason)) => {
+                // 第一轮：已经累计 100 字节
+                // 第二轮：peek 到 60 字节
+                // previous_len = 100;
+                // response_bytes.len() = 160;
+                // 假设 httparse 发现完整 header 结束于累计 buffer 的第 130 字节：
+                // 那么当前这一轮只应从 socket 消费：
+                //
+                // let consume = header_end - previous_len;
+                // 130 - 100 = 30
+                let consume = header_end - previous_len;
+                // 只消费当前轮中的 header 部分: 30
+                stream
+                    .read_exact(&mut peek_buf[..consume])
+                    .await
+                    .map_err(WebSocketError::Io)?;
+                return Ok((status_code, reason));
+            }
         }
     }
-    Err(WebSocketError::Io(io::Error::other(
-        "proxy response header too large",
-    )))
+    Err(WebSocketError::Io(io::Error::other("proxy response header too large")))
+}
+
+fn malformed_proxy_response() -> WebSocketError {
+    WebSocketError::Io(io::Error::other("malformed proxy response"))
 }
 
 /// 对 proxy URL user-info 执行 percent decode；`+` 在 URL user-info 中保持原字节。
