@@ -55,7 +55,7 @@ use super::{
     Outcomes,
     config_helpers::get_claude_path,
     session_urls::build_session_urls,
-    zz_recovered_types::{
+    types::{
         ClaudeCodeExecutor, ClaudeError, ClaudeObservability, Executor, McpServerRegistration,
         claude_attrs, format_exit_status,
     },

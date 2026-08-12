@@ -8,11 +8,11 @@ mod git;
 mod gitproxy_adapter;
 #[allow(clippy::module_inception)]
 mod sources;
-mod zz_recovered_types;
+mod types;
 
 pub use git::new_git_handler;
 pub use sources::new_source_handler_manager;
-pub use zz_recovered_types::{
+pub use types::{
     GitHandler, GitProxyConfig, GitProxyFactory, GitProxyManager, GitRemoteUpdater, ProcessMode,
     RepoAuth, SourceHandler, SourceHandlerManager, SourceSlot, SourceValue, SourcesError,
     SourcesResult,

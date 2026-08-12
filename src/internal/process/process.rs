@@ -24,7 +24,7 @@ use crate::internal::{
     util::{OutputStreamer, StreamType},
 };
 
-use super::zz_recovered_types::{
+use super::types::{
     ProcessError, ProcessExitError, ProcessResult, go_errno_text, go_spawn_error,
     resolve_go_command,
 };

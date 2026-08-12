@@ -1,4 +1,4 @@
-//! 对应 Go `internal/orchestrator/zz_recovered_types.go` 的类型声明。
+//! Orchestrator 的共享类型声明。
 //!
 //! 恢复出的 Go 文件把协议 DTO、轮询 trait 和 orchestrator 配置集中在一起；Rust
 //! 版本保留同一文件边界，并用 `Arc<dyn Trait>` 表达可共享接口、用

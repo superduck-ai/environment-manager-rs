@@ -42,7 +42,7 @@ use super::{
     AnthropicEnvironmentType, Config, Language,
     anthropic::{InitActivityStopGuard, copy_dir, extract_exit_code},
     decode_config,
-    zz_recovered_types::HookConfig,
+    types::HookConfig,
 };
 
 /// 测试活动记录器保存的可观察调用。

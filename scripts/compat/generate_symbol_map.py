@@ -120,10 +120,12 @@ def receiver_type(receiver: str | None) -> str | None:
 
 
 def expected_rust_path(relative: Path) -> Path:
-    """返回旧布局下的机械期望路径；实际命中路径由符号索引决定。"""
+    """返回 Rust 约定下的期望路径；实际命中路径由符号索引决定。"""
 
     if relative == Path("main.go"):
         return Path("src/main.rs")
+    if relative.name == "zz_recovered_types.go":
+        relative = relative.with_name("types.go")
     return Path("src") / relative.with_suffix(".rs")
 
 

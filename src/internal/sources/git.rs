@@ -39,7 +39,7 @@ use crate::internal::{
 };
 
 use super::gitproxy_adapter::ProductionGitProxyFactory;
-use super::zz_recovered_types::SharedAuthProvider;
+use super::types::SharedAuthProvider;
 
 const GIT_HTTP_PROXY_AUTH_CONFIG: &str = "http.proxyAuthMethod=basic";
 

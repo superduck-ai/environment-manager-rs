@@ -8,13 +8,13 @@
 mod manager;
 mod mcp;
 mod tunnel_register;
-mod zz_recovered_types;
+mod types;
 
 pub use manager::{
     is_tunnel_enabled, new_manager_with_executor_and_claude_config, run_init_only,
     wait_for_shutdown_signal,
 };
-pub use zz_recovered_types::{
+pub use types::{
     ClaudeExecutorFactory, CreateTunnelClientFunc, EnvironmentLeaseAdapter, Manager,
     ManagerApiClient, ManagerApiClientAdapter, ManagerError, ManagerLeaseRequest,
     ManagerLeaseRuntime, ManagerObservability, TunnelClient,

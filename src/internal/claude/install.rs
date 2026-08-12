@@ -13,7 +13,7 @@ use crate::internal::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::zz_recovered_types::{
+use super::types::{
     CapturedCommandError, ClaudeError, ClaudeObservability, claude_attrs, run_combined_command,
     run_stdout_command,
 };

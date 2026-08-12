@@ -1,6 +1,6 @@
 //! 认证子系统的数据类型。
 //!
-//! 文件名与恢复后的 Go `zz_recovered_types.go` 对应。敏感字段不会通过 `Debug`
+//! 类型源自恢复后的 Go `zz_recovered_types.go`。敏感字段不会通过 `Debug`
 //! 输出，避免错误链或诊断日志意外泄漏令牌。
 
 use serde::{Deserialize, Deserializer, Serialize};

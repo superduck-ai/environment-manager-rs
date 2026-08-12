@@ -19,10 +19,8 @@ use walkdir::WalkDir;
 use crate::internal::logger::{LogAttributes, Logger, default_slog_logger};
 use crate::internal::tunnel::actions::{ActionError, ProgressUpdate};
 
+use super::types::{AntspaceClient, AntspaceDeployResult, AntspaceResponse, OptionalProgress};
 use super::vercel::MAX_DEPLOYMENT_BYTES;
-use super::zz_recovered_types::{
-    AntspaceClient, AntspaceDeployResult, AntspaceResponse, OptionalProgress,
-};
 
 /// Antspace 整次 HTTP 请求的固定超时，对应 Go 的十五分钟 `http.Client.Timeout`。
 const ANTSPACE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);

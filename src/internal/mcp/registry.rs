@@ -26,7 +26,7 @@ use crate::internal::{
     session::ActivityRecorder,
 };
 
-use super::zz_recovered_types::{
+use super::types::{
     AllowedTools, BaseServer, MCPServerConfigurator, MCPServerRegistration, McpError, McpResult,
     RegistrationStore, ServerConfig, ShouldRegister, log_attributes,
 };
@@ -142,7 +142,7 @@ pub fn new_registration(
                     );
                 }
                 Ok(server)
-            }) as super::zz_recovered_types::FactoryFuture
+            }) as super::types::FactoryFuture
         },
     );
 

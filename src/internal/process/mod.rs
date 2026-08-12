@@ -7,14 +7,12 @@
 #[allow(clippy::module_inception)]
 mod process;
 mod script;
-mod zz_recovered_types;
+mod types;
 
 pub use process::execute;
 pub use script::{ScriptError, execute_script};
-pub use zz_recovered_types::{
-    GoCommandError, ProcessError, ProcessExitError, ProcessResult, Result,
-};
-pub(crate) use zz_recovered_types::{go_spawn_error, resolve_go_command};
+pub use types::{GoCommandError, ProcessError, ProcessExitError, ProcessResult, Result};
+pub(crate) use types::{go_spawn_error, resolve_go_command};
 
 #[cfg(test)]
 #[path = "process_test.rs"]

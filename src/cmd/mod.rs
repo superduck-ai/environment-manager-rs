@@ -21,8 +21,8 @@ mod provision_packages;
 mod setup;
 #[path = "cmd_task_run.rs"]
 mod task_run;
+mod types;
 mod utils;
-mod zz_recovered_types;
 
 use std::ffi::OsString;
 

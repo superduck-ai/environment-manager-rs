@@ -25,7 +25,7 @@ use crate::internal::{logger::Logger, util::OutputStreamer};
 use super::{
     ProcessError, ProcessResult, execute,
     process::attributes,
-    zz_recovered_types::{go_errno_text, go_utf8_error_view},
+    types::{go_errno_text, go_utf8_error_view},
 };
 
 /// 临时脚本准备或执行错误。

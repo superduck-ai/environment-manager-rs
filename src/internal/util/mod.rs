@@ -13,8 +13,8 @@ mod retry;
 mod stopper;
 mod stream;
 mod tailer;
+mod types;
 mod version;
-mod zz_recovered_types;
 
 pub(crate) use duration::{format_go_duration, go_duration_nanoseconds};
 pub use git::{GitRefError, update_remote_tracking_branch};
@@ -24,12 +24,12 @@ pub use periodic_invoker::{PeriodicInvokerError, new_periodic_invoker};
 pub use retry::{RetryError, retry_operation};
 pub use stream::{BoxError, output_streamer};
 pub use tailer::{TailerError, new_tailer};
-pub use version::{
-    VersionInitError, claude_code_version, initialize_versions, set_claude_code_version, version,
-};
-pub use zz_recovered_types::{
+pub use types::{
     ErrorClassifier, Line, OutputStreamer, PeriodicInvoker, RetryConfig, Stopper, StreamType,
     TailLine, Tailer,
+};
+pub use version::{
+    VersionInitError, claude_code_version, initialize_versions, set_claude_code_version, version,
 };
 
 #[cfg(test)]

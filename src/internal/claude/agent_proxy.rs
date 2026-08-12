@@ -39,7 +39,7 @@ use crate::internal::tunnel::{
     LocalWebSocketSink, LocalWebSocketStream, connect_websocket_with_config,
 };
 
-use super::zz_recovered_types::ClaudeError;
+use super::types::ClaudeError;
 
 pub(super) const STALE_RELAY_TOKEN_PATH: &str = "/run/ccr/session_token";
 const SYSTEM_CA_BUNDLE_PATH: &str = "/etc/ssl/certs/ca-certificates.crt";

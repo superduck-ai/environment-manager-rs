@@ -16,7 +16,7 @@ use crate::internal::{
     config::{ClaudeConfig, StartupContext},
     mcp::{
         BaseServer, MCPServer, MCPServerConfigurator, MCPServerRegistration, McpError, McpResult,
-        new_registration, zz_recovered_types::log_attributes,
+        new_registration, types::log_attributes,
     },
     session::ActivityRecorder,
 };

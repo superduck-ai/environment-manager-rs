@@ -16,7 +16,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{Value, json};
 
 use super::error::CliError;
-use super::zz_recovered_types::{
+use super::types::{
     CodeSignConfig, McpRequest, McpResponse, McpToolCallParams, McpToolResult, RetryConfig,
 };
 

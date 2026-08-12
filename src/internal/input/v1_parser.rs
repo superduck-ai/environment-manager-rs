@@ -16,7 +16,7 @@ use crate::internal::config::{ConfigError, McpConfig, OutcomeField, StartupConte
 use crate::internal::logger::{LogAttributes, Logger};
 
 use super::secret::{SecretError, decode_work_secret, parse_v1_work_response};
-use super::zz_recovered_types::{
+use super::types::{
     EnvironmentConfigResponse, InputParser, Outcomes, ParsedContext, SessionContext,
     SessionContextProvider, SessionContextRequest, V1Parser, V1WorkResponse, WorkSecret,
 };

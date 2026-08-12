@@ -25,7 +25,7 @@ use crate::internal::api::HttpClient;
 use crate::internal::logger::{LogAttributes, LogLevel, Logger, default_slog_logger};
 use crate::internal::util::{RetryConfig, RetryError, Stopper, retry_operation};
 
-use super::zz_recovered_types::{
+use super::types::{
     DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD, DEFAULT_SHUTDOWN_GRACE_PERIOD, HealthFileError,
     HeartbeatError, HeartbeatResponse, LeaseInfo, LeaseManager, LeaseManagerError,
     LeaseManagerInner, LeaseState, Lifecycle, NO_SERVER_HEARTBEAT, SHUTDOWN_GRACE_PERIOD_BUFFER,

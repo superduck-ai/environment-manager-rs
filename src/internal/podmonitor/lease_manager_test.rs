@@ -27,7 +27,7 @@ use super::lease_manager::{
     claude_code_stuck_threshold_from, is_permanent_heartbeat_error, is_precondition_failed_error,
     is_retriable_stop_error, new_lease_manager_with_stuck_threshold, read_stop_response_body,
 };
-use super::zz_recovered_types::{
+use super::types::{
     DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD, DEFAULT_SHUTDOWN_GRACE_PERIOD, HeartbeatError,
     LeaseManager, LeaseManagerError, NO_SERVER_HEARTBEAT, SHUTDOWN_GRACE_PERIOD_BUFFER,
     StopApiError, StopRequestError,

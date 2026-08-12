@@ -1,6 +1,6 @@
 //! session 活动记录器的数据类型与接口。
 //!
-//! 文件名与 Go 的 `zz_recovered_types.go` 对应。Go 的同步 `EventPoster` 在调用点
+//! 类型源自 Go 的 `zz_recovered_types.go`。Go 的同步 `EventPoster` 在调用点
 //! 实际执行网络 I/O，因此 Rust 接口使用 async trait，避免阻塞 Tokio worker。
 
 use std::collections::BTreeMap;

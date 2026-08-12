@@ -8,13 +8,11 @@
 mod anthropic;
 mod config;
 pub mod install_scripts;
-mod zz_recovered_types;
+mod types;
 
 pub use anthropic::{REGISTRATION, new};
 pub use config::decode_config;
-pub use zz_recovered_types::{
-    AnthropicEnvironmentType, AnthropicError, Config, Language, RunScriptError,
-};
+pub use types::{AnthropicEnvironmentType, AnthropicError, Config, Language, RunScriptError};
 
 #[cfg(test)]
 mod anthropic_test;

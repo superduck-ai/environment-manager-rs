@@ -8,7 +8,7 @@ mod file_logger;
 mod go_default_logger;
 mod log_writer;
 mod multi_handler;
-mod zz_recovered_types;
+mod types;
 
 #[cfg(test)]
 mod file_logger_test;
@@ -23,6 +23,6 @@ pub use file_logger::{
 pub use go_default_logger::default_slog_logger;
 pub use log_writer::{LogWriter, MAX_LOG_WRITER_BUFFERED_LINE};
 pub use multi_handler::{MinLevelHandler, MultiHandler};
-pub use zz_recovered_types::{
+pub use types::{
     LogAttributes, LogHandler, LogHandlerError, LogLevel, LogRecord, LogSource, Logger,
 };

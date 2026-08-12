@@ -22,7 +22,7 @@ use crate::internal::tunnel::actions::{
     Action, ActionError, ActionRequest, ActionResult, ProgressReporter,
 };
 
-use super::zz_recovered_types::{FileEntry, SnapshotAction, SnapshotResponse};
+use super::types::{FileEntry, SnapshotAction, SnapshotResponse};
 
 /// 对应 Go `snapshotTimeout`：快照 action 最多运行三十秒。
 pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);

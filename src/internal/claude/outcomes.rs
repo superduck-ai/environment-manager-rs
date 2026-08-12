@@ -13,7 +13,7 @@ use std::{collections::HashMap, fmt};
 
 use crate::internal::logger::{Logger, default_slog_logger};
 
-use super::zz_recovered_types::claude_attrs;
+use super::types::claude_attrs;
 
 /// 一个 session 允许写入的仓库及其目标分支。
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

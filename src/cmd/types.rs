@@ -1,4 +1,4 @@
-//! 对应 Go `cmd/zz_recovered_types.go` 的恢复类型集合。
+//! 命令层共享类型。
 //!
 //! code-sign 的 JSON-RPC DTO 与重试参数保留在原文件基名中；TaskContext 和 stdin
 //! client 则承载 task-run 已接线的 v0/v1 统一上下文。所有 JSON 字段显式保持 Go 拼写。

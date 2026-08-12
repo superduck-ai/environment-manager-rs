@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::internal::auth::AuthConfig;
 use crate::internal::config::{McpConfigFile, Source};
 
-use super::zz_recovered_types::{V1WorkResponse, WorkSecret};
+use super::types::{V1WorkResponse, WorkSecret};
 
 /// 把 work secret 中显式 JSON `null` 的值类型字段还原为 Go 零值。
 ///

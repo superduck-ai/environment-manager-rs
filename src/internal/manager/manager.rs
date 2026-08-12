@@ -36,7 +36,7 @@ use crate::internal::{
 
 use super::{
     tunnel_register::default_create_tunnel_client_func,
-    zz_recovered_types::{
+    types::{
         ClaudeExecutorFactory, CommandFailure, CreateTunnelClientFunc, EnvironmentLeaseAdapter,
         Manager, ManagerApiClient, ManagerError, ManagerLeaseRequest, ManagerLeaseRuntime,
         ManagerObservability, McpRegistrationBatch,

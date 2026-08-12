@@ -765,7 +765,7 @@ def direct_runtime_calls(rust_root: Path) -> list[Call]:
         in {"debug", "info", "warn", "error", "log", "log_with_logger"}
         and call.path
         not in {
-            "src/internal/logger/zz_recovered_types.rs",
+            "src/internal/logger/types.rs",
             # `emit` 使用 track_caller，runtime location 是 Write 内两个 self.emit
             # 调用；这两个位置由 log_writer_rows 单独建规则。
             "src/internal/logger/log_writer.rs",

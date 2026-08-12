@@ -44,7 +44,7 @@ use crate::internal::{
 use super::{
     AnthropicEnvironmentType, AnthropicError, Config, Language, RunScriptError, decode_config,
     install_scripts,
-    zz_recovered_types::{HookConfig, ScopedActivityRecorder, SharedScopedRecorder, boxed},
+    types::{HookConfig, ScopedActivityRecorder, SharedScopedRecorder, boxed},
 };
 
 /// Baku 镜像内置 Vite 模板目录。

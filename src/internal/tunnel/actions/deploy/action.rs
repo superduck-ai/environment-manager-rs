@@ -24,8 +24,8 @@ use crate::internal::tunnel::actions::{
 };
 
 use super::antspace::create_tarball;
+use super::types::{DeployAction, DeployRequest, DeployResponse, VercelClient};
 use super::vercel::{collect_files, project_name, validate_project_dir};
-use super::zz_recovered_types::{DeployAction, DeployRequest, DeployResponse, VercelClient};
 
 /// 空请求使用的固定 Baku 项目目录。
 const DEFAULT_PROJECT_DIR: &str = "/home/claude/project";

@@ -5,18 +5,18 @@
 //! Tokio/Reqwest API client，而不会让 JSON 解析层持有具体 HTTP 实现。
 
 pub mod secret;
+pub mod types;
 pub mod v0_parser;
 pub mod v1_parser;
-pub mod zz_recovered_types;
 
 pub use secret::{SecretError, decode_work_secret, parse_v1_work_response};
-pub use v0_parser::V0ParseError;
-pub use v1_parser::{V1ParseError, normalize_api_base_url};
-pub use zz_recovered_types::{
+pub use types::{
     EnvironmentConfigResponse, InputParser, NoSessionContextProvider, Outcomes, ParsedContext,
     SessionContext, SessionContextProvider, SessionContextRequest, V0Parser, V1Parser, V1WorkData,
     V1WorkResponse, WorkSecret,
 };
+pub use v0_parser::V0ParseError;
+pub use v1_parser::{V1ParseError, normalize_api_base_url};
 
 #[cfg(test)]
 mod input_test;

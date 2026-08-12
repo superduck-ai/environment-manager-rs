@@ -7,10 +7,10 @@
 #[allow(clippy::module_inception)]
 mod byoc;
 mod source_processor;
-mod zz_recovered_types;
+mod types;
 
 pub use byoc::{MAX_TASK_SETUP_SCRIPT_BYTES, REGISTRATION, new};
-pub use zz_recovered_types::{
+pub use types::{
     ByocConfig, ByocEnvironmentType, ByocError, ContainProvideAuthTransport, LeaseManagerFactory,
     LeaseManagerRequest, SourceProcessMode, SourceProcessRequest, SourceProcessor,
     SourceProcessorError,

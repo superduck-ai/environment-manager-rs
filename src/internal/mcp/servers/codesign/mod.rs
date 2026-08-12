@@ -7,13 +7,13 @@
 mod registration;
 mod server;
 mod sign_operations;
-mod zz_recovered_types;
+mod types;
 
 pub use registration::{configure_server, registration, should_register};
 pub use sign_operations::{
     ERR_EMPTY_CONTENT, ERR_SIGNING_FAILED, read_file_content, sanitize_source,
 };
-pub use zz_recovered_types::{
+pub use types::{
     CodeSignMCPServer, RemoteSignRequest, RemoteSignResponse, SignRequest, SignResponse, SourceInfo,
 };
 

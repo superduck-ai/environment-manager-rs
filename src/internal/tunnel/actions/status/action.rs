@@ -15,7 +15,7 @@ use crate::internal::tunnel::actions::{
     Action, ActionError, ActionRequest, ActionResult, ProgressReporter,
 };
 
-use super::zz_recovered_types::{StatusAction, StatusRequest, StatusResult};
+use super::types::{StatusAction, StatusRequest, StatusResult};
 
 /// 对应 Go `(*StatusAction).Timeout`：端口探测 action 最多运行五秒。
 pub const STATUS_TIMEOUT: Duration = Duration::from_secs(5);

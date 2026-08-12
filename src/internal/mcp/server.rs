@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use crate::internal::logger::{LogLevel, Logger};
 
 use super::rmcp_adapter;
-use super::zz_recovered_types::{
+use super::types::{
     BaseServer, CallToolRequest, MCPServer, McpError, McpResult, ServerConfig, ServerRuntime,
     ToolConfig, log_attributes,
 };

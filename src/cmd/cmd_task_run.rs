@@ -46,8 +46,8 @@ use crate::internal::{
 };
 
 use super::error::{CliError, RuntimeError};
+use super::types::{StdinConfigClient, TaskContext};
 use super::utils::{LogLevel, bool_value, flag_arg, logger_level, parse_log_level};
-use super::zz_recovered_types::{StdinConfigClient, TaskContext};
 
 const LONG_ABOUT: &str = r#"Connects directly to the API to execute an existing session id.
 

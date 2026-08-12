@@ -1,4 +1,4 @@
-//! 对应 Go `internal/util/zz_recovered_types.go` 的类型对照入口。
+//! Util 模块的公共类型重导出入口。
 //!
 //! 实际实现按职责保留在 `periodic_invoker.rs`、`retry.rs`、`stream.rs`、
 //! `stopper.rs` 与 `tailer.rs`；本文件统一重导出恢复出的 Go 类型，便于符号清单

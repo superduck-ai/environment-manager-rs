@@ -6,16 +6,16 @@
 
 mod action;
 mod antspace;
+mod types;
 mod vercel;
-mod zz_recovered_types;
 
 pub use action::{DEPLOY_TIMEOUT, new_deploy_action};
 pub use antspace::{create_tarball, new_antspace_client};
+pub use types::{
+    AntspaceClient, AntspaceDeployResult, DeployAction, Deployment, FileEntry, VercelClient,
+};
 pub use vercel::{
     CollectedFiles, MAX_DEPLOYMENT_BYTES, collect_files, project_name, validate_project_dir,
-};
-pub use zz_recovered_types::{
-    AntspaceClient, AntspaceDeployResult, DeployAction, Deployment, FileEntry, VercelClient,
 };
 
 #[cfg(test)]

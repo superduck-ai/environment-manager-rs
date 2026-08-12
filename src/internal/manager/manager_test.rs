@@ -37,7 +37,7 @@ use super::{
     CreateTunnelClientFunc, Manager, ManagerApiClient, ManagerError, ManagerLeaseRequest,
     ManagerLeaseRuntime, TunnelClient, is_tunnel_enabled,
     new_manager_with_executor_and_claude_config,
-    zz_recovered_types::{ClaudeExecutorFactory, EnvironmentLeaseAdapter},
+    types::{ClaudeExecutorFactory, EnvironmentLeaseAdapter},
 };
 
 /// 丢弃全部测试日志的 handler。

@@ -29,7 +29,7 @@ use super::{
     Outcomes,
     install::{get_installed_version, is_specific_version},
     install_or_update_claude_code, run_init,
-    zz_recovered_types::run_combined_command,
+    types::run_combined_command,
 };
 
 /// 丢弃全部日志的 handler。

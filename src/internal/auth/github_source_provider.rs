@@ -7,7 +7,7 @@ use url::{Position, Url};
 
 use crate::internal::logger::{LogAttributes, Logger};
 
-use super::zz_recovered_types::{
+use super::types::{
     AuthContext, GitHubAuthType, GitHubSourceAuthProvider, Permission, SourceAuthProvider,
 };
 

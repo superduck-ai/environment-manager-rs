@@ -10,7 +10,7 @@ mod metrics;
 mod o11y_service;
 mod otel_logging;
 mod otel_metrics;
-mod zz_recovered_types;
+mod types;
 
 pub mod diag;
 
@@ -22,7 +22,7 @@ pub use metrics::{
 };
 pub use o11y_service::{get_o11y_service, new_o11y_service};
 pub use otel_metrics::{increment, record_function_deferred, record_gauge};
-pub use zz_recovered_types::*;
+pub use types::*;
 
 #[cfg(test)]
 mod metric_types_test;
