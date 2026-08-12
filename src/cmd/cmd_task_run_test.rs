@@ -1,4 +1,4 @@
-//! `task-run` 命令解析与运行时兼容测试。
+//! `task-run` 命令解析与运行时测试。
 //!
 //! 对应 Go `cmd/cmd_task_run_test.go`；CCR 使用 loopback 真 HTTP，manager
 //! 仅在信号包装边界使用 fake，不伪造生产 backend 成功路径。
@@ -25,8 +25,7 @@ use crate::internal::{
 use super::task_run::{
     TaskRunManager, TaskRunObservability, acknowledge_work_if_needed,
     apply_ccr_backend_claude_environment, build_task_run_backend, init_diag_logging,
-    load_context_from_bytes, run_task_run_manager, task_run_claude_path,
-    v0_missing_startup_context_panic_error, validate_api_base_url,
+    load_context_from_bytes, run_task_run_manager, task_run_claude_path, validate_api_base_url,
     wrap_claude_code_availability_error,
 };
 use super::zz_recovered_types::{StdinConfigClient, TaskContext};
@@ -64,19 +63,19 @@ fn test_logger() -> Logger {
     Logger::new(Arc::new(DiscardHandler))
 }
 
-/// task-run 缺少 session 时必须是 Cobra 风格的一号退出错误。
+/// task-run 缺少 session 时必须是 Clap 的 usage error。
 #[test]
 fn task_run_requires_session() {
     let error = parse_from("dev", ["environment-runner", "task-run"])
         .expect_err("session must be required");
     assert_eq!(error.kind(), CliErrorKind::Usage);
-    assert_eq!(error.exit_code(), 1);
+    assert_eq!(error.exit_code(), 2);
     assert_eq!(error.stream(), OutputStream::Stderr);
-    assert!(error.rendered().starts_with("Error:"));
+    assert!(error.rendered().starts_with("error:"));
     assert!(error.rendered().contains("--session"));
 }
 
-/// task-run 默认版本推导和“是否显式设置”状态必须与 Go RunE 一致。
+/// task-run 默认版本与“是否显式设置”状态必须稳定。
 #[test]
 fn task_run_defaults_preserve_explicitness() {
     let Invocation::TaskRun(args) = parse_from(
@@ -92,15 +91,13 @@ fn task_run_defaults_preserve_explicitness() {
     assert_eq!(args.session_mode, SessionMode::New);
     assert!(!args.session_mode_was_set);
     assert!(!args.stdin_was_set);
-    assert!(args.upgrade_claude_code);
-    assert!(!args.upgrade_claude_code_was_set);
     assert_eq!(args.claude_agent_version, "latest");
 }
 
-/// 显式关闭旧升级 flag 时应把目标版本推导为 current。
+/// 已废弃的 Go 升级布尔参数应被移除。
 #[test]
-fn task_run_legacy_upgrade_false_maps_to_current() {
-    let Invocation::TaskRun(args) = parse_from(
+fn task_run_rejects_legacy_upgrade_flag() {
+    let error = parse_from(
         "dev",
         [
             "environment-runner",
@@ -110,34 +107,29 @@ fn task_run_legacy_upgrade_false_maps_to_current() {
             "--upgrade-claude-code=false",
         ],
     )
-    .expect("legacy upgrade false must parse") else {
-        panic!("unexpected invocation");
-    };
-
-    assert!(!args.upgrade_claude_code);
-    assert!(args.upgrade_claude_code_was_set);
-    assert_eq!(args.claude_agent_version, "current");
+    .expect_err("legacy upgrade flag must no longer parse");
+    assert_eq!(error.kind(), CliErrorKind::Usage);
+    assert_eq!(error.exit_code(), 2);
 }
 
-/// 新旧 Claude 版本 flag 同时显式设置时应保留旧错误文本。
+/// Claude Agent 版本使用单一的字符串参数。
 #[test]
-fn task_run_rejects_conflicting_version_flags() {
-    let error = parse_from(
+fn task_run_accepts_explicit_claude_agent_version() {
+    let Invocation::TaskRun(args) = parse_from(
         "dev",
         [
             "environment-runner",
             "task-run",
             "--session",
             "session-1",
-            "--upgrade-claude-code",
             "--claude-agent-version",
             "stable",
         ],
     )
-    .expect_err("version flags must conflict");
-    assert_eq!(error.kind(), CliErrorKind::Validation);
-    assert!(error.rendered().contains("mutually exclusive"));
-    assert!(error.rendered().starts_with("Error:"));
+    .expect("explicit version must parse") else {
+        panic!("unexpected invocation");
+    };
+    assert_eq!(args.claude_agent_version, "stable");
 }
 
 /// local-testing 应在解析结果中应用旧 RunE 的 verbose/git 派生行为。
@@ -476,94 +468,20 @@ fn task_run_preserves_raw_claude_install_error() {
     let error = wrap_claude_code_availability_error(&source);
     let expected: &[u8] = b"failed to ensure Claude Code is available: npm failed: \xff\xfe\0";
     assert_eq!(error.as_bytes(), expected);
-    let rendered = render_runtime_error_bytes(CobraCommand::TaskRun, error.as_bytes());
+    let (rendered, exit_code) = render_runtime_error(&error);
+    assert_eq!(exit_code, 1);
     let raw_error_occurrences = rendered
         .windows(expected.len())
         .filter(|window| *window == expected)
         .count();
-    assert_eq!(raw_error_occurrences, 2);
+    assert_eq!(raw_error_occurrences, 1);
 }
 
-/// 验证 V0 缺失 startup context 只走 Go runtime 直出分支。
-///
-/// 该测试从 task-run 的真实字节解析边界进入，确保 sentinel 不会被
-/// `failed to parse/load` 包装，也不会被 Cobra renderer 添加 usage 或双 `Error:`。
+/// V0 缺失或无效 startup context 应返回普通解析错误。
 #[tokio::test]
-async fn task_run_v0_missing_startup_context_uses_direct_go_panic_output() {
-    let error = load_context_from_bytes(
-        &CancellationToken::new(),
-        &test_logger(),
-        "session-missing-startup",
-        InputFormat::V0,
-        std::path::Path::new("/workspace"),
-        br#"{"environment":{"environment_type":"byoc"}}"#,
-    )
-    .await
-    .expect_err("缺失 startup_context 必须进入 Go runtime panic 兼容分支");
-
-    assert!(error.writes_directly_to_stderr());
-    assert_eq!(error.exit_code(), 2);
-    assert!(
-        error.as_bytes().starts_with(
-            b"panic: runtime error: invalid memory address or nil pointer dereference\n"
-        )
-    );
-    let required_frames: &[&[u8]] = &[
-        b"[signal SIGSEGV: segmentation violation code=0x1 addr=0xc0 pc=0x635588]\n",
-        b"goroutine 1 [running]:\n",
-        b"internal/input.(*V0Parser).Parse(0x0, {0xa188f8, 0xffdda0}, {0x0, 0x2b, 0x200})\n",
-        b"internal/input/v0_parser.go:58 +0x188\n",
-        b"cmd.loadContextFromStdin({0xa188f8, 0xffdda0}, 0x0, {0x0, 0x1a}, {0x8bc9e1, 0x2}, {0x0, 0x48})\n",
-        b"cmd/cmd_task_run.go:576 +0x2b4\n",
-        b"cmd.AddTaskRunCommand.func1(0x0, {0x8bcf78?, 0x4?, 0x8bcf7c?})\n",
-        b"cmd/cmd_task_run.go:152 +0x378\n",
-        b"github.com/spf13/cobra.(*Command).execute(0x0, {0x0, 0x3, 0x3})\n",
-        b"cobra@v1.9.1/command.go:1015 +0x7d4\n",
-        b"github.com/spf13/cobra.(*Command).ExecuteC(0x0)\n",
-        b"cobra@v1.9.1/command.go:1148 +0x350\n",
-        b"github.com/spf13/cobra.(*Command).Execute(...)\n",
-        b"cobra@v1.9.1/command.go:1071\n",
-        b"main.main()\n",
-        b"./main.go:45 +0x2c8\n",
-    ];
-    let mut cursor = 0;
-    for frame in required_frames {
-        let relative = error.as_bytes()[cursor..]
-            .windows(frame.len())
-            .position(|window| window == *frame)
-            .unwrap_or_else(|| panic!("缺少或乱序的 Go panic frame: {frame:?}"));
-        cursor += relative + frame.len();
-    }
-    assert!(error.as_bytes().ends_with(b"\n"));
-    assert!(!error.as_bytes().starts_with(b"failed to parse stdin:"));
-
-    let (rendered, exit_code) = render_task_run_runtime_error(&error);
-    assert_eq!(exit_code, 2);
-    assert_eq!(rendered, error.as_bytes());
-    assert!(
-        !rendered
-            .windows(b"Error: ".len())
-            .any(|part| part == b"Error: ")
-    );
-    assert!(
-        !rendered
-            .windows(b"Usage:\n".len())
-            .any(|part| part == b"Usage:\n")
-    );
-    assert!(
-        !rendered
-            .windows(b"thread 'main' panicked".len())
-            .any(|part| { part == b"thread 'main' panicked" })
-    );
-}
-
-/// 验证 V0 其他解析错误不会被误分类为 Go runtime panic。
-///
-/// 显式 `null` 在 Go 中会得到非 nil 的零值 context，随后返回普通领域校验错误；
-/// 非法 JSON 形状更早失败。两者都必须继续进入 Cobra/exit 1 路径。
-#[tokio::test]
-async fn task_run_v0_only_missing_startup_context_uses_exit_two() {
+async fn task_run_v0_invalid_startup_context_returns_error() {
     for payload in [
+        br#"{"environment":{"environment_type":"byoc"}}"#.as_slice(),
         br#"{"startup_context":null,"environment":{"environment_type":"byoc"}}"#.as_slice(),
         br#"{"startup_context":"not-an-object"}"#.as_slice(),
     ] {
@@ -577,32 +495,20 @@ async fn task_run_v0_only_missing_startup_context_uses_exit_two() {
         )
         .await
         .expect_err("无效 V0 输入必须返回普通解析错误");
-        assert!(!error.writes_directly_to_stderr());
-        assert_eq!(error.exit_code(), 1);
         assert!(error.as_bytes().starts_with(b"failed to parse stdin: "));
+        let (rendered, exit_code) = render_runtime_error(&error);
+        assert_eq!(exit_code, 1);
+        assert!(rendered.starts_with(b"Error: failed to parse stdin: "));
     }
 }
 
-/// 验证普通 task-run RuntimeError 仍使用原 Cobra 三段输出和退出码 1。
+/// 验证普通 task-run RuntimeError 只输出一次错误和退出码 1。
 #[test]
-fn task_run_normal_runtime_error_keeps_cobra_rendering() {
+fn task_run_normal_runtime_error_is_rendered_once() {
     let error = RuntimeError::message("ordinary failure");
-    let (rendered, exit_code) = render_task_run_runtime_error(&error);
+    let (rendered, exit_code) = render_runtime_error(&error);
     assert_eq!(exit_code, 1);
-    assert_eq!(
-        rendered,
-        render_runtime_error_bytes(CobraCommand::TaskRun, b"ordinary failure")
-    );
-}
-
-/// 验证外层上下文包装不会污染已经代表 Go 进程终止的 panic transcript。
-#[test]
-fn task_run_go_panic_bypasses_error_context_wrapping() {
-    let error = v0_missing_startup_context_panic_error();
-    let expected = error.as_bytes().to_vec();
-    let wrapped = error.context(b"failed to load context from stdin: ");
-    assert_eq!(wrapped.as_bytes(), expected);
-    assert!(wrapped.writes_directly_to_stderr());
+    assert_eq!(rendered, b"Error: ordinary failure\n");
 }
 
 /// `runTaskRunManager` 测试双：立即返回指定结果，不触发真实信号。
@@ -668,15 +574,15 @@ async fn test_run_task_run_manager_treats_context_canceled_as_success() {
     .expect("context cancellation must be successful shutdown");
 }
 
-/// 验证 manager 原始错误经过 task-run `%w` 包装和 Cobra 三段 renderer 后仍逐字节一致。
+/// 验证 manager 原始错误经过 task-run `%w` 包装后仍逐字节一致。
 ///
 /// `ff fe 00` 同时覆盖连续非法 UTF-8 与 NUL；日志/Display 应逐字节替换前两者，
-/// 但最终 stderr 中的两份错误正文必须保留原值。
+/// 但最终 stderr 中的错误正文必须保留原值。
 #[tokio::test]
-async fn task_run_preserves_raw_manager_error_through_cobra_rendering() {
+async fn task_run_preserves_raw_manager_error_through_rendering() {
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::task_run_preserves_raw_manager_error_through_cobra_rendering"
+        "::task_run_preserves_raw_manager_error_through_rendering"
     )) {
         return;
     }
@@ -702,7 +608,8 @@ async fn task_run_preserves_raw_manager_error_through_cobra_rendering() {
         "environment manager failed: execution failed: \u{fffd}\u{fffd}\0"
     );
 
-    let rendered = render_runtime_error_bytes(CobraCommand::TaskRun, error.as_bytes());
+    let (rendered, exit_code) = render_runtime_error(&error);
+    assert_eq!(exit_code, 1);
     assert!(rendered.starts_with(b"Error: "));
     assert!(rendered.ends_with(b"\n"));
     assert_eq!(
@@ -713,15 +620,11 @@ async fn task_run_preserves_raw_manager_error_through_cobra_rendering() {
         .windows(expected.len())
         .filter(|window| *window == expected)
         .count();
-    assert_eq!(raw_error_occurrences, 2);
+    assert_eq!(raw_error_occurrences, 1);
     assert!(
-        rendered
-            .windows(b"Usage:\n  environment-runner task-run".len())
-            .any(|window| window == b"Usage:\n  environment-runner task-run")
-    );
-    assert_eq!(
-        render_runtime_error_bytes(CobraCommand::TaskRun, b"ordinary UTF-8 error"),
-        render_runtime_error(CobraCommand::TaskRun, "ordinary UTF-8 error").as_bytes()
+        !rendered
+            .windows(b"Usage:".len())
+            .any(|part| part == b"Usage:")
     );
 }
 

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::error::CliError;
-use super::utils::{LogLevel, ignored_positionals, logger_level, parse_log_level};
+use super::utils::{LogLevel, logger_level, parse_log_level};
 use crate::internal::logger::create_logger_with_file_output;
 use crate::internal::orchestrator::{new_poller_with_worker_id, new_whoami_client};
 
@@ -56,7 +56,7 @@ pub struct PollArgs {
     pub log_level: LogLevel,
 }
 
-/// 构造 `poll` 子命令及全部兼容 flag。
+/// 构造 `poll` 子命令及全部 flag。
 pub(crate) fn add_poll_command() -> Command {
     Command::new("poll")
         .about("Make a single poll request for work")
@@ -69,7 +69,6 @@ pub(crate) fn add_poll_command() -> Command {
         .arg(Arg::new("service-key-file").long("service-key-file").help("Path to file containing the environment service key. If not set, falls back to ENVIRONMENT_SERVICE_KEY environment variable").value_parser(value_parser!(PathBuf)))
         .arg(Arg::new("reclaim-older-than-ms").long("reclaim-older-than-ms").default_value("0").help("Reclaim unacknowledged work items older than this many milliseconds (0 = use API default of 5000ms)").allow_hyphen_values(true).value_parser(value_parser!(i64)))
         .arg(Arg::new("log-level").long("log-level").default_value("info").help("Log level (debug, info, warn, error)").value_parser(ValueParser::new(parse_log_level)))
-        .arg(ignored_positionals())
 }
 
 /// 将 Clap matches 转换为运行时独立的 poll 参数。
@@ -92,7 +91,7 @@ pub(crate) fn from_matches(matches: &ArgMatches) -> Result<PollArgs, CliError> {
     })
 }
 
-/// 将 Cobra 的空字符串约定转换为 Rust 的 `Option`。
+/// 把可选字符串参数转换为 owned 值。
 fn optional_string(matches: &ArgMatches, id: &str) -> Option<String> {
     matches
         .get_one::<String>(id)

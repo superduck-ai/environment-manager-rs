@@ -20,7 +20,7 @@ use std::{
 use async_trait::async_trait;
 use clap::builder::ValueParser;
 use clap::parser::ValueSource;
-use clap::{Arg, ArgAction, ArgMatches, Command, value_parser};
+use clap::{Arg, ArgMatches, Command, value_parser};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -46,10 +46,7 @@ use crate::internal::{
 };
 
 use super::error::{CliError, RuntimeError};
-use super::utils::{
-    LogLevel, bool_value, ignored_positionals, logger_level, mark_required_flags, parse_log_level,
-    switch_arg,
-};
+use super::utils::{LogLevel, bool_value, flag_arg, logger_level, parse_log_level};
 use super::zz_recovered_types::{StdinConfigClient, TaskContext};
 
 const LONG_ABOUT: &str = r#"Connects directly to the API to execute an existing session id.
@@ -76,11 +73,6 @@ Provide a JSON object via stdin with the following structure:
 
 // 该资产由固定 Go 1.25.7 ARM64 oracle 的真实 CLI transcript 生成；文件只包含 panic
 // 起始处到 EOF，崩溃前的 logger 行仍由 Rust 正常执行路径产生。只有独立运行中
-// 确实变化的 receiver、heap/argv 与 working-directory 字符串 data 指针槽会固定为
-// 0x0；signal addr/PC、静态指针、长度与 frame offset 仍保留 oracle 原值并逐字节比较。
-const GO_V0_MISSING_STARTUP_CONTEXT_PANIC: &[u8] =
-    include_bytes!("cobra_assets/v0_missing_startup_panic.txt");
-
 /// `build_task_run_backend` 的后端选择结果。
 ///
 /// 普通调用只使用 `backend` trait object；code-session 还保留具体 CCR 实例，供注册后
@@ -351,11 +343,7 @@ pub struct TaskRunArgs {
     pub allowed_tools: Option<String>,
     /// 是否启用本地测试模式。
     pub local_testing: bool,
-    /// 已废弃的升级布尔值。
-    pub upgrade_claude_code: bool,
-    /// 用户是否显式设置了升级布尔值，用于兼容版本推导和冲突检测。
-    pub upgrade_claude_code_was_set: bool,
-    /// 解析兼容 flag 后得到的最终 Claude Agent 目标版本。
+    /// 最终 Claude Agent 目标版本。
     pub claude_agent_version: String,
     /// 是否设置 `CLAUDE_CODE_DEBUG=1`。
     pub debug: bool,
@@ -377,56 +365,34 @@ pub struct TaskRunArgs {
     pub claude_path: Option<PathBuf>,
 }
 
-/// 对应 Go `AddTaskRunCommand`，构造 `task-run` 子命令及全部兼容 flag。
+/// 构造 `task-run` 子命令及全部 flag。
 pub(crate) fn add_task_run_command() -> Command {
-    let command = Command::new("task-run")
+    Command::new("task-run")
         .about("Handles execution of a provided session")
         .long_about(LONG_ABOUT)
-        .arg(Arg::new("session").long("session").help("ID of the session to manage (required)"))
+        .arg(Arg::new("session").long("session").required(true).help("ID of the session to manage (required)"))
         .arg(Arg::new("log-level").long("log-level").default_value("info").help("Log level (debug, info, warn, error)").value_parser(ValueParser::new(parse_log_level)))
-        .arg(switch_arg("stdin", "Deprecated: stdin is now always used. This flag is ignored."))
+        .arg(flag_arg("stdin", "Deprecated: stdin is now always used. This flag is ignored."))
         .arg(Arg::new("input-format").long("input-format").default_value("v0").help("Input format for stdin data: 'v0' (startup_context/environment/auth) or 'v1' (work response with packed secret)").value_parser(value_parser!(InputFormat)))
         .arg(Arg::new("session-mode").long("session-mode").default_value("new").help("Session mode: 'new' (default for Cloud), 'resume' (skip git clone and setup scripts), 'resume-cached' (default for self-hosted), 'setup-only' (exit after setup)").value_parser(value_parser!(SessionMode)))
         .arg(Arg::new("allowed-tools").long("allowed-tools").help("Comma-separated list of allowed tools for Claude (e.g., 'Bash,Edit,Write,MultiEdit,Agent,Glob,Grep,LS,View,Search,NotebookEdit,NotebookRead,TodoRead,TodoWrite')"))
-        .arg(switch_arg("local-testing", "Disable Claude WebSocket connections and git configuration (run in standalone mode for local testing)"))
-        .arg(upgrade_bool_arg())
+        .arg(flag_arg("local-testing", "Disable Claude WebSocket connections and git configuration (run in standalone mode for local testing)"))
         .arg(Arg::new("claude-agent-version").long("claude-agent-version").help("Target Claude Agent version (latest, current, stable, or specific version like 2.0.20), located at `claude --version`. Use 'current' to skip installation and updates. Defaults to 'latest' if not specified."))
-        .arg(switch_arg("debug", "Enable debug mode when executing the Claude Agent."))
-        .arg(switch_arg("verbose-claude-logs", "Enable verbose logging of Claude Agent output to console (automatically enabled with --local-testing)"))
-        .arg(switch_arg("print-code-logs", "Print Claude Code logs to console when execution completes or fails"))
+        .arg(flag_arg("debug", "Enable debug mode when executing the Claude Agent."))
+        .arg(flag_arg("verbose-claude-logs", "Enable verbose logging of Claude Agent output to console (automatically enabled with --local-testing)"))
+        .arg(flag_arg("print-code-logs", "Print Claude Code logs to console when execution completes or fails"))
         .arg(Arg::new("environment-id").long("environment-id").help("Environment ID for API calls (required for self-hosted)"))
         .arg(Arg::new("organization-id").long("organization-id").help("Organization ID for API calls (required for self-hosted)"))
         .arg(Arg::new("local-append-system-prompt").long("local-append-system-prompt").help("Additional system prompt content to append locally (useful for self-hosted environments to inject custom instructions)"))
         .arg(Arg::new("working-directory").long("working-directory").default_value_os(get_default_working_directory().into_os_string()).help("Default working directory for the session (used when session context doesn't specify cwd)").value_parser(value_parser!(PathBuf)))
-        .arg(switch_arg("skip-git-config", "Skip git configuration setup (use container's existing .gitconfig)"))
+        .arg(flag_arg("skip-git-config", "Skip git configuration setup (use container's existing .gitconfig)"))
         .arg(Arg::new("claude-path").long("claude-path").help("Path to the Claude CLI executable or a wrapper binary. When specified, this executable runs instead of the default 'claude' command. Wrapper binaries must forward all arguments and connect stdin/stdout directly to Claude Code.").value_parser(value_parser!(PathBuf)))
-        .arg(ignored_positionals());
-
-    // 保留 Go 的构造顺序：所有 flag 注册完成后，再由共享 helper 集中添加必填约束。
-    mark_required_flags(command, &["session"])
 }
 
-/// 将 Clap matches 转换为 task-run 参数，并执行旧 RunE 中的纯参数派生逻辑。
+/// 将 Clap matches 转换为 task-run 参数。
 pub(crate) fn from_matches(matches: &ArgMatches) -> Result<TaskRunArgs, CliError> {
-    let upgrade_was_set = explicitly_set(matches, "upgrade-claude-code");
-    let upgrade = *matches
-        .get_one::<bool>("upgrade-claude-code")
-        .expect("defaulted upgrade flag");
     let requested_version = optional_string(matches, "claude-agent-version");
-
-    if upgrade_was_set && requested_version.is_some() {
-        let message = "--upgrade-claude-code and --claude-agent-version are mutually exclusive; use --claude-agent-version=current to skip installation";
-        return Err(CliError::validation_rendered(
-            super::cobra_compat::render_runtime_error(super::CobraCommand::TaskRun, message),
-        ));
-    }
-    let claude_agent_version = requested_version.unwrap_or_else(|| {
-        if upgrade_was_set && !upgrade {
-            "current".to_owned()
-        } else {
-            "latest".to_owned()
-        }
-    });
+    let claude_agent_version = requested_version.unwrap_or_else(|| "latest".to_owned());
 
     let local_testing = bool_value(matches, "local-testing");
     let verbose_claude_logs = local_testing || bool_value(matches, "verbose-claude-logs");
@@ -451,8 +417,6 @@ pub(crate) fn from_matches(matches: &ArgMatches) -> Result<TaskRunArgs, CliError
         session_mode_was_set: explicitly_set(matches, "session-mode"),
         allowed_tools: optional_string(matches, "allowed-tools"),
         local_testing,
-        upgrade_claude_code: upgrade,
-        upgrade_claude_code_was_set: upgrade_was_set,
         claude_agent_version,
         debug: bool_value(matches, "debug"),
         verbose_claude_logs,
@@ -477,26 +441,12 @@ pub(crate) fn get_default_working_directory() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/root"))
 }
 
-/// 构造默认值为 true、同时接受 `--flag=false` 的弃用升级 flag。
-fn upgrade_bool_arg() -> Arg {
-    Arg::new("upgrade-claude-code")
-        .long("upgrade-claude-code")
-        .help("Deprecated: use --claude-agent-version instead. When true (default), upgrades Claude Agent to latest version.")
-        .action(ArgAction::Set)
-        .num_args(0..=1)
-        .require_equals(true)
-        .default_missing_value("true")
-        .default_value("true")
-        .overrides_with("upgrade-claude-code")
-        .value_parser(value_parser!(bool))
-}
-
 /// 判断某个参数值是否来自命令行，而不是 Clap 默认值。
 fn explicitly_set(matches: &ArgMatches, id: &str) -> bool {
     matches.value_source(id) == Some(ValueSource::CommandLine)
 }
 
-/// 将 Cobra 的空字符串约定转换为 Rust 的 `Option`。
+/// 把可选字符串参数转换为 owned 值。
 fn optional_string(matches: &ArgMatches, id: &str) -> Option<String> {
     matches
         .get_one::<String>(id)
@@ -625,12 +575,7 @@ pub(super) async fn load_context_from_bytes(
             session_id: session_id.to_owned(),
         }
         .parse_with_logger_for_cli(data, logger)
-        .map_err(|error| match error {
-            crate::internal::input::V0ParseError::StartupContextRequired => {
-                v0_missing_startup_context_panic_error()
-            }
-            error => RuntimeError::message(format!("failed to parse stdin: {error}")),
-        })?,
+        .map_err(|error| RuntimeError::message(format!("failed to parse stdin: {error}")))?,
         InputFormat::V1 => {
             let parser = crate::internal::input::V1Parser::new(
                 working_directory.to_string_lossy().into_owned(),
@@ -646,15 +591,6 @@ pub(super) async fn load_context_from_bytes(
         }
     };
     Ok(task_context_from_parsed(parsed))
-}
-
-/// 构造 V0 缺失 startup context 时的 Go runtime 崩溃结果。
-///
-/// 对应 Go：`internal/input.(*V0Parser).Parse` 对 nil `startupContext` 的字段解引用。
-/// transcript 不经过 Cobra，也不添加 `failed to parse/load` 上下文；这些包装代码在
-/// Go 进程中尚未获得控制权。退出码由 [`RuntimeError`] 固定为 2。
-pub(super) fn v0_missing_startup_context_panic_error() -> RuntimeError {
-    RuntimeError::go_runtime_panic(GO_V0_MISSING_STARTUP_CONTEXT_PANIC.to_vec())
 }
 
 /// 把 input 层的解析结果转换成 Go `TaskContext` 对应类型。
@@ -1304,7 +1240,7 @@ pub(super) trait TaskRunManager: Send {
 
 #[async_trait]
 impl TaskRunManager for Manager {
-    /// 原样转发 manager 错误，直到 Cobra renderer 前都不调用有损 `Display`。
+    /// 原样转发 manager 错误，直到二进制入口前都不调用有损 `Display`。
     async fn run(&mut self, cancellation: &CancellationToken) -> Result<(), ManagerError> {
         Manager::run(self, cancellation).await
     }

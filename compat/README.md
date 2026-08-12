@@ -16,6 +16,8 @@ Rust 源码重新生成。CSV 将机械期望路径与实际命中的 Rust 路�
   owner。严格的 Go `NewFoo` 还可映射到 owner 精确匹配的 Rust `Foo::new`；其他
   非机械映射必须由紧邻 Rust 声明的 doc code span 明确引用 Go 符号。
   `rust_path`、`rust_line` 和 `rust_symbol` 均来自实际源码。
+- `removed-cobra-compat`：仅用于产品决策明确移除的 Cobra CLI 辅助符号。允许项在
+  生成器中逐个列出，不能由 CSV 手工添加。
 - `symbol-missing`：Rust package 已存在，但没有匹配声明。
 - `pending`：Rust 文件/package 尚不存在，或缺失文件中没有任何严格符号匹配。
 - `ambiguous`：存在多个可能声明，生成器拒绝猜测。
@@ -38,7 +40,7 @@ python3 scripts/compat/generate_symbol_map.py --check --require-complete \
 
 `--check` 验证 CSV 与两棵源码树一致；`--require-complete` 还会拒绝 `pending`、
 `symbol-missing`、`ambiguous`、`name-only-match` 和缺少 wrapper 的生成文件。明确的
-`generated-exempt` 是审计豁免，不会被报告成 `migrated`。
+`generated-exempt` 和 `removed-cobra-compat` 是审计豁免，不会被报告成 `migrated`。
 
 Linux ARM64 发布门禁额外传入 `--expected-go-tests 295`。它同时校验当前只读 Go
 基线仍精确包含 295 个顶层 `Test*` 场景，以及这 295 项在 CSV 中全部处于

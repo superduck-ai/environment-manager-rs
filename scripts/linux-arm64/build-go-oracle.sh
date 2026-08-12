@@ -47,7 +47,7 @@ podman run --rm --pull=always --arch arm64 \
     test "$(go env GOVERSION)" = "go1.25.7"
     git config --global --add safe.directory /workspace
     export CGO_ENABLED=0 GOOS=linux GOARCH=arm64
-    # 正式 rollback 与 CLI 差分 oracle 使用同一组核心构建参数。差分 runner 还会
+    # 正式 rollback 与行为 oracle 使用同一组核心构建参数。差分 runner 还会
     # 为协议 probe 使用 go test overlay；该 overlay 只影响 probe，不属于 rollback。
     go build -trimpath -buildvcs=false \
       -ldflags "-s -w -X main.Version=${ORACLE_VERSION}" \

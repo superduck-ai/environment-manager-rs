@@ -12,9 +12,7 @@ use tokio::process::Command as TokioCommand;
 use tokio_util::sync::CancellationToken;
 
 use super::error::CliError;
-use super::utils::{
-    LogLevel, bool_value, ignored_positionals, logger_level, parse_log_level, switch_arg,
-};
+use super::utils::{LogLevel, bool_value, flag_arg, logger_level, parse_log_level};
 use crate::internal::claude::install_or_update_claude_code;
 use crate::internal::logger::{LogAttributes, Logger, create_logger_with_file_output};
 use crate::internal::orchestrator::new_whoami_client;
@@ -73,7 +71,7 @@ pub struct SetupArgs {
     pub service_key_file: Option<PathBuf>,
 }
 
-/// 构造 `setup` 子命令及全部兼容 flag。
+/// 构造 `setup` 子命令及全部 flag。
 pub(crate) fn add_setup_command() -> Command {
     Command::new("setup")
         .about("Install dependencies for orchestrator mode")
@@ -82,11 +80,10 @@ pub(crate) fn add_setup_command() -> Command {
         .arg(Arg::new("log-level").long("log-level").default_value("info").help("Log level (debug, info, warn, error)").value_parser(ValueParser::new(parse_log_level)))
         .arg(Arg::new("claude-code-version").long("claude-code-version").default_value("latest").help("Version of Claude Code to install (latest, stable, or specific version like 2.0.20)"))
         .arg(Arg::new("sandbox-runtime-version").long("sandbox-runtime-version").default_value("latest").help("Version of sandbox-runtime to install (latest or specific version)"))
-        .arg(switch_arg("skip-claude-code", "Skip Claude Code installation"))
-        .arg(switch_arg("skip-sandbox-runtime", "Skip sandbox-runtime installation"))
+        .arg(flag_arg("skip-claude-code", "Skip Claude Code installation"))
+        .arg(flag_arg("skip-sandbox-runtime", "Skip sandbox-runtime installation"))
         .arg(Arg::new("api-url").long("api-url").default_value("https://api.anthropic.com").help("API base URL for connectivity healthcheck"))
         .arg(Arg::new("service-key-file").long("service-key-file").help("Path to environment service key file for API healthcheck. Falls back to ENVIRONMENT_SERVICE_KEY env var if not set. When provided, verifies connectivity by calling /v1/environments/whoami").value_parser(value_parser!(PathBuf)))
-        .arg(ignored_positionals())
 }
 
 /// 将 Clap matches 转换为运行时独立的 setup 参数。

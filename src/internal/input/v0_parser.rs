@@ -2,8 +2,8 @@
 //!
 //! parser 保留环境配置中的未知字段，并在成功后统一补全 API URL scheme。为保持
 //! 当前 Go 工作树的库内行为，缺失 `startup_context` 的普通入口仍触发同文本 panic；
-//! CLI 专用入口则把它转换成类型化错误，交给二进制入口复刻 Go runtime 的 stderr 与
-//! 退出码。显式 JSON `null` 仍先构造零值 context，再走正常的 API base URL 校验分支。
+//! CLI 专用入口则把它转换成类型化错误。显式 JSON `null` 仍先构造零值 context，
+//! 再走正常的 API base URL 校验分支。
 
 use std::{pin::Pin, time::Instant};
 
@@ -29,7 +29,7 @@ pub enum V0ParseError {
     /// stdin 不是合法 V0 JSON object。
     #[error("failed to parse V0 stdin JSON: {0}")]
     InvalidStdin(#[source] serde_json::Error),
-    /// 缺少 startup_context；仅 CLI 专用入口返回该值，普通 parser 入口仍会 panic。
+    /// 缺少 startup_context；CLI 专用入口返回该值，普通 parser 入口仍会 panic。
     #[error("failed to parse startup_context: startup context is required")]
     StartupContextRequired,
     /// startup_context JSON 形状无效。
@@ -63,13 +63,12 @@ pub enum V0ParseError {
 /// 缺失 `startup_context` 时共享解析流程采用的行为。
 ///
 /// Go parser 本身返回 nil context 后由调用方解引用并 panic。Rust 的库内 parser 保留
-/// 这一语义，CLI 却需要绕过 Rust 全局 panic hook，才能输出 Go runtime transcript
-/// 并以 2 退出，因此只有 CLI 入口选择 `ReturnErrorForCli`。
+/// 这一语义，CLI 则返回可诊断的普通错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MissingStartupContextBehavior {
     /// 复刻 parser 被直接调用时发生的 panic，供单元测试和差分 probe 使用。
     PanicLikeGoParser,
-    /// 返回专用错误，由 task-run 最外层生成 Go runtime 崩溃外观。
+    /// 返回专用错误，供 CLI 正常报告无效输入。
     ReturnErrorForCli,
 }
 
@@ -124,10 +123,8 @@ impl V0Parser {
 
     /// 使用生产 logger 解析 CLI 收到的完整 V0 stdin payload。
     ///
-    /// 对应 Go：`(*V0Parser).Parse` 经 `cmd.loadContextFromStdin` 调用的特殊崩溃边界。
     /// 除缺失 `startup_context` 外，本方法与 [`Self::parse_with_logger`] 的阶段、日志和
-    /// 错误完全一致。该唯一分支返回 [`V0ParseError::StartupContextRequired`]，让 CLI
-    /// 在不触发 Rust panic hook 的前提下复刻 Go runtime stack 与退出码 2。
+    /// 错误完全一致；该唯一分支返回 [`V0ParseError::StartupContextRequired`]。
     ///
     /// # 参数
     /// - `data`：已经从 stdin 读到 EOF 的原始 JSON 字节，仅在调用期间借用。
@@ -289,16 +286,16 @@ impl V0Parser {
 
     /// 反序列化、校验并归一化 startup_context。
     ///
-    /// `missing_behavior` 仅用于区分库内 panic 与 CLI 受控崩溃输出；显式 `null`、非法
-    /// JSON 形状和领域校验错误都走原有路径，避免扩大 exit 2 的适用范围。
+    /// `missing_behavior` 仅用于区分库内 panic 与 CLI 普通错误；显式 `null`、非法
+    /// JSON 形状和领域校验错误都走原有路径。
     fn parse_startup_context(
         &self,
         value: Option<&Value>,
         missing_behavior: MissingStartupContextBehavior,
     ) -> Result<StartupContext, V0ParseError> {
         // Go 的 parseStartupContext 对 missing RawMessage 返回 nil、nil，调用方随后立即
-        // 解引用并产生固定 runtime panic。该行为会影响 CLI stderr/退出码，因此不能
-        // 把 missing 和显式 null 合并成一个更安全的 Rust 错误。
+        // 解引用并产生固定 runtime panic。显式 null 则会构造零值 context，不能与
+        // missing 合并。
         let Some(value) = value else {
             return match missing_behavior {
                 MissingStartupContextBehavior::PanicLikeGoParser => {

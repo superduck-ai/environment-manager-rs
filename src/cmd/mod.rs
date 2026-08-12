@@ -1,11 +1,10 @@
-//! Environment Runner 的命令行兼容层。
+//! Environment Runner 的命令行解析层。
 //!
 //! 这个模块只负责三件事：构造稳定的 Clap 命令树、把原始参数解析为强类型
-//! [`Invocation`]，以及把 Clap 的提前退出/参数错误转换成接近 Cobra 的输出约定。
+//! [`Invocation`]，以及把 Clap 的提前退出/参数错误交给二进制入口。
 //! 真正的网络、进程、沙箱和会话执行不放在解析层；上层必须显式匹配
 //! [`Invocation`] 并调用相应运行时，避免解析成功被误当成业务执行成功。
 
-mod cobra_compat;
 #[path = "cmd_code_sign.rs"]
 mod code_sign;
 mod completion;
@@ -29,19 +28,13 @@ use std::ffi::OsString;
 
 use clap::{Arg, ArgAction, Command};
 
-pub use cobra_compat::{
-    CobraCommand, render_runtime_error, render_runtime_error_bytes, render_task_run_runtime_error,
-};
 pub use code_sign::{CodeSignArgs, CodeSignOperation, SshSignArgs, run_code_sign};
-pub use completion::{CompletionArgs, CompletionShell, render_completion_script};
-pub use error::{CliError, CliErrorKind, OutputStream, RuntimeError};
+pub use completion::{CompletionArgs, CompletionShell, render_completion_for_root};
+pub use error::{CliError, CliErrorKind, OutputStream, RuntimeError, render_runtime_error};
 pub use orchestrator::{OrchestratorArgs, SandboxBackend, run_orchestrator};
 pub use poll::{PollArgs, run_poll};
 pub use print_sandbox_settings::{PrintSandboxSettingsArgs, run_print_sandbox_settings};
-pub use provision_packages::{
-    CommandExitError, ProvisionPackagesArgs, exit_code as provision_packages_exit_code,
-    run_provision_packages,
-};
+pub use provision_packages::{ProvisionPackagesArgs, run_provision_packages};
 pub use setup::{SetupArgs, run_setup};
 pub use task_run::{InputFormat, SessionMode, TaskRunArgs, run_task_run};
 pub use utils::{LogLevel, parse_go_duration, parse_log_level};
@@ -55,7 +48,7 @@ const ROOT_LONG_ABOUT: &str = "Environment Runner handles the lifecycle of agent
 /// 的 `ArgMatches`，也不会因命令尚未迁移而得到一个空的成功结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
-    /// 为指定 shell 生成自动补全脚本的 Cobra 兼容命令。
+    /// 为指定 shell 生成自动补全脚本。
     Completion(CompletionArgs),
     /// 持续轮询并调度会话工作的 orchestrator 命令。
     Orchestrator(OrchestratorArgs),
@@ -75,23 +68,25 @@ pub enum Invocation {
 
 /// 构造完整的 Environment Runner Clap 命令树。
 ///
-/// `version` 使用静态字符串，是为了同时兼容 Cargo 构建版本与发布流水线在编译期
-/// 注入的版本。公开子命令按 Cobra 帮助的稳定顺序注册；隐藏的 `code-sign` 仍可
-/// 直接解析，但不会出现在普通帮助中。Cobra 自动注入的 completion 也显式建模。
+/// `version` 使用静态字符串，是为了同时支持 Cargo 构建版本与发布流水线在编译期
+/// 注入的版本。隐藏的 `code-sign` 仍可直接解析，但不会出现在普通帮助中。
 #[must_use]
 pub fn command(version: &'static str) -> Command {
     Command::new("environment-runner")
         .version(version)
         .disable_version_flag(true)
-        .about("Manages environments for agentic sessions")
-        .long_about(ROOT_LONG_ABOUT)
         .arg(
             Arg::new("version")
                 .short('v')
+                .visible_short_alias('V')
                 .long("version")
-                .help("version for environment-runner")
-                .action(ArgAction::Version),
+                .action(ArgAction::Version)
+                .help("Print version"),
         )
+        .about("Manages environments for agentic sessions")
+        .long_about(ROOT_LONG_ABOUT)
+        .subcommand_required(true)
+        .arg_required_else_help(true)
         .subcommand(completion::command())
         .subcommand(orchestrator::add_orchestrator_command())
         .subcommand(task_run::add_task_run_command())
@@ -105,7 +100,7 @@ pub fn command(version: &'static str) -> Command {
 /// 按 Go 入口的 argv0 规则规范化原始参数。
 ///
 /// Git 把 `gpg.ssh.program` 配成名为 `code-sign` 的可执行文件时，不会再传入
-/// `code-sign` 子命令。旧 Go 入口会检查 `argv[0]` 的 basename，并在它后面插入
+/// `code-sign` 子命令。入口检查 `argv[0]` 的 basename，并在它后面插入
 /// 隐藏子命令名；这里逐字保留该行为。参数使用 [`OsString`]，因此签名文件路径即使
 /// 不是 UTF-8 也不会在规范化阶段丢失。
 #[must_use]
@@ -128,8 +123,8 @@ where
 
 /// 解析原始 argv，并返回等待运行时执行的强类型调用。
 ///
-/// 帮助、版本以及根命令无子命令这三种情况通过 [`CliError`] 表达为退出码 `0`
-/// 的“成功型提前退出”；其余 Clap 错误和跨 flag 业务校验使用退出码 `1`。这样的
+/// 帮助和版本通过 [`CliError`] 表达为退出码 `0` 的“成功型提前退出”；
+/// 其余参数错误保留 Clap 的原生退出码。这样的
 /// 返回值让 `main` 能精确选择 stdout/stderr，同时避免调用 Clap 的 `exit()`。
 pub fn parse_from<I, T>(version: &'static str, argv: I) -> Result<Invocation, CliError>
 where
@@ -137,7 +132,7 @@ where
     T: Into<OsString>,
 {
     let argv = normalize_argv_for_codesign(argv);
-    // Cobra 的 `DisableFlagParsing` 会把 `--` 本身也原样交给 RunE；Clap 即使给位置
+    // Git 会把 OpenSSH 参数原样交给这个包装器；Clap 即使给位置
     // 参数开启 `allow_hyphen_values`，仍会消费 `--` 这个分隔符。code-sign 是 Git
     // 调用的 argv 兼容入口，因此在识别到隐藏子命令后直接截取原始 OsString，避免
     // `--`、非 UTF-8 路径或未来 OpenSSH flag 被解析器改写。普通命令仍走完整 Clap
@@ -147,20 +142,12 @@ where
             raw_args: argv.into_iter().skip(2).collect(),
         }));
     }
-    if let Some(help) = cobra_compat::requested_help(&argv) {
-        return Err(CliError::help(help));
-    }
-    if let Some(version_text) = cobra_compat::requested_version(version, &argv) {
-        return Err(CliError::version(version_text));
-    }
     let matches = command(version)
-        .try_get_matches_from(argv.clone())
-        .map_err(|error| cobra_compat::render_clap_error(&argv, &error))?;
+        .try_get_matches_from(argv)
+        .map_err(CliError::from_clap)?;
 
     let Some((name, subcommand_matches)) = matches.subcommand() else {
-        return Err(CliError::help(cobra_compat::render_help(
-            CobraCommand::Root,
-        )));
+        return Err(CliError::internal("required subcommand was not parsed"));
     };
 
     match name {

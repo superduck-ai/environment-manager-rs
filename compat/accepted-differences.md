@@ -3,6 +3,20 @@
 本文记录经过明确决策、不会继续通过私有依赖补丁复刻的行为。这里的项目必须仍通过
 正常业务路径测试；新增差异不能仅凭修改测试写入本清单。
 
+## CLI：采用 Clap 原生参数语义
+
+Rust 实现不再复刻 Go Cobra/pflag 的帮助、错误、补全和参数兼容层。命令树、必填参数、
+布尔开关、位置参数、版本输出和 shell completion 均由 Clap 直接定义和生成。
+
+因此，旧的 `-v` 版本简写、`--flag=false` 布尔写法、被静默忽略的多余位置参数、
+`completion <shell>` 下的 Cobra 专用选项，以及 `task-run --upgrade-claude-code` 不再
+支持。调用方应使用 `-V`/`--version`、无值布尔开关、合法位置参数和当前帮助中列出的
+Clap 参数。业务命令、协议输出及 `code-sign` 的原始 argv 入口不受这项差异影响。
+
+V0 stdin 缺少 `startup_context` 时，CLI 返回普通解析错误并以 1 退出，不再复刻 Go
+nil pointer dereference 的 panic transcript 和退出码 2。库内 parser 差分 probe 仍保留
+该 Go 行为，用于监测输入协议本身的变化。
+
 ## WebSocket：采用上游 Tungstenite 的标准行为
 
 Rust 实现自 2026-08-01 起不再 vendoring `tungstenite`，主 Tunnel 和本地 WebSocket

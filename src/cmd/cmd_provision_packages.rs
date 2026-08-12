@@ -5,7 +5,7 @@
 //! 权威 JSON 对象，stderr 只返回有界诊断，绝不包含 manifest、spec 或 manager 输出。
 
 use std::{
-    fmt::{self, Display, Formatter},
+    fmt::Display,
     io::{self, Write},
     time::Instant,
 };
@@ -19,7 +19,10 @@ use crate::internal::packages::{
     Category, ProvisionContext, Provisioner, Result as ProvisionResult, Stage, Status,
 };
 
-use super::{error::CliError, utils::switch_arg};
+use super::{
+    error::{CliError, RuntimeError},
+    utils::flag_arg,
+};
 
 /// CLI 校验完成后的 package provisioning 参数。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,47 +56,6 @@ impl PackageProvisioner for Provisioner {
     }
 }
 
-/// 命令已经产生或无法产生最终 JSON 后返回给二进制入口的稳定退出错误。
-#[derive(Debug)]
-pub struct CommandExitError {
-    exit_code: i32,
-    diagnostic: String,
-}
-
-impl CommandExitError {
-    /// 返回 Go `commandExitError` 携带的稳定进程退出码。
-    #[must_use]
-    pub const fn exit_code(&self) -> i32 {
-        self.exit_code
-    }
-}
-
-/// 对应 Go `ExitCode`，提取 package provisioning 命令错误携带的稳定退出码。
-///
-/// Rust 调用链已经把错误收窄为 [`CommandExitError`]，因此不再需要 Go
-/// `errors.As` 的 `(code, ok)`；只要进入此函数，错误类型和退出码就都已确定。
-#[must_use]
-pub const fn exit_code(error: &CommandExitError) -> i32 {
-    error.exit_code()
-}
-
-impl Display for CommandExitError {
-    /// 对应 Go `commandExitError.Error`，输出有界、无 package spec 的非权威诊断正文。
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.diagnostic)
-    }
-}
-
-impl std::error::Error for CommandExitError {
-    /// 对应 Go `commandExitError.Unwrap`。
-    ///
-    /// Rust 错误本身直接持有最终诊断字符串，没有另一个需要暴露的动态错误节点；
-    /// 因而标准错误链在这里终止，外部退出码仍由 [`CommandExitError::exit_code`] 提供。
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        None
-    }
-}
-
 /// 构造 `provision-packages` 子命令及两个协议 flag。
 pub(crate) fn add_provision_packages_command() -> Command {
     Command::new("provision-packages")
@@ -103,32 +65,17 @@ pub(crate) fn add_provision_packages_command() -> Command {
                 .long("protocol")
                 .help("Package provisioning protocol version"),
         )
-        .arg(switch_arg("stdin", "Read the package manifest from stdin"))
-        // Cobra 的 Args 回调需要自行生成特定 exit=2 错误；先接收位置参数，随后在
-        // from_matches 统一拒绝，避免 Clap 提前泄露用户输入或打印 usage。
-        .arg(Arg::new("_positionals").num_args(0..).hide(true))
+        .arg(flag_arg("stdin", "Read the package manifest from stdin"))
 }
 
-/// 把 Clap matches 转成 owned 参数，并拒绝全部位置参数。
-///
-/// 对应 Go `rejectProvisionPackagesArgs`；Clap 先接收隐藏位置参数，本函数再生成同一条
-/// 单行错误和 exit 2，避免 Clap 默认 usage 或用户参数泄露到 stderr。
+/// 把 Clap matches 转成 owned 参数。
 pub(crate) fn from_matches(matches: &ArgMatches) -> Result<ProvisionPackagesArgs, CliError> {
-    if matches
-        .get_many::<String>("_positionals")
-        .is_some_and(|mut values| values.next().is_some())
-    {
-        return Err(CliError::command_exit(
-            "Error: provision-packages does not accept positional arguments\n",
-            2,
-        ));
-    }
     Ok(ProvisionPackagesArgs {
         protocol: matches
             .get_one::<String>("protocol")
             .cloned()
             .unwrap_or_default(),
-        stdin: matches.get_one::<bool>("stdin").copied().unwrap_or(false),
+        stdin: matches.get_flag("stdin"),
     })
 }
 
@@ -140,9 +87,7 @@ pub(crate) fn from_matches(matches: &ArgMatches) -> Result<ProvisionPackagesArgs
 /// 函数为 SIGINT/SIGTERM 建立取消 token，并在完成后停止信号任务。manifest 解码在
 /// 应用层直接等待同一 token，避免为一次性 stdin 读取维护额外 reader 适配器。
 /// 所有输出都由 `run_with_provisioner` 集中生成，避免信号分支多写 JSON。
-pub async fn run_provision_packages(
-    arguments: &ProvisionPackagesArgs,
-) -> Result<(), CommandExitError> {
+pub async fn run_provision_packages(arguments: &ProvisionPackagesArgs) -> Result<(), RuntimeError> {
     // Go 只在两个协议 flag 都合法后注册 SIGINT/SIGTERM。先处理错误调用，既保持该
     // 初始化顺序，也避免极窄信号窗口把本应稳定的 invalid_manifest 结果改成取消。
     if arguments.protocol != "v1" || !arguments.stdin {
@@ -183,7 +128,7 @@ async fn run_with_provisioner(
     provisioner: &dyn PackageProvisioner,
     input: &mut (dyn AsyncRead + Unpin + Send),
     output: &mut dyn Write,
-) -> Result<(), CommandExitError> {
+) -> Result<(), RuntimeError> {
     let started = Instant::now();
     let result = if arguments.protocol != "v1" || !arguments.stdin {
         invalid_invocation_result(started)
@@ -231,7 +176,7 @@ fn invalid_invocation_result(started: Instant) -> ProvisionResult {
 fn emit_provision_result(
     output: &mut dyn Write,
     result: ProvisionResult,
-) -> Result<(), CommandExitError> {
+) -> Result<(), RuntimeError> {
     if serde_json::to_writer(&mut *output, &result).is_err() || output.write_all(b"\n").is_err() {
         let finalize = ProvisionResult {
             version: 1,
@@ -256,12 +201,9 @@ fn emit_provision_result(
     }
 }
 
-/// 创建携带稳定退出码和有界诊断的命令错误。
-fn exit_error(exit_code: i32, diagnostic: String) -> CommandExitError {
-    CommandExitError {
-        exit_code,
-        diagnostic,
-    }
+/// 创建携带稳定退出码和有界诊断的运行时错误。
+fn exit_error(exit_code: i32, diagnostic: String) -> RuntimeError {
+    RuntimeError::with_exit_code(diagnostic, exit_code)
 }
 
 /// 对应 Go `resultDiagnostic`，只展示结果元数据，不展示 category 或用户输入。
