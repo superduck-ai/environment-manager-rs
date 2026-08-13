@@ -39,7 +39,7 @@ impl ManagerImpl {
 /// 验证 config 并包装 server 构造错误。
 ///
 /// `None` 在进入 server 前直接返回 `config is required`；其他验证错误统一添加
-/// `failed to create server:` 前缀，与 错误 source chain 形成的可观察文本一致。
+/// 创建失败统一增加 `failed to create server:` 上下文。
 pub fn new_manager(config: Option<Config>) -> GitProxyResult<SharedManager> {
     let config = config.ok_or_else(|| GitProxyError::message("config is required"))?;
     let server = new_server(Some(config.clone()))

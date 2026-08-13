@@ -342,7 +342,7 @@ impl DeployAction {
                 Some(Arc::clone(&progress)),
             )
             .await?
-            .ok_or("antspace deploy returned nil result")?;
+            .ok_or("antspace deploy returned no result")?;
         let body = serde_json::to_vec(&AntspaceActionResponse {
             status: "deployed",
             url: result.url,

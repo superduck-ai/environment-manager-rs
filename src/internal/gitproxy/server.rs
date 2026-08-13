@@ -117,7 +117,7 @@ impl Server for ServerImpl {
         let handler = Handler::new(Arc::clone(&self.config), new_http_client()?, repo_tokens);
         let app = Router::new().fallback(move |request: http::Request<axum::body::Body>| {
             let handler = handler.clone();
-            async move { handler.serve_http(request).await }
+            async move { handler.handle_request(request).await }
         });
 
         let shutdown = CancellationToken::new();

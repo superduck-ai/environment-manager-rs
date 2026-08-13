@@ -17,9 +17,9 @@ use std::time::Duration;
 /// - `duration`：需要格式化的非负时长；所有权不转移。
 ///
 /// # 返回
-/// 与 正数 duration 相同的紧凑字符串，例如 `0s`、`1.5ms`、`1m30s`。
+/// 返回紧凑字符串，例如 `0s`、`1.5ms`、`1m30s`。
 #[must_use]
-pub(crate) fn format_go_duration(duration: Duration) -> String {
+pub(crate) fn format_duration(duration: Duration) -> String {
     let nanos = duration.as_nanos();
     if nanos == 0 {
         return "0s".to_owned();
@@ -70,7 +70,7 @@ pub(crate) fn duration_nanoseconds(duration: Duration) -> i64 {
     i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
 }
 
-/// 格式化小于一秒的 duration，并按 规则删除小数末尾零。
+/// 格式化小于一秒的 duration，并删除小数末尾零。
 ///
 /// `unit_nanos` 只能是 `1_000` 或 `1_000_000`，分别生成微秒和毫秒文本；调用方已
 /// 按数量级分流，因此整数部分始终处于 `1..=999`。

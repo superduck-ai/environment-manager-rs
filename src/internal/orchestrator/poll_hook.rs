@@ -10,11 +10,11 @@ use rand::Rng;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    OrchestratorError, OrchestratorResult, PollHook, PollHookContext, PollerInterface, RawMessage,
+    OrchestratorError, OrchestratorResult, PollHook, PollHookContext, PollerInterface, RawWork,
     run_command_capture,
 };
 use crate::internal::process::CaptureMode;
-use crate::internal::util::{duration_nanoseconds, format_go_duration};
+use crate::internal::util::{duration_nanoseconds, format_duration};
 
 /// 创建命令型 poller。
 ///
@@ -51,7 +51,7 @@ impl PollHook {
     pub async fn poll(
         &self,
         cancellation: &CancellationToken,
-    ) -> OrchestratorResult<Option<RawMessage>> {
+    ) -> OrchestratorResult<Option<RawWork>> {
         if self.command.is_empty() {
             return Err(OrchestratorError::message(
                 "poll hook command is not configured",
@@ -95,7 +95,7 @@ impl PollHook {
             tracing::error!("duration" = ?(duration_nanoseconds(duration)), "stderr" = ?(stderr), "error" = ?(error), "{}", "poll hook execution failed");
             return Err(OrchestratorError::message(format!(
                 "poll hook failed after {}: {error} (stderr: {stderr})",
-                format_go_duration(duration)
+                format_duration(duration)
             )));
         }
 
@@ -145,10 +145,7 @@ impl PollHook {
 #[async_trait]
 impl PollerInterface for PollHook {
     /// 通过统一 poller trait 转发到 PollHook 的固有实现。
-    async fn poll(
-        &self,
-        cancellation: &CancellationToken,
-    ) -> OrchestratorResult<Option<RawMessage>> {
+    async fn poll(&self, cancellation: &CancellationToken) -> OrchestratorResult<Option<RawWork>> {
         PollHook::poll(self, cancellation).await
     }
 

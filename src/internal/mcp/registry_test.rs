@@ -277,14 +277,14 @@ async fn test_new_registration_factory_reports_configuration_errors() {
         return;
     }
     let _reset = reset_registry_for_test();
-    let nil_configurator = new_registration(
-        "nil-config",
-        "Nil config",
+    let missing_configurator = new_registration(
+        "missing-config",
+        "Missing config",
         None,
         Arc::new(|_, _| true),
         Arc::new(String::new),
     );
-    let error = match (nil_configurator.factory)(
+    let error = match (missing_configurator.factory)(
         CancellationToken::new(),
         None,
         PathBuf::new(),
@@ -296,7 +296,7 @@ async fn test_new_registration_factory_reports_configuration_errors() {
         Err(error) => error,
         Ok(_) => panic!("缺失 configurator 必须失败"),
     };
-    assert!(error.to_string().contains("configurator is nil"));
+    assert!(error.to_string().contains("configurator is missing"));
 
     let failed_server = Arc::new(FakeRegistryServer {
         name: "start-failure".to_owned(),
@@ -377,20 +377,20 @@ exit 0
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn test_register_with_claude_reports_nil_config_and_add_failure() {
+async fn test_register_with_claude_reports_missing_config_and_add_failure() {
     // 父测试进程只启动隔离子进程，不在自身读写全局环境。
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::test_register_with_claude_reports_nil_config_and_add_failure"
+        "::test_register_with_claude_reports_missing_config_and_add_failure"
     )) {
         return;
     }
     let error = register_with_claude(&CancellationToken::new(), "demo", None)
         .await
-        .expect_err("nil config 必须失败");
+        .expect_err("缺失 config 必须失败");
     assert_eq!(
         error.to_string(),
-        "claude mcp add failed: server config is nil"
+        "claude mcp add failed: server config is missing"
     );
 
     let _environment = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;

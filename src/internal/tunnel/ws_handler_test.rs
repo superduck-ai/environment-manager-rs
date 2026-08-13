@@ -41,7 +41,7 @@ fn test_websocket_headers_reject_reserved_handshake_duplicates() {
             }],
             false,
         )
-        .expect_err("Gorilla reserved header must fail before dialing");
+        .expect_err("reserved WebSocket header must fail before dialing");
         assert_eq!(
             error.to_string(),
             format!("websocket: duplicate header not allowed: {canonical_name}")
@@ -215,10 +215,7 @@ async fn test_open_tunnel_reports_rejected_websocket_handshake() {
 
     let errors = sender.errors.lock().unwrap();
     assert_eq!(errors.len(), 1);
-    assert_eq!(
-        errors[0].error_message,
-        "403 Forbidden: websocket: bad handshake"
-    );
+    assert_eq!(errors[0].error_message, "HTTP error: 403 Forbidden");
     server.abort();
 }
 

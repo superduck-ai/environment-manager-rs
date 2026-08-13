@@ -70,34 +70,15 @@ impl std::fmt::Display for ClaudeError {
     ///
     /// 原始 stderr 不应经过此方法，应调用 `as_bytes` 或 `into_bytes`。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&go_utf8_error_view(&self.message))
+        formatter.write_str(&String::from_utf8_lossy(&self.message))
     }
 }
 
 impl std::error::Error for ClaudeError {}
 
-/// 为日志/Display 将每个无效字节分别替换为 U+FFFD。
-///
-/// 每个无效输入字节都产生一个替换字符；`from_utf8_lossy` 可能合并坏字节段，
-/// 因此不能直接使用。
-pub(super) fn go_utf8_error_view(value: &[u8]) -> String {
-    let mut output = String::new();
-    let mut remaining = value;
-    while !remaining.is_empty() {
-        match std::str::from_utf8(remaining) {
-            Ok(valid) => {
-                output.push_str(valid);
-                break;
-            }
-            Err(error) => {
-                let valid = &remaining[..error.valid_up_to()];
-                output.push_str(std::str::from_utf8(valid).unwrap_or_default());
-                output.push('\u{fffd}');
-                remaining = &remaining[error.valid_up_to() + 1..];
-            }
-        }
-    }
-    output
+/// 为日志/Display 生成有损 UTF-8 视图。
+pub(super) fn lossy_utf8_error_view(value: &[u8]) -> String {
+    String::from_utf8_lossy(value).into_owned()
 }
 
 /// MCP registry 与 Claude 执行器之间的最小不透明 registration 边界。

@@ -44,12 +44,12 @@ pub(super) struct HeartbeatResponse {
     #[serde(default)]
     pub(super) ttl_seconds: i64,
     /// 服务端最后观察到 Claude Code 活动并更新租约的时间。
-    #[serde(default = "go_zero_time")]
+    #[serde(default = "default_lease_updated_at")]
     pub(super) lease_updated_at: DateTime<Utc>,
 }
 
 /// 返回公元一年 UTC 零值。
-fn go_zero_time() -> DateTime<Utc> {
+fn default_lease_updated_at() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(1, 1, 1, 0, 0, 0)
         .single()
         .expect("公元一年 UTC 是固定有效时间")

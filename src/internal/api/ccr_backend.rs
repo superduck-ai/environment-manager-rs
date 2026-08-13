@@ -8,14 +8,24 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use async_trait::async_trait;
 use chrono::SecondsFormat;
-use serde::{Deserialize, Deserializer, de};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::util::go_path_escape;
+use crate::internal::util::escape_path_segment;
 
-use super::client::marshal_go_dynamic_json;
 use super::{ApiError, DiagLogEntry, HttpClient, OtlpEndpoints, SessionBackend, SessionEvent};
+
+#[derive(Serialize)]
+struct EventRequest<'a> {
+    events: [EventPayload<'a>; 1],
+    worker_epoch: i64,
+}
+
+#[derive(Serialize)]
+struct EventPayload<'a> {
+    payload: &'a SessionEvent,
+}
 
 /// CCR v2 worker backend。
 pub struct CCRBackend {
@@ -110,7 +120,7 @@ impl CCRBackend {
         format!(
             "{}/v1/code/sessions/{}/worker/{suffix}",
             self.http_client.base_url(),
-            go_path_escape(&self.session_id)
+            escape_path_segment(&self.session_id)
         )
     }
 }
@@ -123,26 +133,15 @@ impl SessionBackend for CCRBackend {
         cancellation: &CancellationToken,
         event: &SessionEvent,
     ) -> Result<(), ApiError> {
-        let payload = serde_json::to_value(event).map_err(|error| {
-            ApiError::message(format!("failed to marshal event for CCR: {error}"))
-        })?;
-        let payload = marshal_go_dynamic_json(&payload).map_err(|error| {
-            ApiError::message(format!("failed to marshal event for CCR: {error}"))
-        })?;
-
-        // CCR payload 的键递归排序、数字按 float64 编码；worker_epoch 则是外层对象
-        // 中的 int64，不能一并转成 float64。手工拼接固定的外层 map 顺序能同时保留
-        // 这两种数值语义，而不会依赖 JSON 对象的插入顺序。
-        let mut request_body = b"{\"events\":[{\"payload\":".to_vec();
-        request_body.extend_from_slice(&payload);
-        request_body.extend_from_slice(b"}],\"worker_epoch\":");
-        request_body.extend_from_slice(self.worker_epoch().to_string().as_bytes());
-        request_body.push(b'}');
+        let request_body = EventRequest {
+            events: [EventPayload { payload: event }],
+            worker_epoch: self.worker_epoch(),
+        };
         self.http_client
-            .do_post_json_bytes(
+            .do_post_json(
                 cancellation,
                 &self.endpoint("events"),
-                request_body,
+                &request_body,
                 &self.auth_token,
                 "CCR event",
             )
@@ -204,7 +203,7 @@ impl SessionBackend for CCRBackend {
             )
             .await
             .map(|_| ())
-            // 与 错误 source chain 一致保留 EndpointNotImplemented 的可判定类型，不能只保留
+            // 增加操作上下文时保留 EndpointNotImplemented 的可判定类型，不能只保留
             // Display 文本，否则诊断 uploader 会把 501 当成普通重试错误。
             .map_err(|error| error.with_context("failed to flush diagnostics to CCR"))
     }

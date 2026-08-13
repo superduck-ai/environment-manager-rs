@@ -11,9 +11,9 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::util::go_path_escape;
+use crate::internal::util::escape_path_segment;
 
-use super::client::{add_version_headers, marshal_go_json, read_response_body_ignoring_errors};
+use super::client::{add_version_headers, read_response_body};
 use super::{ApiError, DiagLogEntry, HttpClient, SessionEvent};
 
 /// SessionIngress events/diag_logs 客户端。
@@ -42,7 +42,7 @@ impl HttpSessionIngressClient {
         format!(
             "{}/{version}/session_ingress/session/{}/{}",
             self.http_client.base_url(),
-            go_path_escape(session_id),
+            escape_path_segment(session_id),
             suffix
         )
     }
@@ -55,7 +55,7 @@ impl HttpSessionIngressClient {
         request_body: &T,
         operation_name: &str,
     ) -> Result<(), ApiError> {
-        let body = marshal_go_json(request_body).map_err(|error| {
+        let body = serde_json::to_vec(request_body).map_err(|error| {
             ApiError::message(format!(
                 "failed to marshal {operation_name} request: {error}"
             ))
@@ -89,7 +89,7 @@ impl HttpSessionIngressClient {
         if status == StatusCode::OK {
             Ok(())
         } else {
-            let body = read_response_body_ignoring_errors(response, cancellation).await;
+            let body = read_response_body(response, cancellation).await?;
             let body = String::from_utf8_lossy(&body);
             if status == StatusCode::NOT_IMPLEMENTED {
                 Err(ApiError::EndpointNotImplemented(format!(

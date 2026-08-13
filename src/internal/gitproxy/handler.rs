@@ -4,13 +4,11 @@
 //! 凭据始终由仓库表重写。成功响应保持流式传输，上游错误响应则先完整读取并脱敏。
 //! HTTP 客户端禁止跟随重定向，从根源上避免 Basic token 跨 host 泄漏。
 
-use std::{collections::HashMap, fmt, io, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc};
 
-use crate::internal::util::{claude_code_version, go_path_escape, version};
+use crate::internal::util::{claude_code_version, escape_path_segment, version};
 use axum::{body::Body, response::Response};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use bytes::Bytes;
-use futures_util::StreamExt as _;
 use http::{
     HeaderMap, HeaderValue, Request, StatusCode,
     header::{AUTHORIZATION, CONTENT_TYPE, HOST, WWW_AUTHENTICATE},
@@ -22,48 +20,6 @@ const REDACTED: &str = "[REDACTED]";
 const X_TOKEN_BACKEND: &str = "x-token-backend";
 const X_ENVIRONMENT_RUNNER_VERSION: &str = "x-environment-runner-version";
 const X_CLAUDE_CODE_VERSION: &str = "x-claude-code-version";
-
-/// `forwardRequest` 失败及 已经写出的可选部分响应。
-///
-/// 在复制上游 header/status 后才读取错误响应体；此时读取失败仍会返回 error，
-/// 但 ServeHTTP 已不能把状态改成 502。Rust 必须显式携带这份部分响应，才能同时
-/// 记录外层失败日志并保留上游状态。
-struct ForwardRequestFailure {
-    error: GitProxyError,
-    response: Option<Response>,
-}
-
-impl ForwardRequestFailure {
-    /// 创建尚未向下游提交 header/status 的失败。
-    ///
-    /// # 参数
-    /// - `error`：已按 错误 source chain 文本完成包装的错误。
-    fn before_response(error: GitProxyError) -> Self {
-        Self {
-            error,
-            response: None,
-        }
-    }
-
-    /// 创建已经提交上游 header/status 后发生的失败。
-    ///
-    /// # 参数
-    /// - `error`：响应体读取阶段返回的原始错误。
-    /// - `response`：保持上游状态和 header 的部分响应。
-    fn after_response(error: GitProxyError, response: Response) -> Self {
-        Self {
-            error,
-            response: Some(response),
-        }
-    }
-}
-
-impl From<GitProxyError> for ForwardRequestFailure {
-    /// 让构造请求、发送请求等提交响应前的 `?` 自动保留“尚未写 header”状态。
-    fn from(error: GitProxyError) -> Self {
-        Self::before_response(error)
-    }
-}
 
 /// 单次 Git proxy 请求所需的不可变共享状态。
 #[derive(Clone)]
@@ -95,7 +51,7 @@ impl Handler {
     /// `info/refs` 的首次无认证请求只返回 Basic challenge；其他路径即使没有认证头
     /// 也继续校验仓库表。进入 Reqwest 后，请求 future 被连接层丢弃会立即取消
     /// 上游传输。
-    pub(super) async fn serve_http(&self, request: Request<Body>) -> Response {
+    pub(super) async fn handle_request(&self, request: Request<Body>) -> Response {
         let method = request.method().as_str().to_owned();
         let path = percent_decode_path(request.uri().path());
         if !path.starts_with("/git/") {
@@ -151,15 +107,13 @@ impl Handler {
 
         match self.forward_request(request, &org, &repo, &git_path).await {
             Ok(response) => response,
-            Err(failure) => {
-                let sanitized = sanitize_error(Some(&failure.error));
+            Err(error) => {
+                let sanitized = sanitize_error(Some(&error));
                 tracing::error!("error" = ?(sanitized.clone()), "org" = ?(org), "repo" = ?(repo), "git_path" = ?(git_path), "{}", "Failed to proxy git request");
-                failure.response.unwrap_or_else(|| {
-                    http_error(
-                        StatusCode::BAD_GATEWAY,
-                        &format!("Proxy error: {sanitized}"),
-                    )
-                })
+                http_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("Proxy error: {sanitized}"),
+                )
             }
         }
     }
@@ -175,10 +129,10 @@ impl Handler {
         org: &str,
         repo: &str,
         git_path: &str,
-    ) -> Result<Response, ForwardRequestFailure> {
+    ) -> GitProxyResult<Response> {
         if !is_valid_git_path(git_path) {
             tracing::warn!("git_path" = ?(git_path.to_owned()), "org" = ?(org.to_owned()), "repo" = ?(repo.to_owned()), "{}", "Invalid git path detected");
-            return Err(GitProxyError::message("invalid git path").into());
+            return Err(GitProxyError::message("invalid git path"));
         }
 
         let repo_key = format!("{org}/{repo}");
@@ -190,7 +144,7 @@ impl Handler {
             Some(auth_token) => auth_token,
             None => {
                 tracing::warn!("repo" = ?(repo_key.clone()), "{}", "No auth token configured for repository");
-                return Err(GitProxyError::message("repository not authorized").into());
+                return Err(GitProxyError::message("repository not authorized"));
             }
         };
 
@@ -199,10 +153,10 @@ impl Handler {
         let base_url = self.config.session_ingress_url.trim_end_matches('/');
         let mut upstream_url = format!(
             "{base_url}/v1/session_ingress/session/{}/git_proxy/{}/{}.git/{}",
-            go_path_escape(&self.config.session_id),
-            go_path_escape(org),
-            go_path_escape(repo),
-            go_path_escape(git_path),
+            escape_path_segment(&self.config.session_id),
+            escape_path_segment(org),
+            escape_path_segment(repo),
+            escape_path_segment(git_path),
         );
         if let Some(query) = parts.uri.query().filter(|query| !query.is_empty()) {
             upstream_url.push('?');
@@ -265,40 +219,12 @@ impl Handler {
         tracing::info!("repo" = ?(repo_key.clone()), "status" = ?(i64::from(status.as_u16())), "{}", "Received response from upstream");
 
         let response_body = if status >= StatusCode::BAD_REQUEST {
-            // 在写出上游 status/header 后才读取错误体；读取失败不能再改写成 502。
-            match upstream_response.bytes().await {
-                Ok(bytes) => logged_sanitized_body(
-                    sanitize_string(&String::from_utf8_lossy(&bytes)),
-                    repo_key.clone(),
-                    status,
-                ),
-                Err(error) => {
-                    let sanitized = sanitize_error(Some(&error));
-                    tracing::error!(error = %sanitized, repo = %repo_key, "Error reading error response body");
-                    // 此时已经执行 `WriteHeader(resp.StatusCode)`。如果上游没有
-                    // Content-Type，外层 HTTP 纯文本错误响应 的状态修改会被忽略，但错误文本
-                    // 仍会追加到 body；已有 Content-Type 时外层不会再写任何内容。
-                    let body = if response_headers
-                        .get(CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or_default()
-                        .is_empty()
-                    {
-                        Body::from(format!("Proxy error: {sanitized}\n"))
-                    } else {
-                        Body::empty()
-                    };
-                    let mut response = Response::new(body);
-                    *response.status_mut() = status;
-                    *response.headers_mut() = response_headers;
-                    return Err(ForwardRequestFailure::after_response(
-                        GitProxyError::message(error.to_string()),
-                        response,
-                    ));
-                }
-            }
+            let bytes = upstream_response.bytes().await.map_err(|error| {
+                GitProxyError::message(format!("failed to read upstream error response: {error}"))
+            })?;
+            Body::from(sanitize_string(&String::from_utf8_lossy(&bytes)))
         } else {
-            logged_streaming_body(upstream_response, repo_key, status)
+            Body::from_stream(upstream_response.bytes_stream())
         };
 
         let mut response = Response::new(response_body);
@@ -306,160 +232,6 @@ impl Handler {
         *response.headers_mut() = response_headers;
         Ok(response)
     }
-}
-
-/// 响应体复制路径，用于区分 中两个独立的 `io.WriteString`/`io.Copy` 错误日志。
-#[derive(Clone, Copy)]
-enum ResponseWriteMode {
-    Sanitized,
-    Streaming,
-}
-
-/// 在 Axum 异步发送响应体期间累计字节，并把完成/中断事件转换为 日志。
-///
-/// 在 handler 内直接写 `ResponseWriter`，因此写入错误和完成字节数都在
-/// `forwardRequest` 返回前可见；Axum 把真正的 socket 写入延后到返回 Response 后。
-/// guard 跟随 body stream 生命周期，从而在正常 EOF 或客户端提前断开时补回同一组
-/// 可观察日志。`completed` 防止显式错误之后的 Drop 再写一条重复事件。
-struct ResponseWriteGuard {
-    repo: String,
-    status: StatusCode,
-    bytes_written: i64,
-    mode: ResponseWriteMode,
-    completed: bool,
-}
-
-impl ResponseWriteGuard {
-    /// 创建尚未写出任何字节的响应日志 guard。
-    ///
-    /// # 参数
-    /// - `repo`：`org/repo` 仓库键。
-    /// - `status`：上游返回的 HTTP 状态。
-    /// - `mode`：错误响应的脱敏写入或成功响应的流式复制路径。
-    fn new(repo: String, status: StatusCode, mode: ResponseWriteMode) -> Self {
-        Self {
-            repo,
-            status,
-            bytes_written: 0,
-            mode,
-            completed: false,
-        }
-    }
-
-    /// 累加一次成功发送给 Axum 的响应数据块长度。
-    ///
-    /// # 参数
-    /// - `length`：数据块字节数；超过 `i64` 的理论值按 `i64::MAX` 饱和。
-    fn add_bytes(&mut self, length: usize) {
-        let length = i64::try_from(length).unwrap_or(i64::MAX);
-        self.bytes_written = self.bytes_written.saturating_add(length);
-    }
-
-    /// 在响应 body 到达 EOF 后记录 `Successfully proxied request`。
-    ///
-    /// # 副作用
-    /// 在 body 到达 EOF 后记录仓库、HTTP 状态和实际传输字节数，并关闭 Drop 失败
-    /// 兜底；日志写入失败不会影响已经发送的 HTTP 响应。
-    fn finish(&mut self) {
-        self.completed = true;
-        tracing::info!("repo" = ?(self.repo.clone()), "status" = ?(i64::from(self.status.as_u16())), "bytes_written" = ?(self.bytes_written), "{}", "Successfully proxied request");
-    }
-
-    /// 记录响应体写入失败，并按写入模式选择精确消息。
-    ///
-    /// # 参数
-    /// - `error`：已经脱敏的错误文本。
-    ///
-    /// # 副作用
-    /// 记录 `error`、`repo` 两个有序属性；调用后 guard 不会在 Drop 时重复记录。
-    fn fail(&mut self, error: String) {
-        self.completed = true;
-        match self.mode {
-            ResponseWriteMode::Sanitized => {
-                tracing::error!(error = %error, repo = %self.repo, "Error writing sanitized response body")
-            }
-            ResponseWriteMode::Streaming => {
-                tracing::error!(error = %error, repo = %self.repo, "Error streaming response body")
-            }
-        }
-    }
-}
-
-impl Drop for ResponseWriteGuard {
-    /// 把尚未到达 EOF 就被 Hyper 丢弃的 body 视为 response writer 的取消错误。
-    ///
-    /// 客户端断连时 Axum 不把 socket 错误传回 body stream；`context canceled` 是
-    /// request context 在同一时刻提供给传输链的稳定错误文本，且不包含凭据。
-    fn drop(&mut self) {
-        if !self.completed {
-            self.fail("context canceled".to_owned());
-        }
-    }
-}
-
-/// 把已聚合并脱敏的上游错误体包装为带完成日志的 Axum body。
-///
-/// # 参数
-/// - `body`：脱敏后的 UTF-8 错误体。
-/// - `repo`：`org/repo` 仓库键。
-/// - `status`：上游 HTTP 状态。
-///
-/// # 返回
-/// 返回只产生一个数据块的 body；正常 EOF 记录成功字节数，提前丢弃记录 `Error writing sanitized response body` 分支。
-fn logged_sanitized_body(body: String, repo: String, status: StatusCode) -> Body {
-    let mut guard = ResponseWriteGuard::new(repo, status, ResponseWriteMode::Sanitized);
-    if body.is_empty() {
-        guard.finish();
-        return Body::empty();
-    }
-
-    let chunk = Bytes::from(body);
-    let stream = futures_util::stream::unfold(Some((Some(chunk), guard)), |state| async move {
-        let (chunk, mut guard) = state?;
-        match chunk {
-            Some(chunk) => {
-                guard.add_bytes(chunk.len());
-                Some((Ok::<Bytes, io::Error>(chunk), Some((None, guard))))
-            }
-            None => {
-                guard.finish();
-                None
-            }
-        }
-    });
-    Body::from_stream(stream)
-}
-
-/// 把 Reqwest 上游成功响应包装为边读边转发且可记录错误/字节数的 body。
-///
-/// # 参数
-/// - `response`：尚未消费响应体的上游响应。
-/// - `repo`：`org/repo` 仓库键。
-/// - `status`：上游 HTTP 状态。
-///
-/// # 返回
-/// 返回保持 backpressure 的流式 body；上游读取错误原样传给 Hyper，并记录 `Error streaming response body`，正常 EOF 则记录成功事件。
-fn logged_streaming_body(response: reqwest::Response, repo: String, status: StatusCode) -> Body {
-    let upstream = Box::pin(response.bytes_stream());
-    let guard = ResponseWriteGuard::new(repo, status, ResponseWriteMode::Streaming);
-    let stream = futures_util::stream::unfold(Some((upstream, guard)), |state| async move {
-        let (mut upstream, mut guard) = state?;
-        match upstream.as_mut().next().await {
-            Some(Ok(chunk)) => {
-                guard.add_bytes(chunk.len());
-                Some((Ok(chunk), Some((upstream, guard))))
-            }
-            Some(Err(error)) => {
-                guard.fail(sanitize_error(Some(&error)));
-                Some((Err(error), None))
-            }
-            None => {
-                guard.finish();
-                None
-            }
-        }
-    });
-    Body::from_stream(stream)
 }
 
 /// 创建明确禁止自动重定向的 HTTP 客户端。
@@ -482,17 +254,13 @@ fn filtered_request_headers(mut headers: HeaderMap) -> HeaderMap {
     headers
 }
 
-/// 构造 HTTP 纯文本错误响应，包括末尾换行与 nosniff header。
+/// 构造 HTTP 纯文本错误响应。
 fn http_error(status: StatusCode, message: &str) -> Response {
-    let mut response = Response::new(Body::from(format!("{message}\n")));
+    let mut response = Response::new(Body::from(message.to_owned()));
     *response.status_mut() = status;
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    response.headers_mut().insert(
-        "x-content-type-options",
-        HeaderValue::from_static("nosniff"),
     );
     response
 }
@@ -536,10 +304,10 @@ pub(super) fn sanitize_error(error: Option<&dyn fmt::Display>) -> String {
     error.map_or_else(String::new, |error| sanitize_string(&error.to_string()))
 }
 
-/// 按 中固定的正则顺序隐藏 Authorization、Anthropic key 与 token 参数。
+/// 按固定顺序隐藏 Authorization、Anthropic key 与 token 参数。
 ///
 /// 顺序不可交换：`sk-ant-ccsr-*` 必须先于通用 `sk-ant-*`，完整 Authorization
-/// 形式也必须先于通用 Bearer/Basic。实现只识别 RE2 `\s` 的 ASCII 空白集合，
+/// 形式也必须先于通用 Bearer/Basic。实现只识别协议文本中的 ASCII 空白集合，
 /// 并严格保留原始前缀、大小写和空白。
 pub(super) fn sanitize_string(value: &str) -> String {
     let mut result = value.to_owned();
@@ -645,7 +413,7 @@ fn replace_token_assignment(input: &str) -> String {
     })
 }
 
-/// 一次手工 RE2 扫描的结果：替换一个范围，或从新位置继续查找。
+/// 一次 token 扫描的结果：替换一个范围，或从新位置继续查找。
 struct ScanMatch {
     replace: Option<(usize, usize)>,
     next_cursor: usize,

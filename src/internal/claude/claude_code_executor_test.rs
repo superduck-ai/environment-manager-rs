@@ -123,11 +123,11 @@ fn test_add_token_via_file_descriptor() {
     assert_eq!(content, "secret-token\n");
 }
 
-/// 验证 stderr tail 在截断前后使用 两套无效 UTF-8 规则。
+/// 验证 stderr tail 在截断前后使用统一的有损 UTF-8 规则。
 #[test]
-fn stderr_tail_replaces_each_invalid_utf8_byte() {
+fn stderr_tail_uses_lossy_utf8() {
     assert_eq!(tail_string(b"\xff\xfe", 8), "\u{fffd}\u{fffd}");
-    assert_eq!(tail_string(b"a\xff\xfeb", 3), "b");
+    assert_eq!(tail_string(b"a\xff\xfeb", 3), "\u{fffd}\u{fffd}b");
     assert_eq!(tail_string("有效\u{fffd}".as_bytes(), 64), "有效\u{fffd}");
 }
 

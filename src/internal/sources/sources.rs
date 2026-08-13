@@ -87,7 +87,7 @@ impl<'recorder> SourceHandlerManager<'recorder> {
 
         for (index, slot) in sources.iter().enumerate() {
             let Some(source) = slot.source_value() else {
-                return Err(SourcesError::message(format!("source[{index}] is nil")));
+                return Err(SourcesError::message(format!("source[{index}] is missing")));
             };
             let source_type = source.get_type();
             tracing::debug!("source_index" = ?(index + 1), "total_count" = ?(sources.len()), "source_type" = ?(source_type), "{}", "Processing source");

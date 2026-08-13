@@ -5,12 +5,10 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use futures_util::StreamExt as _;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Request, Response};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::internal::util::{claude_code_version, version};
@@ -56,7 +54,7 @@ impl ApiError {
 /// `HttpClient` 构造选项。
 #[derive(Clone, Debug)]
 pub struct ClientOptions {
-    /// 整个请求的超时；`None` 或零值使用 默认 5 分钟。
+    /// 整个请求的超时；`None` 或零值使用默认的 5 分钟。
     pub timeout: Option<Duration>,
     /// 重试策略；`None` 使用默认值。
     pub retry_config: Option<RetryConfig>,
@@ -92,7 +90,7 @@ impl HttpClient {
     /// 缺少 scheme 时补 `https://` 并创建 HTTP client。
     ///
     /// # 参数
-    /// - `base_url`：后端根 URL；未显式提供 HTTP(S) scheme 时按 补 HTTPS。
+    /// - `base_url`：后端根 URL；未显式提供 HTTP(S) scheme 时补 HTTPS。
     /// - `retry_config`：可选重试策略；为空时使用 三次指数退避默认值。
     ///
     /// # 返回
@@ -250,7 +248,7 @@ impl HttpClient {
         auth_token: &str,
         operation_name: &str,
     ) -> Result<Vec<u8>, ApiError> {
-        let body = marshal_go_json(request_body).map_err(|error| {
+        let body = serde_json::to_vec(request_body).map_err(|error| {
             ApiError::message(format!(
                 "failed to marshal {operation_name} request: {error}"
             ))
@@ -296,8 +294,7 @@ impl HttpClient {
                 ApiError::message(format!("failed to post {operation_name}: {error}"))
             })?;
         let status = response.status();
-        // 错误响应仍应保留传输中断前已经收到的 body，便于显示服务端诊断。
-        let response_body = read_response_body_ignoring_errors(response, cancellation).await;
+        let response_body = read_response_body(response, cancellation).await?;
         if status == reqwest::StatusCode::OK {
             return Ok(response_body);
         }
@@ -333,206 +330,15 @@ pub(crate) fn add_version_headers(headers: &mut HeaderMap) -> Result<(), ApiErro
 
 /// 严格读取响应 body，并在取消或传输失败时返回错误。
 ///
-/// Reqwest 负责其原生支持的 content decoding；该 helper 只保留取消处理和 partial
-/// body 收集，避免在多个 API 调用点重复流读取循环。
+/// Reqwest 负责 content decoding 和流读取；该 helper 只增加取消处理和统一错误类型。
 pub(crate) async fn read_response_body(
     response: Response,
     cancellation: &CancellationToken,
 ) -> Result<Vec<u8>, ApiError> {
-    let outcome = read_response_body_outcome(response, cancellation).await;
-    match outcome.error {
-        Some(error) => Err(error),
-        None => Ok(outcome.body),
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(ApiError::message("response body read canceled")),
+        result = response.bytes() => result
+            .map(|body| body.to_vec())
+            .map_err(|error| ApiError::message(error.without_url().to_string())),
     }
-}
-
-/// 读取响应 body，忽略读取错误但保留传输中断前已经到达的字节。
-pub(crate) async fn read_response_body_ignoring_errors(
-    response: Response,
-    cancellation: &CancellationToken,
-) -> Vec<u8> {
-    read_response_body_outcome(response, cancellation)
-        .await
-        .body
-}
-
-/// body reader 的内部结果；错误路径仍携带已经读取或解压出的字节。
-struct ResponseBodyOutcome {
-    body: Vec<u8>,
-    error: Option<ApiError>,
-}
-
-/// 收集 Reqwest 响应流并处理取消。
-async fn read_response_body_outcome(
-    response: Response,
-    cancellation: &CancellationToken,
-) -> ResponseBodyOutcome {
-    let mut stream = response.bytes_stream();
-    let mut body = Vec::new();
-    let mut error = None;
-
-    loop {
-        let next = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => {
-                error = Some(ApiError::message("response body read canceled"));
-                break;
-            }
-            next = stream.next() => next,
-        };
-        match next {
-            Some(Ok(chunk)) => body.extend_from_slice(&chunk),
-            Some(Err(source)) => {
-                error = Some(ApiError::message(source.without_url().to_string()));
-                break;
-            }
-            None => break,
-        }
-    }
-
-    ResponseBodyOutcome { body, error }
-}
-
-/// 使用 Serde 编码强类型值，并补齐协议要求的 HTML 安全转义。
-///
-/// 该函数不擅自重排 struct 字段，而是保持声明顺序。调用方若要求 map 键有序，
-/// 必须传入 `BTreeMap`。输出没有末尾换行。
-pub(crate) fn marshal_go_json<T: Serialize + ?Sized>(
-    value: &T,
-) -> Result<Vec<u8>, serde_json::Error> {
-    let encoded = serde_json::to_string(value)?;
-    Ok(escape_go_json_html(encoded).into_bytes())
-}
-
-/// 把一棵动态 JSON 值编码为紧凑 JSON。
-///
-/// 动态 object 的键必须递归排序，number 必须先收窄到 IEEE-754 float64；CCR event
-/// 正好经历这次 round-trip，不能沿用强类型 Serde 的字段顺序和 64 位整数精度。
-pub(crate) fn marshal_go_dynamic_json(value: &Value) -> Result<Vec<u8>, serde_json::Error> {
-    let mut output = String::new();
-    write_go_dynamic_json_value(value, &mut output)?;
-    Ok(output.into_bytes())
-}
-
-/// 递归写入一项紧凑的动态 JSON 值。
-fn write_go_dynamic_json_value(
-    value: &Value,
-    output: &mut String,
-) -> Result<(), serde_json::Error> {
-    match value {
-        Value::Null => output.push_str("null"),
-        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
-        Value::Number(value) => output.push_str(&format_go_dynamic_number(value)),
-        Value::String(value) => output.push_str(&go_json_string(value)?),
-        Value::Array(values) => {
-            output.push('[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(',');
-                }
-                write_go_dynamic_json_value(value, output)?;
-            }
-            output.push(']');
-        }
-        Value::Object(values) => {
-            output.push('{');
-            let mut entries: Vec<_> = values.iter().collect();
-            entries.sort_unstable_by_key(|(key, _)| *key);
-            for (index, (key, value)) in entries.into_iter().enumerate() {
-                if index != 0 {
-                    output.push(',');
-                }
-                output.push_str(&go_json_string(key)?);
-                output.push(':');
-                write_go_dynamic_json_value(value, output)?;
-            }
-            output.push('}');
-        }
-    }
-    Ok(())
-}
-
-/// 使用 Serde 完成控制字符转义，再补 HTML 和行分隔符转义。
-fn go_json_string(value: &str) -> Result<String, serde_json::Error> {
-    serde_json::to_string(value).map(escape_go_json_html)
-}
-
-/// 对一段已经合法的紧凑 JSON 补齐 HTML 和行分隔符转义。
-fn escape_go_json_html(encoded: String) -> String {
-    encoded
-        .replace('&', "\\u0026")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029")
-}
-
-/// 把动态 JSON number 收窄为 float64 后按 JSON 指数阈值编码。
-fn format_go_dynamic_number(number: &serde_json::Number) -> String {
-    let value = number
-        .as_f64()
-        .expect("serde_json::Number without arbitrary_precision always fits f64");
-    let shortest = value.to_string();
-    let (negative, unsigned) = shortest
-        .strip_prefix('-')
-        .map_or((false, shortest.as_str()), |value| (true, value));
-    let (mantissa, parsed_exponent) = unsigned
-        .split_once(['e', 'E'])
-        .map_or((unsigned, 0_i32), |(mantissa, exponent)| {
-            (mantissa, exponent.parse::<i32>().unwrap_or_default())
-        });
-    let decimal_index = mantissa.find('.').unwrap_or(mantissa.len());
-    let mut digits = mantissa.replace('.', "");
-    let Some(first_non_zero) = digits.find(|character| character != '0') else {
-        return if negative { "-0" } else { "0" }.to_owned();
-    };
-    let removed_leading = i32::try_from(first_non_zero).unwrap_or(i32::MAX);
-    digits.drain(..first_non_zero);
-    let decimal_index = i32::try_from(decimal_index).unwrap_or(i32::MAX) - removed_leading;
-    let scientific_exponent = parsed_exponent + decimal_index - 1;
-    while digits.len() > 1 && digits.ends_with('0') {
-        digits.pop();
-    }
-
-    let absolute = value.abs();
-    let use_exponent = absolute != 0.0 && !(1e-6..1e21).contains(&absolute);
-    let mut formatted = String::new();
-    if negative {
-        formatted.push('-');
-    }
-    if use_exponent {
-        formatted.push(digits.as_bytes()[0] as char);
-        if digits.len() > 1 {
-            formatted.push('.');
-            formatted.push_str(&digits[1..]);
-        }
-        formatted.push('e');
-        if scientific_exponent >= 0 {
-            formatted.push('+');
-        }
-        formatted.push_str(&scientific_exponent.to_string());
-        return formatted;
-    }
-
-    let fixed_decimal_index = scientific_exponent + 1;
-    if fixed_decimal_index <= 0 {
-        formatted.push_str("0.");
-        for _ in 0..fixed_decimal_index.unsigned_abs() {
-            formatted.push('0');
-        }
-        formatted.push_str(&digits);
-    } else {
-        let fixed_decimal_index = usize::try_from(fixed_decimal_index).unwrap_or(usize::MAX);
-        if fixed_decimal_index >= digits.len() {
-            formatted.push_str(&digits);
-            for _ in digits.len()..fixed_decimal_index {
-                formatted.push('0');
-            }
-        } else {
-            formatted.push_str(&digits[..fixed_decimal_index]);
-            formatted.push('.');
-            formatted.push_str(&digits[fixed_decimal_index..]);
-        }
-    }
-    formatted
 }

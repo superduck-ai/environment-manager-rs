@@ -2,11 +2,9 @@
 //!
 //! [`BaseServer`] 在 loopback 随机端口上暴露 `/mcp`，
 //! [`MCPServerRegistration`] 把业务服务器接入 Claude CLI。业务代码只依赖稳定的
-//! JSON-RPC/MCP wire 层，不直接依赖第三方 MCP 框架，
-//! 官方 `rmcp` SDK 被限制在适配层内，不会改变 codesign/supabase API。
+//! JSON-RPC/MCP wire 层，不依赖第三方 MCP 框架。
 
 mod registry;
-mod rmcp_adapter;
 mod server;
 pub mod servers;
 mod types;
@@ -23,7 +21,5 @@ pub use types::{
 
 #[cfg(test)]
 mod registry_test;
-#[cfg(test)]
-mod rmcp_adapter_test;
 #[cfg(test)]
 mod server_test;

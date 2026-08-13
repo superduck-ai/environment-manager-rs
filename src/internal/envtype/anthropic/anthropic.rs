@@ -30,7 +30,7 @@ use crate::internal::{
     process::{CaptureMode, execute_script, run_command},
     session::{ActivityRecorder, ActivityRecorderError, NoopActivityRecorder},
     sources::{ProcessMode, new_source_handler_manager},
-    util::{BoxError, Stopper, format_go_duration, output_streamer},
+    util::{BoxError, Stopper, format_duration, output_streamer},
 };
 
 use super::{
@@ -469,7 +469,7 @@ impl AnthropicEnvironmentType {
                 );
             }
         }
-        // 与 局部 manager 的生命周期一致；类型系统同时保证 recorder wrapper
+        // 与局部 manager 的生命周期一致；类型系统同时保证 recorder wrapper
         // 不可能越过当前 initialize 调用。
         drop(manager);
         Ok(())
@@ -552,7 +552,7 @@ impl AnthropicEnvironmentType {
                 tracing::error!(
                     language = %language.name,
                     version = %language.version,
-                    duration = %format_go_duration(duration),
+                    duration = %format_duration(duration),
                     error = %error,
                     "Failed to install language"
                 );
@@ -566,7 +566,7 @@ impl AnthropicEnvironmentType {
                 tracing::info!(
                     language = %language.name,
                     version = %language.version,
-                    duration = %format_go_duration(duration),
+                    duration = %format_duration(duration),
                     "Successfully installed language"
                 );
             }
@@ -575,7 +575,7 @@ impl AnthropicEnvironmentType {
             tracing::error!(
                 error_count = errors.len(),
                 total_count = languages.len(),
-                duration = %format_go_duration(started.elapsed()),
+                duration = %format_duration(started.elapsed()),
                 errors = %errors.join(", "),
                 "Failed to install some languages"
             );
@@ -586,7 +586,7 @@ impl AnthropicEnvironmentType {
         }
         tracing::info!(
             language_count = languages.len(),
-            duration = %format_go_duration(started.elapsed()),
+            duration = %format_duration(started.elapsed()),
             "Successfully installed all languages in parallel"
         );
         Ok(())
@@ -650,7 +650,7 @@ impl AnthropicEnvironmentType {
             language = %language.name,
             version = %language.version,
             exit_code = result.exit_code,
-            duration = %format_go_duration(result.duration),
+            duration = %format_duration(result.duration),
             success,
             "Installation script completed"
         );
@@ -666,7 +666,7 @@ impl AnthropicEnvironmentType {
                 language = %language.name,
                 version = %language.version,
                 exit_code = result.exit_code,
-                duration = %format_go_duration(result.duration),
+                duration = %format_duration(result.duration),
                 error = %error,
                 output = %captured,
                 "Installation script failed"
@@ -688,7 +688,7 @@ impl AnthropicEnvironmentType {
         tracing::info!(
             language = %language.name,
             version = %language.version,
-            duration = %format_go_duration(result.duration),
+            duration = %format_duration(result.duration),
             "Successfully installed language"
         );
         Ok(())

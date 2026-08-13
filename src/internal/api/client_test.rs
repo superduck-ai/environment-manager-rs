@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{body_json, body_string, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::internal::util::go_path_escape;
+use crate::internal::util::escape_path_segment;
 
 use super::session_ingress_client::diag_logs_to_wire_format;
 use super::*;
@@ -115,7 +115,7 @@ fn event_timestamps_use_trimmed_rfc3339_nanos() {
 #[test]
 fn session_context_preserves_missing_null_and_string_zero_values() {
     let missing: SessionContextResponse =
-        serde_json::from_str("{}").expect("缺失 session_context 使用 Go 结构体零值");
+        serde_json::from_str("{}").expect("缺失 session_context 使用默认值");
     assert!(missing.session_context.outcomes.is_none());
     assert!(missing.session_context.mcp_config.is_none());
 
@@ -129,7 +129,7 @@ fn session_context_preserves_missing_null_and_string_zero_values() {
             "mcp_config": null
         }
     }))
-    .expect("Go string/RawMessage 字段接受显式 null");
+    .expect("值字段和原始 JSON 字段接受显式 null");
     assert!(explicit_null.session_context.cwd.is_empty());
     assert_eq!(explicit_null.session_context.outcomes, Some(Value::Null));
     assert_eq!(explicit_null.session_context.mcp_config, Some(Value::Null));
@@ -318,7 +318,7 @@ fn test_api_uses_shared_path_segment_escape_edge_cases() {
     ];
 
     for (input, expected) in cases {
-        assert_eq!(go_path_escape(input), expected, "input={input:?}");
+        assert_eq!(escape_path_segment(input), expected, "input={input:?}");
     }
 }
 
@@ -363,7 +363,7 @@ async fn test_acknowledge_work_escapes_both_ids_as_path_segments() {
     client
         .acknowledge_work(&CancellationToken::new(), "env/%2e;中文", "work,:@&=+$")
         .await
-        .expect("Go-compatible escaped ACK path should succeed");
+        .expect("escaped ACK path should succeed");
 }
 
 /// 验证 CCR worker 的所有子资源共享同一个已转义 session segment。
@@ -390,7 +390,7 @@ async fn test_ccr_backend_escapes_session_id_as_path_segment() {
         backend
             .register_worker(&CancellationToken::new())
             .await
-            .expect("Go-compatible escaped register path should succeed"),
+            .expect("escaped register path should succeed"),
         7
     );
 }
@@ -430,7 +430,7 @@ async fn ccr_register_worker_epoch_accepts_null_and_missing_defaults() {
             backend
                 .register_worker(&CancellationToken::new())
                 .await
-                .expect("Go-compatible zero worker epoch should parse"),
+                .expect("missing worker epoch should use zero"),
             0
         );
     }
@@ -484,12 +484,12 @@ async fn json_body_uses_native_gzip_decoding() {
     );
     let headers = String::from_utf8_lossy(headers).to_ascii_lowercase();
     assert!(headers.contains("accept-encoding: gzip\r\n"));
-    assert_eq!(body, br#"{"a":"\u003c\u2028\u0026\u003e","z":"last"}"#);
+    assert_eq!(body, "{\"a\":\"<\u{2028}&>\",\"z\":\"last\"}".as_bytes());
 }
 
-/// 响应提前截断时，错误文案仍保留已经读到的 partial body。
+/// 响应提前截断时返回读取错误，而不把 partial body 当成完整响应。
 #[tokio::test]
-async fn truncated_non_ok_response_keeps_partial_body() {
+async fn truncated_non_ok_response_returns_read_error() {
     let response =
         b"HTTP/1.1 418 I'm a teapot\r\nContent-Length: 10\r\nConnection: close\r\n\r\npart"
             .to_vec();
@@ -517,12 +517,12 @@ async fn truncated_non_ok_response_keeps_partial_body() {
         )
         .await
         .unwrap_err();
-    assert_eq!(error.to_string(), "partial responded with non-OK 418: part");
+    assert!(!error.to_string().contains("non-OK 418: part"));
 }
 
-/// CCR event 的 map round-trip 与 diagnostics map 顺序必须逐字节等于。
+/// CCR event 保持整数精度，diagnostics 发送等价 JSON。
 #[tokio::test]
-async fn ccr_request_bodies_preserve_sorted_dynamic_json_and_number_rules() {
+async fn ccr_request_bodies_preserve_json_values() {
     let event_response =
         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
     let (event_base, event_request) = spawn_raw_api_response(event_response).await;
@@ -565,7 +565,7 @@ async fn ccr_request_bodies_preserve_sorted_dynamic_json_and_number_rules() {
         + 4..];
     assert_eq!(
         event_body,
-        br#"{"events":[{"payload":{"data":{"big":9007199254740992,"number":1,"z":"\u003c\u0026\u003e"},"subtype":"done","type":"event","uuid":"u"}}],"worker_epoch":0}"#
+        br#"{"events":[{"payload":{"type":"event","uuid":"u","data":{"big":9007199254740993,"number":1.0,"z":"<&>"},"subtype":"done"}}],"worker_epoch":0}"#
     );
 
     let diagnostics_response =
@@ -604,7 +604,7 @@ async fn ccr_request_bodies_preserve_sorted_dynamic_json_and_number_rules() {
         + 4..];
     assert_eq!(
         diagnostics_body,
-        br#"{"lines":[{"fields":{"message":"\u003c\u0026\u003e"},"timestamp":"2026-07-15T01:02:03.000Z"}],"session_id":"session","worker_epoch":0}"#
+        br#"{"lines":[{"fields":{"message":"<&>"},"timestamp":"2026-07-15T01:02:03.000Z"}],"session_id":"session","worker_epoch":0}"#
     );
 }
 
@@ -624,7 +624,7 @@ fn session_ingress_otlp_endpoints_keep_raw_base_url() {
     );
 }
 
-/// 已取消请求和 connection-refused 都必须走统一的 retry 包装顺序。
+/// 已取消请求和传输失败都必须经过统一的 retry 包装。
 #[tokio::test]
 async fn retry_reports_cancellation_and_transport_errors() {
     let client = HttpClient::new(
@@ -663,8 +663,10 @@ async fn retry_reports_cancellation_and_transport_errors() {
         .await
         .unwrap_err();
     let error = error.to_string();
-    assert!(error.starts_with("request failed after 0 retries: request failed: "));
-    assert!(error.contains("error sending request"));
+    assert!(
+        error.starts_with("request failed after 0 retries: "),
+        "{error}"
+    );
 }
 
 #[tokio::test]

@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     NoopOrchestratorObserver, Orchestrator, OrchestratorConfig, OrchestratorError,
-    OrchestratorEvent, OrchestratorObserver, OrchestratorResult, RawMessage, SessionOutput,
+    OrchestratorEvent, OrchestratorObserver, OrchestratorResult, RawWork, SessionOutput,
     StdoutSessionOutput,
 };
 use crate::internal::util::duration_nanoseconds;
@@ -72,7 +72,7 @@ impl Orchestrator {
     /// 在一个 poll 窗口内寻找 session。
     ///
     /// 失败次数跨 poll 窗口保存，成功（包括空队列）才清零。第 N 次连续失败退避
-    /// `min(2^N, 60)` 秒，所以第一次是 2 秒。与 一致，deadline 只在循环顶部检查；
+    /// `min(2^N, 60)` 秒，所以第一次是 2 秒。deadline 只在循环顶部检查；
     /// 已开始的退避或 jitter 不会被 deadline 截短，但始终可被取消令牌中断。
     pub async fn poll_for_session(
         &self,
@@ -80,7 +80,7 @@ impl Orchestrator {
         poll_timeout: Duration,
         remaining_loop_time: Duration,
         consecutive_failures: &mut i64,
-    ) -> OrchestratorResult<Option<RawMessage>> {
+    ) -> OrchestratorResult<Option<RawWork>> {
         let now = Instant::now();
         let poll_deadline = now.checked_add(poll_timeout).unwrap_or(now);
         tracing::info!("poll_timeout" = ?(duration_nanoseconds(poll_timeout)), "remaining_loop_time" = ?(duration_nanoseconds(remaining_loop_time)), "{}", "starting poll loop");

@@ -11,7 +11,7 @@ use reqwest::header::AUTHORIZATION;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    OrchestratorError, OrchestratorResult, Poller, PollerInterface, RawMessage, WorkResponse,
+    OrchestratorError, OrchestratorResult, Poller, PollerInterface, RawWork, WorkResponse,
 };
 use crate::internal::util::{claude_code_version, duration_nanoseconds, version};
 
@@ -58,7 +58,7 @@ impl Poller {
     pub async fn poll(
         &self,
         cancellation: &CancellationToken,
-    ) -> OrchestratorResult<Option<RawMessage>> {
+    ) -> OrchestratorResult<Option<RawWork>> {
         tracing::debug!(
             environment_id = %self.environment_id,
             worker_id = %self.worker_id,
@@ -182,10 +182,7 @@ impl Poller {
 #[async_trait]
 impl PollerInterface for Poller {
     /// 通过统一 poller trait 转发到 HTTP Poller 的固有实现。
-    async fn poll(
-        &self,
-        cancellation: &CancellationToken,
-    ) -> OrchestratorResult<Option<RawMessage>> {
+    async fn poll(&self, cancellation: &CancellationToken) -> OrchestratorResult<Option<RawWork>> {
         Poller::poll(self, cancellation).await
     }
 

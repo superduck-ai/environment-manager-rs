@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     claude_code_executor::filter_init_only_from_environ,
     config_helpers::get_claude_path,
-    types::{ClaudeError, ClaudeObservability, go_utf8_error_view, run_combined_command},
+    types::{ClaudeError, ClaudeObservability, lossy_utf8_error_view, run_combined_command},
 };
 
 /// 执行 init hook；未提供 o11y adapter 时不伪造诊断事件。
@@ -72,7 +72,7 @@ pub async fn run_init_with_observability(
             (-1, message, error.output.expect_combined())
         }
     };
-    let error_view = go_utf8_error_view(&error);
+    let error_view = lossy_utf8_error_view(&error);
     tracing::error!("error" = ?(&error_view), exit_code, "duration_ms" = ?(duration_ms), "output" = ?(String::from_utf8_lossy(&output)), "{}", "claude --init-only failed");
     if let Some(observability) = observability {
         observability.log_claude_init(false, Some(exit_code), duration_ms);

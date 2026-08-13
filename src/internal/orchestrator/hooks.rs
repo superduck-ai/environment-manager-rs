@@ -13,7 +13,7 @@ use super::{
 };
 use crate::internal::{
     process::{CaptureMode, run_command},
-    util::{duration_nanoseconds, format_go_duration},
+    util::{duration_nanoseconds, format_duration},
 };
 
 impl Hook {
@@ -136,7 +136,7 @@ impl Hook {
             ),
         };
         let output = String::from_utf8_lossy(&output).into_owned();
-        let formatted_duration = format_go_duration(duration);
+        let formatted_duration = format_duration(duration);
         if let Some(error) = error {
             tracing::error!(hook = %self.name, command = %self.command, "duration" = ?(duration_nanoseconds(duration)), "output" = ?(output), "error" = ?(error), "hook execution failed");
             return Err(OrchestratorError::message(format!(

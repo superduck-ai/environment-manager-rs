@@ -8,7 +8,7 @@ use std::io::{self, Write};
 
 use tracing::Level;
 
-/// 无换行单行允许保留的最大字节数，与 一致为 1 MiB。
+/// 无换行单行允许保留的最大字节数，固定为 1 MiB。
 pub const MAX_LOG_WRITER_BUFFERED_LINE: usize = 1 << 20;
 
 /// 面向字节流的逐行日志 writer。

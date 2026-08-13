@@ -64,12 +64,8 @@ impl Client {
             name: slug.to_owned(),
             verify_jwt: true,
         };
-        // JSON encoder 在 metadata 后附带换行，保留这一 multipart 字节行为。
-        let metadata_json = format!(
-            "{}\n",
-            serde_json::to_string(&metadata)
-                .map_err(|error| McpError::message(format!("encode metadata: {error}")))?
-        );
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|error| McpError::message(format!("encode metadata: {error}")))?;
         let mut form = Form::new().text("metadata", metadata_json);
         for file in files {
             let bytes = tokio::fs::read(&file.abs_path).await.map_err(|error| {

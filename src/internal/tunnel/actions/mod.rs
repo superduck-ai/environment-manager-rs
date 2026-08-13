@@ -1,7 +1,7 @@
 //! Tunnel 控制 action 注册、调度与内置实现。
 //!
 //! Registry 保证同名 action 单实例运行，使用
-//! 有界超时和取消令牌执行，并把进度及最终结果编码成与 一致的 NDJSON 分片。
+//! 有界超时和取消令牌执行，并把进度及最终结果编码成 tunnel 协议要求的 NDJSON 分片。
 
 mod registry;
 mod types;

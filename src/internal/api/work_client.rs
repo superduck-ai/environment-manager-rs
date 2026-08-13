@@ -1,14 +1,14 @@
 //! work ACK 客户端。
 //!
-//! ACK 只接受 HTTP 200 或 204；认证、beta 和版本 header 的名称与 完全一致。
+//! ACK 只接受 HTTP 200 或 204；认证、beta 和版本 header 遵循后端 API 契约。
 
 use reqwest::header::HeaderValue;
 use reqwest::{Method, StatusCode};
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::util::go_path_escape;
+use crate::internal::util::escape_path_segment;
 
-use super::client::{add_version_headers, read_response_body_ignoring_errors};
+use super::client::{add_version_headers, read_response_body};
 use super::{ApiError, HttpClient};
 
 /// 环境 work API 客户端。
@@ -40,8 +40,8 @@ impl WorkClient {
         let endpoint = format!(
             "{}/v1/environments/{}/work/{}/ack",
             self.http_client.base_url(),
-            go_path_escape(environment_id),
-            go_path_escape(work_id)
+            escape_path_segment(environment_id),
+            escape_path_segment(work_id)
         );
         let mut request = self
             .http_client
@@ -68,7 +68,7 @@ impl WorkClient {
             .map_err(|error| ApiError::message(format!("ACK request failed: {error}")))?;
         let status = response.status();
         if status != StatusCode::OK && status != StatusCode::NO_CONTENT {
-            let body = read_response_body_ignoring_errors(response, cancellation).await;
+            let body = read_response_body(response, cancellation).await?;
             Err(ApiError::message(format!(
                 "ACK request returned status {}: {}",
                 status.as_u16(),

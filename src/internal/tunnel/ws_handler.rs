@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message};
 use tokio_util::sync::CancellationToken;
 
-use super::client::{connect_websocket_with_config, gorilla_websocket_config};
+use super::client::{connect_websocket_with_config, tunnel_websocket_config};
 use super::{
     TunnelError, WsHandler, WsResponseSender, WsTunnel, WsTunnelClose, WsTunnelError,
     WsTunnelMessage, WsTunnelOpen, WsTunnelOpened, apply_websocket_tunnel_headers,
@@ -96,12 +96,12 @@ impl WsHandler {
 
         // 本地连接使用上游 Tungstenite 的标准协议状态机。项目不再向依赖内部
         // 注入 write-poison；任何写失败都会在应用层立即取消并移除整条 tunnel。
-        let websocket_config = gorilla_websocket_config();
+        let websocket_config = tunnel_websocket_config();
         let handshake = tokio::select! {
                    () = cancellation.cancelled() => return Err(TunnelError::message("context canceled")),
                    handshake = tokio::time::timeout(
                        WEBSOCKET_HANDSHAKE_TIMEOUT,
-        // 本地 `localhost` 会按 ProxyFromEnvironment 特例直连。仍经过
+        // 本地 `localhost` 会按环境代理规则直连。仍经过
         // 共享 dial helper，使未来的非 loopback 调用也遵守代理规则。
                        connect_websocket_with_config(outbound, websocket_config),
                    ) => handshake,
@@ -109,14 +109,7 @@ impl WsHandler {
         let (socket, response) = match handshake {
             Ok(Ok(connected)) => connected,
             Ok(Err(error)) => {
-                // 握手 response 存在时将状态放在错误前；错误本体固定为
-                // `websocket: bad handshake`，不能泄漏 tungstenite
-                // 的 `HTTP error` 或 `IO error` 前缀。
-                let message = match error.response_status() {
-                    Some(status) => format!("{status}: {error}"),
-                    None => error.to_string(),
-                };
-                send_ws_error(sender.as_ref(), &request.tunnel_id, &message).await?;
+                send_ws_error(sender.as_ref(), &request.tunnel_id, &error.to_string()).await?;
                 return Ok(());
             }
             Err(_) => {
@@ -377,7 +370,7 @@ impl WsHandler {
                 Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => {}
                 Err(error) => {
                     if !tunnel.cancellation.is_cancelled() {
-                        if is_gorilla_abnormal_eof(&error) {
+                        if is_abnormal_websocket_eof(&error) {
                             // WebSocket 把未经 close handshake 的 EOF 包装成
                             // `CloseError{1006, "unexpected EOF"}`，上层因此必须收到
                             // WsClose，不能改成普通 WsError。
@@ -452,7 +445,7 @@ pub(super) fn websocket_close_message(code: i32, reason: &str) -> Message {
 /// 底层 TCP 在没有 WebSocket close handshake 时返回 EOF，tungstenite 将其
 /// 表示为 `ResetWithoutClosingHandshake`；某些 stream wrapper 会直接保留
 /// `UnexpectedEof`。两者在 WebSocket 都是代码 1006、文本 `unexpected EOF`。
-fn is_gorilla_abnormal_eof(error: &WebSocketError) -> bool {
+fn is_abnormal_websocket_eof(error: &WebSocketError) -> bool {
     matches!(
         error,
         WebSocketError::Protocol(ProtocolError::ResetWithoutClosingHandshake)

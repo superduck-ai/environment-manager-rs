@@ -54,18 +54,6 @@ pub enum V0ParseError {
     InvalidAuth(#[source] AuthError),
 }
 
-/// 缺失 `startup_context` 时共享解析流程采用的行为。
-///
-/// parser 本身返回 `None` cancellation 后由调用方解引用并 panic。Rust 的库内 parser 保留
-/// 这一语义，CLI 则返回可诊断的普通错误。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MissingStartupContextBehavior {
-    /// 实现parser 被直接调用时发生的 panic，供单元测试和差分 probe 使用。
-    PanicLikeGoParser,
-    /// 返回专用错误，供 CLI 正常报告无效输入。
-    ReturnErrorForCli,
-}
-
 #[derive(Default, Deserialize)]
 struct V0EnvironmentConfig {
     #[serde(default, deserialize_with = "deserialize_string_or_null")]
@@ -92,7 +80,7 @@ where
 impl V0Parser {
     /// 解析完整 V0 stdin payload。
     pub fn parse(&self, data: &[u8]) -> Result<ParsedContext, V0ParseError> {
-        self.parse_internal(data, MissingStartupContextBehavior::PanicLikeGoParser)
+        self.parse_internal(data)
     }
 
     /// 解析 CLI 收到的完整 V0 stdin payload。
@@ -106,24 +94,19 @@ impl V0Parser {
     /// # 返回
     /// 成功时返回完整解析上下文；输入缺字段或其他阶段失败时返回类型化解析错误。
     pub(crate) fn parse_for_cli(&self, data: &[u8]) -> Result<ParsedContext, V0ParseError> {
-        self.parse_internal(data, MissingStartupContextBehavior::ReturnErrorForCli)
+        self.parse_internal(data)
     }
 
     /// 执行 V0 共享解析流程，并按调用入口决定日志及缺字段行为。
     ///
     /// `missing_startup_context` 只改变 `None` 解引用的承载方式，不能改变它之前的
     /// JSON 解码和日志，也不能让它之后的 environment/auth 阶段继续执行。
-    fn parse_internal(
-        &self,
-        data: &[u8],
-        missing_startup_context: MissingStartupContextBehavior,
-    ) -> Result<ParsedContext, V0ParseError> {
+    fn parse_internal(&self, data: &[u8]) -> Result<ParsedContext, V0ParseError> {
         let started = Instant::now();
         tracing::info!("data_size_bytes" = ?(data.len()), "{}", "Parsing V0 input format");
         let input: serde_json::Map<String, Value> =
             serde_json::from_slice(data).map_err(V0ParseError::InvalidStdin)?;
-        let startup_context =
-            self.parse_startup_context(input.get("startup_context"), missing_startup_context)?;
+        let startup_context = self.parse_startup_context(input.get("startup_context"))?;
         self.log_startup_context(&startup_context);
         let environment = self.parse_environment(input.get("environment"))?;
         tracing::info!("environment_type" = ?(&environment.environment_type), "has_allowed_tools" = ?(!environment.allowed_tools.is_empty()), "has_disallowed_tools" = ?(!environment.disallowed_tools.is_empty()), "{}", "Parsed environment from V0 input");
@@ -163,26 +146,8 @@ impl V0Parser {
 
     /// 反序列化、校验并归一化 startup_context。
     ///
-    /// `missing_behavior` 仅用于区分库内 panic 与 CLI 普通错误；显式 `null`、非法
-    /// JSON 形状和领域校验错误都走原有路径。
-    fn parse_startup_context(
-        &self,
-        value: Option<&Value>,
-        missing_behavior: MissingStartupContextBehavior,
-    ) -> Result<StartupContext, V0ParseError> {
-        // parseStartupContext 对 missing RawMessage 返回 `None`、`None`，调用方随后立即
-        // 解引用并产生固定 runtime panic。显式 null 则会构造零值 context，不能与
-        // missing 合并。
-        let Some(value) = value else {
-            return match missing_behavior {
-                MissingStartupContextBehavior::PanicLikeGoParser => {
-                    panic!("runtime error: invalid memory address or nil pointer dereference");
-                }
-                MissingStartupContextBehavior::ReturnErrorForCli => {
-                    Err(V0ParseError::StartupContextRequired)
-                }
-            };
-        };
+    fn parse_startup_context(&self, value: Option<&Value>) -> Result<StartupContext, V0ParseError> {
+        let value = value.ok_or(V0ParseError::StartupContextRequired)?;
         let mut startup_context = if value.is_null() {
             StartupContext::default()
         } else {

@@ -80,7 +80,7 @@ pub fn new_registration(
             Box::pin(async move {
                 let Some(configurator) = configurator else {
                     return Err(McpError::message(format!(
-                        "failed to configure {name} server: configurator is nil"
+                        "failed to configure {name} server: configurator is missing"
                     )));
                 };
 
@@ -166,7 +166,7 @@ pub fn get_mcp_registrations(
 /// 使用 Claude CLI 删除同名旧条目并添加 HTTP MCP server。
 ///
 /// `mcp list` 和 `mcp remove` 失败都只降级为继续 add；最终 add 失败才返回错误。
-/// argv 与 完全一致，URL 固定为 loopback `/mcp`，header 使用精确 Bearer 文本。
+/// URL 固定为 loopback `/mcp`，header 使用精确 Bearer 文本。
 pub async fn register_with_claude(
     cancellation: &CancellationToken,
     server_name: &str,
@@ -175,7 +175,7 @@ pub async fn register_with_claude(
     let started = Instant::now();
     let Some(server_config) = server_config else {
         return Err(McpError::message(
-            "claude mcp add failed: server config is nil",
+            "claude mcp add failed: server config is missing",
         ));
     };
     let url = format!("http://127.0.0.1:{}/mcp", server_config.port);
@@ -195,7 +195,7 @@ pub async fn register_with_claude(
     }) {
         tracing::info!("server_name" = ?(server_name), "{}", "MCP server already registered, removing and re-adding");
 
-        // remove 失败与 一致只记录诊断，随后仍然执行 add。失败结果先统一成
+        // remove 失败只记录诊断，随后仍然执行 add。失败结果先统一成
         // `(error, output)`，以便所有失败共享唯一日志源位置。
         let remove_failure = match run_claude(cancellation, ["mcp", "remove", server_name]).await {
             Ok(output) if output.status.success() => {

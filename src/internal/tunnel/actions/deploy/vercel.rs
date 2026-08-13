@@ -13,7 +13,7 @@ use sha1::{Digest as _, Sha1};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
-use crate::internal::{tunnel::actions::ActionError, util::format_go_duration};
+use crate::internal::{tunnel::actions::ActionError, util::format_duration};
 
 use super::types::{Deployment, FileEntry, VercelClient, VercelErrorResponse};
 
@@ -233,7 +233,7 @@ impl VercelClient {
             }
         }
 
-        Err(format!("deployment not ready after {}", format_go_duration(timeout)).into())
+        Err(format!("deployment not ready after {}", format_duration(timeout)).into())
     }
 }
 
@@ -317,44 +317,16 @@ pub fn validate_project_dir(directory: &str) -> Result<(), ActionError> {
 }
 
 ///
-/// 最多保留去前缀后的前 20 个 UTF-8 **字节**，随后做 Unicode simple lowercase；
-/// ASCII 小写字母、数字和连字符之外的每个 rune 都变成一个连字符。无效或被截断的
-/// UTF-8 字节按 range 规则逐字节变成连字符。
+/// 最多保留去前缀后的前 20 个 Unicode 字符，随后规范化为项目名允许的 ASCII。
 #[must_use]
 pub fn project_name(session_id: &str) -> String {
     let stripped = session_id
         .strip_prefix("session_staging_")
         .or_else(|| session_id.strip_prefix("session_"))
         .unwrap_or(session_id);
-    let bytes = &stripped.as_bytes()[..stripped.len().min(20)];
-    let mut normalized = String::with_capacity(bytes.len());
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        match std::str::from_utf8(&bytes[offset..]) {
-            Ok(valid) => {
-                for character in valid.chars() {
-                    push_project_character(&mut normalized, character);
-                }
-                break;
-            }
-            Err(error) => {
-                let valid_up_to = error.valid_up_to();
-                if valid_up_to > 0 {
-                    // SAFETY-free decode: `valid_up_to` is guaranteed to end on a UTF-8 boundary.
-                    let valid = std::str::from_utf8(&bytes[offset..offset + valid_up_to])
-                        .expect("Utf8Error::valid_up_to identifies valid UTF-8");
-                    for character in valid.chars() {
-                        push_project_character(&mut normalized, character);
-                    }
-                    offset += valid_up_to;
-                }
-                let invalid_bytes = error.error_len().unwrap_or(bytes.len() - offset);
-                for _ in 0..invalid_bytes {
-                    normalized.push('-');
-                }
-                offset += invalid_bytes;
-            }
-        }
+    let mut normalized = String::with_capacity(stripped.len().min(20));
+    for character in stripped.chars().take(20) {
+        push_project_character(&mut normalized, character);
     }
     format!("baku-{normalized}")
 }

@@ -167,7 +167,7 @@ impl Source {
 impl McpServerConfig {
     /// 判断该 server 是否使用已知远端传输。
     ///
-    /// 与 一致：只要 `type` 非空就只按 `sse|http|ws` 判断；仅当 `type`
+    /// 只要 `type` 非空就只按 `sse|http|ws` 判断；仅当 `type`
     /// 为空时，非空 URL 才会令结果为 true。
     #[must_use]
     pub fn is_remote(&self) -> bool {

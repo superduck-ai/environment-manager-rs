@@ -360,12 +360,12 @@ async fn test_source_handler_manager_dispatches_handlers() {
         vec!["custom_source".to_owned()]
     );
 
-    let nil_sources: [Option<&FakeConfigSource>; 1] = [None];
-    let nil_error = manager
-        .process_sources(&CancellationToken::new(), &nil_sources)
+    let missing_sources: [Option<&FakeConfigSource>; 1] = [None];
+    let missing_error = manager
+        .process_sources(&CancellationToken::new(), &missing_sources)
         .await
-        .expect_err("nil source should fail");
-    assert!(nil_error.to_string().contains("source[0] is nil"));
+        .expect_err("missing source should fail");
+    assert!(missing_error.to_string().contains("source[0] is missing"));
 }
 
 /// 验证 manager、默认 recorder 和动态 handler 都能安全借用当前 async 栈帧。
@@ -398,7 +398,7 @@ async fn source_handler_manager_preserves_scoped_trait_object_lifetimes() {
     manager
         .process_sources(&CancellationToken::new(), &[&source])
         .await
-        .expect("missing handler remains a non-fatal Go-compatible result");
+        .expect("missing handler remains a non-fatal result");
     assert!(failure_recorded.load(Ordering::SeqCst));
 
     let handler: Arc<dyn SourceHandler + '_> = Arc::new(BorrowedSourceHandler {

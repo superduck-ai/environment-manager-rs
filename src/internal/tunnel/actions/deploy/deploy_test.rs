@@ -89,10 +89,9 @@ fn test_project_name() {
         "baku-abcdefghijklmnopqrst"
     );
     assert_eq!(project_name("Already-OK"), "baku-already-ok");
-    // 20 字节边界截断一个三字节 rune；range 会把剩余两个非法字节各变成 `-`。
     assert_eq!(
         project_name("123456789012345678€"),
-        "baku-123456789012345678--"
+        "baku-123456789012345678-"
     );
 }
 

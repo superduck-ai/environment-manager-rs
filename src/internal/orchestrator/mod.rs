@@ -22,7 +22,7 @@ pub(crate) use types::SessionData;
 pub use types::{
     CommandOutcome, Hook, NoopOrchestratorObserver, Orchestrator, OrchestratorConfig,
     OrchestratorError, OrchestratorEvent, OrchestratorObserver, OrchestratorResult, PollHook,
-    PollHookContext, Poller, PollerInterface, RawMessage, SandboxAdapter, SandboxRequest,
+    PollHookContext, Poller, PollerInterface, RawWork, SandboxAdapter, SandboxRequest,
     SessionOutput, StdoutSessionOutput, WhoamiClient, WhoamiResponse, WorkData, WorkResponse,
 };
 pub use whoami::new_whoami_client;

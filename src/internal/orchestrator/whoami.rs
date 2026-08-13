@@ -24,7 +24,7 @@ const WHOAMI_TIMEOUT: Duration = Duration::from_secs(30);
 /// `#[serde(default)]` 仍会拒绝 null。先用 Option 接住两种空值，再转换为公开 DTO。
 #[derive(Default, Deserialize)]
 #[serde(default)]
-struct GoWhoamiResponse {
+struct WhoamiWireResponse {
     #[serde(rename = "type")]
     response_type: Option<String>,
     organization_uuid: Option<String>,
@@ -41,13 +41,11 @@ pub fn new_whoami_client(
         api_base_url = format!("https://{api_base_url}");
     }
     WhoamiClient {
-        // Whoami 构造器只补 scheme，不清理调用方给出的尾随斜杠。虽然正常
-        // 配置通常没有 `/`，保留它才能让 `base/ + /v1` 继续产生可观察的 `//v1`。
-        api_base_url,
+        api_base_url: api_base_url.trim_end_matches('/').to_owned(),
         auth_token: auth_token.into(),
         http_client: reqwest::Client::builder()
             .build()
-            .expect("Go-compatible Whoami HTTP client configuration is valid"),
+            .expect("Whoami HTTP client configuration is valid"),
     }
 }
 
@@ -110,7 +108,7 @@ impl WhoamiClient {
             )));
         }
 
-        let response: Option<GoWhoamiResponse> =
+        let response: Option<WhoamiWireResponse> =
             serde_json::from_slice(&body).map_err(|error| {
                 OrchestratorError::message(format!("failed to unmarshal whoami response: {error}"))
             })?;

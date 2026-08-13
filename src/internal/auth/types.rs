@@ -172,7 +172,7 @@ impl AuthContext {
 
     /// 判断是否配置了可识别的 Supabase 项目。
     ///
-    /// 与 一致，只检查 `project_ref`，不会要求其余三个字段同时非空。
+    /// Supabase 凭据只以 `project_ref` 判断是否启用，不要求其余三个字段同时非空。
     #[must_use]
     pub fn has_supabase(&self) -> bool {
         !self.supabase_project_ref.is_empty()

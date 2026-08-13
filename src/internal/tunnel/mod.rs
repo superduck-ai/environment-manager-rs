@@ -21,7 +21,7 @@ pub use client::{add_jitter, new_client, with_action_registry};
 pub(crate) use handler::new_handler_with_timing_for_test;
 pub use handler::{HTTP_TUNNEL_CHUNK_SIZE, new_handler};
 pub use helpers::{
-    apply_tunnel_headers, apply_websocket_tunnel_headers, flatten_http_headers, marshal_protojson,
+    apply_tunnel_headers, apply_websocket_tunnel_headers, encode_protojson, flatten_http_headers,
 };
 pub use types::{
     Client, ClientOption, Handler, TunnelError, WsHandler, WsResponseSender, WsSenderError,

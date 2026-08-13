@@ -84,7 +84,7 @@ fn test_mcp_server_config_validation() {
 
 /// 验证 startup context 的完整 JSON、source 分派和 MCP 未知字段保留。
 #[test]
-fn test_startup_context_unmarshal_validate_and_mcp_extras() {
+fn test_startup_context_deserialize_validate_and_mcp_extras() {
     let value = json!({
         "api_base_url": "api.example.test",
         "sources": [{
@@ -218,7 +218,7 @@ fn test_startup_context_explicit_null_fields_use_defaults() {
         "environment_sub_type": null,
         "use_code_sessions": null
     }))
-    .expect("V0 startup 的显式 null 值类型字段应采用 Go 零值");
+    .expect("V0 startup 的显式 null 值类型字段应采用默认值");
     assert_eq!(startup, StartupContext::default());
 
     let top_level_null: StartupContext =
@@ -263,7 +263,7 @@ fn test_nested_config_explicit_null_values_use_defaults() {
             "permission_policy": null
         }]
     }))
-    .expect("MCP server 的显式 null 应采用 Go 零值");
+    .expect("MCP server 的显式 null 应采用字段默认值");
     assert_eq!(server.server_type, "");
     assert_eq!(server.url, "");
     assert_eq!(server.command, "");
@@ -297,7 +297,7 @@ fn test_nested_config_explicit_null_values_use_defaults() {
             "branches": [null]
         }
     }))
-    .expect("outcome 的显式 null 应采用 Go 零值");
+    .expect("outcome 的显式 null 应采用字段默认值");
     assert_eq!(outcome.outcome_type, "");
     assert_eq!(outcome.git_info.git_type, "");
     assert_eq!(outcome.git_info.repo, "");

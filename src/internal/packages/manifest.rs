@@ -247,18 +247,18 @@ fn is_package_manager_option(spec: &str) -> bool {
 
 /// 判断任意 URL authority 中是否出现 `@`。
 ///
-/// 这里只实现固定正则 `[a-z][a-z0-9+.-]*://[^/\s?#]*@` 的状态机，避免为单个安全
-/// 检查增加 regex 依赖。实现显式支持 Kelvin sign、long s 和 RE2 的 ASCII `\s`；
-/// percent-encoding 是否有效不影响凭据判定。
+/// 这里只实现固定模式 `[a-z][a-z0-9+.-]*://[^/\s?#]*@` 的状态机，避免为单个安全
+/// 检查增加 regex 依赖。Kelvin sign 和 long s 作为 ASCII scheme 字母的视觉混淆字符
+/// 一并拒绝；percent-encoding 是否有效不影响凭据判定。
 #[must_use]
 fn contains_url_credentials(spec: &str) -> bool {
     for (start, first) in spec.char_indices() {
-        if !is_go_ascii_fold_letter(first) {
+        if !is_scheme_letter(first) {
             continue;
         }
         let mut cursor = start + first.len_utf8();
         while let Some(character) = spec[cursor..].chars().next() {
-            if !(is_go_ascii_fold_letter(character)
+            if !(is_scheme_letter(character)
                 || character.is_ascii_digit()
                 || matches!(character, '+' | '.' | '-'))
             {
@@ -274,7 +274,7 @@ fn contains_url_credentials(spec: &str) -> bool {
             if character == '@' {
                 return true;
             }
-            if matches!(character, '/' | '?' | '#') || is_go_regexp_space(character) {
+            if matches!(character, '/' | '?' | '#') || is_pattern_whitespace(character) {
                 break;
             }
             cursor += character.len_utf8();
@@ -289,12 +289,12 @@ fn contains_url_credentials(spec: &str) -> bool {
 /// 字母只有普通大小写两项。这里不能用 `is_alphabetic`，否则会错误接受任意 Unicode
 /// 字母作为 URL scheme。
 #[must_use]
-fn is_go_ascii_fold_letter(character: char) -> bool {
+fn is_scheme_letter(character: char) -> bool {
     character.is_ascii_alphabetic() || matches!(character, '\u{212a}' | '\u{017f}')
 }
 
-/// 判断字符是否属于 RE2 Perl `\s` 的 ASCII 字节集合。
+/// 判断字符是否属于凭据扫描模式使用的 ASCII 空白集合。
 #[must_use]
-fn is_go_regexp_space(character: char) -> bool {
+fn is_pattern_whitespace(character: char) -> bool {
     matches!(character, ' ' | '\t' | '\n' | '\r' | '\u{000c}')
 }

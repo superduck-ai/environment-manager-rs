@@ -274,7 +274,7 @@ where
 
 /// 为缺少 scheme 的 API base URL 补 `https://`。
 ///
-/// 与 一致，仅做字符串前缀判断，不在此处验证 URL、去除尾斜杠或改写大小写。
+/// 仅做字符串前缀判断，不在此处验证 URL、去除尾斜杠或改写大小写。
 #[must_use]
 pub fn normalize_api_base_url(api_base_url: &str) -> String {
     if api_base_url.starts_with("http://") || api_base_url.starts_with("https://") {

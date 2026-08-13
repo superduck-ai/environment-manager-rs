@@ -1,9 +1,6 @@
 //! `internal/input` 的行为回归测试。
 
-use std::{
-    panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE};
 use serde_json::{Value, json};
@@ -14,7 +11,7 @@ use crate::internal::auth::AuthConfig;
 ///
 /// 验证 work secret 的 URL-safe Base64、source、auth 和全部 gateway 字段。
 #[test]
-fn test_work_secret_unmarshal_and_decode() {
+fn test_work_secret_deserialization_and_decode() {
     let encoded = encoded_work_secret(json!({
         "version": 1,
         "session_ingress_token": "ingress-token",
@@ -143,7 +140,7 @@ fn test_work_secret_explicit_null_values_use_defaults() {
         "mcp_config": null,
         "environment_variables": null
     })))
-    .expect("可选 null 字段应保留 Go nil 语义");
+    .expect("可选 null 字段应保持未设置状态");
     assert!(optional_nulls.auth.is_empty());
     assert!(optional_nulls.claude_code_args.is_none());
     assert!(optional_nulls.mcp_config.is_none());
@@ -365,12 +362,12 @@ async fn test_v1_parser_preserves_explicit_null_session_fields() {
             &secret,
         ))
         .await
-        .expect("显式 null 应按 Go 零值语义解析");
+        .expect("显式 null 应按字段默认值解析");
 
     assert!(parsed.outcomes.is_empty());
     assert!(
         parsed.startup_context.mcp_config.is_some(),
-        "显式 null mcp_config 在 Go 中会创建 non-nil 零值配置"
+        "显式 null mcp_config 应创建可用的默认配置"
     );
 }
 
@@ -447,38 +444,23 @@ fn test_v0_parser_parses_input() {
     );
 }
 
-/// 验证缺失 startup context 只在 CLI 专用入口转换为错误。
-///
-/// 普通 `parse` 保留 panic payload，CLI 入口把它转换为 sentinel。
+/// 验证所有 V0 解析入口都安全地报告缺失 startup context。
 #[test]
-fn v0_missing_startup_context_preserves_parser_panic_and_cli_sentinel() {
+fn v0_missing_startup_context_returns_error() {
     let parser = V0Parser {
         session_id: "session-missing-startup".to_owned(),
     };
     let payload = br#"{"environment":{"environment_type":"byoc"}}"#;
 
-    assert_nil_dereference_panic(catch_unwind(AssertUnwindSafe(|| parser.parse(payload))));
+    assert!(matches!(
+        parser.parse(payload),
+        Err(V0ParseError::StartupContextRequired)
+    ));
 
     let error = parser
         .parse_for_cli(payload)
-        .expect_err("CLI 入口必须把 nil dereference 转换为专用 sentinel");
+        .expect_err("CLI 入口必须返回缺字段错误");
     assert!(matches!(error, V0ParseError::StartupContextRequired));
-}
-
-/// 断言 parser panic payload 保持 runtime 空值解引用 文本。
-fn assert_nil_dereference_panic<T>(outcome: std::thread::Result<T>) {
-    let payload = match outcome {
-        Ok(_) => panic!("普通 V0 parser 入口必须继续 panic"),
-        Err(payload) => payload,
-    };
-    let message = payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
-    assert_eq!(
-        message,
-        Some("runtime error: invalid memory address or nil pointer dereference")
-    );
 }
 
 /// 验证 V0 environment 必填字段以及缺失 startup context 的安全错误。

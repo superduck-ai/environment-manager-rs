@@ -67,12 +67,12 @@ pub(crate) const fn tracing_level(level: LogLevel) -> tracing::Level {
     }
 }
 
-/// 解析 CLI duration 语法 风格的非负持续时间。
+/// 解析 CLI 使用的非负 duration 语法。
 ///
 /// 支持 `ns`、`us`、`µs`、`μs`、`ms`、`s`、`m`、`h` 以及连续组合和小数，
 /// 例如 `500ms`、`1.5s`、`1h30m`。CLI 的超时没有负值语义，因此负数会被明确
 /// 拒绝；`0` 表示“不设超时”。
-pub fn parse_go_duration(input: &str) -> Result<Duration, String> {
+pub fn parse_duration(input: &str) -> Result<Duration, String> {
     let unsigned_input = input.strip_prefix('+').unwrap_or(input);
     if unsigned_input == "0" {
         return Ok(Duration::ZERO);

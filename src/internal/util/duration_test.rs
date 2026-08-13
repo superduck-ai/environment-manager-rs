@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use super::{duration_nanoseconds, format_go_duration};
+use super::{duration_nanoseconds, format_duration};
 
 /// 覆盖紧凑 duration 格式的全部单位切换和复合时长边界。
 #[test]
@@ -34,7 +34,7 @@ fn format_duration_uses_compact_positive_syntax() {
     ];
 
     for (duration, expected) in cases {
-        assert_eq!(format_go_duration(duration), expected, "{duration:?}");
+        assert_eq!(format_duration(duration), expected, "{duration:?}");
     }
 }
 

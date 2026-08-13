@@ -156,7 +156,7 @@ pub struct PermissionDenial {
     /// 拒绝原因。
     pub reason: String,
     /// 请求发生时间。
-    #[serde(serialize_with = "serialize_go_time_rfc3339_nano")]
+    #[serde(serialize_with = "serialize_rfc3339_nanos")]
     pub requested_at: DateTime<Utc>,
 }
 
@@ -222,7 +222,7 @@ pub struct EnvManagerLogEventData {
     /// 人类可读内容。
     pub content: String,
     /// UTC 时间戳。
-    #[serde(serialize_with = "serialize_go_time_rfc3339_nano")]
+    #[serde(serialize_with = "serialize_rfc3339_nanos")]
     pub timestamp: DateTime<Utc>,
     /// 附加结构化字段；BTreeMap 保持 JSON 的排序行为。
     pub extra: BTreeMap<String, Value>,
@@ -272,7 +272,7 @@ pub enum LogLevel {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct DiagLogEntry {
     /// 原日志时间戳。
-    #[serde(serialize_with = "serialize_go_time_rfc3339_nano")]
+    #[serde(serialize_with = "serialize_rfc3339_nanos")]
     pub timestamp: DateTime<Utc>,
     /// 日志自定义字段。
     pub fields: BTreeMap<String, Value>,
@@ -284,16 +284,13 @@ pub struct DiagLogEntry {
 /// 例如 120ms 必须写成 `.12Z`。事件 payload 会被后端逐字节观察，因此不能
 /// 直接依赖 Chrono 的默认 Serde 实现。还会拒绝四位范围外的年份，这里同步在
 /// 序列化边界返回错误。
-fn serialize_go_time_rfc3339_nano<S>(
-    value: &DateTime<Utc>,
-    serializer: S,
-) -> Result<S::Ok, S::Error>
+fn serialize_rfc3339_nanos<S>(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
     if !(0..=9999).contains(&value.year()) {
         return Err(serde::ser::Error::custom(
-            "Time.MarshalJSON: year outside of range [0,9999]",
+            "timestamp year outside of range [0,9999]",
         ));
     }
 

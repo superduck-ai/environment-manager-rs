@@ -183,11 +183,7 @@ pub async fn run_poll(
         return Ok(());
     };
 
-    // Poller 已经验证 work envelope；这里仍按 命令重新解码为动态 JSON，只为
-    // 实现缩进 JSON 编码 的人类可读 stdout，而不改变请求校验的职责边界。
-    // 不能直接调用 `serde_json::to_vec_pretty`：本 crate 为其他协议启用了
-    // 对象会递归按 key 排序，并把
-    // 所有数字先转换成 float64。下面的专用 formatter 保留这些可观察差异。
+    // Poller 已经验证 work envelope；这里重新解码只为输出人类可读的缩进 JSON。
     let payload: Value = match serde_json::from_slice(&work_json) {
         Ok(payload) => payload,
         Err(_) => {
@@ -196,7 +192,7 @@ pub async fn run_poll(
             return Ok(());
         }
     };
-    match format_go_pretty_json(&payload) {
+    match serde_json::to_vec_pretty(&payload) {
         Ok(pretty) => {
             let _ = output.write_all(&pretty);
             let _ = output.write_all(b"\n");
@@ -207,160 +203,4 @@ pub async fn run_poll(
         }
     }
     Ok(())
-}
-
-/// 按动态 JSON 的 wire 规则生成两空格缩进 JSON。
-///
-/// 三个容易被普通 serde pretty printer 忽略的细节：对象键按 UTF-8 字典序排序、
-/// 动态 JSON 数字先经过 IEEE-754 float64、字符串中的 `<`/`>`/`&` 和行分隔符被
-/// 转义。合法 JSON 动态值通常不会编码失败。
-fn format_go_pretty_json(value: &Value) -> Result<Vec<u8>, serde_json::Error> {
-    let mut output = String::new();
-    write_go_json_value(value, 0, &mut output)?;
-    Ok(output.into_bytes())
-}
-
-/// 递归写入一个 风格 JSON 值；`depth` 表示当前值所在的缩进层级。
-fn write_go_json_value(
-    value: &Value,
-    depth: usize,
-    output: &mut String,
-) -> Result<(), serde_json::Error> {
-    match value {
-        Value::Null => output.push_str("null"),
-        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
-        Value::Number(value) => output.push_str(&format_go_json_number(value)),
-        Value::String(value) => output.push_str(&go_json_string(value)?),
-        Value::Array(values) => {
-            if values.is_empty() {
-                output.push_str("[]");
-                return Ok(());
-            }
-            output.push_str("[\n");
-            for (index, value) in values.iter().enumerate() {
-                write_indent(output, depth + 1);
-                write_go_json_value(value, depth + 1, output)?;
-                if index + 1 != values.len() {
-                    output.push(',');
-                }
-                output.push('\n');
-            }
-            write_indent(output, depth);
-            output.push(']');
-        }
-        Value::Object(values) => {
-            if values.is_empty() {
-                output.push_str("{}");
-                return Ok(());
-            }
-            output.push_str("{\n");
-            let mut entries: Vec<_> = values.iter().collect();
-            entries.sort_unstable_by_key(|(key, _)| *key);
-            let entry_count = entries.len();
-            for (index, (key, value)) in entries.into_iter().enumerate() {
-                write_indent(output, depth + 1);
-                output.push_str(&go_json_string(key)?);
-                output.push_str(": ");
-                write_go_json_value(value, depth + 1, output)?;
-                if index + 1 != entry_count {
-                    output.push(',');
-                }
-                output.push('\n');
-            }
-            write_indent(output, depth);
-            output.push('}');
-        }
-    }
-    Ok(())
-}
-
-/// indent 固定为空 prefix、两个 ASCII 空格。
-fn write_indent(output: &mut String, depth: usize) {
-    for _ in 0..depth {
-        output.push_str("  ");
-    }
-}
-
-/// 使用 serde 完成 JSON 字符串的控制字符转义，再补齐 默认的 HTML 转义。
-fn go_json_string(value: &str) -> Result<String, serde_json::Error> {
-    let encoded = serde_json::to_string(value)?;
-    Ok(encoded
-        .replace('&', "\\u0026")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029"))
-}
-
-/// 把 JSON number 收窄为 IEEE-754 float64 后再编码。
-fn format_go_json_number(number: &serde_json::Number) -> String {
-    let value = number
-        .as_f64()
-        .expect("serde_json::Number without arbitrary_precision always fits f64");
-    let shortest = value.to_string();
-    let (negative, unsigned) = shortest
-        .strip_prefix('-')
-        .map_or((false, shortest.as_str()), |value| (true, value));
-    let (mantissa, parsed_exponent) = unsigned
-        .split_once(['e', 'E'])
-        .map_or((unsigned, 0_i32), |(mantissa, exponent)| {
-            (mantissa, exponent.parse::<i32>().unwrap_or_default())
-        });
-    let decimal_index = mantissa.find('.').unwrap_or(mantissa.len());
-    let mut digits = mantissa.replace('.', "");
-    let first_non_zero = digits.find(|character| character != '0');
-
-    // float64 的正负零必须保留符号；紧凑浮点格式化 会输出 `-0`。
-    let Some(first_non_zero) = first_non_zero else {
-        return if negative { "-0" } else { "0" }.to_owned();
-    };
-    let removed_leading = i32::try_from(first_non_zero).unwrap_or(i32::MAX);
-    digits.drain(..first_non_zero);
-    let decimal_index = i32::try_from(decimal_index).unwrap_or(i32::MAX) - removed_leading;
-    let scientific_exponent = parsed_exponent + decimal_index - 1;
-    while digits.len() > 1 && digits.ends_with('0') {
-        digits.pop();
-    }
-
-    let absolute = value.abs();
-    let use_exponent = absolute != 0.0 && !(1e-6..1e21).contains(&absolute);
-    let mut formatted = String::new();
-    if negative {
-        formatted.push('-');
-    }
-    if use_exponent {
-        formatted.push(digits.as_bytes()[0] as char);
-        if digits.len() > 1 {
-            formatted.push('.');
-            formatted.push_str(&digits[1..]);
-        }
-        formatted.push('e');
-        if scientific_exponent >= 0 {
-            formatted.push('+');
-        }
-        formatted.push_str(&scientific_exponent.to_string());
-        return formatted;
-    }
-
-    let fixed_decimal_index = scientific_exponent + 1;
-    if fixed_decimal_index <= 0 {
-        formatted.push_str("0.");
-        for _ in 0..fixed_decimal_index.unsigned_abs() {
-            formatted.push('0');
-        }
-        formatted.push_str(&digits);
-    } else {
-        let fixed_decimal_index = usize::try_from(fixed_decimal_index).unwrap_or(usize::MAX);
-        if fixed_decimal_index >= digits.len() {
-            formatted.push_str(&digits);
-            for _ in digits.len()..fixed_decimal_index {
-                formatted.push('0');
-            }
-        } else {
-            formatted.push_str(&digits[..fixed_decimal_index]);
-            formatted.push('.');
-            formatted.push_str(&digits[fixed_decimal_index..]);
-        }
-    }
-    formatted
 }

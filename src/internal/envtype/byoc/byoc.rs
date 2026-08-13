@@ -133,7 +133,7 @@ impl LeaseManagerHandle for podmonitor::LeaseManager {
 ///
 /// # 返回
 /// 配置合法时返回已接好生产 adapter 的环境；JSON、类型、CWD 或脚本大小不合法时
-/// 返回与 文本一致的 `ByocError`。本函数不访问文件、网络或子进程。
+/// 返回带稳定上下文的 `ByocError`。本函数不访问文件、网络或子进程。
 pub fn new(data: &[u8]) -> Result<ByocEnvironmentType, ByocError> {
     let config: ByocConfig = serde_json::from_slice(data)?;
     if config.environment_type != "byoc" {

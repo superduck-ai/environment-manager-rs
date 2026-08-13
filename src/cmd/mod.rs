@@ -37,7 +37,7 @@ pub use print_sandbox_settings::{PrintSandboxSettingsArgs, run_print_sandbox_set
 pub use provision_packages::{ProvisionPackagesArgs, run_provision_packages};
 pub use setup::{SetupArgs, run_setup};
 pub use task_run::{InputFormat, SessionMode, TaskRunArgs, run_task_run};
-pub use utils::{LogLevel, parse_go_duration, parse_log_level};
+pub use utils::{LogLevel, parse_duration, parse_log_level};
 
 const ROOT_LONG_ABOUT: &str = "Environment Runner handles the lifecycle of agentic sessions.";
 

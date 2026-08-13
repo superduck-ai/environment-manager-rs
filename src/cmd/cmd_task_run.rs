@@ -105,7 +105,7 @@ struct ApiSessionContextProvider {
 impl crate::internal::input::SessionContextProvider for ApiSessionContextProvider {
     /// 为每份 work secret 使用其中的 base URL 与 ingress token 获取 session context。
     ///
-    /// token 只进入 Authorization header；返回 DTO 会保留 RawMessage 字段的
+    /// token 只进入 Authorization header；返回 DTO 会保留原始 JSON 字段的
     /// missing/null 差别，供 V1 parser 实现MCP 指针和 outcomes 日志语义。
     fn get_session_context<'a>(
         &'a self,

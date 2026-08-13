@@ -15,10 +15,10 @@ mod tailer;
 mod types;
 mod version;
 
-pub(crate) use duration::{duration_nanoseconds, format_go_duration};
+pub(crate) use duration::{duration_nanoseconds, format_duration};
 pub use git::{GitRefError, update_remote_tracking_branch};
 pub use lockfile::{FileLockGuard, LockError, acquire_container_lock, acquire_lock};
-pub(crate) use path_escape::go_path_escape;
+pub(crate) use path_escape::escape_path_segment;
 pub use periodic_invoker::{PeriodicInvokerError, new_periodic_invoker};
 pub use retry::{RetryError, retry_operation};
 pub use stream::{BoxError, output_streamer};

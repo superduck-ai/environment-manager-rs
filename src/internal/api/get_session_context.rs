@@ -7,7 +7,7 @@ use reqwest::header::HeaderValue;
 use reqwest::{Method, StatusCode};
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::util::go_path_escape;
+use crate::internal::util::escape_path_segment;
 
 use super::client::read_response_body;
 use super::{ApiError, HttpClient, SessionContext, SessionContextResponse};
@@ -37,7 +37,7 @@ impl SessionsClient {
         let endpoint = format!(
             "{}/v2/sessions/{}",
             self.http_client.base_url(),
-            go_path_escape(session_id)
+            escape_path_segment(session_id)
         );
         let mut request = self
             .http_client

@@ -613,7 +613,7 @@ fn test_supabase_directories_use_0755_under_zero_umask() {
     if let Some(path) = std::env::var_os(ZERO_UMASK_CHILD_DIRECTORY) {
         umask(Mode::empty());
         create_dir_all_0755(&std::path::PathBuf::from(path).join("first/second"))
-            .expect("以 Go mode 创建 Supabase 目录树");
+            .expect("以 0755 mode 创建 Supabase 目录树");
         return;
     }
 

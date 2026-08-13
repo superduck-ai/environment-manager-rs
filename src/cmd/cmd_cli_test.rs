@@ -312,24 +312,18 @@ fn code_sign_rejects_unsupported_operation() {
 /// duration 解析器应覆盖默认值、组合、小数和微秒拼写。
 #[test]
 fn duration_parser_supports_cli_syntax() {
-    assert_eq!(parse_go_duration("0").unwrap(), Duration::ZERO);
+    assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+    assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
     assert_eq!(
-        parse_go_duration("500ms").unwrap(),
-        Duration::from_millis(500)
-    );
-    assert_eq!(
-        parse_go_duration("1.5s").unwrap(),
+        parse_duration("1.5s").unwrap(),
         Duration::from_millis(1_500)
     );
-    assert_eq!(
-        parse_go_duration("1h30m").unwrap(),
-        Duration::from_secs(5_400)
-    );
-    assert_eq!(parse_go_duration("2µs").unwrap(), Duration::from_micros(2));
-    assert_eq!(parse_go_duration("+2s").unwrap(), Duration::from_secs(2));
-    assert_eq!(parse_go_duration("0.5ns").unwrap(), Duration::ZERO);
-    assert!(parse_go_duration("5").is_err());
-    assert!(parse_go_duration("-1s").is_err());
+    assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5_400));
+    assert_eq!(parse_duration("2µs").unwrap(), Duration::from_micros(2));
+    assert_eq!(parse_duration("+2s").unwrap(), Duration::from_secs(2));
+    assert_eq!(parse_duration("0.5ns").unwrap(), Duration::ZERO);
+    assert!(parse_duration("5").is_err());
+    assert!(parse_duration("-1s").is_err());
 }
 
 /// 日志级别应严格接受四个受支持值并返回稳定错误。
@@ -613,8 +607,7 @@ async fn setup_command_registers_and_runs_skip_mode() {
 }
 
 ///
-/// 这里使用精确 stdout 快照，额外覆盖 map key 排序、float64 数字舍入和 HTML
-/// 转义；仅断言包含字段无法发现这些格式差异。
+/// 这里使用精确 stdout 快照，验证输出保持 JSON 数字精度和内容。
 #[tokio::test(flavor = "current_thread")]
 async fn poll_command_prints_work_and_null() {
     let directory = TempDir::new().unwrap();
@@ -645,18 +638,18 @@ async fn poll_command_prints_work_and_null() {
         execute_command_with_stdout(output),
         concat!(
             "{\n",
-            "  \"big\": 9007199254740992,\n",
+            "  \"big\": 9007199254740993,\n",
             "  \"data\": {\n",
             "    \"id\": \"session-1\",\n",
             "    \"type\": \"session\"\n",
             "  },\n",
             "  \"environment_id\": \"env-1\",\n",
             "  \"id\": \"work-1\",\n",
-            "  \"number\": 1,\n",
+            "  \"number\": 1.0,\n",
             "  \"secret\": \"secret\",\n",
             "  \"state\": \"available\",\n",
             "  \"type\": \"work\",\n",
-            "  \"z\": \"\\u003c\\u2028\\u0026\\u003e\"\n",
+            "  \"z\": \"<\u{2028}&>\"\n",
             "}\n"
         )
     );
@@ -818,7 +811,7 @@ fn code_sign_parses_ssh_arguments() {
     assert_eq!(
         arguments.parse_operation().unwrap_err(),
         "no file specified to sign",
-        "Go treats -- as an unknown flag and consumes its following value"
+        "the parser keeps the raw separator but reports the missing file operand"
     );
 }
 
@@ -1002,7 +995,7 @@ async fn signing_attempts_retry_transient_failures() {
     server.verify().await;
 }
 
-/// 端到端 code-sign 单测：请求协议、tool error 和 `.sig` 副作用都必须与 一致。
+/// 端到端验证 code-sign 请求协议、tool error 和 `.sig` 文件副作用。
 #[tokio::test(flavor = "current_thread")]
 async fn ssh_sign_calls_server_and_checks_signature() {
     // 父测试进程只启动隔离子进程，不在自身读写全局环境。

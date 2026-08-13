@@ -88,37 +88,12 @@ impl ManagerError {
 impl Display for ManagerError {
     /// 为日志、指标和诊断系统生成有效的 UTF-8 文本视图。
     ///
-    /// 每个单独的无效输入字节都替换为一个 U+FFFD，避免
-    /// `String::from_utf8_lossy` 合并连续坏字节。
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&go_utf8_error_view(&self.message))
+        formatter.write_str(&String::from_utf8_lossy(&self.message))
     }
 }
 
 impl std::error::Error for ManagerError {}
-
-/// 将任意错误字节转换成逐坏字节替换的 UTF-8 文本。
-fn go_utf8_error_view(value: &[u8]) -> String {
-    let mut output = String::new();
-    let mut remaining = value;
-    while !remaining.is_empty() {
-        match std::str::from_utf8(remaining) {
-            Ok(valid) => {
-                output.push_str(valid);
-                break;
-            }
-            Err(error) => {
-                let valid_end = error.valid_up_to();
-                // `valid_up_to` 定义了合法 UTF-8 前缀，因此这里不会失败；避免 unwrap
-                // 也让错误展示路径永远不会因为另一个格式化错误 panic。
-                output.push_str(std::str::from_utf8(&remaining[..valid_end]).unwrap_or_default());
-                output.push('\u{fffd}');
-                remaining = &remaining[valid_end + 1..];
-            }
-        }
-    }
-    output
-}
 
 /// Manager 使用的 API client 能力集合。
 ///

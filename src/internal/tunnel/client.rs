@@ -28,10 +28,10 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketCon
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
-use crate::internal::util::format_go_duration;
+use crate::internal::util::format_duration;
 
 use super::actions::{ActionError, Registry, ResponseSender};
-use super::helpers::marshal_protojson;
+use super::helpers::encode_protojson;
 use super::{
     Client, ClientOption, ClientWsResponseSender, HttpResponseSender, HttpTunnelCancel,
     HttpTunnelRequest, HttpTunnelResponseChunk, HttpTunnelResponseError, HttpTunnelResponseHeaders,
@@ -62,7 +62,7 @@ const MAX_PROXY_RESPONSE_HEADERS: usize = 128;
 /// 环境代理选择 第一次使用时捕获的进程级代理配置。
 static ENVIRONMENT_PROXY_CONFIG: OnceLock<EnvironmentProxyConfig> = OnceLock::new();
 
-/// `ProxyFromEnvironment` 所需的原始环境快照。
+/// WebSocket 代理选择所需的原始环境快照。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct EnvironmentProxyConfig {
     pub(super) http_proxy: String,
@@ -70,57 +70,6 @@ pub(super) struct EnvironmentProxyConfig {
     pub(super) no_proxy: String,
     pub(super) cgi: bool,
 }
-
-/// WebSocket 建连的稳定错误边界。
-///
-/// `tokio-tungstenite` 会把底层网络错误显示为 `IO error: ...`，并把非 101
-/// 握手显示为 `HTTP error: <status>`；协议要求透明返回底层网络错误，并对握手失败
-/// 固定返回 `websocket: bad handshake`，同时通过独立 response 暴露状态。这个类型
-/// 同时保存两部分信息，供主 Tunnel 与本地 WS Tunnel 按各自格式拼接。
-#[derive(Debug)]
-pub(crate) struct GorillaDialFailure {
-    message: String,
-    response_status: Option<String>,
-}
-
-impl GorillaDialFailure {
-    /// 把 tungstenite 错误归一化为协议可观察的文本和 response 状态。
-    ///
-    /// `Io` 必须只显示内部 `io::Error`；否则代理拒绝、SOCKS5 协商失败等错误会
-    /// 多出 Rust 特有前缀。`Http` 表示服务器确实返回了 HTTP response，因此保留
-    /// `<code> <reason>` 并把错误本体固定为 WebSocket 的 `ErrBadHandshake` 文本。
-    fn from_websocket_error(error: WebSocketError) -> Self {
-        match error {
-            WebSocketError::Io(error) => Self {
-                message: error.to_string(),
-                response_status: None,
-            },
-            WebSocketError::Http(response) => Self {
-                message: "websocket: bad handshake".to_owned(),
-                response_status: Some(http_status_text(response.status())),
-            },
-            error => Self {
-                message: error.to_string(),
-                response_status: None,
-            },
-        }
-    }
-
-    /// 返回 WebSocket 会通过 `*HTTP response 交给调用方的状态文本。
-    #[must_use]
-    pub(super) fn response_status(&self) -> Option<&str> {
-        self.response_status.as_deref()
-    }
-}
-
-impl std::fmt::Display for GorillaDialFailure {
-    /// 只输出 WebSocket error 本体；response 状态由调用点另行拼接。
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for GorillaDialFailure {}
 
 /// 代理选择结果；除解析后的 URL 外保留“显式设置密码”这一位。
 ///
@@ -167,18 +116,6 @@ pub(super) fn ping_write_failure(
         PingWriteFailure::WebSocket(error) => {
             TunnelError::message(format!("write tunnel ping: {error}"))
         }
-    }
-}
-
-/// 把 Rust HTTP status 转成标准的 `code reason` 形式。
-///
-/// 响应状态是 `"<code> <reason>"`；未知状态码没有标准 reason 时只保留数字。
-/// tungstenite 的 response 类型已丢弃原始 reason phrase，因此标准状态使用 HTTP
-/// 规范中的 canonical reason，这是两端正常握手失败时共同可观察的值。
-fn http_status_text(status: http::StatusCode) -> String {
-    match status.canonical_reason() {
-        Some(reason) => format!("{} {reason}", status.as_u16()),
-        None => status.as_u16().to_string(),
     }
 }
 
@@ -263,13 +200,9 @@ impl Client {
         let (socket, _response) = match connected {
             Ok(Ok(connected)) => connected,
             Ok(Err(error)) => {
-                let message = match error.response_status() {
-                    Some(status) => {
-                        format!("connect tunnel websocket ({status}): {error}")
-                    }
-                    None => format!("connect tunnel websocket: {error}"),
-                };
-                return Err(TunnelError::message(message));
+                return Err(TunnelError::message(format!(
+                    "connect tunnel websocket: {error}"
+                )));
             }
             Err(_) => {
                 return Err(TunnelError::message(
@@ -379,7 +312,7 @@ impl Client {
                 Err(error) if cancellation.is_cancelled() => return Err(error),
                 Err(error) => {
                     let wait = add_jitter(delay);
-                    tracing::warn!("error" = ?(error.to_string()), "retry_in" = ?(format_go_duration(wait)), "{}", "tunnel_connect_failed");
+                    tracing::warn!("error" = ?(error.to_string()), "retry_in" = ?(format_duration(wait)), "{}", "tunnel_connect_failed");
                     tokio::select! {
                         () = cancellation.cancelled() => return Err(TunnelError::message("context canceled")),
                         () = tokio::time::sleep(wait) => {}
@@ -659,7 +592,7 @@ impl Client {
 
     /// 序列化 lowerCamel ProtoJSON 并写入主 Tunnel text frame。
     async fn send_response(&self, response: TunnelResponse) -> Result<(), TunnelError> {
-        let data = marshal_protojson(&response)
+        let data = encode_protojson(&response)
             .map_err(|error| TunnelError::message(format!("marshal response: {error}")))?;
         let text = String::from_utf8(data)
             .map_err(|error| TunnelError::message(format!("marshal response: {error}")))?;
@@ -802,15 +735,15 @@ impl WsResponseSender for ClientWsResponseSender {
     }
 }
 
-/// 使用进程级 `ProxyFromEnvironment` 快照建立 WebSocket。
+/// 使用进程级代理环境快照建立 WebSocket。
 ///
 /// 未命中代理时使用 tokio-tungstenite 的直连路径；命中 HTTP 代理
 /// 时先建立 CONNECT tunnel，再将同一 TcpStream 交给 rustls/WebSocket
 /// handshake。因此 `wss` 始终校验目标主机证书，不会因为代理而降级。
 pub(super) async fn connect_websocket(
     request: WebSocketRequest,
-) -> Result<(LocalWebSocket, WebSocketResponse), GorillaDialFailure> {
-    connect_websocket_with_config(request, gorilla_websocket_config()).await
+) -> Result<(LocalWebSocket, WebSocketResponse), WebSocketError> {
+    connect_websocket_with_config(request, tunnel_websocket_config()).await
 }
 
 /// 统一的 WebSocket 出站连接器。
@@ -825,21 +758,19 @@ pub(super) async fn connect_websocket(
 pub(crate) async fn connect_websocket_with_config(
     ws_request: WebSocketRequest,
     websocket_config: WebSocketConfig,
-) -> Result<(LocalWebSocket, WebSocketResponse), GorillaDialFailure> {
+) -> Result<(LocalWebSocket, WebSocketResponse), WebSocketError> {
     let config = ENVIRONMENT_PROXY_CONFIG.get_or_init(EnvironmentProxyConfig::from_process);
     connect_websocket_with_proxy_and_websocket_config(ws_request, config, websocket_config).await
 }
 
 /// 使用显式代理快照建立 WebSocket，供生产路径与无环境竞态的测试共用。
 ///
-/// 返回错误已经转换成 WebSocket 的错误文本；调用方仍可通过
-/// [`WebSocketDialFailure::response_status`] 区分带 HTTP response 的坏握手。
 #[cfg(test)]
 pub(super) async fn connect_websocket_with_proxy_config(
     request: WebSocketRequest,
     config: &EnvironmentProxyConfig,
-) -> Result<(LocalWebSocket, WebSocketResponse), GorillaDialFailure> {
-    connect_websocket_with_proxy_and_websocket_config(request, config, gorilla_websocket_config())
+) -> Result<(LocalWebSocket, WebSocketResponse), WebSocketError> {
+    connect_websocket_with_proxy_and_websocket_config(request, config, tunnel_websocket_config())
         .await
 }
 
@@ -849,24 +780,19 @@ async fn connect_websocket_with_proxy_and_websocket_config(
     ws_request: WebSocketRequest,
     config: &EnvironmentProxyConfig,
     websocket_config: WebSocketConfig,
-) -> Result<(LocalWebSocket, WebSocketResponse), GorillaDialFailure> {
-    let target_url = Url::parse(&ws_request.uri().to_string()).map_err(|error| {
-        GorillaDialFailure::from_websocket_error(invalid_input(error.to_string()))
-    })?;
+) -> Result<(LocalWebSocket, WebSocketResponse), WebSocketError> {
+    let target_url = Url::parse(&ws_request.uri().to_string())
+        .map_err(|error| invalid_input(error.to_string()))?;
     // 选择代理, None 表示直连，Some(proxy) 表示走代理
-    let proxy = proxy_selection_for_websocket_target(&target_url, config)
-        .map_err(GorillaDialFailure::from_websocket_error)?;
+    let proxy = proxy_selection_for_websocket_target(&target_url, config)?;
 
     match proxy {
         None => {
             tokio_tungstenite::connect_async_with_config(ws_request, Some(websocket_config), false)
                 .await
-                .map_err(GorillaDialFailure::from_websocket_error)
         }
         Some(proxy) => {
-            let tcp_stream = connect_via_proxy(&proxy, &target_url)
-                .await
-                .map_err(GorillaDialFailure::from_websocket_error)?;
+            let tcp_stream = connect_via_proxy(&proxy, &target_url).await?;
             tokio_tungstenite::client_async_tls_with_config(
                 ws_request,
                 tcp_stream,
@@ -874,7 +800,6 @@ async fn connect_websocket_with_proxy_and_websocket_config(
                 None,
             )
             .await
-            .map_err(GorillaDialFailure::from_websocket_error)
         }
     }
 }
@@ -886,7 +811,7 @@ async fn connect_websocket_with_proxy_and_websocket_config(
 /// 上限，必须显式取消。握手校验、子协议协商和 text UTF-8 校验则直接采用
 /// 上游 Tungstenite 的 RFC 行为，不再维护项目私有的 WebSocket 补丁。
 #[must_use]
-pub(super) fn gorilla_websocket_config() -> WebSocketConfig {
+pub(super) fn tunnel_websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(None)
         .max_frame_size(None)
@@ -984,7 +909,7 @@ fn proxy_selection_for_websocket_target(
     };
     if is_http && config.cgi {
         return Err(WebSocketError::Io(io::Error::other(
-            "refusing to use HTTP_PROXY value in CGI environment; see golang.org/s/cgihttpproxy",
+            "refusing to use HTTP_PROXY value in CGI environment",
         )));
     }
     if should_bypass_proxy(target, &config.no_proxy) {
@@ -1254,9 +1179,8 @@ async fn connect_via_http_proxy(
         .await
         .map_err(WebSocketError::Io)?;
 
-    let mut connect_request = format!(
-        "CONNECT {target_authority} HTTP/1.1\r\nHost: {target_authority}\r\nUser-Agent: Go-http-client/1.1\r\n"
-    );
+    let mut connect_request =
+        format!("CONNECT {target_authority} HTTP/1.1\r\nHost: {target_authority}\r\n");
     if password_set {
         let mut credentials = percent_decode_user_info(proxy.username());
         credentials.push(b':');
@@ -1359,8 +1283,8 @@ async fn connect_via_socks5_proxy(proxy: &Url, target: &Url) -> Result<TcpStream
                 "proxy: SOCKS5 proxy at {proxy_address} requires authentication"
             ))));
         }
-        // x/net/proxy 对代理返回的其他 method 不作预先限制，
-        // 而是直接继续 CONNECT，这个宽容分支不能自作主张收紧。
+        // RFC 1928 为后续认证方式保留了额外 method 值；代理选择非拒绝值时继续
+        // CONNECT，由服务端决定是否接受后续请求。
         _ => {}
     }
 
@@ -1670,12 +1594,8 @@ pub fn add_jitter(base: Duration) -> Duration {
 
 /// 解码允许未知字段的 Tunnel ProtoJSON。
 ///
-/// 先由 `decodeTunnelValue` 支持动态 interface，再分别通过 `asHTTPRequest`、
-/// `asHTTPCancel`、`asWSOpen`、`asWSMessage` 与 `asWSClose` 做运行时断言；Rust 在
-/// 此处一次解码为强类型 oneof，后续 match 已保证每个分支拿到正确消息类型。
-///
-/// pbjson 默认拒绝未知字段，而 明确使用 `DiscardUnknown: true`；因此先只删除消息
-/// schema 以外的 key，再交给生成的反序列化器处理别名、Base64、数值范围和 oneof 冲突。
+/// Tunnel wire 协议为向前兼容而忽略未知字段；这里先只删除消息 schema 以外的 key，
+/// 再交给生成的强类型反序列化器处理字段别名、Base64、数值范围和 oneof 冲突。
 fn decode_tunnel_request(data: &[u8]) -> Result<TunnelRequest, TunnelError> {
     let mut value: Value = serde_json::from_slice(data)
         .map_err(|error| TunnelError::message(format!("decode tunnel request: {error}")))?;
@@ -1793,7 +1713,7 @@ fn sanitize_headers(value: Option<&mut Value>) {
     }
 }
 
-/// 仅保留允许的 JSON object key，其他 key 模拟 ProtoJSON DiscardUnknown 丢弃。
+/// 仅保留允许的 JSON object key，丢弃协议允许忽略的未知字段。
 fn retain_fields(object: &mut serde_json::Map<String, Value>, allowed: &[&str]) {
     object.retain(|key, _| allowed.contains(&key.as_str()));
 }

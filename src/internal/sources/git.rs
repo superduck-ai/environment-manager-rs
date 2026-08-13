@@ -38,7 +38,7 @@ const GIT_HTTP_PROXY_AUTH_CONFIG: &str = "http.proxyAuthMethod=basic";
 /// 保存全部配置并读取 post-clone Hook 环境变量。
 ///
 /// `POST_CLONE_HOOK_PATH` 只在构造时读取一次；之后修改进程环境不会改变已创建
-/// handler，这与 对象生命周期一致。`'recorder` 原样来自调用方；返回的 handler
+/// handler，这与 recorder 对象生命周期一致。`'recorder` 原样来自调用方；返回的 handler
 /// 不能比 recorder 活得更久，因此局部初始化 recorder 无需伪装成 `'static`。
 #[allow(clippy::too_many_arguments)]
 pub fn new_git_handler<'recorder>(

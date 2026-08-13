@@ -356,7 +356,7 @@ fn test_is_baku_environment() {
 
 /// 验证 `None` 配置 返回稳定错误。
 #[tokio::test]
-async fn test_initialize_nil_config_returns_error() {
+async fn test_initialize_missing_config_returns_error() {
     let mut environment = environment(None);
     let error = environment
         .initialize(&CancellationToken::new(), None)

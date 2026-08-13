@@ -396,21 +396,8 @@ pub(super) async fn do_single_attempt(
         .map_err(|error| format!("failed to parse response: {error}"))?;
     let object = match &value {
         Value::Object(object) => Some(object),
-        // 允许 JSON null 解到非指针结构体，并得到全部零值；随后才由 result
-        // 缺失检查返回稳定错误。
         Value::Null => None,
-        Value::Array(_) => {
-            return Err("failed to parse response: json: cannot unmarshal array into Go value of type cmd.MCPResponse".to_owned());
-        }
-        Value::Bool(_) => {
-            return Err("failed to parse response: json: cannot unmarshal bool into Go value of type cmd.MCPResponse".to_owned());
-        }
-        Value::Number(_) => {
-            return Err("failed to parse response: json: cannot unmarshal number into Go value of type cmd.MCPResponse".to_owned());
-        }
-        Value::String(_) => {
-            return Err("failed to parse response: json: cannot unmarshal string into Go value of type cmd.MCPResponse".to_owned());
-        }
+        _ => return Err("failed to parse response: expected a JSON object".to_owned()),
     };
     let response: McpResponse = if value.is_null() {
         McpResponse::default()

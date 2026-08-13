@@ -120,7 +120,7 @@ pub enum ConfigError {
         source: serde_json::Error,
     },
     /// 顶层配置引用为空；Rust API 通常不会产生，只用于可选验证入口。
-    #[error("config is nil")]
+    #[error("config is missing")]
     MissingConfig,
     /// 必需 Anthropic 域名没有被允许。
     #[error("required domain {required:?} not found in allowed domains (have: {allowed:?})")]
@@ -140,7 +140,7 @@ pub enum ConfigError {
 /// `NamedTempFile` 在写入失败时自动删除；成功后 `keep` 关闭 RAII 删除责任，
 /// 交给 [`cleanup_config_file`] 或 [`super::SandboxRuntime`] 管理。
 pub fn write_config_file(config: &SrtConfig) -> Result<PathBuf, ConfigError> {
-    let data = marshal_go_sandbox_json(config).map_err(ConfigError::Serialize)?;
+    let data = serde_json::to_vec_pretty(config).map_err(ConfigError::Serialize)?;
     let mut file = tempfile::Builder::new()
         .prefix("srt-config-")
         .suffix(".json")
@@ -155,43 +155,20 @@ pub fn write_config_file(config: &SrtConfig) -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
-/// 生成 sandbox 配置字节。
-///
-/// serde 负责两空格布局，但默认不执行 JSON 的 HTML 安全
-/// 转义。这里在已生成的合法 JSON 上替换 `<`、`>`、`&`、U+2028 和 U+2029；这些
-/// 字符在 JSON 语法中只可能来自字符串，因此不会改写结构。此 API 不追加换行，
-/// 本函数同样直接返回最后一个 `}`。
-///
-/// # 参数
-/// - `config`：待写出的完整 SRT 配置，借用期间不修改。
-///
-/// # 返回
-/// 成功时返回与 MarshalIndent 一致的 UTF-8 字节；序列化失败时返回 serde 错误。
-fn marshal_go_sandbox_json(config: &SrtConfig) -> Result<Vec<u8>, serde_json::Error> {
-    let pretty = serde_json::to_string_pretty(config)?;
-    let escaped = pretty
-        .replace('&', "\\u0026")
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029");
-    Ok(escaped.into_bytes())
-}
-
 /// 仅当路径安全地位于系统临时目录下时删除配置文件。
 ///
 /// 空路径、无法绝对化的路径、临时目录本身、目录外路径以及以 `.` 开头的相对路径
-/// 都被静默忽略，与 防误删逻辑一致。实际删除失败会保留
+/// 都被静默忽略，以避免清理调用误删工作目录。实际删除失败会保留
 /// `failed to remove config file: ...` 外层前缀和底层 I/O 错误。
 pub fn cleanup_config_file(path: impl AsRef<Path>) -> Result<(), ConfigError> {
     let path = path.as_ref();
     if path.as_os_str().is_empty() {
         return Ok(());
     }
-    let Ok(absolute) = go_style_absolute(path) else {
+    let Ok(absolute) = lexical_absolute(path) else {
         return Ok(());
     };
-    let Ok(temp_dir) = go_style_absolute(&std::env::temp_dir()) else {
+    let Ok(temp_dir) = lexical_absolute(&std::env::temp_dir()) else {
         return Ok(());
     };
     let Ok(relative) = absolute.strip_prefix(&temp_dir) else {
@@ -202,7 +179,7 @@ pub fn cleanup_config_file(path: impl AsRef<Path>) -> Result<(), ConfigError> {
         return Ok(());
     }
 
-    remove_go_path(path).map_err(|source| ConfigError::Remove {
+    remove_path(path).map_err(|source| ConfigError::Remove {
         path: path.to_owned(),
         source,
     })
@@ -219,7 +196,7 @@ pub fn cleanup_config_file(path: impl AsRef<Path>) -> Result<(), ConfigError> {
 ///
 /// # 返回
 /// 文件、链接或空目录删除成功时返回 `Ok(())`；其他情况返回对应 I/O 错误。
-fn remove_go_path(path: &Path) -> io::Result<()> {
+fn remove_path(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::IsADirectory => std::fs::remove_dir(path),
@@ -238,7 +215,7 @@ fn remove_go_path(path: &Path) -> io::Result<()> {
 ///
 /// # 返回
 /// 返回折叠 `.`、`..` 后的绝对 Linux 路径；仅在读取当前工作目录失败时返回错误。
-fn go_style_absolute(path: &Path) -> io::Result<PathBuf> {
+fn lexical_absolute(path: &Path) -> io::Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_owned()
     } else {
@@ -365,9 +342,9 @@ mod tests {
         cleanup_config_file(Path::new("")).unwrap();
     }
 
-    /// 验证 sandbox writer 的字节与 1.25.7 缩进 JSON 编码 探针一致。
+    /// 验证 sandbox writer 生成可往返的两空格缩进 JSON。
     #[test]
-    fn marshals_indented_json_with_html_escapes() {
+    fn serializes_indented_json() {
         let config = SrtConfig {
             network: NetworkConfig {
                 allowed_domains: vec![
@@ -388,8 +365,8 @@ mod tests {
             "{\n",
             "  \"network\": {\n",
             "    \"allowedDomains\": [\n",
-            "      \"api.\\u003c\\u003e\\u0026.example\",\n",
-            "      \"line\\u2028sep\\u2029end\"\n",
+            "      \"api.<>&.example\",\n",
+            "      \"line sep end\"\n",
             "    ],\n",
             "    \"deniedDomains\": null\n",
             "  },\n",
@@ -406,9 +383,8 @@ mod tests {
             "  \"enableWeakerNestedSandbox\": false\n",
             "}"
         );
-        let encoded = marshal_go_sandbox_json(&config).unwrap();
+        let encoded = serde_json::to_vec_pretty(&config).unwrap();
         assert_eq!(encoded, expected.as_bytes());
-        assert_eq!(encoded.len(), 321);
         assert!(!encoded.ends_with(b"\n"));
     }
 
@@ -455,7 +431,7 @@ mod tests {
         assert!(!config.filesystem.allow_git_config);
     }
 
-    /// 验证精确域名、双向 wildcard 和无关域名行为与 一致。
+    /// 验证精确域名、双向 wildcard 和无关域名的匹配行为。
     #[test]
     fn validates_domains() {
         assert!(domain_matches("*.anthropic.com", "api.anthropic.com"));
@@ -527,7 +503,7 @@ mod tests {
         assert!(!directory.exists());
     }
 
-    /// 验证删除错误外层文案不重复注入 path，与 错误 source chain 包装前缀一致。
+    /// 验证删除错误外层文案不重复注入 path，并保留稳定的错误上下文前缀。
     #[test]
     fn cleanup_remove_error_uses_stable_prefix() {
         let temp = tempfile::Builder::new()
@@ -562,7 +538,7 @@ mod tests {
         drop(sentinel_file);
 
         let guard = TempDir::new().unwrap();
-        let guard_path = go_style_absolute(guard.path()).unwrap();
+        let guard_path = lexical_absolute(guard.path()).unwrap();
         let mut disguised_path = guard_path.clone();
         // 从现有 guard 目录逐级返回根目录，再拼入 sentinel 的绝对组件。当前命令
         // 会因原始字符串仍以系统临时目录开头而误删 sentinel。

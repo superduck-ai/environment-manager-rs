@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::error::CliError;
 use super::utils::{
-    LogLevel, bool_value, flag_arg, parse_go_duration, parse_log_level, tracing_level,
+    LogLevel, bool_value, flag_arg, parse_duration, parse_log_level, tracing_level,
 };
 use crate::internal::orchestrator::{
     CommandOutcome, Hook, OrchestratorConfig, OrchestratorError, OrchestratorResult,
@@ -230,7 +230,7 @@ fn duration_arg(id: &'static str, default: &'static str, help: &'static str) -> 
         .default_value(default)
         .help(help)
         .allow_hyphen_values(true)
-        .value_parser(ValueParser::new(parse_go_duration))
+        .value_parser(ValueParser::new(parse_duration))
 }
 
 /// 构造默认值为零且允许负数语法的整型 flag。
@@ -513,7 +513,7 @@ fn load_orchestrator_service_key(service_key_file: Option<&Path>) -> Result<Stri
 
 /// 运行 orchestrator，并实现SIGINT/SIGTERM 后最多等待 30 秒的优雅关闭窗口。
 ///
-/// 状态机自行结束时传播非取消错误；信号路径无论最终错误或超时都返回成功，这与 命令为了容器编排器正常停止而采用的退出码策略一致。
+/// 状态机自行结束时传播非取消错误；信号路径无论最终错误或超时都返回成功，使容器编排器能够正常停止。
 async fn run_orchestrator_until_signal(
     orchestrator: &crate::internal::orchestrator::Orchestrator,
 ) -> Result<(), String> {

@@ -122,7 +122,7 @@ fn accepts_null_and_missing_defaults() {
             "task_setup_script":null,
             "environment":{"EMPTY":null}
         }"#)
-    .expect("Go-compatible null values should parse");
+    .expect("null values should map to configuration defaults");
     assert_eq!(environment.get_cwd(), "");
     assert_eq!(environment.config.task_setup_script, "");
     assert_eq!(
@@ -503,7 +503,7 @@ async fn branch_checkout_uses_replaceable_source_processor() {
 
 /// 认证 transport 必须注入 Bearer、organization、runner/Claude 版本和 beta header。
 #[tokio::test]
-async fn test_contain_provide_auth_round_tripper_adds_headers() {
+async fn test_contain_provide_auth_transport_adds_headers() {
     use wiremock::matchers::{header, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -513,8 +513,8 @@ async fn test_contain_provide_auth_round_tripper_adds_headers() {
         .build()
         .unwrap();
     transport.authorize_request(&mut request).unwrap();
-    let capture = CaptureRoundTripper::default();
-    capture.round_trip(&request);
+    let capture = HeaderCapture::default();
+    capture.capture(&request);
     let captured_headers = capture.headers.lock().unwrap().clone().unwrap();
     assert_eq!(captured_headers["authorization"], "Bearer ingress-token");
     assert_eq!(captured_headers["x-organization-uuid"], "org-1");
@@ -679,14 +679,14 @@ async fn test_create_lease_manager_sends_authenticated_heartbeat() {
 /// 保存认证完成后的请求头。通过自定义 HTTP transport 截获请求；
 /// Rust 的 reqwest client 不开放 transport 替换，因此这里在发包前的同一边界捕获。
 #[derive(Default)]
-struct CaptureRoundTripper {
+struct HeaderCapture {
     headers: Mutex<Option<reqwest::header::HeaderMap>>,
 }
 
-impl CaptureRoundTripper {
+impl HeaderCapture {
     ///
     /// 克隆请求头供认证断言使用，不发送网络请求，也不修改原始 request。
-    fn round_trip(&self, request: &reqwest::Request) {
+    fn capture(&self, request: &reqwest::Request) {
         *self.headers.lock().unwrap() = Some(request.headers().clone());
     }
 }

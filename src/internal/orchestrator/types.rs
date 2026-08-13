@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::internal::process::{CommandFailure, CommandOutput};
 
 /// 后端 work envelope 的原始 JSON 字节。
-pub type RawMessage = Vec<u8>;
+pub type RawWork = Vec<u8>;
 
 /// orchestrator 子系统的稳定文本错误。
 ///
@@ -111,10 +111,7 @@ impl Default for Hook {
 #[async_trait]
 pub trait PollerInterface: Send + Sync {
     /// 非阻塞查询一次队列；`None` 表示队列为空。
-    async fn poll(
-        &self,
-        cancellation: &CancellationToken,
-    ) -> OrchestratorResult<Option<RawMessage>>;
+    async fn poll(&self, cancellation: &CancellationToken) -> OrchestratorResult<Option<RawWork>>;
 
     /// 空队列后的 1–3 秒随机等待；取消应立即中断。
     async fn sleep_with_jitter(&self, cancellation: &CancellationToken) -> OrchestratorResult<()>;

@@ -147,7 +147,7 @@ async fn test_new_server_validates_config() {
 }
 
 #[tokio::test]
-async fn test_server_start_stop_and_manager_proxy_ur_ls() {
+async fn test_server_start_stop_and_manager_proxy_urls() {
     let manager = new_manager(Some(Config {
         session_ingress_url: "http://session-ingress.test".to_owned(),
         session_id: "session-123".to_owned(),
@@ -182,7 +182,7 @@ async fn test_server_start_stop_and_manager_proxy_ur_ls() {
 }
 
 #[tokio::test]
-async fn test_handler_serve_http_challenges_and_rejects_invalid_requests() {
+async fn test_handler_challenges_and_rejects_invalid_requests() {
     let handler = handler_for(
         Config {
             session_ingress_url: "http://session-ingress.test".to_owned(),
@@ -193,7 +193,7 @@ async fn test_handler_serve_http_challenges_and_rejects_invalid_requests() {
     );
 
     let response = handler
-        .serve_http(
+        .handle_request(
             Request::builder()
                 .uri("/bad/path")
                 .body(Body::empty())
@@ -205,10 +205,10 @@ async fn test_handler_serve_http_challenges_and_rejects_invalid_requests() {
         response.headers().get(CONTENT_TYPE).unwrap(),
         "text/plain; charset=utf-8"
     );
-    assert_eq!(response_body(response).await, "Invalid path format\n");
+    assert_eq!(response_body(response).await, "Invalid path format");
 
     let response = handler
-        .serve_http(
+        .handle_request(
             Request::builder()
                 .uri("/git/anthropic/demo.git/info/refs")
                 .body(Body::empty())
@@ -223,7 +223,7 @@ async fn test_handler_serve_http_challenges_and_rejects_invalid_requests() {
     assert_eq!(response_body(response).await, "");
 
     let response = handler
-        .serve_http(
+        .handle_request(
             Request::builder()
                 .method("POST")
                 .uri("/git/anthropic/demo.git/%2e%2e/config")
@@ -235,7 +235,7 @@ async fn test_handler_serve_http_challenges_and_rejects_invalid_requests() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = response_body(response).await;
     assert!(!body.contains("client-token"));
-    assert_eq!(body, "Proxy error: invalid git path\n");
+    assert_eq!(body, "Proxy error: invalid git path");
 }
 
 #[tokio::test]
@@ -310,7 +310,7 @@ async fn test_handler_forwards_git_hub_request_to_session_ingress() {
         )]),
     );
     let response = handler
-        .serve_http(
+        .handle_request(
             Request::builder()
                 .method("POST")
                 .uri("/git/org%3B%2C%3A%40%26%3D%2B%24%E4%B8%AD%E6%96%87/repo%3B%2C%3A%40%26%3D%2B%24%E4%B8%AD%E6%96%87.git/objects/a%3Bb%2Cc%3A%40%26%3D%2B%24%E4%B8%AD%E6%96%87?service=git-upload-pack")
@@ -390,7 +390,7 @@ async fn test_handler_forwards_ghe_path_and_sanitizes_error_bodies() {
         HashMap::from([("org/repo".to_owned(), "ghe-token".to_owned())]),
     );
     let response = handler
-        .serve_http(
+        .handle_request(
             Request::builder()
                 .uri("/git/ghe.example.com/org/repo.git/HEAD")
                 .header(AUTHORIZATION, "Basic client-auth")
@@ -453,7 +453,7 @@ async fn test_handler_does_not_follow_upstream_redirects() {
         HashMap::from([("anthropic/demo".to_owned(), "repo-token".to_owned())]),
     );
     let response = handler
-        .serve_http(
+        .handle_request(
             Request::builder()
                 .uri("/git/anthropic/demo.git/HEAD")
                 .header(AUTHORIZATION, "Basic client-auth")

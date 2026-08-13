@@ -16,7 +16,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use fs2::FileExt;
 use thiserror::Error;
 
-use super::go_path_escape;
+use super::escape_path_segment;
 
 const CONTAINER_LOCK_PATH: &str = "/tmp/environment-manager-container.lock";
 
@@ -92,7 +92,7 @@ enum AcquirePathError {
 
 /// 已持有的文件锁。
 ///
-/// guard 被丢弃时先解锁、再关闭文件、最后删除锁文件，顺序与 清理闭包一致。
+/// guard 被丢弃时先解锁、再关闭文件、最后删除锁文件。
 /// 锁的正确性来自打开文件描述上的 `flock`，不是锁文件是否存在。
 pub struct FileLockGuard {
     file: Option<File>,
@@ -295,7 +295,7 @@ fn acquire_path(path: PathBuf) -> Result<File, AcquirePathError> {
 fn get_lock_path(session_id: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "environment-manager-{}.lock",
-        go_path_escape(session_id)
+        escape_path_segment(session_id)
     ))
 }
 

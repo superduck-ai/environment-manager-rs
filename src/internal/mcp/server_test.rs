@@ -8,10 +8,6 @@ use std::sync::{
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::server::{
-    HttpHeaderTerminator, HttpRequestEvent, HttpRequestTracker, MCP_READ_HEADER_TIMEOUT,
-    MCP_READ_TIMEOUT, MCP_WRITE_TIMEOUT, McpDeadlineState, McpReadDeadlineStage,
-};
 use super::{
     BaseServer, CallToolResult, MCPServer, McpError, Tool, ToolConfig, ToolHandler,
     new_tool_result_text,
@@ -21,30 +17,6 @@ use super::{
 struct McpHttpResponse {
     status: reqwest::StatusCode,
     body: String,
-}
-
-/// 用于把底层 body 写入失败注入测试路径。
-struct FailingResponseWriter {
-    write_error: String,
-    headers: http::HeaderMap,
-    status: Option<http::StatusCode>,
-}
-
-impl FailingResponseWriter {
-    /// 返回可修改的真实 HeaderMap。
-    fn header(&mut self) -> &mut http::HeaderMap {
-        &mut self.headers
-    }
-
-    /// 每次写入都返回预先注入的 I/O 错误。
-    fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
-        Err(std::io::Error::other(self.write_error.clone()))
-    }
-
-    /// 记录调用状态供失败路径断言。
-    fn write_header(&mut self, status: http::StatusCode) {
-        self.status = Some(status);
-    }
 }
 
 /// 按需附加 Bearer token 并返回未解析正文。
@@ -139,32 +111,12 @@ async fn test_response_writer_tracks_first_status() {
     )
     .await;
     assert_eq!(response.status, reqwest::StatusCode::UNAUTHORIZED);
-    assert_eq!(response.body, "Unauthorized\n");
+    assert_eq!(response.body, "Unauthorized");
     base.stop().await;
 }
 
 #[tokio::test]
-async fn test_response_writer_write_defaults_to_ok_and_wraps_errors() {
-    let mut failing_writer = FailingResponseWriter {
-        write_error: "write failed".to_owned(),
-        headers: http::HeaderMap::new(),
-        status: None,
-    };
-    failing_writer.header().insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_static("application/json"),
-    );
-    failing_writer.write_header(http::StatusCode::OK);
-    let write_error = failing_writer
-        .write(b"boom")
-        .expect_err("注入的底层 writer 必须失败");
-    assert_eq!(write_error.to_string(), "write failed");
-    assert_eq!(failing_writer.status, Some(http::StatusCode::OK));
-    assert_eq!(
-        failing_writer.header().get(http::header::CONTENT_TYPE),
-        Some(&http::HeaderValue::from_static("application/json"))
-    );
-
+async fn test_tool_errors_use_json_rpc_response() {
     let failing = ToolConfig {
         tool: Tool::new("fail", "fail", json!({"type": "object"})),
         handler: ToolHandler::new(|_, _| async { Err(McpError::message("write failed")) }),
@@ -185,7 +137,7 @@ async fn test_response_writer_write_defaults_to_ok_and_wraps_errors() {
     .await;
     assert_eq!(response.status, reqwest::StatusCode::OK);
     assert!(response.body.contains("write failed"));
-    assert!(response.body.ends_with('\n'));
+    assert!(!response.body.ends_with('\n'));
     base.stop().await;
 }
 
@@ -372,134 +324,6 @@ fn test_base_server_accessors() {
     assert_eq!(server.get_name(), "demo");
     assert!(Arc::clone(&server).get_tools().is_empty());
     assert!(server.should_register_with_claude());
-}
-
-/// header timeout 只能在跨 read 边界观察到完整 `\r\n\r\n` 后切换为 read timeout。
-#[test]
-fn test_mcp_http_timeout_header_terminator_and_durations() {
-    assert_eq!(MCP_READ_HEADER_TIMEOUT, std::time::Duration::from_secs(10));
-    assert_eq!(MCP_READ_TIMEOUT, std::time::Duration::from_secs(120));
-    assert_eq!(MCP_WRITE_TIMEOUT, std::time::Duration::from_secs(120));
-
-    let mut detector = HttpHeaderTerminator::default();
-    assert!(!detector.observe(b"POST /mcp HTTP/1.1\r\nHost: local\r"));
-    assert!(!detector.observe(b"\nContent-Type: application/json\r\n\r"));
-    assert!(detector.observe(b"\nbody bytes"));
-    assert!(detector.observe(b"do not reset the detector"));
-}
-
-/// 同一连接上的两个固定长度 POST 必须分别产生完整生命周期事件；第二条请求的
-/// `POST` 即使拆成两次 read，也要等 tracker 收齐四字节后才启动 header 计时。
-#[test]
-fn test_mcp_http_request_tracker_two_posts_and_fragmented_second_header() {
-    let mut tracker = HttpRequestTracker::new();
-
-    assert_eq!(
-        tracker.observe(b"POST /mcp HTTP/1.1\r\nContent-Length: 5\r\n\r\nab"),
-        [HttpRequestEvent::HeaderComplete]
-    );
-    assert_eq!(tracker.deadline_stage(), McpReadDeadlineStage::Body);
-
-    // 固定 body 的后三字节完成首请求；随后的 `PO` 仍处于 idle Peek(4)，不能提前
-    // 给第二条请求发 Started 事件。
-    assert_eq!(tracker.observe(b"cdePO"), [HttpRequestEvent::Complete]);
-    assert_eq!(tracker.deadline_stage(), McpReadDeadlineStage::Idle);
-
-    assert_eq!(
-        tracker.observe(b"ST /mcp HTTP/1.1\r\nContent-Length: 0\r\n\r\n"),
-        [
-            HttpRequestEvent::Started,
-            HttpRequestEvent::HeaderComplete,
-            HttpRequestEvent::Complete,
-        ]
-    );
-    assert_eq!(tracker.deadline_stage(), McpReadDeadlineStage::Idle);
-}
-
-/// chunked body、扩展参数和 trailer 可以与下一条 pipelined 请求共处一个 socket
-/// read；边界跟踪器必须在零 chunk 的最终空行后立即重新进入 idle/next-request。
-#[test]
-fn test_mcp_http_request_tracker_chunked_and_pipelined_boundary() {
-    let mut tracker = HttpRequestTracker::new();
-    assert_eq!(
-        tracker.observe(b"POST /mcp HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWi",),
-        [HttpRequestEvent::HeaderComplete]
-    );
-    let events = tracker.observe(
-        b"ki\r\n5;kind=text\r\npedia\r\n0\r\nX-Test: yes\r\n\r\n\
-          POST /mcp HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
-    );
-
-    assert_eq!(
-        events,
-        [
-            HttpRequestEvent::Complete,
-            HttpRequestEvent::Started,
-            HttpRequestEvent::HeaderComplete,
-            HttpRequestEvent::Complete,
-        ]
-    );
-    assert_eq!(tracker.deadline_stage(), McpReadDeadlineStage::Idle);
-}
-
-/// deadline 纯状态测试覆盖 关键绝对时间：首请求从 accept 起算、整体 read 从
-/// 请求开始起算、响应进度开启新 idle 窗口、后续请求收齐四字节后重置 header/write。
-#[test]
-fn test_mcp_http_deadline_resets_for_each_keep_alive_request() {
-    let accepted_at = tokio::time::Instant::now();
-    let mut deadlines = McpDeadlineState::new(accepted_at);
-    assert_eq!(
-        deadlines.read_deadline(),
-        accepted_at + MCP_READ_HEADER_TIMEOUT
-    );
-    assert_eq!(deadlines.read_stage(), McpReadDeadlineStage::Header);
-
-    deadlines.observe_read(
-        b"POST /mcp HTTP/1.1\r\nContent-Length: 3\r\n\r\nab",
-        accepted_at + std::time::Duration::from_secs(2),
-    );
-    assert_eq!(deadlines.read_deadline(), accepted_at + MCP_READ_TIMEOUT);
-    assert_eq!(
-        deadlines.write_deadline(),
-        accepted_at + std::time::Duration::from_secs(2) + MCP_WRITE_TIMEOUT
-    );
-    assert_eq!(deadlines.read_stage(), McpReadDeadlineStage::Body);
-
-    deadlines.observe_read(b"c", accepted_at + std::time::Duration::from_secs(3));
-    // body 完成后仍保留本请求整体 read deadline，不能从 body 完成点凭空延长。
-    assert_eq!(deadlines.read_deadline(), accepted_at + MCP_READ_TIMEOUT);
-    assert_eq!(deadlines.read_stage(), McpReadDeadlineStage::Idle);
-
-    let response_at = accepted_at + std::time::Duration::from_secs(50);
-    deadlines.observe_response_progress(response_at);
-    assert_eq!(deadlines.read_deadline(), response_at + MCP_READ_TIMEOUT);
-
-    deadlines.observe_read(b"PO", accepted_at + std::time::Duration::from_secs(60));
-    assert_eq!(deadlines.read_stage(), McpReadDeadlineStage::Idle);
-    assert_eq!(deadlines.read_deadline(), response_at + MCP_READ_TIMEOUT);
-
-    let second_started_at = accepted_at + std::time::Duration::from_secs(61);
-    deadlines.observe_read(b"ST", second_started_at);
-    assert_eq!(deadlines.read_stage(), McpReadDeadlineStage::Header);
-    assert_eq!(
-        deadlines.read_deadline(),
-        second_started_at + MCP_READ_HEADER_TIMEOUT
-    );
-
-    let second_header_at = accepted_at + std::time::Duration::from_secs(62);
-    deadlines.observe_read(
-        b" /mcp HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
-        second_header_at,
-    );
-    assert_eq!(deadlines.read_stage(), McpReadDeadlineStage::Idle);
-    assert_eq!(
-        deadlines.read_deadline(),
-        second_started_at + MCP_READ_TIMEOUT
-    );
-    assert_eq!(
-        deadlines.write_deadline(),
-        second_header_at + MCP_WRITE_TIMEOUT
-    );
 }
 
 /// 覆盖未知字段保留与工具排序的协议行为。

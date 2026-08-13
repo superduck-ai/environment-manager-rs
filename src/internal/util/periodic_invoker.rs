@@ -15,7 +15,7 @@ use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::{BoxError, Stopper, format_go_duration};
+use super::{BoxError, Stopper, format_duration};
 
 type PeriodicFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send + 'static>>;
 type PeriodicFunction = Arc<dyn Fn() -> PeriodicFuture + Send + Sync + 'static>;
@@ -24,7 +24,7 @@ type PeriodicFunction = Arc<dyn Fn() -> PeriodicFuture + Send + Sync + 'static>;
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum PeriodicInvokerError {
     /// 间隔必须大于零。
-    #[error("interval must be positive, got {}", format_go_duration(*interval))]
+    #[error("interval must be positive, got {}", format_duration(*interval))]
     NonPositiveInterval {
         /// 调用方传入的无效间隔。
         interval: Duration,

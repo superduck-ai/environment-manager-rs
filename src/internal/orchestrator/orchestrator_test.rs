@@ -302,9 +302,9 @@ async fn test_whoami_client_get_identity() {
     );
 }
 
-/// 验证 Whoami 构造器保留 原始尾随斜杠，因此请求路径可见双斜杠。
+/// 验证 Whoami 构造器规范化尾随斜杠。
 #[tokio::test]
-async fn whoami_preserves_trailing_base_url_slash() {
+async fn whoami_normalizes_trailing_base_url_slash() {
     let (base_url, request) = spawn_http_response(
         200,
         &[],
@@ -315,10 +315,10 @@ async fn whoami_preserves_trailing_base_url_slash() {
     client
         .get_identity(&CancellationToken::new())
         .await
-        .expect("尾随斜杠只改变 wire path，不应影响身份解析");
+        .expect("尾随斜杠不应影响身份解析");
 
     let request = request.await.unwrap();
-    assert!(request.starts_with("GET //v1/environments/whoami "));
+    assert!(request.starts_with("GET /v1/environments/whoami "));
 }
 
 /// 验证 Whoami 的状态、JSON 与 response type 错误。
@@ -330,8 +330,8 @@ async fn test_whoami_client_reports_status_parse_and_type_errors() {
         .get_identity(&CancellationToken::new())
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("status 401"));
-    assert!(error.to_string().contains("nope"));
+    assert!(error.to_string().contains("status 401"), "{error}");
+    assert!(error.to_string().contains("nope"), "{error}");
 
     let (base_url, _request) = spawn_http_response(200, &[], b"{bad json").await;
     let client = new_whoami_client(base_url, "token");
@@ -548,12 +548,12 @@ async fn spawn_http_response(
 
 /// 按预置顺序返回 poll 结果，jitter 不等待。
 struct SequencePoller {
-    responses: Mutex<VecDeque<Result<Option<RawMessage>, String>>>,
+    responses: Mutex<VecDeque<Result<Option<RawWork>, String>>>,
 }
 
 impl SequencePoller {
     /// 创建顺序 poller。
-    fn new(responses: impl IntoIterator<Item = Result<Option<RawMessage>, String>>) -> Self {
+    fn new(responses: impl IntoIterator<Item = Result<Option<RawWork>, String>>) -> Self {
         Self {
             responses: Mutex::new(responses.into_iter().collect()),
         }
@@ -563,10 +563,7 @@ impl SequencePoller {
 #[async_trait]
 impl PollerInterface for SequencePoller {
     /// 返回下一条预置结果；耗尽后表示空队列。
-    async fn poll(
-        &self,
-        _cancellation: &CancellationToken,
-    ) -> OrchestratorResult<Option<RawMessage>> {
+    async fn poll(&self, _cancellation: &CancellationToken) -> OrchestratorResult<Option<RawWork>> {
         self.responses
             .lock()
             .unwrap()
@@ -587,10 +584,7 @@ struct CancellingErrorPoller;
 #[async_trait]
 impl PollerInterface for CancellingErrorPoller {
     /// 取消并返回模拟后端错误。
-    async fn poll(
-        &self,
-        cancellation: &CancellationToken,
-    ) -> OrchestratorResult<Option<RawMessage>> {
+    async fn poll(&self, cancellation: &CancellationToken) -> OrchestratorResult<Option<RawWork>> {
         cancellation.cancel();
         Err(OrchestratorError::message("backend unavailable"))
     }

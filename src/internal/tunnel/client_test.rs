@@ -25,8 +25,8 @@ use url::Url;
 use super::actions::{ResponseSender, new_registry};
 use super::client::{
     EnvironmentProxyConfig, PingWriteFailure, connect_websocket_with_proxy_config,
-    gorilla_websocket_config, ping_write_failure, proxy_for_websocket_target, read_proxy_response,
-    read_tunnel_data_message, should_offer_socks5_auth, socks5_proxy_port,
+    ping_write_failure, proxy_for_websocket_target, read_proxy_response, read_tunnel_data_message,
+    should_offer_socks5_auth, socks5_proxy_port, tunnel_websocket_config,
 };
 use super::{
     HttpResponseSender, HttpTunnelRequest, HttpTunnelResponseError, TunnelRequest, TunnelResponse,
@@ -181,7 +181,7 @@ async fn test_tunnel_endpoint_matches_connect_path() {
 /// WebSocket 未设置 read limit，两个 tungstenite 默认上限都必须关闭。
 #[test]
 fn test_websocket_config_has_no_incoming_frame_or_message_limit() {
-    let config = gorilla_websocket_config();
+    let config = tunnel_websocket_config();
     assert_eq!(config.max_frame_size, None);
     assert_eq!(config.max_message_size, None);
 }
@@ -411,7 +411,7 @@ async fn test_client_run_dispatches_proto_jsonhttp_request() {
         })),
     };
     let mut request_json = serde_json::to_value(request).unwrap();
-    // 使用 DiscardUnknown；同时在顶层和嵌套层注入未知字段验证 Rust 适配层。
+    // 同时在顶层和嵌套层注入未知字段，验证协议的向前兼容行为。
     request_json["futureTopLevel"] = serde_json::json!(true);
     request_json["httpRequest"]["futureNested"] = serde_json::json!("ignored");
     socket
@@ -544,7 +544,7 @@ fn test_proxy_from_environment_selection_and_no_proxy_rules() {
     );
 }
 
-/// 非 101 握手必须同时保留 response status 和固定 ErrBadHandshake 文本。
+/// 非 101 握手返回 Tungstenite 的原生 HTTP 错误。
 #[tokio::test]
 async fn test_websocket_bad_handshake_includes_status_and_client_context() {
     let router = Router::new().fallback(|| async { StatusCode::FORBIDDEN });
@@ -555,8 +555,7 @@ async fn test_websocket_bad_handshake_includes_status_and_client_context() {
     let error = connect_websocket_with_proxy_config(request, &EnvironmentProxyConfig::default())
         .await
         .expect_err("403 response must fail the websocket handshake");
-    assert_eq!(error.response_status(), Some("403 Forbidden"));
-    assert_eq!(error.to_string(), "websocket: bad handshake");
+    assert_eq!(error.to_string(), "HTTP error: 403 Forbidden");
 
     let client = new_client(
         "session-rejected",
@@ -568,21 +567,21 @@ async fn test_websocket_bad_handshake_includes_status_and_client_context() {
     let error = client
         .connect(&CancellationToken::new())
         .await
-        .expect_err("Client::connect must add the Go call-site context");
+        .expect_err("Client::connect must add the tunnel call-site context");
     assert_eq!(
         error.to_string(),
-        "connect tunnel websocket (403 Forbidden): websocket: bad handshake"
+        "connect tunnel websocket: HTTP error: 403 Forbidden"
     );
     server.abort();
 }
 
-/// SOCKS5 显式端口和 auth offer 条件必须保留内嵌 x/net/proxy。
+/// SOCKS5 只在显式配置端口和有效凭据时启用相应握手字段。
 #[test]
 fn test_socks5_proxy_defaults_and_auth_offer_boundaries() {
     assert_eq!(
         socks5_proxy_port(&Url::parse("socks5://proxy.example").unwrap()),
         None,
-        "Gorilla 将 u.Host 原样交给 SOCKS5 dialer，不补 1080"
+        "未配置的代理端口不能被隐式补成 1080"
     );
     assert_eq!(
         socks5_proxy_port(&Url::parse("socks5://proxy.example:9080").unwrap()),
@@ -607,10 +606,11 @@ async fn test_websocket_socks5_proxy_requires_explicit_port() {
     let error = connect_websocket_with_proxy_config(request, &config)
         .await
         .expect_err("SOCKS5 URL without a port must fail before DNS or TCP dialing");
-    assert_eq!(
-        error.to_string(),
-        "dial tcp: address proxy.example: missing port in address"
-    );
+    let tokio_tungstenite::tungstenite::Error::Io(error) = error else {
+        panic!("expected an I/O error")
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains("missing port"));
 }
 
 /// CGI 安全检查必须早于 loopback/NO_PROXY，防止 HTTP_PROXY header 注入。
@@ -659,14 +659,15 @@ async fn test_websocket_proxy_connect_and_non_200_reason() {
     let error = connect_websocket_with_proxy_config(request, &config)
         .await
         .expect_err("407 proxy response must fail the websocket dial");
-    assert_eq!(error.to_string(), "Proxy Authentication Required");
+    let tokio_tungstenite::tungstenite::Error::Io(error) = error else {
+        panic!("expected an I/O error")
+    };
+    assert!(error.to_string().contains("Proxy Authentication Required"));
 
     let connect_request = request_rx.await.unwrap();
     assert!(
         connect_request
-            .starts_with(
-                "CONNECT backend.example:8080 HTTP/1.1\r\nHost: backend.example:8080\r\nUser-Agent: Go-http-client/1.1\r\n"
-            )
+            .starts_with("CONNECT backend.example:8080 HTTP/1.1\r\nHost: backend.example:8080\r\n")
     );
     assert!(connect_request.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
     proxy.await.unwrap();
@@ -765,13 +766,13 @@ async fn test_http_proxy_basic_auth_requires_explicit_password() {
     let encoded_colon_in_username = capture_http_proxy_connect("user%3Aname@").await;
     assert!(
         !encoded_colon_in_username.contains("Proxy-Authorization:"),
-        "percent-encoded colon 属于用户名，不能设置 Go passwordSet"
+        "percent-encoded colon 属于用户名，不能被误判为显式密码"
     );
 
     let explicit_empty_password = capture_http_proxy_connect("user:@").await;
     assert!(
         explicit_empty_password.contains("Proxy-Authorization: Basic dXNlcjo=\r\n"),
-        "显式空密码仍属于 passwordSet=true"
+        "显式空密码仍应发送 Basic 凭据"
     );
 }
 
@@ -826,12 +827,10 @@ async fn test_websocket_proxy_supports_socks5_with_authentication() {
     let error = connect_websocket_with_proxy_config(request, &config)
         .await
         .expect_err("SOCKS5 connection-refused reply must fail the websocket dial");
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "proxy: SOCKS5 proxy at 127.0.0.1:{proxy_port} failed to connect: connection refused"
-        )
-    );
+    let tokio_tungstenite::tungstenite::Error::Io(error) = error else {
+        panic!("expected an I/O error")
+    };
+    assert!(error.to_string().contains("connection refused"));
     proxy.await.unwrap();
 }
 
@@ -871,12 +870,10 @@ async fn test_websocket_socks5_proxy_reports_truncated_reply_port() {
     let error = connect_websocket_with_proxy_config(request, &config)
         .await
         .expect_err("truncated SOCKS5 bind port must fail");
-    assert!(
-        error.to_string().starts_with(&format!(
-            "proxy: failed to read port from SOCKS5 proxy at 127.0.0.1:{proxy_port}:"
-        )),
-        "unexpected error: {error}"
-    );
+    let tokio_tungstenite::tungstenite::Error::Io(error) = error else {
+        panic!("expected an I/O error")
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     proxy.await.unwrap();
 }
 
@@ -893,5 +890,8 @@ async fn test_websocket_proxy_rejects_unsupported_proxy_scheme() {
     let error = connect_websocket_with_proxy_config(request, &config)
         .await
         .expect_err("unsupported proxy scheme must not be downgraded");
-    assert_eq!(error.to_string(), "proxy: unknown scheme: https");
+    let tokio_tungstenite::tungstenite::Error::Io(error) = error else {
+        panic!("expected an I/O error")
+    };
+    assert!(error.to_string().contains("unknown scheme: https"));
 }

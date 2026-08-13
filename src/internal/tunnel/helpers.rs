@@ -2,67 +2,24 @@
 //!
 //! 这里处理 header 与 ProtoJSON 字节布局；未知 ProtoJSON 字段的宽容解码放在 client。
 
-use std::io;
-
 use http::header::{HOST, HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 
 use super::{Header, TunnelError};
 
-/// Tunnel 协议紧凑格式的 Serde JSON formatter。
-///
-/// 协议格式不在冒号后加空格，但会在 object
-/// 和 array 的每个逗号后写一个 ASCII 空格。`serde_json`默认
-/// 紧凑 formatter 不写这个空格，因此需要在 token 边界定制，不能
-/// 对最终字符串做替换（字符串值自身可以包含逗号）。
-struct GoProtoJsonFormatter;
-
-impl serde_json::ser::Formatter for GoProtoJsonFormatter {
-    /// 在非首个 array 元素前写入 ProtoJSON 的逗号和单空格。
-    fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
-    where
-        W: ?Sized + io::Write,
-    {
-        if first {
-            Ok(())
-        } else {
-            writer.write_all(b", ")
-        }
-    }
-
-    /// 在非首个 object 键前写入 ProtoJSON 的逗号和单空格。
-    fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
-    where
-        W: ?Sized + io::Write,
-    {
-        if first {
-            Ok(())
-        } else {
-            writer.write_all(b", ")
-        }
-    }
-}
-
-/// 按稳定字节布局编码。
+/// 编码 Tunnel ProtoJSON。
 ///
 /// # 参数
 /// - `value`：已由 `pbjson` 生成 `Serialize` 实现的 Tunnel Proto 消息。
 ///
 /// # 返回
-/// 成功时返回 lowerCamel ProtoJSON 字节；生成的 Serde 实现拒绝
-/// 某个字段时原样返回序列化错误。
-///
-/// # 协议字节
-/// 保留 ProtoJSON 在逗号后的单空格、pbjson 字段顺序、Base64 bytes
-/// 和默认值省略规则；该空格是 WebSocket text frame 中可观察的协议字节。
-pub fn marshal_protojson<T>(value: &T) -> Result<Vec<u8>, serde_json::Error>
+/// 成功时返回 lowerCamel ProtoJSON 字节；生成的 Serde 实现拒绝某个字段时原样返回
+/// 序列化错误。JSON 空白不属于协议语义。
+pub fn encode_protojson<T>(value: &T) -> Result<Vec<u8>, serde_json::Error>
 where
     T: Serialize + ?Sized,
 {
-    let mut output = Vec::new();
-    let mut serializer = serde_json::Serializer::with_formatter(&mut output, GoProtoJsonFormatter);
-    value.serialize(&mut serializer)?;
-    Ok(output)
+    serde_json::to_vec(value)
 }
 
 ///

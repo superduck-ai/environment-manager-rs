@@ -196,11 +196,11 @@ impl From<String> for RuntimeError {
 }
 
 impl Display for RuntimeError {
-    /// 为日志、断言和诊断输出提供 风格的逐坏字节替换视图。
+    /// 为日志、断言和诊断输出提供有损 UTF-8 视图。
     ///
     /// 原始 stderr 输出不得使用本方法；它会用替换字符显示非 UTF-8 字节。
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&go_utf8_error_view(&self.message))
+        formatter.write_str(&String::from_utf8_lossy(&self.message))
     }
 }
 
@@ -214,27 +214,4 @@ pub fn render_runtime_error(error: &RuntimeError) -> (Vec<u8>, i32) {
     rendered.extend_from_slice(error.as_bytes());
     rendered.push(b'\n');
     (rendered, error.exit_code())
-}
-
-/// 将任意错误字节转换成逐坏字节替换的 UTF-8 文本。
-fn go_utf8_error_view(value: &[u8]) -> String {
-    let mut output = String::new();
-    let mut remaining = value;
-    while !remaining.is_empty() {
-        match std::str::from_utf8(remaining) {
-            Ok(valid) => {
-                output.push_str(valid);
-                break;
-            }
-            Err(error) => {
-                let valid_end = error.valid_up_to();
-                // `valid_up_to` 保证该切片为合法 UTF-8；格式化错误本身不能因损坏的
-                // 子进程输出而 panic，所以失败时保守使用空合法前缀。
-                output.push_str(std::str::from_utf8(&remaining[..valid_end]).unwrap_or_default());
-                output.push('\u{fffd}');
-                remaining = &remaining[valid_end + 1..];
-            }
-        }
-    }
-    output
 }

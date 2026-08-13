@@ -83,7 +83,7 @@ fn successful_heartbeat(last_heartbeat: &str, lease_updated_at: DateTime<Utc>) -
     })
 }
 
-/// 验证默认健康路径和环境阈值解析与 一致。
+/// 验证默认健康路径和环境变量阈值解析。
 #[test]
 fn test_default_health_path_and_stuck_threshold() {
     assert!(get_default_health_file_path().ends_with(Path::new(".agent-health/envmgr-healthy")));
@@ -241,7 +241,7 @@ async fn test_start_initial_heartbeat_failure_and_stop_after_start() {
         tokio::time::timeout(Duration::from_millis(50), manager.stop())
             .await
             .is_err(),
-        "Go stopChan is never closed when initial heartbeat fails"
+        "failed startup must not report the manager as cleanly stopped"
     );
 }
 

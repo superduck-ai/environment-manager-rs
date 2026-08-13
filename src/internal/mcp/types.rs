@@ -294,7 +294,7 @@ pub trait MCPServer: Send + Sync {
     /// 启动 loopback HTTP server。
     async fn start(&self, tools: Vec<ToolConfig>) -> McpResult<ServerConfig>;
 
-    /// 幂等停止 HTTP server 和 heartbeat 任务。
+    /// 幂等停止 HTTP server。
     async fn stop(&self);
 
     /// 是否还需通过 `claude mcp add` 注册。
@@ -378,14 +378,8 @@ impl fmt::Debug for MCPServerRegistration {
 pub(crate) struct ServerRuntime {
     /// 通知 HTTP accept loop 开始优雅退出。
     pub server_cancellation: CancellationToken,
-    /// 在 listener 关闭后通知 heartbeat 退出，保留阶段顺序。
-    pub heartbeat_cancellation: CancellationToken,
     /// HTTP accept loop。
     pub server_task: JoinHandle<()>,
-    /// 周期健康日志任务。
-    pub heartbeat_task: JoinHandle<()>,
-    /// 诊断所需的实际 loopback 地址。
-    pub listener_address: String,
 }
 
 /// 业务 server 共享的 loopback HTTP 实现。
@@ -400,7 +394,7 @@ pub struct BaseServer {
     pub(crate) debug_hardcoded_token: bool,
     /// 当前监听端口；未启动时为零。
     pub(crate) port: RwLock<u16>,
-    /// HTTP/heartbeat 生命周期状态。
+    /// HTTP server 生命周期状态。
     pub(crate) runtime: tokio::sync::Mutex<Option<ServerRuntime>>,
 }
 

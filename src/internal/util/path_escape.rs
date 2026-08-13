@@ -23,10 +23,10 @@
 /// 无文件、网络或环境变量副作用；唯一分配是返回字符串。
 ///
 /// # 协议约束
-/// 这里只实现`PathEscape` 本身，不负责完整 URL parser 对 `.`/`..` path segment
+/// 这里只实现后端 path-segment 编码，不负责完整 URL parser 对 `.`/`..` path segment
 /// 的归一化；上游 `url` 会按 WHATWG 清理后端明确禁止的完整 `.`/`..` ID。
 #[must_use]
-pub(crate) fn go_path_escape(value: &str) -> String {
+pub(crate) fn escape_path_segment(value: &str) -> String {
     const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
 
     let mut escaped = String::with_capacity(value.len());
@@ -49,7 +49,7 @@ pub(crate) fn go_path_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::go_path_escape;
+    use super::escape_path_segment;
 
     /// 表驱动覆盖 path-segment 模式的保留字符、百分号二次编码和 UTF-8 字节。
     #[test]
@@ -74,7 +74,7 @@ mod tests {
         ];
 
         for (input, expected) in cases {
-            assert_eq!(go_path_escape(input), expected, "input={input:?}");
+            assert_eq!(escape_path_segment(input), expected, "input={input:?}");
         }
     }
 }

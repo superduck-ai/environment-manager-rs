@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use reqwest::StatusCode;
+use reqwest::{StatusCode, multipart};
 use tar::{Builder as TarBuilder, Header};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
@@ -160,14 +160,21 @@ impl AntspaceClient {
         tarball: Vec<u8>,
         progress: OptionalProgress,
     ) -> Result<Option<AntspaceDeployResult>, ActionError> {
-        let (body, content_type) = build_multipart_body(app_name, &tarball);
+        let form = multipart::Form::new()
+            .text("app", app_name.to_owned())
+            .part(
+                "dist",
+                multipart::Part::bytes(tarball)
+                    .file_name("dist.tar.gz")
+                    .mime_str("application/octet-stream")
+                    .map_err(|error| format!("failed to create deploy request: {error}"))?,
+            );
         let url = format!("{}/deploy", self.control_plane_url);
         let request = self
             .http_client
             .post(url)
             .header("Authorization", format!("Bearer {}", self.auth_token))
-            .header("Content-Type", content_type)
-            .body(body)
+            .multipart(form)
             .build()
             .map_err(|error| format!("failed to create deploy request: {error}"))?;
         self.read_deploy_response(cancellation, request, progress)
@@ -253,30 +260,4 @@ impl AntspaceClient {
             service: response.service,
         }))
     }
-}
-
-/// 在内存中构造顺序的完整请求体。
-///
-/// boundary 使用 30 个随机字节的 60 位小写十六进制；`app` field 后接 `dist` file，
-/// 每段采用 CRLF，并以 `--boundary--\r\n` 收尾。提前完成整个 body 保留 在发 HTTP
-/// 请求前已经承担全部 multipart 内存开销和序列化工作的时序。
-fn build_multipart_body(app_name: &str, tarball: &[u8]) -> (Vec<u8>, String) {
-    let random_bytes = rand::random::<[u8; 30]>();
-    let boundary = random_bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let mut body = Vec::with_capacity(app_name.len() + tarball.len() + 512);
-    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(b"Content-Disposition: form-data; name=\"app\"\r\n\r\n");
-    body.extend_from_slice(app_name.as_bytes());
-    body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
-    body.extend_from_slice(
-        b"Content-Disposition: form-data; name=\"dist\"; filename=\"dist.tar.gz\"\r\n",
-    );
-    body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
-    body.extend_from_slice(tarball);
-    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-    let content_type = format!("multipart/form-data; boundary={boundary}");
-    (body, content_type)
 }

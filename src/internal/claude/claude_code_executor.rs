@@ -955,7 +955,7 @@ impl ClaudeCodeExecutor {
         if let Some(error) = run.error.as_deref() {
             // 日志文件和 JSON 属性必须是合法 UTF-8；只在这些观测旁路生成替换
             // 视图，最终返回的 ClaudeError 仍拼接原始 PathError 字节。
-            let error_view = go_json_valid_utf8(error);
+            let error_view = String::from_utf8_lossy(error);
             append_log(
                 log_file,
                 format!(
@@ -966,7 +966,7 @@ impl ClaudeCodeExecutor {
             )
             .await;
             let stderr_tail = if run.stderr.is_empty() {
-                "<nil>".to_owned()
+                "<empty>".to_owned()
             } else {
                 tail_string(&run.stderr, 100 * 1024)
             };
@@ -1358,56 +1358,10 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// 实现对任意 stderr 字节的截断与 UTF-8 处理。
-///
-/// 未截断时把无效字节写成 U+FFFD；发生截断时删除尾部切片中的所有无效字节。
+/// 返回 stderr 的最后 `max_bytes` 字节，并生成有损 UTF-8 视图。
 pub(super) fn tail_string(value: &[u8], max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return go_json_valid_utf8(value);
-    }
-    delete_invalid_utf8(&value[value.len() - max_bytes..])
-}
-
-/// 把每个无效 UTF-8 字节替换为一个 U+FFFD，匹配 JSON 字符串编码。
-fn go_json_valid_utf8(value: &[u8]) -> String {
-    let mut output = String::new();
-    let mut remaining = value;
-    while !remaining.is_empty() {
-        match std::str::from_utf8(remaining) {
-            Ok(valid) => {
-                output.push_str(valid);
-                break;
-            }
-            Err(error) => {
-                let valid = &remaining[..error.valid_up_to()];
-                // `valid_up_to` 保证该前缀位于 UTF-8 字符边界。
-                output.push_str(std::str::from_utf8(valid).unwrap_or_default());
-                output.push('\u{fffd}');
-                remaining = &remaining[error.valid_up_to() + 1..];
-            }
-        }
-    }
-    output
-}
-
-/// 删除所有无效 UTF-8 字节，保留有效 U+FFFD 字符和其他有效片段。
-fn delete_invalid_utf8(value: &[u8]) -> String {
-    let mut output = String::new();
-    let mut remaining = value;
-    while !remaining.is_empty() {
-        match std::str::from_utf8(remaining) {
-            Ok(valid) => {
-                output.push_str(valid);
-                break;
-            }
-            Err(error) => {
-                let valid = &remaining[..error.valid_up_to()];
-                output.push_str(std::str::from_utf8(valid).unwrap_or_default());
-                remaining = &remaining[error.valid_up_to() + 1..];
-            }
-        }
-    }
-    output
+    let start = value.len().saturating_sub(max_bytes);
+    String::from_utf8_lossy(&value[start..]).into_owned()
 }
 
 /// 把 Tokio 子进程等待结果归一化为退出码或 `-1`。

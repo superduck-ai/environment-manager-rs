@@ -23,7 +23,7 @@ use crate::internal::{
         CallToolRequest, CallToolResult, MCPServer, McpError, McpResult, ServerConfig, Tool,
         ToolConfig, ToolHandler, new_tool_result_error, new_tool_result_text,
     },
-    util::go_path_escape,
+    util::escape_path_segment,
 };
 
 use super::{
@@ -40,7 +40,7 @@ const CONTROL_RESPONSE_LIMIT: usize = 1024;
 ///
 /// 显式 mode 很重要：Rust `create_dir_all` 默认请求 `0777`，在宽松 umask 下会让
 /// migrations 或生成类型的父目录额外可写。这里仍让内核应用当前 umask，且不会
-/// 修改已经存在的目录权限，与 创建语义一致。
+/// 创建目录并把所有已经存在的路径段权限统一为 `0755`。
 ///
 /// # 错误
 /// 任一级目录不能创建，或路径组件被普通文件占用时返回底层 I/O 错误。
@@ -138,7 +138,7 @@ impl SupabaseMCPServer {
         let api_base_url = normalize_api_base_url(&self.api_base_url);
         let endpoint = format!(
             "{api_base_url}/v2/ccr-sessions/{}/supabase-credentials",
-            go_path_escape(&self.session_id)
+            escape_path_segment(&self.session_id)
         );
         let request = self
             .credentials_http_client
@@ -571,7 +571,7 @@ impl SupabaseMCPServer {
         let api_base_url = normalize_api_base_url(&self.api_base_url);
         let endpoint = format!(
             "{api_base_url}/v2/ccr-sessions/{}/supabase-provision",
-            go_path_escape(&self.session_id)
+            escape_path_segment(&self.session_id)
         );
         let request = self
             .credentials_http_client

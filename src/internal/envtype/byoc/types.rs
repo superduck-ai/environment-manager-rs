@@ -265,30 +265,24 @@ pub trait SourceProcessor: Send + Sync {
     ) -> Result<(), SourceProcessorError>;
 }
 
-/// 为 Contain/Provide API 添加 ingress 认证的 Reqwest round tripper。
+/// 为 Contain/Provide API 提供已配置 ingress 认证的 Reqwest client。
 #[derive(Clone)]
-pub struct ContainProvideAuthRoundTripper {
+pub struct ContainProvideAuthTransport {
     pub(crate) client: Client,
     pub(crate) token: String,
     pub(crate) organization_uuid: String,
 }
 
-impl fmt::Debug for ContainProvideAuthRoundTripper {
+impl fmt::Debug for ContainProvideAuthTransport {
     /// 仅输出 organization 和 token 是否存在，不泄漏 Bearer 凭据。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ContainProvideAuthRoundTripper")
+            .debug_struct("ContainProvideAuthTransport")
             .field("organization_uuid", &self.organization_uuid)
             .field("has_token", &!self.token.is_empty())
             .finish_non_exhaustive()
     }
 }
-
-/// 公开的 BYOC environment 类型别名。
-///
-/// 新名称与 `containProvideAuthRoundTripper` 对齐；别名保留已经采用
-/// `Transport` 术语的内部调用面。
-pub type ContainProvideAuthTransport = ContainProvideAuthRoundTripper;
 
 /// podmonitor factory 创建 lease manager 所需的全部输入。
 #[derive(Clone)]
@@ -372,7 +366,7 @@ impl fmt::Debug for ByocEnvironmentType {
     }
 }
 
-impl ContainProvideAuthRoundTripper {
+impl ContainProvideAuthTransport {
     /// 构造带 30 秒超时的 Reqwest client，保留 HTTP client 语义。
     pub fn new(
         token: impl Into<String>,
@@ -405,7 +399,7 @@ impl ContainProvideAuthRoundTripper {
     pub fn authorize_request(&self, request: &mut Request) -> Result<(), ByocError> {
         let headers = authentication_headers(&self.token, &self.organization_uuid)?;
         for (name, value) in &headers {
-            // `insert` 而不是 append，保留 Header.Set 覆盖调用方同名值的语义。
+            // `insert` 而不是 append，确保认证 header 覆盖调用方同名值。
             request.headers_mut().insert(name.clone(), value.clone());
         }
         Ok(())
