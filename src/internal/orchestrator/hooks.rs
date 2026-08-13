@@ -1,28 +1,18 @@
 //! timeout Hook 与 execute Hook 的异步子进程执行。
 //!
-//! 原 Go 代码使用 `exec.CommandContext(...).CombinedOutput()`。这里用 Tokio pipe
-//! 并发排空 stdout/stderr，避免任一 pipe 填满造成死锁；取消和超时都会杀死子进程，
-//! 等待其退出并收完已经产生的输出后再返回。
+//! 使用 Tokio pipe 并发排空 stdout/stderr，避免任一 pipe 填满造成死锁；取消和
+//! 超时都会终止并回收直接子进程，再收完已经产生的输出。
 
-use std::{
-    future::pending,
-    process::Stdio,
-    time::{Duration, Instant},
-};
+use std::time::Duration;
 
-use nix::{fcntl::OFlag, unistd::pipe2};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    process::Command,
-    task::JoinHandle,
-};
+use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use super::{
     CommandOutcome, Hook, OrchestratorError, OrchestratorResult, SandboxRequest, SessionData,
 };
 use crate::internal::{
-    process::{go_spawn_error, resolve_go_command},
+    process::{CaptureMode, run_command},
     util::{duration_nanoseconds, format_go_duration},
 };
 
@@ -38,12 +28,13 @@ impl Hook {
 
         tracing::info!(hook = %self.name, command = %self.command, "executing hook");
 
-        let outcome = run_command_combined_capture(
+        let outcome = run_command_capture(
             cancellation,
             &self.command,
             &self.args,
             None,
             duration_timeout(self.timeout),
+            CaptureMode::Combined,
         )
         .await;
         self.finish_execution(outcome)
@@ -117,12 +108,13 @@ impl Hook {
                 }
             }
         } else {
-            run_command_combined_capture(
+            run_command_capture(
                 cancellation,
                 &self.command,
                 &args,
                 Some(stdin_data),
                 timeout,
+                CaptureMode::Combined,
             )
             .await
         };
@@ -132,17 +124,28 @@ impl Hook {
 
     /// 统一记录成功/失败并生成与 Go Hook 相同结构的错误。
     fn finish_execution(&self, outcome: CommandOutcome) -> OrchestratorResult<()> {
-        let output = String::from_utf8_lossy(&outcome.combined_output()).into_owned();
-        let duration = format_go_duration(outcome.duration);
-        if let Some(error) = outcome.error {
-            tracing::error!(hook = %self.name, command = %self.command, "duration" = ?(duration_nanoseconds(outcome.duration)), "output" = ?(output), "error" = ?(error), "hook execution failed");
+        let (duration, output, error) = match outcome {
+            Ok(outcome) => {
+                let error = (!outcome.status.success()).then(|| outcome.status.to_string());
+                (outcome.duration, outcome.output.expect_combined(), error)
+            }
+            Err(outcome) => (
+                outcome.duration,
+                outcome.output.expect_combined(),
+                Some(outcome.kind.to_string()),
+            ),
+        };
+        let output = String::from_utf8_lossy(&output).into_owned();
+        let formatted_duration = format_go_duration(duration);
+        if let Some(error) = error {
+            tracing::error!(hook = %self.name, command = %self.command, "duration" = ?(duration_nanoseconds(duration)), "output" = ?(output), "error" = ?(error), "hook execution failed");
             return Err(OrchestratorError::message(format!(
-                "hook {} failed after {duration}: {error}\nOutput: {output}",
+                "hook {} failed after {formatted_duration}: {error}\nOutput: {output}",
                 self.name
             )));
         }
 
-        tracing::info!(hook = %self.name, command = %self.command, "duration" = ?(duration_nanoseconds(outcome.duration)), "output" = ?(output), "hook execution completed");
+        tracing::info!(hook = %self.name, command = %self.command, "duration" = ?(duration_nanoseconds(duration)), "output" = ?(output), "hook execution completed");
         Ok(())
     }
 }
@@ -189,337 +192,9 @@ pub(crate) async fn run_command_capture(
     args: &[String],
     stdin_data: Option<&[u8]>,
     timeout: Option<Duration>,
+    capture: CaptureMode,
 ) -> CommandOutcome {
-    let started = Instant::now();
-    let resolved_command = match resolve_go_command(std::ffi::OsStr::new(command)) {
-        Ok(command) => command,
-        Err(error) => {
-            return CommandOutcome {
-                duration: started.elapsed(),
-                error: Some(error.to_string()),
-                ..CommandOutcome::default()
-            };
-        }
-    };
-    if cancellation.is_cancelled() {
-        return CommandOutcome {
-            duration: started.elapsed(),
-            error: Some("context canceled".to_owned()),
-            ..CommandOutcome::default()
-        };
-    }
-
-    let mut process = Command::new(&resolved_command);
-    process
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    if stdin_data.is_some() {
-        process.stdin(Stdio::piped());
-    } else {
-        process.stdin(Stdio::null());
-    }
-
-    let mut child = match process.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return CommandOutcome {
-                duration: started.elapsed(),
-                error: Some(go_spawn_error(&resolved_command, &error).to_string()),
-                ..CommandOutcome::default()
-            };
-        }
-    };
-
-    let stdout_task = child.stdout.take().map(read_pipe);
-    let stderr_task = child.stderr.take().map(read_pipe);
-    let stdin_task = match (child.stdin.take(), stdin_data) {
-        (Some(mut stdin), Some(data)) => {
-            let data = data.to_vec();
-            Some(tokio::spawn(async move {
-                stdin.write_all(&data).await?;
-                stdin.shutdown().await
-            }))
-        }
-        _ => None,
-    };
-
-    enum StopReason {
-        Completed(std::io::Result<std::process::ExitStatus>),
-        Cancelled,
-        TimedOut,
-    }
-
-    let timeout_future = async {
-        match timeout {
-            Some(timeout) => tokio::time::sleep(timeout).await,
-            None => pending::<()>().await,
-        }
-    };
-    tokio::pin!(timeout_future);
-
-    let stop_reason = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => StopReason::Cancelled,
-        _ = &mut timeout_future => StopReason::TimedOut,
-        status = child.wait() => StopReason::Completed(status),
-    };
-
-    let mut primary_error = match stop_reason {
-        StopReason::Completed(Ok(status)) if status.success() => None,
-        StopReason::Completed(Ok(status)) => Some(exit_status_error(status)),
-        StopReason::Completed(Err(error)) => Some(error.to_string()),
-        StopReason::Cancelled => {
-            terminate_and_reap(&mut child).await;
-            Some("context canceled".to_owned())
-        }
-        StopReason::TimedOut => {
-            terminate_and_reap(&mut child).await;
-            Some("context deadline exceeded".to_owned())
-        }
-    };
-
-    let stdout = join_pipe(stdout_task, &mut primary_error).await;
-    let stderr = join_pipe(stderr_task, &mut primary_error).await;
-    if let Some(task) = stdin_task {
-        match task.await {
-            Ok(Ok(())) => {}
-            // 子进程提前退出时 EPIPE 是正常伴随现象，主退出状态更有诊断价值。
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Ok(Err(error)) => set_secondary_error(&mut primary_error, error.to_string()),
-            Err(error) => {
-                set_secondary_error(&mut primary_error, format!("stdin task failed: {error}"))
-            }
-        }
-    }
-
-    CommandOutcome {
-        stdout,
-        stderr,
-        duration: started.elapsed(),
-        error: primary_error,
-    }
-}
-
-/// 对应 Go `exec.Cmd.CombinedOutput`，使用同一个内核 pipe 捕获 stdout 与 stderr。
-///
-/// 普通 Hook 和 sandbox Hook 的错误文本会公开两个流的真实写入顺序，因此不能先分流
-/// 再在 Rust 端拼接。pipe 在创建时原子设置 `O_CLOEXEC`，避免并发 spawn 在设置
-/// close-on-exec 前继承写端并阻止 EOF。取消与超时仍只终止直接子进程。
-///
-/// # 参数
-/// - `cancellation`：上层取消令牌；预取消时不启动进程。
-/// - `command`：未经 shell 展开的 executable。
-/// - `args`：原样传入的 argv。
-/// - `stdin_data`：可选原始 stdin 字节。
-/// - `timeout`：可选 Hook deadline；`None` 表示只受上层取消控制。
-///
-/// # 返回
-/// 合并字节保存在 `CommandOutcome.stdout`，`stderr` 保持为空，使现有
-/// `combined_output()` 仍返回原始字节；错误、耗时和回收语义与分流版本相同。
-pub(crate) async fn run_command_combined_capture(
-    cancellation: &CancellationToken,
-    command: &str,
-    args: &[String],
-    stdin_data: Option<&[u8]>,
-    timeout: Option<Duration>,
-) -> CommandOutcome {
-    let started = Instant::now();
-    let resolved_command = match resolve_go_command(std::ffi::OsStr::new(command)) {
-        Ok(command) => command,
-        Err(error) => {
-            return CommandOutcome {
-                duration: started.elapsed(),
-                error: Some(error.to_string()),
-                ..CommandOutcome::default()
-            };
-        }
-    };
-    if cancellation.is_cancelled() {
-        return CommandOutcome {
-            duration: started.elapsed(),
-            error: Some("context canceled".to_owned()),
-            ..CommandOutcome::default()
-        };
-    }
-
-    // Go CombinedOutput 把两个 fd 指向同一个 bytes.Buffer。这里让两个 fd 指向同一
-    // pipe，保留内核接收顺序；O_CLOEXEC 在 pipe2 内原子生效，避免并发继承竞态。
-    let (read_end, write_end) = match pipe2(OFlag::O_CLOEXEC) {
-        Ok(pipe) => pipe,
-        Err(error) => {
-            return CommandOutcome {
-                duration: started.elapsed(),
-                error: Some(error.to_string()),
-                ..CommandOutcome::default()
-            };
-        }
-    };
-    let stderr_end = match write_end.try_clone() {
-        Ok(stderr_end) => stderr_end,
-        Err(error) => {
-            return CommandOutcome {
-                duration: started.elapsed(),
-                error: Some(error.to_string()),
-                ..CommandOutcome::default()
-            };
-        }
-    };
-
-    let mut process = Command::new(&resolved_command);
-    process
-        .args(args)
-        .stdout(Stdio::from(write_end))
-        .stderr(Stdio::from(stderr_end))
-        .kill_on_drop(true);
-    if stdin_data.is_some() {
-        process.stdin(Stdio::piped());
-    } else {
-        process.stdin(Stdio::null());
-    }
-
-    let mut child = match process.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return CommandOutcome {
-                duration: started.elapsed(),
-                error: Some(go_spawn_error(&resolved_command, &error).to_string()),
-                ..CommandOutcome::default()
-            };
-        }
-    };
-    drop(process);
-
-    let reader = tokio::fs::File::from_std(std::fs::File::from(read_end));
-    let output_task = Some(read_pipe(reader));
-    let stdin_task = match (child.stdin.take(), stdin_data) {
-        (Some(mut stdin), Some(data)) => {
-            let data = data.to_vec();
-            Some(tokio::spawn(async move {
-                stdin.write_all(&data).await?;
-                stdin.shutdown().await
-            }))
-        }
-        _ => None,
-    };
-
-    enum StopReason {
-        Completed(std::io::Result<std::process::ExitStatus>),
-        Cancelled,
-        TimedOut,
-    }
-
-    let timeout_future = async {
-        match timeout {
-            Some(timeout) => tokio::time::sleep(timeout).await,
-            None => pending::<()>().await,
-        }
-    };
-    tokio::pin!(timeout_future);
-
-    let stop_reason = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => StopReason::Cancelled,
-        _ = &mut timeout_future => StopReason::TimedOut,
-        status = child.wait() => StopReason::Completed(status),
-    };
-    let mut primary_error = match stop_reason {
-        StopReason::Completed(Ok(status)) if status.success() => None,
-        StopReason::Completed(Ok(status)) => Some(exit_status_error(status)),
-        StopReason::Completed(Err(error)) => Some(error.to_string()),
-        StopReason::Cancelled => {
-            terminate_and_reap(&mut child).await;
-            Some("context canceled".to_owned())
-        }
-        StopReason::TimedOut => {
-            terminate_and_reap(&mut child).await;
-            Some("context deadline exceeded".to_owned())
-        }
-    };
-
-    let output = join_pipe(output_task, &mut primary_error).await;
-    if let Some(task) = stdin_task {
-        match task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
-            Ok(Err(error)) => set_secondary_error(&mut primary_error, error.to_string()),
-            Err(error) => {
-                set_secondary_error(&mut primary_error, format!("stdin task failed: {error}"))
-            }
-        }
-    }
-
-    CommandOutcome {
-        stdout: output,
-        stderr: Vec::new(),
-        duration: started.elapsed(),
-        error: primary_error,
-    }
-}
-
-/// 持续读取 pipe 直至 EOF。
-fn read_pipe<R>(mut pipe: R) -> JoinHandle<std::io::Result<Vec<u8>>>
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut output = Vec::new();
-        pipe.read_to_end(&mut output).await?;
-        Ok(output)
-    })
-}
-
-/// 回收取消或超时的子进程，并保持 Go `exec.CommandContext` 的对外错误优先级。
-///
-/// `start_kill` 或随后 `wait` 的错误不额外写日志：Go 的 watcher 不会为这两个内部
-/// 步骤产生独立日志，而且调用者已经固定返回 `context canceled` 或
-/// `context deadline exceeded`。保留回收动作可以避免 Linux zombie，同时不会增加
-/// Go 基线中不存在的 stderr 副作用。
-async fn terminate_and_reap(child: &mut tokio::process::Child) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
-/// 汇合 reader 任务，并在主错误为空时保存 pipe 错误。
-async fn join_pipe(
-    task: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
-    primary_error: &mut Option<String>,
-) -> Vec<u8> {
-    let Some(task) = task else {
-        return Vec::new();
-    };
-    match task.await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            set_secondary_error(primary_error, error.to_string());
-            Vec::new()
-        }
-        Err(error) => {
-            set_secondary_error(primary_error, format!("output task failed: {error}"));
-            Vec::new()
-        }
-    }
-}
-
-/// 仅在没有更直接的进程错误时采用辅助 I/O 错误。
-fn set_secondary_error(primary_error: &mut Option<String>, error: String) {
-    if primary_error.is_none() {
-        *primary_error = Some(error);
-    }
-}
-
-/// 将 Unix 退出状态格式化为 Go `exec.ExitError` 的常见文本。
-fn exit_status_error(status: std::process::ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit status {code}");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            return format!("signal {signal}");
-        }
-    }
-    status.to_string()
+    let mut process = Command::new(command);
+    process.args(args);
+    run_command(process, cancellation, timeout, stdin_data, capture).await
 }

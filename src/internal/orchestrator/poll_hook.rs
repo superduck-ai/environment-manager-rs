@@ -13,6 +13,7 @@ use super::{
     OrchestratorError, OrchestratorResult, PollHook, PollHookContext, PollerInterface, RawMessage,
     run_command_capture,
 };
+use crate::internal::process::CaptureMode;
 use crate::internal::util::{duration_nanoseconds, format_go_duration};
 
 /// 对应 Go `NewPollHook`，创建命令型 poller。
@@ -69,33 +70,50 @@ impl PollHook {
             &self.args,
             Some(&stdin_data),
             Some(self.timeout),
+            CaptureMode::Separate,
         )
         .await;
 
-        if let Some(error) = outcome.error {
-            let stderr = String::from_utf8_lossy(&outcome.stderr).into_owned();
-            tracing::error!("duration" = ?(duration_nanoseconds(outcome.duration)), "stderr" = ?(stderr), "error" = ?(error), "{}", "poll hook execution failed");
+        let (duration, stdout, stderr, error) = match outcome {
+            Ok(outcome) => {
+                let error = (!outcome.status.success()).then(|| outcome.status.to_string());
+                let (stdout, stderr) = outcome.output.expect_separate();
+                (outcome.duration, stdout, stderr, error)
+            }
+            Err(outcome) => {
+                let (stdout, stderr) = outcome.output.expect_separate();
+                (
+                    outcome.duration,
+                    stdout,
+                    stderr,
+                    Some(outcome.kind.to_string()),
+                )
+            }
+        };
+        if let Some(error) = error {
+            let stderr = String::from_utf8_lossy(&stderr).into_owned();
+            tracing::error!("duration" = ?(duration_nanoseconds(duration)), "stderr" = ?(stderr), "error" = ?(error), "{}", "poll hook execution failed");
             return Err(OrchestratorError::message(format!(
                 "poll hook failed after {}: {error} (stderr: {stderr})",
-                format_go_duration(outcome.duration)
+                format_go_duration(duration)
             )));
         }
 
-        let output = String::from_utf8_lossy(&outcome.stdout);
+        let output = String::from_utf8_lossy(&stdout);
         let output = output.trim();
         if output.is_empty() || output == "null" {
-            tracing::debug!("duration" = ?(duration_nanoseconds(outcome.duration)), "{}", "poll hook returned empty queue");
+            tracing::debug!("duration" = ?(duration_nanoseconds(duration)), "{}", "poll hook returned empty queue");
             return Ok(None);
         }
 
         if let Err(error) = serde_json::from_str::<serde_json::Value>(output) {
-            tracing::error!("duration" = ?(duration_nanoseconds(outcome.duration)), "output" = ?(output), "error" = ?(error.to_string()), "{}", "poll hook returned invalid JSON");
+            tracing::error!("duration" = ?(duration_nanoseconds(duration)), "output" = ?(output), "error" = ?(error.to_string()), "{}", "poll hook returned invalid JSON");
             return Err(OrchestratorError::message(format!(
                 "poll hook returned invalid JSON: {error}"
             )));
         }
 
-        tracing::info!("duration" = ?(duration_nanoseconds(outcome.duration)), "{}", "poll hook returned work");
+        tracing::info!("duration" = ?(duration_nanoseconds(duration)), "{}", "poll hook returned work");
         Ok(Some(output.as_bytes().to_vec()))
     }
 

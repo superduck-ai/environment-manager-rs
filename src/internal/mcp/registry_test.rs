@@ -418,5 +418,5 @@ exit 0
     .await
     .expect_err("add 非零退出必须失败");
     assert!(error.to_string().contains("claude mcp add failed"));
-    assert!(error.to_string().contains("exit status 7"));
+    assert!(error.to_string().contains("exit status: 7"));
 }

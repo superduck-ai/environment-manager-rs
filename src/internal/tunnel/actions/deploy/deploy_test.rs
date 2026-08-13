@@ -554,11 +554,11 @@ async fn build_combines_output_and_reports_exit_status() {
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-    let failure = run_build_program(&CancellationToken::new(), directory.path(), &script)
+    let output = run_build_program(&CancellationToken::new(), directory.path(), &script)
         .await
-        .unwrap_err();
-    assert_eq!(failure.error, "exit status: 7");
-    assert_eq!(failure.output, b"stdoutstderr");
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    assert_eq!(output.output.expect_combined(), b"stdoutstderr");
 }
 
 /// 验证取消只 kill direct child，并等待继承 pipe 的孙进程自行关闭输出端。
@@ -592,7 +592,7 @@ async fn cancelling_build_kills_only_direct_child() {
     .unwrap();
     cancellation.cancel();
 
-    // Go CombinedOutput 会等待共享 pipe EOF。direct child 已被 kill 后，继承 pipe 的
+    // 捕获命令会等待共享 pipe EOF。direct child 已被 kill 后，继承 pipe 的
     // grandchild 尚存，因此任务此刻应继续阻塞；这同时证明实现没有偷偷杀整个组。
     assert!(
         tokio::time::timeout(Duration::from_millis(50), &mut task)
@@ -604,7 +604,7 @@ async fn cancelling_build_kills_only_direct_child() {
         .unwrap()
         .unwrap()
         .unwrap_err();
-    assert_eq!(failure.error, "signal: killed");
+    assert_eq!(failure.to_string(), "command was cancelled");
     assert!(
         directory.path().join("grandchild-alive").exists(),
         "grandchild must survive direct-child cancellation and close its pipe naturally"

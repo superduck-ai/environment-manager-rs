@@ -500,7 +500,7 @@ async fn test_handle_install_error() {
     );
 }
 
-/// 验证 npm CombinedOutput 的非 UTF-8 与 NUL 字节一直保留在 ClaudeError 中。
+/// 验证 npm 捕获输出的非 UTF-8 与 NUL 字节一直保留在 ClaudeError 中。
 ///
 /// `Display` 只能产生有损 UTF-8 视图；兼容 CLI 必须使用 `ClaudeError::as_bytes()`。
 #[tokio::test]
@@ -530,15 +530,11 @@ async fn npm_install_error_preserves_raw_combined_output_bytes() {
     .unwrap_err();
     assert_eq!(
         error.as_bytes(),
-        b"claude code installation failed during npm install: npm install failed: exit status 5, output: \xff\xfe\0"
+        b"claude code installation failed during npm install: npm install failed: exit status: 5, output: \xff\xfe\0"
     );
 }
 
-/// 验证 PATH 解析到非 UTF-8 目录后，spawn PathError 字节可穿过完整安装错误链。
-///
-/// fixture 具有 executable bit、但内容不是 Linux 可执行格式，使 LookPath 成功而
-/// `execve` 返回 ENOEXEC；这样既覆盖 raw resolved path，也覆盖 `command_error` 和
-/// fatal install 包装，不依赖直接调用内部格式化 helper。
+/// 验证 PATH 中格式无效的 executable 返回 Rust 原生 spawn 错误。
 #[tokio::test]
 async fn npm_spawn_error_preserves_non_utf8_resolved_path_bytes() {
     if !crate::internal::enter_isolated_process_test(concat!(
@@ -566,20 +562,20 @@ async fn npm_spawn_error_preserves_non_utf8_resolved_path_bytes() {
     )
     .await
     .unwrap_err();
-    let mut expected =
-        b"claude code installation failed during npm install: npm install failed: fork/exec "
-            .to_vec();
-    expected.extend_from_slice(npm.as_os_str().as_encoded_bytes());
-    expected.extend_from_slice(b": exec format error, output: ");
-    assert_eq!(error.as_bytes(), expected);
+    assert!(
+        error
+            .to_string()
+            .contains("npm install failed: failed to spawn command:")
+    );
+    assert!(error.to_string().contains("Exec format error"));
 }
 
-/// 验证缺失 PATH executable 使用 Go `exec.LookPath` 文本而不是 Rust errno 文本。
+/// 验证缺失 PATH executable 使用 Rust 原生启动错误。
 #[tokio::test]
-async fn npm_missing_from_path_uses_go_look_path_error() {
+async fn npm_missing_from_path_uses_native_spawn_error() {
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::npm_missing_from_path_uses_go_look_path_error"
+        "::npm_missing_from_path_uses_native_spawn_error"
     )) {
         return;
     }
@@ -595,13 +591,15 @@ async fn npm_missing_from_path_uses_go_look_path_error() {
     )
     .await
     .unwrap_err();
-    assert_eq!(
-        error.as_bytes(),
-        b"claude code installation failed during npm install: npm install failed: exec: \"npm\": executable file not found in $PATH, output: "
+    assert!(
+        error
+            .to_string()
+            .contains("npm install failed: failed to spawn command:")
     );
+    assert!(error.to_string().contains("No such file or directory"));
 }
 
-/// 验证预取消的 CombinedOutput 不启动 child，也不产生脚本 marker 副作用。
+/// 验证预取消的捕获命令不启动 child，也不产生脚本 marker 副作用。
 #[tokio::test]
 async fn combined_output_pre_cancel_does_not_spawn() {
     let temp = TempDir::new().unwrap();
@@ -623,15 +621,16 @@ async fn combined_output_pre_cancel_does_not_spawn() {
     )
     .await
     .unwrap_err();
-    assert_eq!(error.error, b"context canceled");
+    assert_eq!(error.to_string(), "command was cancelled");
+    assert!(error.output.expect_combined().is_empty());
     assert!(!marker.exists());
 }
 
-/// 验证 direct child 退出后，CombinedOutput 仍等待继承 writer 的孙进程关闭 pipe。
+/// 验证 direct child 退出后，捕获命令仍等待继承 writer 的孙进程关闭 pipe。
 #[tokio::test]
 async fn combined_output_waits_for_descendant_pipe_eof() {
     // 同模块 npm 测试会替换进程级 PATH；本 fixture 依赖 sleep，必须共用全局锁，
-    // 否则 shell 的 “sleep: not found” 会进入 CombinedOutput 并造成伪失败。
+    // 否则 shell 的 “sleep: not found” 会进入捕获输出并造成伪失败。
     let _path_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
     let temp = TempDir::new().unwrap();
     let command = write_script(&temp, "pipe-holder", "#!/bin/sh\nsleep 0.25 &\nexit 0\n");
@@ -645,19 +644,19 @@ async fn combined_output_waits_for_descendant_pipe_eof() {
     )
     .await
     .unwrap();
-    assert!(output.is_empty());
+    assert!(output.output.expect_combined().is_empty());
     assert!(
         started.elapsed() >= Duration::from_millis(180),
-        "孙进程关闭继承 pipe 前 CombinedOutput 不应返回"
+        "孙进程关闭继承 pipe 前捕获命令不应返回"
     );
 }
 
-/// 验证 signal 退出使用 Go Linux/ARM64 的完整信号名称。
+/// 验证 signal 退出使用 Rust 原生退出状态文本。
 #[tokio::test]
-async fn combined_output_formats_linux_signal_name_like_go() {
+async fn combined_output_formats_native_signal_status() {
     let temp = TempDir::new().unwrap();
     let command = write_script(&temp, "signal-exit", "#!/bin/sh\nkill -USR1 $$\n");
-    let error = run_combined_command(
+    let output = run_combined_command(
         &CancellationToken::new(),
         command.as_os_str(),
         &[],
@@ -665,9 +664,9 @@ async fn combined_output_formats_linux_signal_name_like_go() {
         None,
     )
     .await
-    .unwrap_err();
-    assert_eq!(error.exit_code, -1);
-    assert_eq!(error.error, b"signal: user defined signal 1");
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(output.status.to_string().contains("SIGUSR1"));
 }
 
 /// 验证 init hook 的 cwd/env/过滤和失败退出码文案。
@@ -703,7 +702,7 @@ async fn init_hook_runs_with_filtered_environment_and_reports_exit_code() {
         .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "claude --init-only failed with exit code 7: exit status 7"
+        "claude --init-only failed with exit code 7: exit status: 7"
     );
 }
 

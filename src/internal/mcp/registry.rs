@@ -6,21 +6,19 @@
 
 use std::{
     ffi::OsStr,
-    os::unix::process::ExitStatusExt as _,
     path::PathBuf,
-    process::{ExitStatus, Stdio},
+    process::ExitStatus,
     sync::{Arc, OnceLock},
     time::Instant,
 };
 
-use nix::{fcntl::OFlag, unistd::pipe2};
-use tokio::{io::AsyncReadExt as _, process::Command};
+use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::internal::{
     auth::AuthContext,
     config::{ClaudeConfig, StartupContext},
-    process::{go_spawn_error, resolve_go_command},
+    process::{CaptureMode, run_command},
     session::ActivityRecorder,
 };
 
@@ -183,12 +181,10 @@ pub async fn register_with_claude(
     let url = format!("http://127.0.0.1:{}/mcp", server_config.port);
     let auth_header = format!("Authorization: Bearer {}", server_config.bearer_token);
 
-    // Go 的 `CombinedOutput` 会把“启动失败”和“非零退出”汇聚到同一个 `err`
-    // 分支。这里先把 Tokio 的两种结果归一化，再从唯一日志调用点输出；这样既保留
-    // 完全相同的事件语义，也避免一个 Go 日志源被多个 Rust 调用点重复消费。
+    // 把启动失败和非零退出归一化，再从唯一日志调用点输出。
     let (listed, list_error) = match run_claude(cancellation, ["mcp", "list"]).await {
         Ok(output) if output.status.success() => (Some(output), None),
-        Ok(output) => (None, Some(exit_status_error(&output.status))),
+        Ok(output) => (None, Some(output.status.to_string())),
         Err(error) => (None, Some(error.to_string())),
     };
     if let Some(error) = list_error {
@@ -207,7 +203,7 @@ pub async fn register_with_claude(
                 None
             }
             Ok(output) => Some((
-                exit_status_error(&output.status),
+                output.status.to_string(),
                 String::from_utf8_lossy(&output.combined).into_owned(),
             )),
             Err(error) => Some((error.to_string(), String::new())),
@@ -229,14 +225,13 @@ pub async fn register_with_claude(
         "--scope",
         "user",
     ];
-    // Go 在 `CombinedOutput` 返回后只计算一次耗时，并让启动失败和非零退出进入同一
-    // 日志分支。Rust 的 wait status 与 I/O 错误是不同通道，因此在这里显式归一化。
+    // 只计算一次耗时，并把启动失败和非零退出归一到同一日志分支。
     let add_result = run_claude(cancellation, args).await;
     let duration_ms = started.elapsed().as_millis();
     let add_failure = match add_result {
         Ok(output) if output.status.success() => None,
         Ok(output) => Some((
-            exit_status_error(&output.status),
+            output.status.to_string(),
             String::from_utf8_lossy(&output.combined).into_owned(),
         )),
         Err(error) => Some((error.to_string(), String::new())),
@@ -250,11 +245,11 @@ pub async fn register_with_claude(
     Ok(())
 }
 
-/// 执行一个可取消的 `claude` 子命令并按 Go `CombinedOutput` 语义捕获输出。
+/// 执行一个可取消的 `claude` 子命令并捕获 stdout/stderr 的交错顺序。
 ///
-/// stdout 和 stderr 指向同一个 `pipe2(O_CLOEXEC)` 写端，因而保留内核观察到的到达
+/// stdout 和 stderr 指向同一个 close-on-exec 管道写端，因而保留内核观察到的到达
 /// 顺序，而不是事后把两个独立缓冲区拼接。取消只向 direct child 发送 SIGKILL 并
-/// wait，不扩展到进程组；这与 Go `exec.CommandContext` 的当前副作用一致。
+/// wait，不扩展到进程组。
 ///
 /// # 参数
 /// - `cancellation`：上层 context；预取消时不启动进程，运行中取消时终止 direct child。
@@ -268,105 +263,15 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let resolved_program = resolve_go_command(OsStr::new("claude"))
-        .map_err(|error| McpError::message(error.to_string()))?;
-    if cancellation.is_cancelled() {
-        return Err(McpError::message("context canceled"));
-    }
-    // CLOEXEC 必须在 pipe 创建时原子设置；若先 pipe 再 fcntl，并发 spawn 可能短暂
-    // 继承父进程写端，让 reader 在 `claude` 已退出后仍无法观察 EOF。
-    let (read_end, write_end) =
-        pipe2(OFlag::O_CLOEXEC).map_err(|error| McpError::message(error.to_string()))?;
-    let stderr_end = write_end
-        .try_clone()
-        .map_err(|error| McpError::message(error.to_string()))?;
-    let mut command = Command::new(&resolved_program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(write_end))
-        .stderr(Stdio::from(stderr_end))
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|error| {
-        McpError::message(go_spawn_error(&resolved_program, &error).to_string())
-    })?;
-    // `Command` 已把 owning FDs 转交给 child；立即 drop 父侧状态，确保最后一个 child
-    // 写端关闭后共享 reader 能收到 EOF。
-    drop(command);
-
-    let mut reader = tokio::fs::File::from_std(std::fs::File::from(read_end));
-    let reader_task = tokio::spawn(async move {
-        let mut combined = Vec::new();
-        reader.read_to_end(&mut combined).await.map(|_| combined)
-    });
-    let status = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            // Go CommandContext 的默认 Cancel 只杀 direct child；wait 仍负责回收僵尸。
-            let _direct_child_kill = child.start_kill();
-            child.wait().await
-        },
-        result = child.wait() => result,
-    }
-    .map_err(|error| McpError::message(error.to_string()))?;
-    let combined = reader_task
+    let mut command = Command::new("claude");
+    command.args(args);
+    let output = run_command(command, cancellation, None, None, CaptureMode::Combined)
         .await
-        .map_err(|error| McpError::message(error.to_string()))?
         .map_err(|error| McpError::message(error.to_string()))?;
-    Ok(ClaudeOutput { status, combined })
-}
-
-/// 把非零 exit status 转成接近 Go `exec.ExitError` 的稳定文本。
-fn exit_status_error(status: &ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit status {code}");
-    }
-    let signal = status.signal().unwrap_or_default();
-    // 使用 libc 针对当前 Linux 目标定义的信号编号，避免假定所有 CPU
-    // 架构都沿用 ARM64 编号，同时保持 Go syscall.Signal.String 的名称。
-    let name = match signal {
-        libc::SIGHUP => "hangup",
-        libc::SIGINT => "interrupt",
-        libc::SIGQUIT => "quit",
-        libc::SIGILL => "illegal instruction",
-        libc::SIGTRAP => "trace/breakpoint trap",
-        libc::SIGABRT => "aborted",
-        libc::SIGBUS => "bus error",
-        libc::SIGFPE => "floating point exception",
-        libc::SIGKILL => "killed",
-        libc::SIGUSR1 => "user defined signal 1",
-        libc::SIGSEGV => "segmentation fault",
-        libc::SIGUSR2 => "user defined signal 2",
-        libc::SIGPIPE => "broken pipe",
-        libc::SIGALRM => "alarm clock",
-        libc::SIGTERM => "terminated",
-        // MIPS 和 SPARC 的 Linux signal ABI 没有 SIGSTKFLT；其他架构按 libc
-        // 定义保留 Go 对 "stack fault" 的命名。
-        #[cfg(not(any(
-            target_arch = "mips",
-            target_arch = "mips64",
-            target_arch = "sparc",
-            target_arch = "sparc64"
-        )))]
-        libc::SIGSTKFLT => "stack fault",
-        libc::SIGCHLD => "child exited",
-        libc::SIGCONT => "continued",
-        libc::SIGSTOP => "stopped (signal)",
-        libc::SIGTSTP => "stopped",
-        libc::SIGTTIN => "stopped (tty input)",
-        libc::SIGTTOU => "stopped (tty output)",
-        libc::SIGURG => "urgent I/O condition",
-        libc::SIGXCPU => "CPU time limit exceeded",
-        libc::SIGXFSZ => "file size limit exceeded",
-        libc::SIGVTALRM => "virtual timer expired",
-        libc::SIGPROF => "profiling timer expired",
-        libc::SIGWINCH => "window changed",
-        libc::SIGIO => "I/O possible",
-        libc::SIGPWR => "power failure",
-        libc::SIGSYS => "bad system call",
-        _ => return format!("signal: signal {signal}"),
-    };
-    format!("signal: {name}")
+    Ok(ClaudeOutput {
+        status: output.status,
+        combined: output.output.expect_combined(),
+    })
 }
 
 /// 测试间清空进程级 registration，避免并行 case 污染插入顺序。

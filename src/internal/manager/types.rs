@@ -29,7 +29,7 @@ use crate::internal::{
 
 /// Manager 对外返回的 Go 兼容错误字节。
 ///
-/// Go 的 `error` 文本实际可以包含任意字节，特别是 Claude/npm `CombinedOutput` 会把
+/// Claude/npm 的捕获输出可能包含任意字节，并会把
 /// 子进程输出直接拼入 `%w` 错误链。这里不能用 `String`，否则还未到 CLI 就会把无效
 /// UTF-8 永久替换。日志与 JSON 通过 [`Display`] 取得 Go `encoding/json` 风格的视图，
 /// 最终 stderr 则通过 [`ManagerError::as_bytes`] 原样输出。
@@ -343,14 +343,6 @@ pub(super) struct McpRegistrationBatch {
     pub(super) servers: Vec<Arc<dyn MCPServer>>,
     /// 尝试过的全部 registrations，包括非致命失败项。
     pub(super) registrations: Vec<Arc<MCPServerRegistration>>,
-}
-
-/// 可取消 direct-child 命令的 combined output 失败信息。
-pub(super) struct CommandFailure {
-    /// spawn、wait、取消或非零退出状态的兼容文本。
-    pub(super) error: String,
-    /// 失败前 stdout/stderr 共用 pipe 中已经读取的字节。
-    pub(super) output: Vec<u8>,
 }
 
 /// 把工作目录字符串转换成 MCP factory 使用的 owned path。

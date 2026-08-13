@@ -8,12 +8,9 @@ use std::{
     env,
     fs::{self, DirBuilder, File, OpenOptions},
     io::{self, Write},
-    os::unix::{
-        fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink},
-        process::ExitStatusExt,
-    },
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
-    process::{ExitStatus, Stdio},
+    process::Stdio,
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
 };
@@ -21,11 +18,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::Value;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt},
-    net::TcpStream,
-    process::Command,
-};
+use tokio::{net::TcpStream, process::Command};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
@@ -34,7 +27,7 @@ use crate::internal::{
     auth::AuthContext,
     config::{SessionMode, StartupContext},
     envtype::{EnvironmentType, Registration, shared},
-    process::execute_script,
+    process::{CaptureMode, execute_script, run_command},
     session::{ActivityRecorder, ActivityRecorderError, NoopActivityRecorder},
     sources::{ProcessMode, new_source_handler_manager},
     util::{BoxError, Stopper, format_go_duration, output_streamer},
@@ -385,7 +378,7 @@ impl AnthropicEnvironmentType {
                             BTreeMap::new(),
                         );
                         let session_error = InitScriptError {
-                            exit_code: extract_exit_code(&error),
+                            exit_code: error.exit_code.unwrap_or(1),
                             output: error.output.clone(),
                         };
                         let _ = activity_recorder
@@ -515,6 +508,7 @@ impl AnthropicEnvironmentType {
                 return Err(RunScriptError {
                     output: tail_to_string(&output),
                     error: AnthropicError::with_source("failed to execute init script", error),
+                    exit_code: None,
                 });
             }
         };
@@ -526,6 +520,7 @@ impl AnthropicEnvironmentType {
             return Err(RunScriptError {
                 output: tail_to_string(&output),
                 error: AnthropicError::formatted_with_source(message, error),
+                exit_code: Some(result.exit_code),
             });
         }
 
@@ -900,7 +895,7 @@ impl AnthropicEnvironmentType {
         tokio::spawn(async move {
             let error = match child.wait().await {
                 Ok(status) if status.success() => None,
-                Ok(status) => Some(go_exit_status(status)),
+                Ok(status) => Some(status.to_string()),
                 Err(error) => Some(error.to_string()),
             };
             if let Some(error) = error {
@@ -994,19 +989,6 @@ fn should_log_install_output_line(line: &str, language: &Language) -> bool {
     .any(|needle| line.contains(needle))
 }
 
-/// 从错误开头解析 Go `exit status N`；不匹配时返回 1。
-pub(super) fn extract_exit_code<E>(error: &E) -> i32
-where
-    E: std::error::Error + ?Sized,
-{
-    error
-        .to_string()
-        .strip_prefix("exit status ")
-        .and_then(|rest| rest.split_whitespace().next())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(1)
-}
-
 /// 在共享缓冲中追加新块并仅保留最后 4096 字节。
 fn append_tail(output: &Mutex<Vec<u8>>, data: &[u8]) {
     let mut output = output
@@ -1059,92 +1041,23 @@ async fn run_command_combined(
     program: &str,
     arguments: &[&str],
 ) -> (Vec<u8>, Result<(), AnthropicError>) {
-    if cancellation.is_cancelled() {
-        return (Vec::new(), Err(AnthropicError::message("context canceled")));
-    }
     let mut command = Command::new(program);
-    command
-        .args(arguments)
-        .current_dir(directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    command.args(arguments).current_dir(directory);
+    match run_command(command, cancellation, None, None, CaptureMode::Combined).await {
+        Ok(output) => {
+            let status = output.status;
+            let output = output.output.expect_combined();
+            if status.success() {
+                (output, Ok(()))
+            } else {
+                (output, Err(AnthropicError::message(status.to_string())))
+            }
+        }
         Err(error) => {
             let message = error.to_string();
-            return (
-                Vec::new(),
-                Err(AnthropicError::formatted_with_source(message, error)),
-            );
+            let output = error.output.expect_combined();
+            (output, Err(AnthropicError::message(message)))
         }
-    };
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let stdout = child.stdout.take().expect("stdout configured as piped");
-    let stderr = child.stderr.take().expect("stderr configured as piped");
-    let stdout_task = tokio::spawn(append_pipe(stdout, Arc::clone(&output)));
-    let stderr_task = tokio::spawn(append_pipe(stderr, Arc::clone(&output)));
-
-    let wait_result = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            // Go `exec.CommandContext` 不为 kill 失败额外写日志；最终 `Wait` 结果才是
-            // 调用方可见的错误边界，因此这里同样只做 best-effort 终止。
-            let _ = child.start_kill();
-            child.wait().await
-        }
-        result = child.wait() => result,
-    };
-    for task in [stdout_task, stderr_task] {
-        // Go `CombinedOutput` 没有独立的 pipe-task 日志；join 故障不能凭空增加一条
-        // 生产日志。这里等待释放缓冲引用，错误仍由命令结果边界决定。
-        let _ = task.await;
-    }
-    let output = Arc::try_unwrap(output)
-        .unwrap_or_else(|_| unreachable!("pipe tasks have released output"))
-        .into_inner()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let result = match wait_result {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(AnthropicError::message(go_exit_status(status))),
-        Err(error) => {
-            let message = error.to_string();
-            Err(AnthropicError::formatted_with_source(message, error))
-        }
-    };
-    (output, result)
-}
-
-/// 持续读取单条 pipe，并按 reader 获锁顺序追加到共享 CombinedOutput。
-async fn append_pipe<R>(mut pipe: R, output: Arc<Mutex<Vec<u8>>>)
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buffer = vec![0_u8; 32 * 1024];
-    loop {
-        match pipe.read(&mut buffer).await {
-            Ok(0) => return,
-            Ok(read) => output
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .extend_from_slice(&buffer[..read]),
-            // Go `CombinedOutput` 不单独输出读取错误日志；当前 helper 的返回类型也
-            // 没有 pipe error 通道，因此静默结束 reader，避免产生额外外部行为。
-            Err(_) => return,
-        }
-    }
-}
-
-/// 把 Unix ExitStatus 转成 Go `exec.ExitError.Error` 的稳定文本。
-fn go_exit_status(status: ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit status {code}");
-    }
-    match status.signal() {
-        Some(libc::SIGKILL) => "signal: killed".to_owned(),
-        Some(libc::SIGTERM) => "signal: terminated".to_owned(),
-        Some(signal) => format!("signal: {signal}"),
-        None => "exit status -1".to_owned(),
     }
 }
 

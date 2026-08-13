@@ -1,8 +1,7 @@
 //! `claude --init-only` session-start hook 执行。
 //!
 //! 子进程继承过滤后的宿主环境，再应用 Claude config 环境覆盖。stdout/stderr 指向
-//! 同一匿名 pipe 以复刻 `CombinedOutput`；取消只终止 direct child，失败文案保留
-//! Go 的退出码和底层 wait/start 错误。
+//! 同一匿名 pipe 以保留交错顺序；取消只终止并回收 direct child。
 
 use std::{ffi::OsString, path::Path, time::Instant};
 
@@ -55,29 +54,32 @@ pub async fn run_init_with_observability(
     .await;
     let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
 
-    match result {
-        Ok(_) => {
+    let (exit_code, error, output) = match result {
+        Ok(output) if output.status.success() => {
             tracing::info!("duration_ms" = ?(duration_ms), "{}", "claude --init-only completed successfully");
             if let Some(observability) = observability {
                 observability.log_claude_init(true, None, duration_ms);
             }
-            Ok(())
+            return Ok(());
         }
+        Ok(output) => (
+            output.status.code().unwrap_or(-1),
+            output.status.to_string().into_bytes(),
+            output.output.expect_combined(),
+        ),
         Err(error) => {
-            let error_view = go_utf8_error_view(&error.error);
-            tracing::error!("error" = ?(&error_view), "exit_code" = ?(error.exit_code), "duration_ms" = ?(duration_ms), "output" = ?(String::from_utf8_lossy(&error.output)), "{}", "claude --init-only failed");
-            if let Some(observability) = observability {
-                observability.log_claude_init(false, Some(error.exit_code), duration_ms);
-            }
-            let mut message = format!(
-                "claude --init-only failed with exit code {}: ",
-                error.exit_code
-            )
-            .into_bytes();
-            // spawn PathError 可能包含非 UTF-8 executable path；外部错误沿用 Go
-            // string 任意字节语义，仅日志属性使用上面的 UTF-8 替换视图。
-            message.extend_from_slice(&error.error);
-            Err(ClaudeError::message_bytes(message))
+            let message = error.to_string().into_bytes();
+            (-1, message, error.output.expect_combined())
         }
+    };
+    let error_view = go_utf8_error_view(&error);
+    tracing::error!("error" = ?(&error_view), exit_code, "duration_ms" = ?(duration_ms), "output" = ?(String::from_utf8_lossy(&output)), "{}", "claude --init-only failed");
+    if let Some(observability) = observability {
+        observability.log_claude_init(false, Some(exit_code), duration_ms);
     }
+    let mut message =
+        format!("claude --init-only failed with exit code {exit_code}: ").into_bytes();
+    // 错误以字节形式保存，仅日志属性使用上方的 UTF-8 替换视图。
+    message.extend_from_slice(&error);
+    Err(ClaudeError::message_bytes(message))
 }

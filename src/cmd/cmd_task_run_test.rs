@@ -494,19 +494,19 @@ async fn test_run_task_run_manager_wraps_failure() {
     assert_eq!(error.as_bytes(), b"environment manager failed: boom");
 }
 
-/// 对应 Go `TestRunTaskRunManagerTreatsContextCanceledAsSuccess`，取消属于正常关闭。
+/// 验证普通错误文本不会被误判为结构化取消。
 #[tokio::test]
-async fn test_run_task_run_manager_treats_context_canceled_as_success() {
+async fn test_run_task_run_manager_does_not_parse_cancellation_text() {
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::test_run_task_run_manager_treats_context_canceled_as_success"
+        "::test_run_task_run_manager_does_not_parse_cancellation_text"
     )) {
         return;
     }
     let mut manager = FakeTaskRunManager {
         result: Some(Err(ManagerError::message("context canceled"))),
     };
-    run_task_run_manager(
+    let error = run_task_run_manager(
         &CancellationToken::new(),
         &mut manager,
         config::SessionMode::New,
@@ -514,7 +514,11 @@ async fn test_run_task_run_manager_treats_context_canceled_as_success() {
         &TaskRunObservability::default(),
     )
     .await
-    .expect("context cancellation must be successful shutdown");
+    .expect_err("an uncancelled error must propagate");
+    assert_eq!(
+        error.as_bytes(),
+        b"environment manager failed: context canceled"
+    );
 }
 
 /// 验证 manager 原始错误经过 task-run `%w` 包装后仍逐字节一致。

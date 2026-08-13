@@ -626,12 +626,12 @@ async fn test_run_returns_environment_initialization_error_before_creating_execu
     assert!(!executor.execute_called.load(Ordering::SeqCst));
 }
 
-/// 验证 executor 返回 context canceled 被解释为正常 shutdown。
+/// 验证 executor 的普通错误文本不会被误判为结构化取消。
 #[tokio::test]
-async fn test_run_treats_canceled_execution_as_clean_shutdown() {
+async fn test_run_does_not_parse_cancellation_text() {
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::test_run_treats_canceled_execution_as_clean_shutdown"
+        "::test_run_does_not_parse_cancellation_text"
     )) {
         return;
     }
@@ -646,10 +646,11 @@ async fn test_run_treats_canceled_execution_as_clean_shutdown() {
         Some("context canceled"),
     );
 
-    manager
+    let error = manager
         .run(&CancellationToken::new())
         .await
-        .expect("canceled execution is clean");
+        .expect_err("uncancelled executor error must propagate");
+    assert_eq!(error.to_string(), "execution failed: context canceled");
 
     assert!(executor.execute_called.load(Ordering::SeqCst));
     assert!(executor.destroy_called.load(Ordering::SeqCst));

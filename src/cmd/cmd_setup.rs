@@ -14,6 +14,7 @@ use super::error::CliError;
 use super::utils::{LogLevel, bool_value, flag_arg, parse_log_level, tracing_level};
 use crate::internal::claude::install_or_update_claude_code;
 use crate::internal::orchestrator::new_whoami_client;
+use crate::internal::process::{CaptureMode, run_command};
 use crate::internal::sandbox::install_sandbox_runtime as install_sandbox_runtime_package;
 use crate::internal::session::NoopActivityRecorder;
 
@@ -213,31 +214,20 @@ async fn run_preflight_checks(cancellation: &CancellationToken) -> Result<(), St
     Ok(())
 }
 
-/// 对应 Go：`cmd/cmd_setup.go` 中的 `checkNpmAvailable`。
-///
 /// 通过 `PATH` 启动 `npm --version`，只在退出成功时视为可用。为兼容 Go，错误包含
 /// 多行安装提示；取消只终止 npm 这个直接子进程，不操作进程组。
 pub(super) async fn check_npm_available(cancellation: &CancellationToken) -> Result<(), String> {
     tracing::debug!("{}", "Checking npm availability");
     let mut command = TokioCommand::new("npm");
-    command.arg("--version").kill_on_drop(true);
-    let output = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            return Err(npm_preflight_error("signal: killed"));
-        }
-        result = command.output() => result.map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                npm_preflight_error("exec: \"npm\": executable file not found in $PATH")
-            } else {
-                npm_preflight_error(&error.to_string())
-            }
-        })?,
-    };
+    command.arg("--version");
+    let output = run_command(command, cancellation, None, None, CaptureMode::Separate)
+        .await
+        .map_err(|error| npm_preflight_error(&error.to_string()))?;
     if !output.status.success() {
-        return Err(npm_preflight_error(&exit_status_text(output.status)));
+        return Err(npm_preflight_error(&output.status.to_string()));
     }
-    tracing::debug!("version" = ?(String::from_utf8_lossy(&output.stdout)), "{}", "npm is available");
+    let (stdout, _) = output.output.expect_separate();
+    tracing::debug!("version" = ?(String::from_utf8_lossy(&stdout)), "{}", "npm is available");
     Ok(())
 }
 
@@ -246,16 +236,6 @@ fn npm_preflight_error(error: &str) -> String {
     format!(
         "pre-flight check failed: npm not found in PATH\n\nnpm is required to install Claude Code and sandbox-runtime.\nPlease install Node.js (which includes npm) before running setup.\n\nError: {error}"
     )
-}
-
-/// 把 Tokio 子进程退出状态转换为 Go `exec.ExitError.Error` 的常见 Linux 文本。
-fn exit_status_text(status: std::process::ExitStatus) -> String {
-    use std::os::unix::process::ExitStatusExt as _;
-    match (status.code(), status.signal()) {
-        (Some(code), _) => format!("exit status {code}"),
-        (_, Some(signal)) => format!("signal: {signal}"),
-        _ => status.to_string(),
-    }
 }
 
 /// 对应 Go：`cmd/cmd_setup.go` 中的 `installClaudeCode`。

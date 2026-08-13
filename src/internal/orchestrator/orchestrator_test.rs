@@ -53,7 +53,7 @@ async fn test_hook_execute_noop_success_and_failure() {
     .await
     .unwrap_err();
     assert!(error.to_string().contains("hook fail failed"));
-    assert!(error.to_string().contains("exit status 9"));
+    assert!(error.to_string().contains("exit status: 9"));
     assert!(error.to_string().contains("boom"));
 }
 
@@ -130,7 +130,7 @@ async fn hook_timeout_kills_child() {
     .execute(&CancellationToken::new())
     .await
     .unwrap_err();
-    assert!(error.to_string().contains("context deadline exceeded"));
+    assert!(error.to_string().contains("command timed out"));
     assert!(started.elapsed() < Duration::from_secs(2));
 }
 

@@ -632,7 +632,6 @@ dependencies = [
  "rand 0.9.5",
  "reqwest",
  "rmcp",
- "rustix",
  "secrecy",
  "serde",
  "serde_json",

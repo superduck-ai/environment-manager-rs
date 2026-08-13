@@ -110,7 +110,7 @@ impl Error for CliError {}
 /// 业务子命令返回给二进制入口的原始错误字节。
 ///
 /// 大多数命令错误是 UTF-8 `String`；`task-run` 的 Claude/npm 子进程错误却可能包含
-/// 任意 `CombinedOutput` 字节。统一类型让 task-run 可以无损传递这些字节，同时仍为
+/// 任意子进程输出字节。统一类型让 task-run 可以无损传递这些字节，同时仍为
 /// 日志和测试提供不会 panic 的 [`Display`] 视图。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {

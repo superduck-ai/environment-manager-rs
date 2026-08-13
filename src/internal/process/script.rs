@@ -7,7 +7,6 @@ use std::{
     fs::File,
     io::{self, Write},
     os::fd::{IntoRawFd, RawFd},
-    os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -21,10 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::internal::util::OutputStreamer;
 
-use super::{
-    ProcessError, ProcessResult, execute,
-    types::{go_errno_text, go_utf8_error_view},
-};
+use super::{ProcessError, ProcessResult, execute};
 
 /// 临时脚本准备或执行错误。
 #[derive(Debug, Error)]
@@ -71,9 +67,7 @@ impl Drop for TemporaryScript {
         // 必须先释放写句柄再 remove，复刻 Go 各个 early-return 分支的顺序。
         drop(self.file.take());
         if let Err(error) = std::fs::remove_file(&self.path) {
-            let path_text = go_utf8_error_view(self.path.as_os_str().as_bytes());
-            let removal_error = format!("remove {}: {}", path_text, go_errno_text(&error));
-            tracing::warn!("path" = ?(path_text), "error" = ?(removal_error), "{}", "Failed to remove temp script file");
+            tracing::warn!(path = %self.path.display(), %error, "Failed to remove temp script file");
         }
     }
 }
@@ -185,8 +179,10 @@ fn close_temporary_script_file(file: File, path: &Path) -> io::Result<()> {
 fn close_raw_temporary_script_file(raw_fd: RawFd, path: &Path) -> io::Result<()> {
     close(raw_fd).map_err(|error| {
         let error = io::Error::from(error);
-        let path = go_utf8_error_view(path.as_os_str().as_bytes());
-        io::Error::other(format!("close {}: {}", path, go_errno_text(&error)))
+        io::Error::new(
+            error.kind(),
+            format!("failed to close {}: {error}", path.display()),
+        )
     })
 }
 

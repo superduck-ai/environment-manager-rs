@@ -10,6 +10,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::internal::process::{CommandFailure, CommandOutput};
+
 /// 与 Go `json.RawMessage` 对应的原始 JSON 字节。
 pub type RawMessage = Vec<u8>;
 
@@ -35,35 +37,8 @@ impl OrchestratorError {
 /// orchestrator 公共结果别名。
 pub type OrchestratorResult<T> = Result<T, OrchestratorError>;
 
-/// Hook 子进程一次执行的完整结果。
-///
-/// `error` 为 `None` 表示退出码为 0；否则包含 Go `exec.ExitError` 风格的文本。
-/// stdout/stderr 分开保存，普通 Hook 会把两者合并进错误输出，PollHook 则只在
-/// 失败文案中暴露 stderr。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CommandOutcome {
-    /// 标准输出。
-    pub stdout: Vec<u8>,
-    /// 标准错误输出。
-    pub stderr: Vec<u8>,
-    /// 从 spawn 前到 wait 完成的单调耗时。
-    pub duration: Duration,
-    /// 启动、等待、取消、超时或非零退出错误。
-    pub error: Option<String>,
-}
-
-impl CommandOutcome {
-    /// 返回与 `CombinedOutput` 等价的诊断字节。
-    ///
-    /// Tokio 分别持有两个 pipe，无法承诺跨 pipe 的字节级时序；因此成功/失败诊断
-    /// 稳定地按 stdout、stderr 拼接。单个流内部顺序保持不变。
-    pub fn combined_output(&self) -> Vec<u8> {
-        let mut output = Vec::with_capacity(self.stdout.len() + self.stderr.len());
-        output.extend_from_slice(&self.stdout);
-        output.extend_from_slice(&self.stderr);
-        output
-    }
-}
+/// Hook 子进程的共享执行结果；非零退出仍是带 `ExitStatus` 的完成结果。
+pub type CommandOutcome = Result<CommandOutput, CommandFailure>;
 
 /// 尚未迁移的 sandbox 包与 Hook 之间的目录内适配请求。
 ///

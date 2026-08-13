@@ -9,21 +9,15 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nix::{fcntl::OFlag, unistd::pipe2};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
-
 use crate::internal::api::{HttpClient, LogCategory, LogLevel as ApiLogLevel};
 use crate::internal::auth::AuthContext;
 use crate::internal::config::{SessionMode, StartupContext};
@@ -31,9 +25,13 @@ use crate::internal::envtype::{
     EnvironmentType, LeaseManagerHandle, LeaseManagerProvider, Registration,
 };
 use crate::internal::podmonitor::{self, get_default_health_file_path};
-use crate::internal::process::{execute_script, go_spawn_error, resolve_go_command};
+use crate::internal::process::{
+    CaptureMode, CommandFailure, CommandOutput, execute_script, run_command,
+};
 use crate::internal::session::ActivityRecorder;
 use crate::internal::util::{BoxError, output_streamer};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use super::{
     ByocConfig, ByocEnvironmentType, ByocError, ContainProvideAuthTransport, LeaseManagerFactory,
@@ -615,13 +613,25 @@ impl ByocEnvironmentType {
         ];
         for (key, value) in configs {
             ensure_not_cancelled(cancellation)?;
-            match run_git_config(cancellation, key, value).await {
-                Ok(()) => {
-                    tracing::debug!(key = %key, value = %value, "Set git config")
+            let failure = match run_git_config(cancellation, key, value).await {
+                Ok(output) if output.status.success() => {
+                    tracing::debug!(key = %key, value = %value, "Set git config");
+                    None
                 }
-                Err(failure) => {
-                    tracing::warn!(key = %key, value = %value, error = %failure.error, output = %failure.output, "Failed to set git config")
+                Ok(output) => Some((
+                    output.status.to_string(),
+                    String::from_utf8_lossy(&output.output.expect_combined()).into_owned(),
+                )),
+                Err(error) => {
+                    let message = error.to_string();
+                    Some((
+                        message,
+                        String::from_utf8_lossy(&error.output.expect_combined()).into_owned(),
+                    ))
                 }
+            };
+            if let Some((error, output)) = failure {
+                tracing::warn!(key, value, error, output, "Failed to set git config")
             }
         }
 
@@ -651,13 +661,25 @@ impl ByocEnvironmentType {
         }
         ensure_not_cancelled(cancellation)?;
         let key_value = signing_key.to_string_lossy();
-        match run_git_config(cancellation, "user.signingkey", &key_value).await {
-            Ok(()) => {
-                tracing::debug!(path = %signing_key.display(), "Set git signing key")
+        let failure = match run_git_config(cancellation, "user.signingkey", &key_value).await {
+            Ok(output) if output.status.success() => {
+                tracing::debug!(path = %signing_key.display(), "Set git signing key");
+                None
             }
-            Err(failure) => {
-                tracing::warn!(error = %failure.error, output = %failure.output, "Failed to set git signing key config")
+            Ok(output) => Some((
+                output.status.to_string(),
+                String::from_utf8_lossy(&output.output.expect_combined()).into_owned(),
+            )),
+            Err(error) => {
+                let message = error.to_string();
+                Some((
+                    message,
+                    String::from_utf8_lossy(&error.output.expect_combined()).into_owned(),
+                ))
             }
+        };
+        if let Some((error, output)) = failure {
+            tracing::warn!(error, output, "Failed to set git signing key config")
         }
         ensure_not_cancelled(cancellation)?;
         tracing::info!("Git configuration setup completed");
@@ -846,122 +868,25 @@ async fn write_if_missing(
     Ok(true)
 }
 
-/// 单条 `git config` 失败时同时保留 Go `CombinedOutput` 和错误文本。
-struct GitConfigFailure {
-    /// 对应 `exec.Cmd.CombinedOutput` 返回的 error。
-    error: BoxError,
-    /// 命令已产生的 stdout/stderr；日志必须保留，包括尾随换行。
-    output: String,
-}
-
-/// 执行单条 `git config --global`，并按 Go `CombinedOutput` 顺序捕获输出。
+/// 执行单条 `git config --global`，并捕获 stdout/stderr 的真实交错顺序。
 ///
-/// stdout 与 stderr 共享同一个 `pipe2(O_CLOEXEC)` 写端，避免把两个独立缓冲区
+/// stdout 与 stderr 共享同一个 close-on-exec 管道写端，避免把两个独立缓冲区
 /// 人工拼接后改变交错顺序。取消发生在进程运行期间时只终止并回收直接 child；已经
 /// 写入 pipe 的内容仍排空后返回，供 warning 日志保留 Go 可观察到的部分输出。
 ///
 /// # 返回
 /// 退出成功时返回 `Ok(())`；启动、取消或非零退出时返回错误和已捕获输出，供调用方
-/// 按 Go 的属性顺序记录 `error` 与 `output`。
+/// 记录 `error` 与 `output`。
 async fn run_git_config(
     cancellation: &CancellationToken,
     key: &str,
     value: &str,
-) -> Result<(), GitConfigFailure> {
-    // Go 的 exec.CommandContext 在构造命令时先执行 LookPath；复用公共兼容层才能让
-    // “git 不存在”和不可执行路径的 error 属性保持 Go 文本，而不是 Rust io 文本。
-    let resolved_program =
-        resolve_go_command(OsStr::new("git")).map_err(|error| GitConfigFailure {
-            error: Box::new(error),
-            output: String::new(),
-        })?;
-    if cancellation.is_cancelled() {
-        return Err(GitConfigFailure {
-            error: Box::new(std::io::Error::other("context canceled")),
-            output: String::new(),
-        });
-    }
-
-    // Go 的 os.Pipe 在 Linux 上原子设置 CLOEXEC；若分两步设置，另一个并发 spawn
-    // 可能短暂继承写端，导致 git 已退出但 reader 仍无法观察到 EOF。
-    let (read_end, write_end) = pipe2(OFlag::O_CLOEXEC).map_err(|error| GitConfigFailure {
-        error: Box::new(error),
-        output: String::new(),
-    })?;
-    let stderr_end = write_end.try_clone().map_err(|error| GitConfigFailure {
-        error: Box::new(error),
-        output: String::new(),
-    })?;
-
-    let mut command = Command::new(&resolved_program);
+) -> Result<CommandOutput, CommandFailure> {
+    let mut command = Command::new("git");
     command
         .args(["config", "--global", key, value])
-        .current_dir("/")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(write_end))
-        .stderr(Stdio::from(stderr_end))
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|error| GitConfigFailure {
-        error: Box::new(go_spawn_error(&resolved_program, &error)),
-        output: String::new(),
-    })?;
-    drop(command);
-
-    // 必须在 wait 同时排空 pipe；若 git 写满内核缓冲区后阻塞，先 wait 再 read 会死锁。
-    let mut reader = tokio::fs::File::from_std(std::fs::File::from(read_end));
-    let reader_task = tokio::spawn(async move {
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output).await.map(|_| output)
-    });
-    let status = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => {
-            // Go CommandContext 默认也只 kill 直接子进程；这里不能扩大为进程组。
-            let _direct_child_kill = child.start_kill();
-            child.wait().await
-        }
-        result = child.wait() => result,
-    };
-    let output = match reader_task.await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            return Err(GitConfigFailure {
-                error: Box::new(error),
-                output: String::new(),
-            });
-        }
-        Err(error) => {
-            return Err(GitConfigFailure {
-                error: Box::new(error),
-                output: String::new(),
-            });
-        }
-    };
-    let output = String::from_utf8_lossy(&output).into_owned();
-    match status {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(GitConfigFailure {
-            error: Box::new(std::io::Error::other(go_exit_status(status))),
-            output,
-        }),
-        Err(error) => Err(GitConfigFailure {
-            error: Box::new(error),
-            output,
-        }),
-    }
-}
-
-/// 把 Linux 子进程状态格式化为 Go `exec.ExitError.Error` 文本。
-fn go_exit_status(status: ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit status {code}");
-    }
-    match status.signal() {
-        Some(libc::SIGKILL) => "signal: killed".to_owned(),
-        Some(libc::SIGTERM) => "signal: terminated".to_owned(),
-        Some(signal) => format!("signal: {signal}"),
-        None => "exit status 1".to_owned(),
-    }
+        .current_dir("/");
+    run_command(command, cancellation, None, None, CaptureMode::Combined).await
 }
 
 /// 在 blocking 池中按 Go `MkdirAll(path, mode)` 语义创建目录。
