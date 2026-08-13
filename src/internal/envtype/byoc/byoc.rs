@@ -1,9 +1,9 @@
 //! BYOC 环境的配置校验、初始化和外部适配逻辑。
 //!
-//! 对应 Go：`internal/envtype/byoc/byoc.go`。本模块负责按 Go 顺序完成工作目录、
+//! 本模块依次完成工作目录、
 //! Claude 设置、Git 全局配置、setup 脚本、缓存分支和 Git proxy 初始化。
 //! Rust 额外保留可注入的 processor/factory trait 以隔离测试；生产构造始终安装
-//! 真实适配器，不改变 Go 的日志、网络和子进程副作用边界。
+//! 真实适配器，不改变 日志、网络和子进程副作用边界。
 
 use std::collections::BTreeMap;
 use std::env;
@@ -39,7 +39,7 @@ use super::{
     SourceProcessorError, source_processor::ProductionSourceProcessor,
 };
 
-/// setup 脚本的最大 UTF-8 字节数，与 Go 的 1 MiB 上限一致。
+/// setup 脚本的最大 UTF-8 字节数，与 1 MiB 上限一致。
 pub const MAX_TASK_SETUP_SCRIPT_BYTES: usize = 1024 * 1024;
 
 /// BYOC 在环境类型注册表中的静态元数据。
@@ -56,13 +56,13 @@ pub static REGISTRATION: LazyLock<Registration> = LazyLock::new(|| Registration 
 
 /// 把 BYOC 创建参数接到真实 podmonitor 状态机的默认工厂。
 ///
-/// Go 版本在 `CreateLeaseManager` 中直接调用 `podmonitor.NewLeaseManager`。Rust 保留
+/// 在 `CreateLeaseManager` 中直接调用 `podmonitor.NewLeaseManager`。Rust 保留
 /// 可注入 factory 仅用于隔离测试，但生产默认值始终使用此适配器，避免调用方额外接线。
 #[derive(Debug, Default)]
 struct PodmonitorLeaseManagerFactory;
 
 impl LeaseManagerFactory for PodmonitorLeaseManagerFactory {
-    /// 对应 Go：`internal/envtype/byoc/byoc.go` 中 `CreateLeaseManager` 的构造尾段。
+    /// 构造尾段。
     ///
     /// 复用带认证 default headers 的 Reqwest client 创建真实租约管理器。
     ///
@@ -110,7 +110,7 @@ impl LeaseManagerHandle for podmonitor::LeaseManager {
             .map_err(|error| Box::new(error) as BoxError)
     }
 
-    /// 保留 Go `LeaseManager.Stop` 的等待语义，包括初始 heartbeat 未成功时持续等待。
+    /// 保留等待语义，包括初始 heartbeat 未成功时持续等待。
     async fn stop(&self) {
         podmonitor::LeaseManager::stop(self).await;
     }
@@ -121,7 +121,6 @@ impl LeaseManagerHandle for podmonitor::LeaseManager {
     }
 }
 
-/// 对应 Go：`internal/envtype/byoc/byoc.go` 中的 `New`。
 ///
 /// 从原始 JSON 创建 BYOC 环境，并在产生任何副作用前完成配置校验。
 ///
@@ -134,7 +133,7 @@ impl LeaseManagerHandle for podmonitor::LeaseManager {
 ///
 /// # 返回
 /// 配置合法时返回已接好生产 adapter 的环境；JSON、类型、CWD 或脚本大小不合法时
-/// 返回与 Go 文本一致的 `ByocError`。本函数不访问文件、网络或子进程。
+/// 返回与 文本一致的 `ByocError`。本函数不访问文件、网络或子进程。
 pub fn new(data: &[u8]) -> Result<ByocEnvironmentType, ByocError> {
     let config: ByocConfig = serde_json::from_slice(data)?;
     if config.environment_type != "byoc" {
@@ -156,16 +155,16 @@ pub fn new(data: &[u8]) -> Result<ByocEnvironmentType, ByocError> {
         session_mode: SessionMode::New,
         startup_context: None,
         auth_context: None,
-        // Go 构造后的 BYOC 会直接调用 internal/sources；Rust 默认接入同一生产实现，
+        // 构造后的 BYOC 会直接调用 internal/sources；Rust 默认接入同一生产实现，
         // 同时保留 setter，供测试替换 Git/网络副作用。
         source_processor: Arc::new(ProductionSourceProcessor),
-        // 生产构造后立即具备与 Go 相同的真实 podmonitor 能力；测试仍可通过 setter
+        // 生产构造后立即具备真实 podmonitor 能力；测试仍可通过 setter
         // 覆盖为捕获工厂，但不会出现生产路径忘记注入而 fail closed 的新行为。
         lease_manager_factory: Some(Arc::new(PodmonitorLeaseManagerFactory)),
     })
 }
 
-/// 按 Unix filepath.Clean 语义构造词法归一化路径并与原字节比较。
+/// 按 Unix 词法路径归一化 语义构造词法归一化路径并与原字节比较。
 fn validate_cwd(cwd: &str) -> Result<(), ByocError> {
     if cwd.is_empty() {
         return Ok(());
@@ -332,15 +331,14 @@ impl ByocEnvironmentType {
                 }
             }
         }
-        // Go 把 proxy 阶段（包括其中观察到的取消）视为 best effort，之后直接成功返回。
+        // 把 proxy 阶段（包括其中观察到的取消）视为 best effort，之后直接成功返回。
         tracing::info!("BYOC environment initialization completed");
         Ok(())
     }
 
     /// 从 Git outcomes 提取仓库到单一 branch 的映射。
     ///
-    /// 非 Git outcome 和空 branches 被忽略；同一 repo 重复出现时保留最后一条，
-    /// 与 Go map 赋值一致。
+    /// 非 Git outcome 和空 branches 被忽略；同一 repo 重复出现时保留最后一条。
     pub fn extract_repo_branch_mapping(
         &self,
         cancellation: &CancellationToken,
@@ -454,7 +452,7 @@ impl ByocEnvironmentType {
     /// 优先级从低到高为：BYOC 默认值、ambient
     /// `CLAUDE_CODE_EXIT_AFTER_STOP_DELAY`、startup entrypoint、最后是
     /// `config.environment`。StartupContext.environment_variables 属于上层子进程
-    /// 合并边界，Go BYOC 在此不合并，Rust 也保持该行为。
+    /// 合并边界，BYOC 在此不合并，Rust 也保持该行为。
     #[must_use]
     pub fn get_claude_environment_variables(&self) -> BTreeMap<String, String> {
         let entrypoint = self
@@ -531,7 +529,7 @@ impl ByocEnvironmentType {
 
     /// 在文件缺失时安全写入 Claude settings 和 stop hook。
     ///
-    /// Go 的 `statPath` 预检查已合并进 `create_new` 原子创建路径；已存在的文件永不
+    /// `statPath` 预检查已合并进 `create_new` 原子创建路径；已存在的文件永不
     /// 覆盖，也不会在检查与写入之间留下 TOCTOU 窗口。新文件使用 create-new 消除
     /// stat/write 竞争；
     /// stop hook 在完整写入并 sync 之后才设为 0755，避免执行半成品。
@@ -551,7 +549,7 @@ impl ByocEnvironmentType {
 
         let settings_path = claude_dir.join("settings.json");
         let stop_hook_path = claude_dir.join("stop-hook-git-check.sh");
-        // Go 先 stat 两个路径并记录所有“已存在”事件，然后才开始任何写入；混合
+        // 先 stat 两个路径并记录所有“已存在”事件，然后才开始任何写入；混合
         // 存在/缺失场景的日志顺序可被外部观察，因此不能简化成逐个检查后写入。
         let settings_exists = tokio::fs::metadata(&settings_path).await.is_ok();
         if settings_exists {
@@ -591,8 +589,7 @@ impl ByocEnvironmentType {
 
     /// 顺序写入 Git 全局配置和签名公钥占位文件。
     ///
-    /// `SKIP_GIT_CONFIG=true` 在首个副作用前直接返回。其他 Git 命令失败与 Go
-    /// 一样只警告并继续；取消则终止当前 child 并阻止后续命令/文件。
+    /// `SKIP_GIT_CONFIG=true` 在首个副作用前直接返回。其他 Git 命令失败只警告并继续；取消则终止当前 child 并阻止后续命令/文件。
     /// 已成功的 `git config` 是持久化副作用，不在中途失败或取消时回滚。
     pub async fn setup_git_config(
         &self,
@@ -686,7 +683,7 @@ impl ByocEnvironmentType {
         Ok(())
     }
 
-    /// 在 sources 处理完成后执行 Go 中的 best-effort Git proxy 阶段。
+    /// 在 sources 处理完成后执行 中的 best-effort Git proxy 阶段。
     async fn setup_git_proxy_after_sources_processed(
         &self,
         cancellation: &CancellationToken,
@@ -872,7 +869,7 @@ async fn write_if_missing(
 ///
 /// stdout 与 stderr 共享同一个 close-on-exec 管道写端，避免把两个独立缓冲区
 /// 人工拼接后改变交错顺序。取消发生在进程运行期间时只终止并回收直接 child；已经
-/// 写入 pipe 的内容仍排空后返回，供 warning 日志保留 Go 可观察到的部分输出。
+/// 写入 pipe 的内容仍排空后返回，供 warning 日志保留 可观察到的部分输出。
 ///
 /// # 返回
 /// 退出成功时返回 `Ok(())`；启动、取消或非零退出时返回错误和已捕获输出，供调用方
@@ -889,7 +886,7 @@ async fn run_git_config(
     run_command(command, cancellation, None, None, CaptureMode::Combined).await
 }
 
-/// 在 blocking 池中按 Go `MkdirAll(path, mode)` 语义创建目录。
+/// 在 blocking 池中按 递归建目录 语义创建目录。
 ///
 /// mode 只影响新建目录并仍受 umask 限制；已存在的目录不会被 chmod。
 async fn create_dir_all_with_mode(path: PathBuf, mode: u32) -> std::io::Result<()> {

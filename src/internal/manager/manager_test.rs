@@ -180,7 +180,7 @@ struct FakeExecutor {
 }
 
 impl FakeExecutor {
-    /// 创建可注入任意错误字节的 fake executor，用于验证 Go error 非 UTF-8 语义。
+    /// 创建可注入任意错误字节的 fake executor，用于验证 稳定错误 非 UTF-8 语义。
     fn new_bytes(execution_error: Option<&[u8]>) -> Self {
         Self {
             execute_called: AtomicBool::new(false),
@@ -383,7 +383,7 @@ fn fake_environment(initialization_error: Option<&str>) -> FakeEnvironment {
     }
 }
 
-/// 对应 Go：`newEnvTypesForTest`；创建只注册一个 fake type 的 EnvTypes。
+/// 创建只注册一个 fake type 的 EnvTypes。
 fn new_env_types_for_test(type_name: &str, environment: FakeEnvironment) -> Arc<EnvTypes> {
     let mut env_types = new_env_types();
     let factory_environment = environment;
@@ -398,14 +398,14 @@ fn new_env_types_for_test(type_name: &str, environment: FakeEnvironment) -> Arc<
     Arc::new(env_types)
 }
 
-/// 对应 Go：`newTestAuthContext`；创建带 session token 的测试认证上下文。
+/// 创建带 session token 的测试认证上下文。
 fn new_test_auth_context() -> AuthContext {
     let mut context = AuthContext::default();
     context.set_session_ingress_token("session-token");
     context
 }
 
-/// 对应 Go：`newManagerForTest`；创建标准 manager、executor 和 factory 调用记录。
+/// 创建标准 manager、executor 和 factory 调用记录。
 fn new_manager_for_test(
     environment_type: &str,
     environment: FakeEnvironment,
@@ -656,7 +656,7 @@ async fn test_run_does_not_parse_cancellation_text() {
     assert!(executor.destroy_called.load(Ordering::SeqCst));
 }
 
-/// 验证 Claude 任意错误字节经过 manager 的 `execution failed: %w` 包装仍保持原值。
+/// 验证 Claude 任意错误字节经过 manager 的 `execution failed: source chain` 包装仍保持原值。
 ///
 /// 日志需要合法 UTF-8，因此 `Display` 对 `ff fe` 分别产生 U+FFFD；最终 CLI 使用的
 /// `as_bytes` 则必须连同 NUL 一字不改地保留。
@@ -752,7 +752,7 @@ async fn test_run_skips_tunnel_when_disabled() {
     }
     let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
     let home = TempDir::new().expect("create HOME");
-    // 公共 fixture 把 `TUNNEL_ENABLED` 设为空串，精确对应 Go disabled 场景。
+    // 公共 fixture 把 `TUNNEL_ENABLED` 设为空串，精确对应 disabled 场景。
     let _environment_restore = configure_process_environment(&home);
     let (mut manager, executor, _) =
         new_manager_for_test("fake", fake_environment(None), SessionMode::New, true, None);
@@ -862,10 +862,10 @@ async fn run_discovers_environment_lease_and_uses_its_cancellation_token() {
 
 /// 验证 tunnel enable 只接受精确 true/1 且要求 factory 已注册。
 #[tokio::test]
-async fn tunnel_enablement_matches_go_values() {
+async fn tunnel_enablement_accepts_supported_values() {
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::tunnel_enablement_matches_go_values"
+        "::tunnel_enablement_accepts_supported_values"
     )) {
         return;
     }

@@ -1,7 +1,6 @@
 //! snapshot action 的目录边界、容量上限、symlink 和 Git 元数据测试。
 //!
-//! 对应 Go `internal/tunnel/actions/snapshot/action_test.go`。测试辅助函数保留与 Go
-//! 相同的职责和机械 snake_case 名称，便于符号映射逐项审计。
+//! 测试辅助函数按职责使用 snake_case 名称。
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -29,7 +28,7 @@ impl ProgressReporter for NoopProgress {
     }
 }
 
-/// 对应 Go `TestNewSnapshotActionDefaults`，锁定仅支持 Linux 的固定项目路径。
+/// 锁定仅支持 Linux 的固定项目路径。
 #[test]
 fn test_new_snapshot_action_defaults() {
     let action = new_snapshot_action();
@@ -45,7 +44,6 @@ fn test_new_snapshot_action_defaults() {
     assert_eq!(action.project_path, PathBuf::from("/home/claude/project"));
 }
 
-/// 对应 Go `TestSnapshotExecuteCollectsFilesAndGitMetadata`。
 #[tokio::test]
 async fn test_snapshot_execute_collects_files_and_git_metadata() {
     // Git 只读 PATH，但必须与并行测试的临时 PATH 写入串行，否则 fixture
@@ -82,7 +80,6 @@ async fn test_snapshot_execute_collects_files_and_git_metadata() {
     assert_eq!(response["app_modified"], true);
 }
 
-/// 对应 Go `TestSnapshotExecuteReturnsProjectResolveError`。
 #[tokio::test]
 async fn test_snapshot_execute_returns_project_resolve_error() {
     let temporary = tempfile::tempdir().unwrap();
@@ -104,7 +101,6 @@ async fn test_snapshot_execute_returns_project_resolve_error() {
     assert!(error.contains("failed to resolve project path"));
 }
 
-/// 对应 Go `TestReadDirRejectsDirectoryOutsideProject`。
 #[test]
 fn test_read_dir_rejects_directory_outside_project() {
     let project = tempfile::tempdir().unwrap();
@@ -124,7 +120,6 @@ fn test_read_dir_rejects_directory_outside_project() {
     assert!(!truncated);
 }
 
-/// 对应 Go `TestReadDirTruncatesWhenTotalCapAlreadyReached`。
 #[test]
 fn test_read_dir_truncates_when_total_cap_already_reached() {
     let project = tempfile::tempdir().unwrap();
@@ -143,7 +138,6 @@ fn test_read_dir_truncates_when_total_cap_already_reached() {
     assert!(truncated);
 }
 
-/// 对应 Go `TestReadFileSafeSkipsOversizedAndSymlinkFiles`。
 #[test]
 fn test_read_file_safe_skips_oversized_and_symlink_files() {
     use std::os::unix::fs::symlink;
@@ -170,7 +164,7 @@ fn test_read_file_safe_skips_oversized_and_symlink_files() {
     );
 }
 
-/// 对应 Go `executeSnapshot`，统一构造带超时语义的 action 调用。
+/// 统一构造带超时语义的 action 调用。
 async fn execute_snapshot(action: &SnapshotAction) -> ActionResult {
     let cancellation = CancellationToken::new();
     tokio::time::timeout(
@@ -189,7 +183,7 @@ async fn execute_snapshot(action: &SnapshotAction) -> ActionResult {
     .expect("snapshot execute")
 }
 
-/// 对应 Go `assertFileEntry`，验证响应数组中唯一文件的名称和文本内容。
+/// 验证响应数组中唯一文件的名称和文本内容。
 fn assert_file_entry(entries: &serde_json::Value, filename: &str, content: &str) {
     let entries = entries.as_array().expect("file entry array");
     assert_eq!(entries.len(), 1);
@@ -197,7 +191,7 @@ fn assert_file_entry(entries: &serde_json::Value, filename: &str, content: &str)
     assert_eq!(entries[0]["content"], content);
 }
 
-/// 对应 Go `newTestSnapshotAction`，把固定生产路径重定向至临时项目。
+/// 把固定生产路径重定向至临时项目。
 fn new_test_snapshot_action(project: &Path) -> SnapshotAction {
     SnapshotAction {
         drafts_path: project.join(".baku/drafts"),
@@ -206,13 +200,13 @@ fn new_test_snapshot_action(project: &Path) -> SnapshotAction {
     }
 }
 
-/// 对应 Go `requireGit`；权威 Linux 镜像必须提供用于兼容测试的外部 Git。
+/// 权威 Linux 镜像必须提供测试所需的外部 Git。
 fn require_git() {
     let status = Command::new("git").arg("--version").status().unwrap();
     assert!(status.success(), "git executable is required");
 }
 
-/// 对应 Go `runGit`，在指定临时仓库运行外部 Git 并验证退出状态。
+/// 在指定临时仓库运行外部 Git 并验证退出状态。
 fn run_git(directory: &Path, arguments: &[&str]) {
     let output = Command::new("git")
         .arg("-C")
@@ -227,12 +221,12 @@ fn run_git(directory: &Path, arguments: &[&str]) {
     );
 }
 
-/// 对应 Go `writeFile`，以 UTF-8 文本写入 fixture。
+/// 以 UTF-8 文本写入 fixture。
 fn write_file(path: impl AsRef<Path>, content: &str) {
     write_file_bytes(path, content.as_bytes());
 }
 
-/// 对应 Go `writeFileBytes`，创建父目录后写入任意字节 fixture。
+/// 创建父目录后写入任意字节 fixture。
 fn write_file_bytes(path: impl AsRef<Path>, content: &[u8]) {
     let path = path.as_ref();
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();

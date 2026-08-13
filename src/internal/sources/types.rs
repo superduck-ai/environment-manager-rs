@@ -1,6 +1,6 @@
 //! `internal/sources` 的共享类型与跨子系统适配边界。
 //!
-//! Go 版本依赖 interface、可空 interface 和具体 `gitproxy.Manager`。Rust
+//! 依赖 interface、可空 interface 和具体 `gitproxy.Manager`。Rust
 //! 版本分别使用 trait object、[`SourceSlot`] 与显式 proxy factory 表达这些语义；
 //! 生产 Git handler 默认接入真实 proxy，测试仍可覆盖或禁用 factory。
 
@@ -22,8 +22,8 @@ use crate::internal::{
 
 /// sources 子系统使用的稳定文本错误。
 ///
-/// 恢复出的 Go 调用方主要依赖 `%w` 拼接后的英文文本。这里把外部库错误在产生处
-/// 转成完整消息，避免公共 API 暴露 Tokio 或平台专属错误枚举。
+/// 调用方依赖错误链拼接后的英文文本。这里把外部库错误在产生处转成完整消息，避免
+/// 公共 API 暴露 Tokio 或平台专属错误枚举。
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct SourcesError {
@@ -31,7 +31,7 @@ pub struct SourcesError {
 }
 
 impl SourcesError {
-    /// 从已完成兼容包装的文本构造错误。
+    /// 从已经包含完整上下文的文本构造错误。
     #[must_use]
     pub fn message(message: impl Into<String>) -> Self {
         Self {
@@ -45,7 +45,7 @@ pub type SourcesResult<T> = Result<T, SourcesError>;
 
 /// source 处理模式的透明字符串类型。
 ///
-/// 不使用封闭 enum 是刻意的：Go 的 `ProcessMode` 是字符串别名，除 `fresh` 与
+/// 不使用封闭 enum 是刻意的：`ProcessMode` 是字符串别名，除 `fresh` 与
 /// `allow-prefetched` 外的任意值都会进入 resume 分支，Rust 必须保留这一零值语义。
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct ProcessMode(pub String);
@@ -59,20 +59,20 @@ impl ProcessMode {
 }
 
 impl From<&str> for ProcessMode {
-    /// 从借用字符串机械构造处理模式。
+    /// 从借用字符串构造处理模式。
     fn from(value: &str) -> Self {
         Self(value.to_owned())
     }
 }
 
 impl From<String> for ProcessMode {
-    /// 从拥有所有权的字符串机械构造处理模式。
+    /// 从拥有所有权的字符串构造处理模式。
     fn from(value: String) -> Self {
         Self(value)
     }
 }
 
-/// Go `config.Source` 在 sources 分派层所需的最小动态接口。
+/// sources 分派层所需的最小动态接口。
 ///
 /// 配置模块当前用封闭 enum 表示 wire source；这个窄 trait 仍允许测试和未来 source
 /// 类型参与 handler 分派，同时让 Git handler 能明确拒绝错误的具体类型。
@@ -112,12 +112,12 @@ impl SourceValue for GitRepositorySource {
     }
 }
 
-/// 把 Rust 切片元素映射为 Go 可空 `config.Source`。
+/// 把 Rust 切片元素映射为可空的配置 source。
 ///
-/// 普通配置切片直接实现该接口；测试可传 `Option<&T>` 精确覆盖 nil source 分支，
+/// 普通配置切片直接实现该接口；测试可传 `Option<&T>` 精确覆盖缺失 source 分支，
 /// 而无需在生产配置 enum 中制造非法 variant。
 pub trait SourceSlot: Sync {
-    /// 返回当前元素中的 source；`None` 对应 Go nil interface。
+    /// 返回当前元素中的 source；`None` 表示缺失的 trait object。
     fn source_value(&self) -> Option<&dyn SourceValue>;
 }
 
@@ -149,7 +149,7 @@ impl<T> SourceSlot for Option<&T>
 where
     T: SourceValue,
 {
-    /// 保留借用 source 的空值，主要用于兼容性测试和动态组装。
+    /// 保留借用 source 的空值，主要用于边界测试和动态组装。
     fn source_value(&self) -> Option<&dyn SourceValue> {
         self.map(|source| source as &dyn SourceValue)
     }
@@ -158,7 +158,7 @@ where
 /// 可跨异步边界共享的 source 认证提供方。
 pub type SharedAuthProvider = Arc<dyn SourceAuthProvider + Send + Sync>;
 
-/// Go `SourceHandler` 的异步 Rust 对应接口。
+/// 异步 source 处理接口。
 #[async_trait]
 pub trait SourceHandler: Send + Sync {
     /// 判断 handler 是否处理给定 source 标签。
@@ -171,7 +171,7 @@ pub trait SourceHandler: Send + Sync {
         source: &dyn SourceValue,
     ) -> SourcesResult<()>;
 
-    /// 暴露可选的 Git remote 更新能力，等价于 Go 的运行时 interface assertion。
+    /// 暴露可选的 Git remote 更新能力。
     fn as_git_remote_updater(&self) -> Option<&dyn GitRemoteUpdater> {
         None
     }
@@ -185,7 +185,7 @@ pub trait SourceHandler: Send + Sync {
     }
 }
 
-/// 只包含 Go `gitRemoteUpdater` 所需方法的窄接口。
+/// 只包含 Git remote 更新所需方法的窄接口。
 #[async_trait]
 pub trait GitRemoteUpdater: Send + Sync {
     /// 若 source 配置了自定义 URL，则更新已存在 clone 的 origin。
@@ -232,7 +232,7 @@ pub struct GitProxyConfig {
     pub token_backend: String,
 }
 
-/// 尚未迁移的 `gitproxy.Manager` 的显式异步适配接口。
+/// 跨模块的 `gitproxy.Manager` 的显式异步适配接口。
 #[async_trait]
 pub trait GitProxyManager: Send + Sync {
     /// 启动本地 proxy 并返回 base URL；重复启动语义由实现保持。

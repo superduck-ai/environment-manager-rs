@@ -1,9 +1,8 @@
 //! Git smart-HTTP 请求解析、认证改写与 session ingress 转发。
 //!
-//! 本文件机械对应 Go `handler.go`。客户端只把 `Authorization` 当作完成 Git Basic
-//! challenge 的信号；真正发往上游的凭据始终由仓库表重写。成功响应保持流式传输，
-//! 上游错误响应则先完整读取并脱敏。HTTP 客户端禁止跟随重定向，对应恢复出的
-//! `CheckRedirect = http.ErrUseLastResponse`，从根源上避免 Basic token 跨 host 泄漏。
+//! 客户端只把 `Authorization` 当作完成 Git Basic challenge 的信号；真正发往上游的
+//! 凭据始终由仓库表重写。成功响应保持流式传输，上游错误响应则先完整读取并脱敏。
+//! HTTP 客户端禁止跟随重定向，从根源上避免 Basic token 跨 host 泄漏。
 
 use std::{collections::HashMap, fmt, io, sync::Arc};
 
@@ -24,9 +23,9 @@ const X_TOKEN_BACKEND: &str = "x-token-backend";
 const X_ENVIRONMENT_RUNNER_VERSION: &str = "x-environment-runner-version";
 const X_CLAUDE_CODE_VERSION: &str = "x-claude-code-version";
 
-/// `forwardRequest` 失败及 Go 已经写出的可选部分响应。
+/// `forwardRequest` 失败及 已经写出的可选部分响应。
 ///
-/// Go 在复制上游 header/status 后才读取错误响应体；此时读取失败仍会返回 error，
+/// 在复制上游 header/status 后才读取错误响应体；此时读取失败仍会返回 error，
 /// 但 ServeHTTP 已不能把状态改成 502。Rust 必须显式携带这份部分响应，才能同时
 /// 记录外层失败日志并保留上游状态。
 struct ForwardRequestFailure {
@@ -38,7 +37,7 @@ impl ForwardRequestFailure {
     /// 创建尚未向下游提交 header/status 的失败。
     ///
     /// # 参数
-    /// - `error`：已按 Go `%w` 文本完成包装的错误。
+    /// - `error`：已按 错误 source chain 文本完成包装的错误。
     fn before_response(error: GitProxyError) -> Self {
         Self {
             error,
@@ -77,7 +76,7 @@ pub(super) struct Handler {
 impl Handler {
     /// 创建 handler，并保留构造时生成的仓库 token 快照。
     ///
-    /// Go server 每次 `Start` 都从 `RepoAuths` 构造一张新 map；这里使用 `Arc` 让
+    /// server 每次 `Start` 都从 `RepoAuths` 构造一张新 map；这里使用 `Arc` 让
     /// Axum 为并发连接克隆 handler 时不复制敏感字符串，同时保持启动后的配置隔离。
     pub(super) fn new(
         config: Arc<Config>,
@@ -91,11 +90,11 @@ impl Handler {
         }
     }
 
-    /// 对应 Go `ServeHTTP`，解析 GitHub/GHE 两种本地路径并返回完整 HTTP 响应。
+    /// 解析 GitHub/GHE 两种本地路径并返回完整 HTTP 响应。
     ///
     /// `info/refs` 的首次无认证请求只返回 Basic challenge；其他路径即使没有认证头
-    /// 也沿用 Go 行为继续校验仓库表。进入 Reqwest 后，请求 future 被连接层丢弃会
-    /// 立即取消上游传输，对应 Go request context 的断连取消。
+    /// 也继续校验仓库表。进入 Reqwest 后，请求 future 被连接层丢弃会立即取消
+    /// 上游传输。
     pub(super) async fn serve_http(&self, request: Request<Body>) -> Response {
         let method = request.method().as_str().to_owned();
         let path = percent_decode_path(request.uri().path());
@@ -165,10 +164,10 @@ impl Handler {
         }
     }
 
-    /// 对应 Go `forwardRequest`，验证仓库与 Git 子路径后流式转发请求和响应。
+    /// 验证仓库与 Git 子路径后流式转发请求和响应。
     ///
     /// 入站 `Authorization`、`Host` 与 `X-Token-Backend` 永远丢弃，随后写入 server
-    /// 配置中的可信值。构造 URL 时逐段复刻 `url.PathEscape`，原始 query 则逐字追加；
+    /// 配置中的可信值。构造 URL 时逐段实现path-segment 百分号编码，原始 query 则逐字追加；
     /// 这样 Git 的 service 参数和 `%2F` 路径编码均不会被二次解释。
     async fn forward_request(
         &self,
@@ -242,7 +241,7 @@ impl Handler {
             );
         }
 
-        // Body 保持流式；不先聚合到内存，才能复刻 Go 直接把 `r.Body` 交给 Transport。
+        // Body 保持流式，不先聚合到内存，直接交给 HTTP transport。
         let upstream_request = self
             .http_client
             .request(parts.method, &upstream_url)
@@ -266,7 +265,7 @@ impl Handler {
         tracing::info!("repo" = ?(repo_key.clone()), "status" = ?(i64::from(status.as_u16())), "{}", "Received response from upstream");
 
         let response_body = if status >= StatusCode::BAD_REQUEST {
-            // Go 在写出上游 status/header 后才读取错误体；读取失败不能再改写成 502。
+            // 在写出上游 status/header 后才读取错误体；读取失败不能再改写成 502。
             match upstream_response.bytes().await {
                 Ok(bytes) => logged_sanitized_body(
                     sanitize_string(&String::from_utf8_lossy(&bytes)),
@@ -276,8 +275,8 @@ impl Handler {
                 Err(error) => {
                     let sanitized = sanitize_error(Some(&error));
                     tracing::error!(error = %sanitized, repo = %repo_key, "Error reading error response body");
-                    // Go 此时已经执行 `WriteHeader(resp.StatusCode)`。如果上游没有
-                    // Content-Type，外层 `http.Error` 的状态修改会被忽略，但错误文本
+                    // 此时已经执行 `WriteHeader(resp.StatusCode)`。如果上游没有
+                    // Content-Type，外层 HTTP 纯文本错误响应 的状态修改会被忽略，但错误文本
                     // 仍会追加到 body；已有 Content-Type 时外层不会再写任何内容。
                     let body = if response_headers
                         .get(CONTENT_TYPE)
@@ -309,16 +308,16 @@ impl Handler {
     }
 }
 
-/// 响应体复制路径，用于区分 Go 中两个独立的 `io.WriteString`/`io.Copy` 错误日志。
+/// 响应体复制路径，用于区分 中两个独立的 `io.WriteString`/`io.Copy` 错误日志。
 #[derive(Clone, Copy)]
 enum ResponseWriteMode {
     Sanitized,
     Streaming,
 }
 
-/// 在 Axum 异步发送响应体期间累计字节，并把完成/中断事件转换为 Go 日志。
+/// 在 Axum 异步发送响应体期间累计字节，并把完成/中断事件转换为 日志。
 ///
-/// Go 在 handler 内直接写 `ResponseWriter`，因此写入错误和完成字节数都在
+/// 在 handler 内直接写 `ResponseWriter`，因此写入错误和完成字节数都在
 /// `forwardRequest` 返回前可见；Axum 把真正的 socket 写入延后到返回 Response 后。
 /// guard 跟随 body stream 生命周期，从而在正常 EOF 或客户端提前断开时补回同一组
 /// 可观察日志。`completed` 防止显式错误之后的 Drop 再写一条重复事件。
@@ -356,7 +355,7 @@ impl ResponseWriteGuard {
         self.bytes_written = self.bytes_written.saturating_add(length);
     }
 
-    /// 对应 Go `forwardRequest` 末尾的 `Successfully proxied request`。
+    /// 在响应 body 到达 EOF 后记录 `Successfully proxied request`。
     ///
     /// # 副作用
     /// 在 body 到达 EOF 后记录仓库、HTTP 状态和实际传输字节数，并关闭 Drop 失败
@@ -366,10 +365,10 @@ impl ResponseWriteGuard {
         tracing::info!("repo" = ?(self.repo.clone()), "status" = ?(i64::from(self.status.as_u16())), "bytes_written" = ?(self.bytes_written), "{}", "Successfully proxied request");
     }
 
-    /// 对应 Go 的响应体写入失败分支，并按写入模式选择精确消息。
+    /// 记录响应体写入失败，并按写入模式选择精确消息。
     ///
     /// # 参数
-    /// - `error`：已经过 `sanitizeError` 等价处理的错误文本。
+    /// - `error`：已经脱敏的错误文本。
     ///
     /// # 副作用
     /// 记录 `error`、`repo` 两个有序属性；调用后 guard 不会在 Drop 时重复记录。
@@ -387,10 +386,10 @@ impl ResponseWriteGuard {
 }
 
 impl Drop for ResponseWriteGuard {
-    /// 把尚未到达 EOF 就被 Hyper 丢弃的 body 视为 Go `ResponseWriter` 的取消错误。
+    /// 把尚未到达 EOF 就被 Hyper 丢弃的 body 视为 response writer 的取消错误。
     ///
     /// 客户端断连时 Axum 不把 socket 错误传回 body stream；`context canceled` 是
-    /// Go request context 在同一时刻提供给传输链的稳定错误文本，且不包含凭据。
+    /// request context 在同一时刻提供给传输链的稳定错误文本，且不包含凭据。
     fn drop(&mut self) {
         if !self.completed {
             self.fail("context canceled".to_owned());
@@ -406,8 +405,7 @@ impl Drop for ResponseWriteGuard {
 /// - `status`：上游 HTTP 状态。
 ///
 /// # 返回
-/// 返回只产生一个数据块的 body；正常 EOF 记录成功字节数，提前丢弃记录 Go 的
-/// `Error writing sanitized response body` 分支。
+/// 返回只产生一个数据块的 body；正常 EOF 记录成功字节数，提前丢弃记录 `Error writing sanitized response body` 分支。
 fn logged_sanitized_body(body: String, repo: String, status: StatusCode) -> Body {
     let mut guard = ResponseWriteGuard::new(repo, status, ResponseWriteMode::Sanitized);
     if body.is_empty() {
@@ -440,8 +438,7 @@ fn logged_sanitized_body(body: String, repo: String, status: StatusCode) -> Body
 /// - `status`：上游 HTTP 状态。
 ///
 /// # 返回
-/// 返回保持 backpressure 的流式 body；上游读取错误原样传给 Hyper，并记录 Go 的
-/// `Error streaming response body`，正常 EOF 则记录成功事件。
+/// 返回保持 backpressure 的流式 body；上游读取错误原样传给 Hyper，并记录 `Error streaming response body`，正常 EOF 则记录成功事件。
 fn logged_streaming_body(response: reqwest::Response, repo: String, status: StatusCode) -> Body {
     let upstream = Box::pin(response.bytes_stream());
     let guard = ResponseWriteGuard::new(repo, status, ResponseWriteMode::Streaming);
@@ -465,10 +462,10 @@ fn logged_streaming_body(response: reqwest::Response, repo: String, status: Stat
     Body::from_stream(stream)
 }
 
-/// 创建与 Go `http.DefaultClient` 传输语义相近、但明确禁止自动重定向的客户端。
+/// 创建明确禁止自动重定向的 HTTP 客户端。
 ///
-/// 恢复出的闭包始终返回 `http.ErrUseLastResponse`。Reqwest 的 `Policy::none` 会把
-/// 原始 3xx 状态、header 与 body 返回给 Git 客户端，并确保 Basic token 不会被
+/// Reqwest 的 `Policy::none` 会把原始 3xx 状态、header 与 body 返回给 Git 客户端，
+/// 并确保 Basic token 不会被
 /// 重放到 Location 指向的其他 host。TLS 使用 Cargo 已启用的 rustls 栈。
 pub(super) fn new_http_client() -> GitProxyResult<reqwest::Client> {
     reqwest::Client::builder()
@@ -485,7 +482,7 @@ fn filtered_request_headers(mut headers: HeaderMap) -> HeaderMap {
     headers
 }
 
-/// 构造 Go `http.Error` 兼容响应，包括末尾换行与 nosniff header。
+/// 构造 HTTP 纯文本错误响应，包括末尾换行与 nosniff header。
 fn http_error(status: StatusCode, message: &str) -> Response {
     let mut response = Response::new(Body::from(format!("{message}\n")));
     *response.status_mut() = status;
@@ -500,9 +497,9 @@ fn http_error(status: StatusCode, message: &str) -> Response {
     response
 }
 
-/// 把 URI 原始 path 的 `%XX` 恢复为 Go `URL.Path` 使用的字节序列。
+/// 把 URI 原始 path 的 `%XX` 恢复为解码后的字节序列。
 ///
-/// Hyper 在 handler 中保留 escaped path，而 Go `net/http` 已经完成一次 PathUnescape。
+/// Hyper 在 handler 中保留 escaped path，而 HTTP/1 已经完成一次 PathUnescape。
 /// 这里的解码让 `%2e%2e` 等编码穿越仍会被后续 `is_valid_git_path` 拒绝。
 fn percent_decode_path(path: &str) -> String {
     let bytes = path.as_bytes();
@@ -534,15 +531,15 @@ const fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// 对可空错误执行与 Go `sanitizeError` 相同的文本脱敏。
+/// 对可空错误执行文本脱敏。
 pub(super) fn sanitize_error(error: Option<&dyn fmt::Display>) -> String {
     error.map_or_else(String::new, |error| sanitize_string(&error.to_string()))
 }
 
-/// 按 Go 中固定的正则顺序隐藏 Authorization、Anthropic key 与 token 参数。
+/// 按 中固定的正则顺序隐藏 Authorization、Anthropic key 与 token 参数。
 ///
 /// 顺序不可交换：`sk-ant-ccsr-*` 必须先于通用 `sk-ant-*`，完整 Authorization
-/// 形式也必须先于通用 Bearer/Basic。实现只识别 Go RE2 `\s` 的 ASCII 空白集合，
+/// 形式也必须先于通用 Bearer/Basic。实现只识别 RE2 `\s` 的 ASCII 空白集合，
 /// 并严格保留原始前缀、大小写和空白。
 pub(super) fn sanitize_string(value: &str) -> String {
     let mut result = value.to_owned();
@@ -559,7 +556,7 @@ pub(super) fn sanitize_string(value: &str) -> String {
     replace_token_assignment(&result)
 }
 
-/// 判断子路径是否属于恢复出的 Git smart-HTTP 白名单。
+/// 判断子路径是否属于 Git smart-HTTP 白名单。
 pub(super) fn is_valid_git_path(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('/')
@@ -704,7 +701,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
-/// 消费 Go regexp `\s` 对应的 ASCII 空白，并返回第一个非空白下标。
+/// 消费 ASCII 空白并返回第一个非空白下标。
 fn consume_whitespace(bytes: &[u8], mut index: usize) -> usize {
     while bytes
         .get(index)

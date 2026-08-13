@@ -1,4 +1,4 @@
-//! `internal/orchestrator` 的行为兼容与状态机测试。
+//! `internal/orchestrator` 的行为与状态机测试。
 
 use std::{
     collections::VecDeque,
@@ -302,7 +302,7 @@ async fn test_whoami_client_get_identity() {
     );
 }
 
-/// 验证 Whoami 构造器保留 Go 的原始尾随斜杠，因此请求路径可见双斜杠。
+/// 验证 Whoami 构造器保留 原始尾随斜杠，因此请求路径可见双斜杠。
 #[tokio::test]
 async fn whoami_preserves_trailing_base_url_slash() {
     let (base_url, request) = spawn_http_response(
@@ -357,7 +357,7 @@ async fn test_whoami_client_reports_status_parse_and_type_errors() {
             .contains("unexpected whoami response type")
     );
 
-    // Go 会把顶层 null 以及 string 字段的显式 null 都解码为结构体零值；两种输入
+    // 会把顶层 null 以及 string 字段的显式 null 都解码为结构体零值；两种输入
     // 都应进入 response type 校验，而不是提前暴露 serde 的类型错误。
     for body in [
         b"null".as_slice(),
@@ -484,7 +484,7 @@ fn write_orchestrator_script(temp: &TempDir, name: &str, body: &str) -> PathBuf 
     path
 }
 
-/// 对应 Go：`shellQuote`，按 POSIX shell 单引号规则转义任意参数。
+/// 按 POSIX shell 单引号规则转义任意参数。
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }

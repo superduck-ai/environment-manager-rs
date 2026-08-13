@@ -1,8 +1,7 @@
 //! V0 stdin 与 V1 work response 输入解析。
 //!
-//! 本模块机械对应 Go 的 `internal/input` 包。跨目录的 API/Claude 类型暂由本模块
-//! wire DTO 表达，并通过 `SessionContextProvider` 隔离网络获取，后续可无损接到
-//! Tokio/Reqwest API client，而不会让 JSON 解析层持有具体 HTTP 实现。
+//! API/Claude 数据由本模块的 wire DTO 表达，并通过 `SessionContextProvider` 隔离网络
+//! 获取，使 JSON 解析层不持有具体 HTTP 实现。
 
 pub mod secret;
 pub mod types;

@@ -1,7 +1,7 @@
 //! Anthropic 环境的初始化编排与外部副作用实现。
 //!
-//! 本文件机械对应 Go `anthropic.go`：sources 模式选择、Baku 模板、hook、
-//! 语言脚本、用户 init script、Git 命令顺序和非 fatal 边界均保持不变。
+//! 负责 sources 模式选择、Baku 模板、hook、语言脚本、用户 init script、Git 命令顺序
+//! 和非 fatal 边界。
 
 use std::{
     collections::BTreeMap,
@@ -46,7 +46,7 @@ const BAKU_PROJECT_DIR: &str = "/home/claude/project";
 /// 脚本日志和失败结果最多保留的尾部字节数。
 const OUTPUT_TAIL_BYTES: usize = 4096;
 
-/// 保存 init script 的长任务 stopper，并复刻 Go `defer stopper.Stop()` 的覆盖范围。
+/// 保存 init script 的长任务 stopper，并实现的覆盖范围。
 ///
 /// 正常初始化结束时 [`Self::stop`] 会异步等待后台 callback；若整个 initialize future
 /// 被 abort 或因 panic 展开，Rust `Drop` 不能等待，但仍会同步传播取消，避免周期记录器
@@ -70,7 +70,7 @@ impl InitActivityStopGuard {
         }
     }
 
-    /// 正常控制流完成时取消并等待在途 callback，保持 Go Stop 的完成边界。
+    /// 正常控制流完成时取消并等待在途 callback，保持 Stop 的完成边界。
     pub(super) async fn stop(mut self) {
         if let Some(stopper) = self.stopper.take() {
             stopper.stop().await;
@@ -98,7 +98,6 @@ pub static REGISTRATION: LazyLock<Registration> = LazyLock::new(|| Registration 
     description: "Anthropic environment with init scripts and environment variables".to_owned(),
 });
 
-/// 对应 Go：`internal/envtype/anthropic/anthropic.go` 中的 `New`。
 ///
 /// 从后端 JSON 创建 Anthropic 环境。
 ///
@@ -106,7 +105,7 @@ pub static REGISTRATION: LazyLock<Registration> = LazyLock::new(|| Registration 
 /// - `data`：Anthropic 环境原始 JSON；函数只在解码期间借用。
 ///
 /// # 返回
-/// 配置有效时返回环境；JSON 解码失败时返回带 Go 兼容文本的 `AnthropicError`。
+/// 配置有效时返回环境；JSON 解码失败时返回带稳定文本的 `AnthropicError`。
 pub fn new(data: &[u8]) -> Result<AnthropicEnvironmentType, AnthropicError> {
     Ok(AnthropicEnvironmentType {
         config: Some(decode_config(data)?),
@@ -173,7 +172,7 @@ impl AnthropicEnvironmentType {
 
     /// 返回配置的工作目录。
     ///
-    /// 与 Go 指针解引用一致，手工构造 nil config 后调用该 accessor 会 panic；正常工厂
+    /// 手工构造 `None` 配置后调用该 accessor 会 panic；正常工厂
     /// 和成功解码路径始终存在配置。
     #[must_use]
     pub fn get_cwd(&self) -> &str {
@@ -357,9 +356,8 @@ impl AnthropicEnvironmentType {
             }
         }
 
-        // Go 使用 defer，因此 stopper 必须存活到整个 Initialize 返回，而不只到脚本
-        // 结束。先在内部 future 中保留所有提前返回，再统一异步 Stop，才能同时复刻
-        // defer 的覆盖范围和 Stop 内部等待 invoker 完成的语义。
+        // stopper 必须存活到整个 initialize 返回，而不只到脚本结束。先在内部 future
+        // 中保留所有提前返回，再统一异步 stop，确保所有路径都等待 invoker 完成。
         let mut init_activity_guard = InitActivityStopGuard::empty();
         let initialization_result = async {
             if has_init_script {
@@ -413,7 +411,7 @@ impl AnthropicEnvironmentType {
     ///
     /// recorder 生命周期仅为本函数；`SourceHandlerManager<'_>` 和默认 Git handler
     /// 通过显式生命周期参数保留该借用，无法被返回或 spawn。源码处理错误 fatal，
-    /// Git proxy 设置错误只记录 warning，与 Go 初始化边界一致。
+    /// Git proxy 设置错误只记录 warning，与 初始化边界一致。
     async fn process_sources(
         &self,
         cancellation: &CancellationToken,
@@ -471,7 +469,7 @@ impl AnthropicEnvironmentType {
                 );
             }
         }
-        // 与 Go 局部 manager 的生命周期一致；类型系统同时保证 recorder wrapper
+        // 与 局部 manager 的生命周期一致；类型系统同时保证 recorder wrapper
         // 不可能越过当前 initialize 调用。
         drop(manager);
         Ok(())
@@ -564,7 +562,7 @@ impl AnthropicEnvironmentType {
                 ));
             } else {
                 // installLanguage 自身成功时还会记录同文案日志；此处保留
-                // installLanguages goroutine 完成点的独立 runtime source。
+                // installLanguages 后台任务 完成点的独立 runtime source。
                 tracing::info!(
                     language = %language.name,
                     version = %language.version,
@@ -686,7 +684,7 @@ impl AnthropicEnvironmentType {
             }
         }
         // 这是 installLanguage 内部的成功点，与并发调度层的同文案日志是
-        // 两个 Go callsite，不能合并到通用 wrapper caller。
+        // 两个 callsite，不能合并到通用 wrapper caller。
         tracing::info!(
             language = %language.name,
             version = %language.version,
@@ -720,7 +718,7 @@ impl AnthropicEnvironmentType {
 
     /// 在单个目录下创建 `.claude/settings.json` 与 stop hook。
     ///
-    /// 已存在文件保持原字节和 mode；任意 `metadata` 错误均进入 Go 的写入分支，
+    /// 已存在文件保持原字节和 mode；任意 `metadata` 错误均进入 写入分支，
     /// 新文件分别使用 0600 和 0755。
     pub(crate) async fn bootstrap_hooks_under_dir(
         &self,
@@ -914,14 +912,14 @@ impl AnthropicEnvironmentType {
         )
     }
 
-    /// 返回必定存在的配置借用；仅在 initialize 的 nil 检查之后使用。
+    /// 返回必定存在的配置借用；仅在 initialize 的 `None` 检查之后使用。
     fn config_ref(&self) -> &Config {
         self.config
             .as_ref()
             .expect("initialize checked anthropic config")
     }
 
-    /// 返回必定存在的配置可变借用；仅在 initialize 的 nil 检查之后使用。
+    /// 返回必定存在的配置可变借用；仅在 initialize 的 `None` 检查之后使用。
     fn config_mut(&mut self) -> &mut Config {
         self.config
             .as_mut()
@@ -1009,7 +1007,7 @@ fn tail_to_string(output: &Mutex<Vec<u8>>) -> String {
     String::from_utf8_lossy(&output).into_owned()
 }
 
-/// 返回 Go `os.UserHomeDir` 在 Linux 上读取的 `$HOME`。
+/// 返回 Linux 上的非空 `$HOME`。
 fn user_home_dir() -> Result<PathBuf, AnthropicError> {
     env::var_os("HOME")
         .filter(|home| !home.is_empty())
@@ -1026,7 +1024,7 @@ fn create_dir_all_with_mode(path: impl AsRef<Path>, mode: u32) -> io::Result<()>
     builder.create(path)
 }
 
-/// 以 Go `os.WriteFile` 的 create/truncate 语义和指定创建 mode 写文件。
+/// 以 create/truncate 语义和指定创建 mode 写文件。
 fn write_file_with_mode(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true).mode(mode);
@@ -1075,7 +1073,7 @@ pub(crate) fn copy_dir(source: &Path, destination: &Path) -> Result<(), Anthropi
     })
 }
 
-/// 执行 `copy_dir` 的逐项复制，并生成恢复源码中的细粒度错误上下文。
+/// 执行 `copy_dir` 的逐项复制，并生成既定的细粒度错误上下文。
 fn copy_dir_inner(source: &Path, destination: &Path) -> Result<(), AnthropicError> {
     for entry in WalkDir::new(source).sort_by_file_name().follow_links(false) {
         let entry = entry.map_err(|error| {

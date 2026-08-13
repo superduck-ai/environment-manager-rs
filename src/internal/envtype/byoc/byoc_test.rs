@@ -113,9 +113,9 @@ fn new_rejects_invalid_config() {
     );
 }
 
-/// Go encoding/json 对 null string/map 保留零值，Rust 配置应保留该兼容性。
+/// 验证 null string 和 map 被映射为配置零值。
 #[test]
-fn accepts_go_compatible_null_zero_values() {
+fn accepts_null_and_missing_defaults() {
     let environment = new(br#"{
             "environment_type":"byoc",
             "cwd":null,
@@ -647,7 +647,7 @@ async fn test_create_lease_manager_sends_authenticated_heartbeat() {
         .and(header("anthropic-beta", "environments-2025-11-01"))
         .and(header_exists("x-environment-runner-version"))
         .and(query_param("organization_uuid", "org-1"))
-        // 不延长租约可以让测试避开默认健康文件写入，同时 Start 仍按 Go 语义成功。
+        // 不延长租约可以让测试避开默认健康文件写入，同时 Start 仍按 成功。
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "lease_extended": false,
             "state": "running"
@@ -675,9 +675,8 @@ async fn test_create_lease_manager_sends_authenticated_heartbeat() {
     server.verify().await;
 }
 
-/// 对应 Go：`captureRoundTripper`。
 ///
-/// 保存认证完成后的请求头。Go 测试通过自定义 `http.RoundTripper` 截获请求；
+/// 保存认证完成后的请求头。通过自定义 HTTP transport 截获请求；
 /// Rust 的 reqwest client 不开放 transport 替换，因此这里在发包前的同一边界捕获。
 #[derive(Default)]
 struct CaptureRoundTripper {
@@ -685,7 +684,6 @@ struct CaptureRoundTripper {
 }
 
 impl CaptureRoundTripper {
-    /// 对应 Go：`captureRoundTripper.RoundTrip`。
     ///
     /// 克隆请求头供认证断言使用，不发送网络请求，也不修改原始 request。
     fn round_trip(&self, request: &reqwest::Request) {
@@ -693,7 +691,6 @@ impl CaptureRoundTripper {
     }
 }
 
-/// 对应 Go：`mustJSON`。
 ///
 /// 把测试 fixture 序列化为 JSON 字节；不可序列化说明 fixture 本身错误，因此直接 panic。
 fn must_json(value: Value) -> Vec<u8> {

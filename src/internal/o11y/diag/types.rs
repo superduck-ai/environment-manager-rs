@@ -17,7 +17,7 @@ use super::CcLogCollector;
 /// 诊断设施的构造、flush、关闭或任务错误。
 #[derive(Debug, thiserror::Error)]
 pub enum DiagError {
-    /// 已经带完整 Go 兼容上下文的普通错误。
+    /// 已经带完整上下文的普通错误。
     #[error("{0}")]
     Message(String),
     /// 远端 batch flush 失败；保留 `ApiError` 便于识别 HTTP 501。
@@ -109,7 +109,7 @@ pub struct DiagService {
     pub(super) parent_cancellation: CancellationToken,
 }
 
-/// 显式替代 Go `context.WithValue(diagLogsContextKey, service)`。
+/// 显式替代。
 #[derive(Clone)]
 pub struct DiagContext {
     pub(super) cancellation: CancellationToken,

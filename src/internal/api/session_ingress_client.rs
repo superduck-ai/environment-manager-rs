@@ -1,6 +1,6 @@
-//! 对应 Go `internal/api/session_ingress_client.go` 的 SessionIngress HTTP 适配器。
+//! SessionIngress HTTP 适配器。
 //!
-//! v1/v2 路径选择、只接受 200 的成功判定和诊断日志扁平 wire 格式均保持 Go 行为。
+//! v1/v2 路径选择、只接受 200 的成功判定和诊断日志扁平 wire 格式均保持。
 
 use std::collections::BTreeMap;
 
@@ -36,7 +36,7 @@ impl HttpSessionIngressClient {
         }
     }
 
-    /// 对应 Go `sessionEndpoint`，拼接并转义 session ID。
+    /// 拼接并转义 session ID。
     pub fn session_endpoint(&self, session_id: &str, suffix: &str) -> String {
         let version = if self.use_v1 { "v1" } else { "v2" };
         format!(
@@ -47,7 +47,7 @@ impl HttpSessionIngressClient {
         )
     }
 
-    /// 对应 Go `postJSON`，发送 SessionIngress 专用请求并解释 501 sentinel。
+    /// 发送 SessionIngress 专用请求并解释 501 sentinel。
     async fn post_json<T: Serialize + ?Sized>(
         &self,
         cancellation: &CancellationToken,
@@ -105,7 +105,7 @@ impl HttpSessionIngressClient {
         }
     }
 
-    /// 对应 Go `PostSessionEvent`，用 `events` 数组包裹单个事件。
+    /// 用 `events` 数组包裹单个事件。
     pub async fn post_session_event(
         &self,
         cancellation: &CancellationToken,
@@ -125,7 +125,7 @@ impl HttpSessionIngressClient {
         Ok(())
     }
 
-    /// 对应 Go `PostForwardDiagLogs`，空日志批次不发送请求。
+    /// 空日志批次不发送请求。
     pub async fn post_forward_diag_logs(
         &self,
         cancellation: &CancellationToken,
@@ -149,7 +149,7 @@ impl HttpSessionIngressClient {
     }
 }
 
-/// 对应 Go `diagLogsToWireFormat`，把 timestamp 与 fields 合并到同一 JSON object。
+/// 把 timestamp 与 fields 合并到同一 JSON object。
 pub(crate) fn diag_logs_to_wire_format(logs: &[DiagLogEntry]) -> Vec<BTreeMap<String, Value>> {
     logs.iter()
         .map(|entry| {
@@ -158,7 +158,7 @@ pub(crate) fn diag_logs_to_wire_format(logs: &[DiagLogEntry]) -> Vec<BTreeMap<St
                 "timestamp".to_owned(),
                 Value::String(entry.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)),
             );
-            // Go 循环在 timestamp 之后复制 fields，因此同名字段必须覆盖生成值。
+            // 循环在 timestamp 之后复制 fields，因此同名字段必须覆盖生成值。
             line.extend(entry.fields.clone());
             line
         })

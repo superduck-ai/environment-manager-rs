@@ -1,4 +1,4 @@
-//! `internal/tunnel/client.go` 对应的后端长连接与 ProtoJSON 分派测试。
+//! 后端长连接与 ProtoJSON 分派测试。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,12 +67,12 @@ async fn start_tunnel_server() -> (
     (port, header_rx, socket_rx, task)
 }
 
-/// 验证 ping 写失败遵循 Go `pingLoop` 的取消优先级和底层网络错误文本。
+/// 验证 ping 写失败遵循取消优先级并保留底层网络错误文本。
 ///
-/// Gorilla 直接包装 `net.Error`，不会带 tungstenite 的 `IO error:` 前缀；如果写失败
-/// 与 context 取消并发发生，Go 则固定返回 `context canceled`。
+/// 网络错误文本不带 tungstenite 的 `IO error:` 前缀；如果写失败与取消并发发生，
+/// 则固定返回 `context canceled`。
 #[test]
-fn ping_write_failure_matches_go_error_priority() {
+fn ping_write_failure_prefers_cancellation_then_network_error() {
     let cancellation = CancellationToken::new();
     assert_eq!(
         ping_write_failure(&cancellation, PingWriteFailure::Timeout).to_string(),
@@ -105,7 +105,7 @@ fn ping_write_failure_matches_go_error_priority() {
 /// 启动一次性原始 WebSocket 握手服务器，精确控制响应 header。
 ///
 /// Axum/tungstenite 服务端会自动规范化 `Connection`/`Upgrade` 并执行
-/// 标准子协议协商，无法构造 Gorilla 与上游 tungstenite 分歧的
+/// 标准子协议协商，无法构造 WebSocket 与上游 tungstenite 分歧的
 /// 响应；因此该 fixture 只解析 challenge key，其余字节原样写回。
 async fn start_raw_handshake_server(
     connection: &'static str,
@@ -178,7 +178,7 @@ async fn test_tunnel_endpoint_matches_connect_path() {
     );
 }
 
-/// Gorilla 未设置 read limit，两个 tungstenite 默认上限都必须关闭。
+/// WebSocket 未设置 read limit，两个 tungstenite 默认上限都必须关闭。
 #[test]
 fn test_websocket_config_has_no_incoming_frame_or_message_limit() {
     let config = gorilla_websocket_config();
@@ -186,7 +186,7 @@ fn test_websocket_config_has_no_incoming_frame_or_message_limit() {
     assert_eq!(config.max_message_size, None);
 }
 
-/// 上游 Tungstenite 接受 RFC 常规握手响应，正常 Tunnel 不依赖私有兼容开关。
+/// 上游 Tungstenite 接受 RFC 常规握手响应，正常 Tunnel 不依赖私有补丁开关。
 #[tokio::test]
 async fn test_upstream_handshake_accepts_standard_response_headers() {
     let (port, server) = start_raw_handshake_server("Upgrade", "websocket", None).await;
@@ -236,7 +236,7 @@ async fn test_upstream_handshake_rejects_unoffered_server_subprotocol() {
     server.await.unwrap();
 }
 
-/// ping/pong 只是同一次 Gorilla `ReadMessage` 内部的控制帧，不得重置 deadline。
+/// ping/pong 只是同一次 WebSocket `ReadMessage` 内部的控制帧，不得重置 deadline。
 #[tokio::test]
 async fn test_tunnel_read_deadline_is_not_reset_by_control_frames() {
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -411,7 +411,7 @@ async fn test_client_run_dispatches_proto_jsonhttp_request() {
         })),
     };
     let mut request_json = serde_json::to_value(request).unwrap();
-    // Go 使用 DiscardUnknown；同时在顶层和嵌套层注入未知字段验证 Rust 适配层。
+    // 使用 DiscardUnknown；同时在顶层和嵌套层注入未知字段验证 Rust 适配层。
     request_json["futureTopLevel"] = serde_json::json!(true);
     request_json["httpRequest"]["futureNested"] = serde_json::json!("ignored");
     socket
@@ -465,7 +465,7 @@ fn test_add_jitter_within_expected_window() {
     assert_eq!(add_jitter(Duration::from_nanos(1)), Duration::from_nanos(1));
 }
 
-/// 覆盖 Go `ProxyFromEnvironment` 最常用的 loopback、域名、端口和 CIDR 规则。
+/// 覆盖 NO_PROXY 常用的 loopback、域名、端口和 CIDR 规则。
 #[test]
 fn test_proxy_from_environment_selection_and_no_proxy_rules() {
     let config = EnvironmentProxyConfig {
@@ -544,9 +544,9 @@ fn test_proxy_from_environment_selection_and_no_proxy_rules() {
     );
 }
 
-/// 非 101 握手必须同时保留 Go response status 和固定 ErrBadHandshake 文本。
+/// 非 101 握手必须同时保留 response status 和固定 ErrBadHandshake 文本。
 #[tokio::test]
-async fn test_websocket_bad_handshake_uses_gorilla_error_and_client_context() {
+async fn test_websocket_bad_handshake_includes_status_and_client_context() {
     let router = Router::new().fallback(|| async { StatusCode::FORBIDDEN });
     let (port, server) = start_server(router).await;
     let request = format!("ws://127.0.0.1:{port}/rejected")
@@ -576,7 +576,7 @@ async fn test_websocket_bad_handshake_uses_gorilla_error_and_client_context() {
     server.abort();
 }
 
-/// SOCKS5 显式端口和 auth offer 条件必须复刻内嵌 x/net/proxy。
+/// SOCKS5 显式端口和 auth offer 条件必须保留内嵌 x/net/proxy。
 #[test]
 fn test_socks5_proxy_defaults_and_auth_offer_boundaries() {
     assert_eq!(
@@ -594,7 +594,7 @@ fn test_socks5_proxy_defaults_and_auth_offer_boundaries() {
     assert!(!should_offer_socks5_auth(b"user", &[b'p'; 256]));
 }
 
-/// SOCKS5 URL 未写端口时必须保留底层 Go Dialer 的 missing-port 失败。
+/// SOCKS5 URL 未写端口时必须返回底层连接器的 missing-port 失败。
 #[tokio::test]
 async fn test_websocket_socks5_proxy_requires_explicit_port() {
     let config = EnvironmentProxyConfig {
@@ -627,7 +627,7 @@ fn test_proxy_from_environment_rejects_http_proxy_in_cgi() {
     assert!(error.to_string().contains("refusing to use HTTP_PROXY"));
 }
 
-/// 验证 HTTP proxy 收到 CONNECT/Basic auth，并保留 Gorilla 的非 200 reason 文本。
+/// 验证 HTTP proxy 收到 CONNECT/Basic auth，并保留 WebSocket 的非 200 reason 文本。
 #[tokio::test]
 async fn test_websocket_proxy_connect_and_non_200_reason() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -756,7 +756,7 @@ async fn capture_http_proxy_connect(user_info: &str) -> String {
     proxy.await.unwrap()
 }
 
-/// Gorilla 只在 URL 显式带 password 时生成 HTTP Proxy Basic header。
+/// WebSocket 只在 URL 显式带 password 时生成 HTTP Proxy Basic header。
 #[tokio::test]
 async fn test_http_proxy_basic_auth_requires_explicit_password() {
     let without_password = capture_http_proxy_connect("user@").await;
@@ -880,7 +880,7 @@ async fn test_websocket_socks5_proxy_reports_truncated_reply_port() {
     proxy.await.unwrap();
 }
 
-/// Gorilla 未为 `https` proxy URL 注册 dialer，Rust 不能将其降级成明文。
+/// WebSocket 未为 `https` proxy URL 注册 dialer，Rust 不能将其降级成明文。
 #[tokio::test]
 async fn test_websocket_proxy_rejects_unsupported_proxy_scheme() {
     let config = EnvironmentProxyConfig {

@@ -1,7 +1,7 @@
 //! 多个命令共享的纯解析工具。
 //!
 //! 这里刻意不依赖日志实现或异步运行时，使命令层可以在内部模块尚未完成时独立
-//! 测试。持续时间解析覆盖 Go `time.ParseDuration` 的 CLI 常用语法，从而不会把
+//! 测试。持续时间解析覆盖 CLI 常用的 duration 语法，从而不会把
 //! 原有 `5m`、`1h30m` 等部署参数强制改写成另一套格式。
 
 use std::fmt::{self, Display, Formatter};
@@ -38,13 +38,13 @@ impl Display for LogLevel {
 impl FromStr for LogLevel {
     type Err = String;
 
-    /// 严格解析 Go 命令接受的四个小写值；不隐式接受大小写变体。
+    /// 严格解析 命令接受的四个小写值；不隐式接受大小写变体。
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         parse_log_level(value)
     }
 }
 
-/// 解析日志级别，并保留 Go `parseLogLevel` 的错误文本。
+/// 解析日志级别，并保留错误文本。
 pub fn parse_log_level(value: &str) -> Result<LogLevel, String> {
     match value {
         "debug" => Ok(LogLevel::Debug),
@@ -67,11 +67,11 @@ pub(crate) const fn tracing_level(level: LogLevel) -> tracing::Level {
     }
 }
 
-/// 解析 Go `time.ParseDuration` 风格的非负持续时间。
+/// 解析 CLI duration 语法 风格的非负持续时间。
 ///
 /// 支持 `ns`、`us`、`µs`、`μs`、`ms`、`s`、`m`、`h` 以及连续组合和小数，
 /// 例如 `500ms`、`1.5s`、`1h30m`。CLI 的超时没有负值语义，因此负数会被明确
-/// 拒绝；`0` 则保留为“不设超时”的兼容值。
+/// 拒绝；`0` 表示“不设超时”。
 pub fn parse_go_duration(input: &str) -> Result<Duration, String> {
     let unsigned_input = input.strip_prefix('+').unwrap_or(input);
     if unsigned_input == "0" {
@@ -104,7 +104,7 @@ pub fn parse_go_duration(input: &str) -> Result<Duration, String> {
         remaining = &remaining[number_end..];
         let (unit_nanos, unit_len) = duration_unit(remaining)
             .ok_or_else(|| format!("invalid duration {input:?}: missing or unknown unit"))?;
-        // Go 会对每个分段的小数纳秒部分截断，再把各段相加。
+        // 会对每个分段的小数纳秒部分截断，再把各段相加。
         total_nanos += (number * unit_nanos).trunc();
         if !total_nanos.is_finite() || total_nanos > i64::MAX as f64 {
             return Err(format!("invalid duration {input:?}: value is too large"));
@@ -144,7 +144,7 @@ fn duration_number_end(value: &str) -> usize {
     if saw_digit { end } else { 0 }
 }
 
-/// 识别 Go 持续时间单位，并返回其纳秒倍率与 UTF-8 字节长度。
+/// 识别 持续时间单位，并返回其纳秒倍率与 UTF-8 字节长度。
 fn duration_unit(value: &str) -> Option<(f64, usize)> {
     const UNITS: &[(&str, f64)] = &[
         ("ns", 1.0),

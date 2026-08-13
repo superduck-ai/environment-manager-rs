@@ -1,4 +1,4 @@
-//! 对应 Go `cmd/cmd_code_sign.go` 的隐藏签名包装命令。
+//! 隐藏签名包装命令。
 //!
 //! Git 的 `gpg.ssh.program` 会传入 OpenSSH 的 `-Y`、
 //! `-f`、`-n` 等值必须原样保留。本文件还实现配置发现、Git object format 探测、
@@ -56,9 +56,9 @@ pub enum CodeSignOperation {
 pub struct SshSignArgs {
     /// 需要签名的文件；执行层应将相对路径转换为绝对路径。
     pub file_path: PathBuf,
-    /// `-f` 指定的 key 文件；旧实现仅记录并忽略它。
+    /// `-f` 指定的 key 文件；当前命令仅记录并忽略它。
     pub key_file: Option<PathBuf>,
-    /// `-n` 指定的 namespace；旧实现仅记录并忽略它。
+    /// `-n` 指定的 namespace；当前命令仅记录并忽略它。
     pub namespace: Option<OsString>,
 }
 
@@ -109,7 +109,7 @@ fn remove_ssh_sign_marker(args: &[OsString]) -> (bool, Vec<OsString>) {
     (found, filtered)
 }
 
-/// 复刻旧 `handleSSHSign` 的宽松 flag 扫描，提取首个非 flag 文件。
+/// 保留旧 `handleSSHSign` 的宽松 flag 扫描，提取首个非 flag 文件。
 fn parse_ssh_sign_args(args: &[OsString]) -> Result<SshSignArgs, String> {
     let mut file_path = None;
     let mut key_file = None;
@@ -132,7 +132,7 @@ fn parse_ssh_sign_args(args: &[OsString]) -> Result<SshSignArgs, String> {
                 namespace = Some(value.clone());
                 index += 2;
             } else {
-                // Go 实现会把未知 flag 后紧邻的第一个非 flag 值也跳过。
+                // 会把未知 flag 后紧邻的第一个非 flag 值也跳过。
                 index += 1;
                 if args
                     .get(index)
@@ -162,10 +162,9 @@ fn starts_with_dash(value: &OsStr) -> bool {
     value.to_string_lossy().starts_with('-')
 }
 
-/// 对应 Go：`cmd/cmd_code_sign.go` 中的 `calculateBackoff`。
 ///
 /// attempt 为零时直接返回初始值；其余轮次先按指数因子计算并截断到最大值，再添加
-/// `[0%, 30%)` 的正抖动。最大值只约束抖动前基础值，这是 Go 实现的刻意行为。
+/// `[0%, 30%)` 的正抖动。最大值只约束抖动前基础值，这是 的刻意行为。
 pub(super) fn calculate_backoff(attempt: usize, config: RetryConfig) -> Duration {
     if attempt == 0 {
         return config.initial_backoff;
@@ -178,17 +177,15 @@ pub(super) fn calculate_backoff(attempt: usize, config: RetryConfig) -> Duration
     Duration::from_secs_f64(base + jitter)
 }
 
-/// 对应 Go：`cmd/cmd_code_sign.go` 中的 `runCodeSign`。
 ///
 /// 识别原始 `-Y sign` 操作并转交 SSH 签名实现。任何其他 GPG/SSH 操作都返回明确
-/// 的兼容错误；本函数不会把原始 argv（可能含路径或其他敏感参数）写入日志。
+/// 的稳定错误；本函数不会把原始 argv（可能含路径或其他敏感参数）写入日志。
 pub async fn run_code_sign(arguments: &CodeSignArgs) -> Result<(), String> {
     match arguments.parse_operation()? {
         CodeSignOperation::SshSign(sign) => handle_ssh_sign(&sign).await,
     }
 }
 
-/// 对应 Go：`cmd/cmd_code_sign.go` 中的 `handleSSHSign`。
 ///
 /// 将文件路径绝对化，探测仓库 object format，从环境或临时文件读取 MCP 配置，调用
 /// `sign_file` 工具并确认服务端创建了同名 `.sig` 文件。`-n` 与 `-f` 仅打印调试
@@ -196,7 +193,7 @@ pub async fn run_code_sign(arguments: &CodeSignArgs) -> Result<(), String> {
 ///
 /// # 副作用
 /// 读取工作目录和配置、执行 `git config`、访问 loopback HTTP server、读取签名文件
-/// 元数据并写 stderr。HTTP 调用和重试与 Go 一样不受外层命令取消影响，只受 10 秒
+/// 元数据并写 stderr。HTTP 调用和重试不受外层命令取消影响，只受 10 秒
 /// 客户端超时约束。
 pub(super) async fn handle_ssh_sign(arguments: &SshSignArgs) -> Result<(), String> {
     let original_path = arguments.file_path.to_string_lossy().into_owned();
@@ -256,7 +253,7 @@ pub(super) async fn handle_ssh_sign(arguments: &SshSignArgs) -> Result<(), Strin
         .map_err(|error| format!("failed to call MCP server: {error}"))?;
     let tool_result_value: Value = serde_json::from_slice(&result_raw)
         .map_err(|error| format!("failed to parse tool result: {error}"))?;
-    // `encoding/json` 把顶层 null 解到结构体时保留零值；serde 对 null→struct 默认
+    // JSON 把顶层 null 解到结构体时保留零值；serde 对 null→struct 默认
     // 报错。签名服务若已经落盘但返回 result:null，旧 wrapper 会继续检查 `.sig`。
     let tool_result: McpToolResult = if tool_result_value.is_null() {
         McpToolResult::default()
@@ -270,7 +267,7 @@ pub(super) async fn handle_ssh_sign(arguments: &SshSignArgs) -> Result<(), Strin
             .first()
             .and_then(|content| {
                 // 类型字段不参与错误文案，但读取它可明确表明未知 MCP content 类型也
-                // 仍按 Go 行为使用首个非空 text，而不是拒绝整个响应。
+                // 仍按 使用首个非空 text，而不是拒绝整个响应。
                 let _content_type = &content.r#type;
                 (!content.text.is_empty()).then_some(content.text.as_str())
             })
@@ -284,13 +281,12 @@ pub(super) async fn handle_ssh_sign(arguments: &SshSignArgs) -> Result<(), Strin
             "signature file not created: {}",
             signature_path.display()
         )),
-        // Go 只针对 `os.IsNotExist` 失败；权限等其他 stat 错误会被忽略，不能在迁移时
+        // 只针对 not-found 判定 失败；权限等其他 stat 错误会被忽略，不能在错误处理时
         // 擅自收紧为“所有 metadata 错误都失败”。
         _ => Ok(()),
     }
 }
 
-/// 对应 Go：`cmd/cmd_code_sign.go` 中的 `readCodeSignConfig`。
 ///
 /// 先尝试同时存在的 `CODESIGN_MCP_PORT`/`CODESIGN_MCP_TOKEN`；端口不是正整数时静默
 /// 回退 `/tmp/codesign-mcp-config.json`。文件缺失、JSON 无效或字段不完整统一折叠为
@@ -340,7 +336,6 @@ pub(super) fn scan_positive_integer(value: &str) -> Option<i64> {
     (parsed > 0).then_some(parsed)
 }
 
-/// 对应 Go：`cmd/cmd_code_sign.go` 中的 `getGitObjectFormat`。
 ///
 /// 在工作目录执行 `git config --get extensions.objectFormat`；仅精确的 `sha256` 选择
 /// SHA-256，命令不存在、退出失败、非 UTF-8 输出和所有其他值都回退 Git 默认 SHA-1。
@@ -363,7 +358,6 @@ pub(super) fn get_git_object_format(working_dir: &std::path::Path) -> &'static s
     }
 }
 
-/// 对应 Go：`cmd/cmd_code_sign.go` 中的 `doSingleAttempt`。
 ///
 /// 发送一次带 JSON content type 和 Bearer token 的 POST，请求成功必须同时满足 HTTP
 /// 200、合法 JSON-RPC response、没有 error 且存在 result。显式 `result: null` 被视为
@@ -402,7 +396,7 @@ pub(super) async fn do_single_attempt(
         .map_err(|error| format!("failed to parse response: {error}"))?;
     let object = match &value {
         Value::Object(object) => Some(object),
-        // Go 允许 JSON null 解到非指针结构体，并得到全部零值；随后才由 result
+        // 允许 JSON null 解到非指针结构体，并得到全部零值；随后才由 result
         // 缺失检查返回稳定错误。
         Value::Null => None,
         Value::Array(_) => {
@@ -424,7 +418,7 @@ pub(super) async fn do_single_attempt(
         serde_json::from_value(value.clone())
             .map_err(|error| format!("failed to parse response: {error}"))?
     };
-    // jsonrpc、id 和 typed result 不参与 Go 控制流，但读取后保留类型作为协议审计点。
+    // jsonrpc、id 和 typed result 不参与 控制流，但读取后保留类型作为协议审计点。
     let _protocol_fields = (&response.jsonrpc, &response.id, &response.result);
     if let Some(error) = response.error {
         let _error_code = error.code;
@@ -436,7 +430,6 @@ pub(super) async fn do_single_attempt(
     serde_json::to_vec(result).map_err(|error| format!("failed to parse response: {error}"))
 }
 
-/// 对应 Go：`cmd/cmd_code_sign.go` 中的 `doAttemptsWithRetry`。
 ///
 /// 总尝试次数为 `max_retries + 1`。每次失败在 stderr 打印当前尝试、总次数、带抖动
 /// 的等待和原始错误；最后一次失败不再 sleep，并用“after N retries”包装最后原因。
@@ -472,7 +465,6 @@ pub(super) async fn do_attempts_with_retry(
     ))
 }
 
-/// 对应 Go：`cmd/cmd_code_sign.go` 中的 `callMCPServer`。
 ///
 /// 将请求编码为紧凑 JSON，创建 10 秒总超时客户端，并访问固定 loopback `/mcp`
 /// 路径。默认最多重试两次，基础退避 100ms、上限 2s、指数因子 2。

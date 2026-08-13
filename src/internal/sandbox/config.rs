@@ -1,6 +1,6 @@
 //! SRT JSON 配置模型、验证和临时文件生命周期。
 //!
-//! 字段通过 serde 精确映射 Go 的 camelCase JSON。临时配置使用 `tempfile`
+//! 字段通过 serde 精确映射 camelCase JSON。临时配置使用 `tempfile`
 //! 原子创建为 0600，cleanup 只允许删除系统临时目录内、且非隐藏路径的文件。
 
 use std::{
@@ -32,7 +32,7 @@ pub struct NetworkConfig {
     /// 允许访问的精确域名或 `*.` 通配域名。
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub allowed_domains: Vec<String>,
-    /// 明确拒绝的域名；`None` 保留 Go nil slice 编码为 JSON null 的区别。
+    /// 明确拒绝的域名；`None` 保留 null 数组 编码为 JSON null 的区别。
     pub denied_domains: Option<Vec<String>>,
 }
 
@@ -46,9 +46,9 @@ pub struct FilesystemConfig {
     /// 允许写入的路径。
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub allow_write: Vec<String>,
-    /// 明确禁止写入的路径；`None` 保留 Go nil slice 编码为 JSON null 的区别。
+    /// 明确禁止写入的路径；`None` 保留 null 数组 编码为 JSON null 的区别。
     pub deny_write: Option<Vec<String>>,
-    /// 是否允许更新用户 git 配置；false 时与 Go `omitempty` 一样省略。
+    /// 是否允许更新用户 git 配置；false 时与 JSON 空值省略 一样省略。
     #[serde(skip_serializing_if = "is_false")]
     pub allow_git_config: bool,
 }
@@ -58,10 +58,10 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// 将 JSON `null` 解码为字段类型的 Go 零值，同时仍接受正常值。
+/// 将 JSON `null` 解码为字段类型的默认值，同时仍接受正常值。
 ///
-/// Go `encoding/json` 把 `null` 写入 struct 或 slice 字段时不会报错：struct 保持
-/// 零值，slice 变为 nil。Rust 模型不需要区分 nil 与空 Vec 的读取行为，因此统一
+/// sandbox 配置协议允许 struct 或 slice 字段为 `null`：struct 保持
+/// 零值，slice 变为 `None`。Rust 模型不需要区分 `None` 与空 Vec 的读取行为，因此统一
 /// 落为 `Default::default()`；缺字段继续由外层 `#[serde(default)]` 处理。
 ///
 /// # 参数
@@ -119,7 +119,7 @@ pub enum ConfigError {
         #[source]
         source: serde_json::Error,
     },
-    /// 顶层配置引用为空；Rust API 通常不会产生，只用于兼容式可选验证入口。
+    /// 顶层配置引用为空；Rust API 通常不会产生，只用于可选验证入口。
     #[error("config is nil")]
     MissingConfig,
     /// 必需 Anthropic 域名没有被允许。
@@ -155,18 +155,18 @@ pub fn write_config_file(config: &SrtConfig) -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
-/// 按 Go `json.MarshalIndent(config, "", "  ")` 生成 sandbox 配置字节。
+/// 生成 sandbox 配置字节。
 ///
-/// serde 的两空格布局与 Go 相同，但默认不执行 Go `encoding/json` 的 HTML 安全
+/// serde 负责两空格布局，但默认不执行 JSON 的 HTML 安全
 /// 转义。这里在已生成的合法 JSON 上替换 `<`、`>`、`&`、U+2028 和 U+2029；这些
-/// 字符在 JSON 语法中只可能来自字符串，因此不会改写结构。Go 此 API 不追加换行，
+/// 字符在 JSON 语法中只可能来自字符串，因此不会改写结构。此 API 不追加换行，
 /// 本函数同样直接返回最后一个 `}`。
 ///
 /// # 参数
 /// - `config`：待写出的完整 SRT 配置，借用期间不修改。
 ///
 /// # 返回
-/// 成功时返回与 Go MarshalIndent 一致的 UTF-8 字节；序列化失败时返回 serde 错误。
+/// 成功时返回与 MarshalIndent 一致的 UTF-8 字节；序列化失败时返回 serde 错误。
 fn marshal_go_sandbox_json(config: &SrtConfig) -> Result<Vec<u8>, serde_json::Error> {
     let pretty = serde_json::to_string_pretty(config)?;
     let escaped = pretty
@@ -181,7 +181,7 @@ fn marshal_go_sandbox_json(config: &SrtConfig) -> Result<Vec<u8>, serde_json::Er
 /// 仅当路径安全地位于系统临时目录下时删除配置文件。
 ///
 /// 空路径、无法绝对化的路径、临时目录本身、目录外路径以及以 `.` 开头的相对路径
-/// 都被静默忽略，与 Go 防误删逻辑一致。实际删除失败会保留
+/// 都被静默忽略，与 防误删逻辑一致。实际删除失败会保留
 /// `failed to remove config file: ...` 外层前缀和底层 I/O 错误。
 pub fn cleanup_config_file(path: impl AsRef<Path>) -> Result<(), ConfigError> {
     let path = path.as_ref();
@@ -208,9 +208,9 @@ pub fn cleanup_config_file(path: impl AsRef<Path>) -> Result<(), ConfigError> {
     })
 }
 
-/// 对应 Go：Linux `os.Remove` 对普通文件、symlink 和空目录的删除语义。
+/// 删除 Linux 上的普通文件、symlink 或空目录。
 ///
-/// Go 在 Unix 上先调用 unlink；仅当内核以 EISDIR 拒绝目录时再调用 rmdir。保持这个
+/// 在 Unix 上先调用 unlink；仅当内核以 EISDIR 拒绝目录时再调用 rmdir。保持这个
 /// 顺序可确保指向目录的 symlink 被当作链接本身删除，不会跟随到目标目录；同时允许
 /// cleanup 删除意外传入的空目录。非空目录和权限错误返回最终系统错误。
 ///
@@ -227,12 +227,11 @@ fn remove_go_path(path: &Path) -> io::Result<()> {
     }
 }
 
-/// 对应 Go：`filepath.Abs` 在 Linux 上执行的“转绝对路径 + `filepath.Clean`”。
+/// 在 Linux 上执行“转绝对路径 + 词法路径归一化”。
 ///
 /// `std::path::absolute` 会保留 `..`，不能直接用于 cleanup 的目录边界判断；否则
 /// `/tmp/guard/../../home/file` 会先通过 `/tmp` 字面前缀检查，再由内核解析到目录外。
-/// 本函数只做词法折叠，不调用 `canonicalize`，因此不会解析 symlink，继续保留 Go
-/// 版本对父目录 symlink 的既有行为。
+/// 本函数只做词法折叠，不调用 `canonicalize`，因此不会解析父目录中的 symlink。
 ///
 /// # 参数
 /// - `path`：待检查路径；相对路径以调用时工作目录为基准。
@@ -252,8 +251,8 @@ fn go_style_absolute(path: &Path) -> io::Result<PathBuf> {
             Component::RootDir => cleaned.push(Path::new("/")),
             Component::CurDir => {}
             Component::ParentDir => {
-                // 对根目录调用 pop 会保持根不变，等价于 Go filepath.Clean 将多余
-                // 的前导 `..` 截断在 `/`，而不是产生相对路径。
+                // 对根目录调用 pop 会保持根不变，将多余的前导 `..` 截断在 `/`，
+                // 而不是产生相对路径。
                 let _at_root = cleaned.pop();
             }
             Component::Normal(name) => cleaned.push(name),
@@ -267,7 +266,7 @@ fn go_style_absolute(path: &Path) -> io::Result<PathBuf> {
 
 /// 判断 allowed pattern 是否满足 required domain/pattern。
 ///
-/// 仅支持 Go 实现使用的 `*.` 前缀通配；suffix 自带前导点，因此
+/// 仅支持 使用的 `*.` 前缀通配；suffix 自带前导点，因此
 /// `evil-anthropic.com` 不会误匹配 `*.anthropic.com`。
 pub(super) fn domain_matches(pattern: &str, required: &str) -> bool {
     if pattern == required {
@@ -312,7 +311,7 @@ pub fn load_and_validate_config(path: impl AsRef<Path>) -> Result<SrtConfig, Con
         path: path.clone(),
         source,
     })?;
-    // Go 将顶层 `null` 解码到现有 struct 指针时保持零值且不报 parse error。
+    // 将顶层 `null` 解码到现有 struct 指针时保持零值且不报 parse error。
     // 先解码 Option 再取默认值，可把错误正确留到后续 validation 阶段。
     let config = serde_json::from_slice::<Option<SrtConfig>>(&data)
         .map(Option::unwrap_or_default)
@@ -366,9 +365,9 @@ mod tests {
         cleanup_config_file(Path::new("")).unwrap();
     }
 
-    /// 验证 sandbox writer 的字节与 Go 1.25.7 `json.MarshalIndent` 探针一致。
+    /// 验证 sandbox writer 的字节与 1.25.7 缩进 JSON 编码 探针一致。
     #[test]
-    fn marshals_go_indented_json_and_html_escapes() {
+    fn marshals_indented_json_with_html_escapes() {
         let config = SrtConfig {
             network: NetworkConfig {
                 allowed_domains: vec![
@@ -413,9 +412,9 @@ mod tests {
         assert!(!encoded.ends_with(b"\n"));
     }
 
-    /// 验证 Go 接受的顶层、嵌套 struct 和 slice null 都进入 validation 阶段。
+    /// 验证 接受的顶层、嵌套 struct 和 slice null 都进入 validation 阶段。
     #[test]
-    fn null_values_decode_to_go_zero_values_before_validation() {
+    fn null_values_decode_to_defaults_before_validation() {
         let temp = TempDir::new().unwrap();
         let cases = [
             ("top-null.json", "null"),
@@ -437,9 +436,9 @@ mod tests {
         }
     }
 
-    /// 验证缺字段采用 Go 零值，未知顶层/嵌套字段被忽略。
+    /// 验证缺字段采用默认值，未知顶层或嵌套字段被忽略。
     #[test]
-    fn missing_and_unknown_fields_match_go_decoder() {
+    fn missing_and_unknown_fields_follow_json_schema() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("unknown.json");
         std::fs::write(
@@ -456,7 +455,7 @@ mod tests {
         assert!(!config.filesystem.allow_git_config);
     }
 
-    /// 验证精确域名、双向 wildcard 和无关域名行为与 Go 一致。
+    /// 验证精确域名、双向 wildcard 和无关域名行为与 一致。
     #[test]
     fn validates_domains() {
         assert!(domain_matches("*.anthropic.com", "api.anthropic.com"));
@@ -513,10 +512,10 @@ mod tests {
         assert!(path.exists());
     }
 
-    /// 验证 cleanup 与 Go `os.Remove` 一样可以删除临时目录内的空目录。
+    /// 验证 cleanup 与 Linux 删除 一样可以删除临时目录内的空目录。
     #[test]
-    fn cleanup_removes_empty_directory_like_go() {
-        // cleanup 会像 Go 一样拒绝相对名以 `.` 开头的路径；TempDir
+    fn cleanup_removes_empty_directory() {
+        // cleanup 会像 一样拒绝相对名以 `.` 开头的路径；TempDir
         // 默认 `.tmp*` 前缀不适合此正向删除 fixture。
         let temp = tempfile::Builder::new()
             .prefix("srt-cleanup-test-")
@@ -528,9 +527,9 @@ mod tests {
         assert!(!directory.exists());
     }
 
-    /// 验证删除错误外层文案不重复注入 path，与 Go `%w` 包装前缀一致。
+    /// 验证删除错误外层文案不重复注入 path，与 错误 source chain 包装前缀一致。
     #[test]
-    fn cleanup_remove_error_uses_go_prefix() {
+    fn cleanup_remove_error_uses_stable_prefix() {
         let temp = tempfile::Builder::new()
             .prefix("srt-cleanup-test-")
             .tempdir_in(std::env::temp_dir())
@@ -565,7 +564,7 @@ mod tests {
         let guard = TempDir::new().unwrap();
         let guard_path = go_style_absolute(guard.path()).unwrap();
         let mut disguised_path = guard_path.clone();
-        // 从现有 guard 目录逐级返回根目录，再拼入 sentinel 的绝对组件。旧实现
+        // 从现有 guard 目录逐级返回根目录，再拼入 sentinel 的绝对组件。当前命令
         // 会因原始字符串仍以系统临时目录开头而误删 sentinel。
         for _ in guard_path
             .components()

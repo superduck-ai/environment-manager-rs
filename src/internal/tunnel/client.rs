@@ -1,6 +1,6 @@
 //! 后端 Tunnel WebSocket 长连接客户端。
 //!
-//! 对应 Go `internal/tunnel/client.go`。客户端建立带 session/auth header 的 WebSocket，
+//! 客户端建立带 session/auth header 的 WebSocket，
 //! 运行读循环和 ping/pong 存活检查，把 HTTP、WebSocket 与控制 action 请求分派给本地
 //! handler，并使用 lowerCamel ProtoJSON 回传结果。Rust 通过拆分读写半部保证单写者约束。
 
@@ -40,7 +40,7 @@ use super::{
     WsTunnelOpened, new_handler, new_ws_handler, tunnel_request, tunnel_response,
 };
 
-/// 对应 Go `tunnelServicePath`，不能改为普通 `/ws` 路径。
+/// 不能改为普通 `/ws` 路径。
 const TUNNEL_SERVICE_PATH: &str = "/anthropic.session_ingress.api.v1alpha.TunnelService/Tunnel";
 /// 后端 WebSocket 握手超时。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -59,7 +59,7 @@ const MAX_PROXY_RESPONSE_HEADER: usize = 64 * 1024;
 /// `httparse` 需要调用方提供 header 槽位；代理握手不使用这些字段，只需设置合理上限。
 const MAX_PROXY_RESPONSE_HEADERS: usize = 128;
 
-/// Go `http.ProxyFromEnvironment` 第一次使用时捕获的进程级代理配置。
+/// 环境代理选择 第一次使用时捕获的进程级代理配置。
 static ENVIRONMENT_PROXY_CONFIG: OnceLock<EnvironmentProxyConfig> = OnceLock::new();
 
 /// `ProxyFromEnvironment` 所需的原始环境快照。
@@ -71,12 +71,12 @@ pub(super) struct EnvironmentProxyConfig {
     pub(super) cgi: bool,
 }
 
-/// Gorilla `DialContext` 的兼容错误边界。
+/// WebSocket 建连的稳定错误边界。
 ///
 /// `tokio-tungstenite` 会把底层网络错误显示为 `IO error: ...`，并把非 101
-/// 握手显示为 `HTTP error: <status>`；Gorilla 则透明返回底层网络错误，并对握手
-/// 失败固定返回 `websocket: bad handshake`，同时通过独立的 response 暴露状态。
-/// 这个类型同时保存两部分信息，供主 Tunnel 与本地 WS Tunnel 按各自 Go 格式拼接。
+/// 握手显示为 `HTTP error: <status>`；协议要求透明返回底层网络错误，并对握手失败
+/// 固定返回 `websocket: bad handshake`，同时通过独立 response 暴露状态。这个类型
+/// 同时保存两部分信息，供主 Tunnel 与本地 WS Tunnel 按各自格式拼接。
 #[derive(Debug)]
 pub(crate) struct GorillaDialFailure {
     message: String,
@@ -84,11 +84,11 @@ pub(crate) struct GorillaDialFailure {
 }
 
 impl GorillaDialFailure {
-    /// 把 tungstenite 的错误归一化为 Gorilla 可观察的文本和 response 状态。
+    /// 把 tungstenite 错误归一化为协议可观察的文本和 response 状态。
     ///
     /// `Io` 必须只显示内部 `io::Error`；否则代理拒绝、SOCKS5 协商失败等错误会
     /// 多出 Rust 特有前缀。`Http` 表示服务器确实返回了 HTTP response，因此保留
-    /// `<code> <reason>` 并把错误本体固定为 Gorilla 的 `ErrBadHandshake` 文本。
+    /// `<code> <reason>` 并把错误本体固定为 WebSocket 的 `ErrBadHandshake` 文本。
     fn from_websocket_error(error: WebSocketError) -> Self {
         match error {
             WebSocketError::Io(error) => Self {
@@ -106,7 +106,7 @@ impl GorillaDialFailure {
         }
     }
 
-    /// 返回 Gorilla 会通过 `*http.Response` 交给调用方的状态文本。
+    /// 返回 WebSocket 会通过 `*HTTP response 交给调用方的状态文本。
     #[must_use]
     pub(super) fn response_status(&self) -> Option<&str> {
         self.response_status.as_deref()
@@ -114,7 +114,7 @@ impl GorillaDialFailure {
 }
 
 impl std::fmt::Display for GorillaDialFailure {
-    /// 只输出 Gorilla error 本体；response 状态由调用点按 Go 源码的格式另行拼接。
+    /// 只输出 WebSocket error 本体；response 状态由调用点另行拼接。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
     }
@@ -122,10 +122,10 @@ impl std::fmt::Display for GorillaDialFailure {
 
 impl std::error::Error for GorillaDialFailure {}
 
-/// 代理选择结果；除解析后的 URL 外保留 Go `url.Userinfo.passwordSet` 位。
+/// 代理选择结果；除解析后的 URL 外保留“显式设置密码”这一位。
 ///
 /// WHATWG `url::Url` 会把 `user:@host` 规范化为 `user@host`，从而丢失“显式空密码”
-/// 与“未提供密码”的差别；Gorilla 只对前者发送 Proxy-Authorization，因此不能只
+/// 与“未提供密码”的差别；WebSocket 只对前者发送 Proxy-Authorization，因此不能只
 /// 根据解析后 URL 的 `password()` 判断。
 #[derive(Debug)]
 struct ProxySelection {
@@ -136,21 +136,21 @@ struct ProxySelection {
 /// 主 Tunnel ping 写入的失败类别。
 ///
 /// timeout 不是 tungstenite 错误，因此单独保存；WebSocket 分支保留原始错误，便于
-/// 像 Gorilla 一样剥离 Rust 库为底层 `io::Error` 添加的 `IO error:` 前缀。
+/// 以便剥离 Rust 库为底层 `io::Error` 添加的 `IO error:` 前缀。
 pub(super) enum PingWriteFailure {
     Timeout,
     WebSocket(WebSocketError),
 }
 
-/// 把 ping 写失败转换为 Go `pingLoop` 的错误优先级和文本。
+/// 按取消优先级把 ping 写失败转换为稳定错误文本。
 ///
 /// # 参数
-/// - `cancellation`：本轮 Tunnel 的取消信号；Go 在 `WriteMessage` 失败后首先检查
-///   `ctx.Err()`，因此并发取消必须覆盖 timeout 或 socket 错误。
+/// - `cancellation`：本轮 Tunnel 的取消信号；在写消息失败后首先检查
+///   取消状态，因此并发取消必须覆盖 timeout 或 socket 错误。
 /// - `failure`：Tokio timeout 或 tungstenite 写错误。
 ///
 /// # 返回
-/// 返回供连接重试循环处理的兼容错误，不记录日志也不修改连接状态。
+/// 返回供连接重试循环处理的稳定错误，不记录日志也不修改连接状态。
 pub(super) fn ping_write_failure(
     cancellation: &CancellationToken,
     failure: PingWriteFailure,
@@ -170,9 +170,9 @@ pub(super) fn ping_write_failure(
     }
 }
 
-/// 把 Rust HTTP status 转成 Go `http.Response.Status` 的标准形式。
+/// 把 Rust HTTP status 转成标准的 `code reason` 形式。
 ///
-/// Go 的响应状态是 `"<code> <reason>"`；未知状态码没有标准 reason 时只保留数字。
+/// 响应状态是 `"<code> <reason>"`；未知状态码没有标准 reason 时只保留数字。
 /// tungstenite 的 response 类型已丢弃原始 reason phrase，因此标准状态使用 HTTP
 /// 规范中的 canonical reason，这是两端正常握手失败时共同可观察的值。
 fn http_status_text(status: http::StatusCode) -> String {
@@ -186,7 +186,7 @@ impl EnvironmentProxyConfig {
     /// 按大写优先、小写回退的顺序读取进程环境。
     ///
     /// 返回值会由 [`ENVIRONMENT_PROXY_CONFIG`] 缓存，因此运行期修改环境
-    /// 不会改变后续连接，与 Go `envProxyOnce` 一致。
+    /// 不会改变后续连接，。
     fn from_process() -> Self {
         Self {
             http_proxy: first_non_empty_environment("HTTP_PROXY", "http_proxy"),
@@ -197,7 +197,6 @@ impl EnvironmentProxyConfig {
     }
 }
 
-/// 对应 Go：`NewClient`。
 ///
 /// 创建 HTTP/WS handler 并依次应用 option。认证 token 进入 `SecretString`，不会被
 /// Debug 或日志意外输出。HTTP client 构造失败时返回错误，不产生半初始化对象。
@@ -226,7 +225,6 @@ pub fn new_client(
     Ok(Arc::new(client))
 }
 
-/// 对应 Go：`WithActionRegistry`。
 ///
 /// 把 `/__control/` 请求交给给定 registry；option 只在客户端发布到 `Arc` 前执行。
 #[must_use]
@@ -235,10 +233,9 @@ pub fn with_action_registry(registry: Arc<Registry>) -> ClientOption {
 }
 
 impl Client {
-    /// 对应 Go：`(*Client).Connect`。
     ///
     /// 构造固定 service endpoint，注入 Bearer 与 `X-Session-ID`，在十秒内完成握手并
-    /// 安装新的读写半部。已有连接会直接丢弃，和 Go 在替换前调用底层 Close 一致。
+    /// 安装新的读写半部。已有连接会直接丢弃，和 在替换前调用底层 Close 一致。
     pub async fn connect(&self, cancellation: &CancellationToken) -> Result<(), TunnelError> {
         let endpoint = self.tunnel_endpoint();
         let mut request = endpoint
@@ -293,7 +290,6 @@ impl Client {
         Ok(())
     }
 
-    /// 对应 Go：`(*Client).Run`。
     ///
     /// 独占 Connect 安装的 reader，同时运行请求读取与 ping loop；任一失败都会取消
     /// 另一侧并关闭 writer。调用方取消返回 `context canceled`，供外层决定是否重试。
@@ -325,7 +321,6 @@ impl Client {
         result
     }
 
-    /// 对应 Go：`(*Client).ConnectAndRun`。
     ///
     /// Connect 自身使用指数退避重试；连接运行结束后再使用独立的 1–30 秒抖动退避。
     /// 只有调用方取消或不可恢复的取消错误才退出该长期循环。
@@ -354,7 +349,7 @@ impl Client {
         }
     }
 
-    /// 对应 Go：`(*Client).Close`，先关闭全部本地 WS tunnel，再关闭后端主连接。
+    /// 先关闭全部本地 WS tunnel，再关闭后端主连接。
     pub async fn close(&self) -> Result<(), TunnelError> {
         if let Some(handler) = &self.ws_handler {
             handler.close_all().await;
@@ -362,8 +357,8 @@ impl Client {
         self.close_web_socket().await
     }
 
-    /// 对应 Go：`(*Client).tunnelEndpoint`。
     #[must_use]
+    /// 返回当前 API base URL 派生出的 WebSocket tunnel 端点。
     pub fn tunnel_endpoint(&self) -> String {
         format!(
             "{}{}",
@@ -397,8 +392,8 @@ impl Client {
 
     /// 从主 WebSocket 读取、解码并分派 TunnelRequest。
     ///
-    /// 每次调用 [`read_tunnel_data_message`] 都对应 Go 在一次
-    /// `ReadMessage` 前设置的绝对 deadline。控制帧不能开启新的
+    /// 每次调用 [`read_tunnel_data_message`] 都使用一个不可重置的绝对 deadline。
+    /// 控制帧不能开启新的
     /// 60 秒窗口；只有完整的 text/binary 应用消息返回并分派后，
     /// 下一轮才会重置 deadline。
     async fn read_loop(
@@ -435,7 +430,7 @@ impl Client {
     /// 每 30 秒发送 ping，并在 90 秒未见 pong 时返回超时。
     async fn ping_loop(&self, cancellation: CancellationToken) -> Result<(), TunnelError> {
         let mut interval = tokio::time::interval(PING_INTERVAL);
-        // Tokio interval 的第一次 tick 立即触发，而 Go ticker 等一个周期；先消费它。
+        // Tokio interval 的第一次 tick 立即触发，而 ticker 等一个周期；先消费它。
         interval.tick().await;
         loop {
             tokio::select! {
@@ -504,11 +499,10 @@ impl Client {
         }
     }
 
-    /// 对应 Go：`(*Client).handleHTTPRequest`。
     ///
     /// 执行一个 HTTP 请求；port 0 的控制路径优先交给 action registry。
     /// `request` 保留一个显式的转换结果边界：生产 Proto oneof 总是传入 `Ok`，
-    /// 兼容测试和未来的类型擦除入口仍可传入 Go `asHTTPRequest` 等价的转换错误。
+    /// 测试和未来的类型擦除入口仍可传入显式转换错误。
     /// 失败时只记录 `http_tunnel_request_invalid`，不会创建 sender 或产生网络副作用。
     async fn handle_http_request(
         self: &Arc<Self>,
@@ -559,10 +553,9 @@ impl Client {
         }
     }
 
-    /// 对应 Go：`(*Client).handleHTTPCancel`。
     ///
     /// 取消一个正在转发的 HTTP 请求；未知 ID 是幂等 no-op。显式 `Result` 参数
-    /// 保留 Go 类型擦除转换失败的日志分支，生产 oneof 分派只传入 `Ok`。
+    /// 保留 类型擦除转换失败的日志分支，生产 oneof 分派只传入 `Ok`。
     fn handle_http_cancel(&self, cancel: Result<HttpTunnelCancel, TunnelError>) {
         let cancel = match cancel {
             Ok(cancel) => cancel,
@@ -577,10 +570,8 @@ impl Client {
         tracing::info!("request_id" = ?(cancel.request_id), "{}", "http_tunnel_request_cancelled");
     }
 
-    /// 对应 Go：`(*Client).handleWSOpen`。
     ///
-    /// 建立一条后端请求的本地 WebSocket tunnel。显式转换结果使 Go
-    /// `asWSOpen` 的错误事件仍有独立、可测试的运行时日志位置。
+    /// 建立一条后端请求的本地 WebSocket tunnel。显式转换结果使 `asWSOpen` 的错误事件仍有独立、可测试的运行时日志位置。
     async fn handle_ws_open(
         self: &Arc<Self>,
         cancellation: CancellationToken,
@@ -614,10 +605,9 @@ impl Client {
         }
     }
 
-    /// 对应 Go：`(*Client).handleWSMessage`。
     ///
-    /// 把后端 WS message 写入指定本地 tunnel。这里保留 Go `asWSMessage`
-    /// 转换失败分支，且 nil-handler 与发送失败分支必须使用两个日志调用点。
+    /// 把后端 WS message 写入指定本地 tunnel。这里保留
+    /// 转换失败分支，且 缺失 handler 与发送失败分支必须使用两个日志调用点。
     async fn handle_ws_message(
         &self,
         cancellation: &CancellationToken,
@@ -631,7 +621,7 @@ impl Client {
             }
         };
         let Some(handler) = &self.ws_handler else {
-            // nil-handler 分支只有 error 属性；不能与下方真实发送失败合并，
+            // 缺失 handler 分支只有 error 属性；不能与下方真实发送失败合并，
             // 否则会误用不同的 Rust 调用位置，还会凭空增加 tunnel_id。
             tracing::error!("error" = ?("websocket handler is not configured".to_owned()), "{}", "ws_tunnel_message_failed");
             return;
@@ -642,9 +632,8 @@ impl Client {
         }
     }
 
-    /// 对应 Go：`(*Client).handleWSClose`。
     ///
-    /// 按后端 close 请求关闭指定本地 tunnel。转换失败、nil-handler 与真实关闭失败
+    /// 按后端 close 请求关闭指定本地 tunnel。转换失败、缺失 handler 与真实关闭失败
     /// 三个事件不合并，以保留各分支的 Rust 调用位置。
     async fn handle_ws_close(
         &self,
@@ -843,8 +832,8 @@ pub(crate) async fn connect_websocket_with_config(
 
 /// 使用显式代理快照建立 WebSocket，供生产路径与无环境竞态的测试共用。
 ///
-/// 返回错误已经转换成 Gorilla 的错误文本；调用方仍可通过
-/// [`GorillaDialFailure::response_status`] 区分带 HTTP response 的坏握手。
+/// 返回错误已经转换成 WebSocket 的错误文本；调用方仍可通过
+/// [`WebSocketDialFailure::response_status`] 区分带 HTTP response 的坏握手。
 #[cfg(test)]
 pub(super) async fn connect_websocket_with_proxy_config(
     request: WebSocketRequest,
@@ -864,7 +853,7 @@ async fn connect_websocket_with_proxy_and_websocket_config(
     let target_url = Url::parse(&ws_request.uri().to_string()).map_err(|error| {
         GorillaDialFailure::from_websocket_error(invalid_input(error.to_string()))
     })?;
-    //  选择代理, None 表示直连，Some(proxy) 表示走代理
+    // 选择代理, None 表示直连，Some(proxy) 表示走代理
     let proxy = proxy_selection_for_websocket_target(&target_url, config)
         .map_err(GorillaDialFailure::from_websocket_error)?;
 
@@ -892,10 +881,10 @@ async fn connect_websocket_with_proxy_and_websocket_config(
 
 /// 构造 Tunnel 使用的标准 WebSocket 配置。
 ///
-/// Go 路径没有调用 `SetReadLimit`，因此 text/binary 消息和单帧都没有
-/// Gorilla 层的 64 MiB/16 MiB 上限。tungstenite 默认值恰好带这两个
+/// 路径没有调用 `SetReadLimit`，因此 text/binary 消息和单帧都没有
+/// WebSocket 层的 64 MiB/16 MiB 上限。tungstenite 默认值恰好带这两个
 /// 上限，必须显式取消。握手校验、子协议协商和 text UTF-8 校验则直接采用
-/// 上游 Tungstenite 的 RFC 行为，不再维护项目私有的 Gorilla 补丁。
+/// 上游 Tungstenite 的 RFC 行为，不再维护项目私有的 WebSocket 补丁。
 #[must_use]
 pub(super) fn gorilla_websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
@@ -905,14 +894,14 @@ pub(super) fn gorilla_websocket_config() -> WebSocketConfig {
 
 /// 在一个不可重置的 deadline 内读取下一条 Tunnel 应用消息。
 ///
-/// 对应 Go `(*Client).readLoop` 中一次 `SetReadDeadline` 加
-/// `ReadMessage`。`reader` 的 ping/pong 和库内部 frame 在同一 deadline
+/// 这相当于一次设置绝对读取 deadline 后调用 `ReadMessage`。`reader` 的 ping/pong
+/// 和库内部 frame 在同一 deadline
 /// 内继续读，不得通过刷控制帧让连接永不超时。`on_pong` 只更新
 /// 独立的 90 秒 pong 存活时钟，不影响本 deadline。
 ///
 /// # 返回
 /// 成功时返回 text/binary 的原始字节；调用方取消、连接结束、
-/// WebSocket 读错、close frame 或绝对 deadline 到期时返回兼容错误。
+/// WebSocket 读错、close frame 或绝对 deadline 到期时返回稳定错误。
 pub(super) async fn read_tunnel_data_message<S, F>(
     cancellation: &CancellationToken,
     reader: &mut S,
@@ -955,10 +944,10 @@ where
     }
 }
 
-/// 按 Go `http.ProxyFromEnvironment` 规则为 ws/wss 目标选择代理。
+/// 按 环境代理选择 规则为 ws/wss 目标选择代理。
 ///
 /// `ws` 对应 `HTTP_PROXY`，`wss` 对应 `HTTPS_PROXY`。CGI 进程中使用
-/// `HTTP_PROXY` 会在 NO_PROXY 判定前拒绝，复刻 Go 防 header 注入的安全顺序。
+/// `HTTP_PROXY` 会在 NO_PROXY 判定前拒绝，以防止 CGI header 注入。
 #[cfg(test)]
 pub(super) fn proxy_for_websocket_target(
     target: &Url,
@@ -975,7 +964,7 @@ pub(super) fn proxy_for_websocket_target(
 /// - Err(...)：代理配置触发安全错误
 ///
 /// 选择规则：
-/// - ws://  → HTTP_PROXY
+/// - ws:// → HTTP_PROXY
 /// - wss:// → HTTPS_PROXY
 /// - 其他协议 → 直连
 /// - 代理未配置或配置无效 → 直连
@@ -1012,10 +1001,10 @@ fn first_non_empty_environment(upper: &str, lower: &str) -> String {
         .unwrap_or_default()
 }
 
-/// 解析代理 URL，并从未规范化的 authority 恢复 Go `passwordSet`。
+/// 解析代理 URL，并从未规范化的 authority 恢复。
 ///
-/// Go 在初始化代理配置时忽略无法解析的值，因此这里返回 `None`，而不把一个无效
-/// 环境变量变成每次连接都失败。纯 `host[:port]` 与 Go 一样补 `http://`。只有
+/// 在初始化代理配置时忽略无法解析的值，因此这里返回 `None`，而不把一个无效
+/// 环境变量变成每次连接都失败。纯 `host[:port]` 会补 `http://`。只有
 /// user-info 中未转义的字面冒号表示密码分隔符；`%3A` 是用户名数据，不能误判。
 fn parse_environment_proxy_selection(value: &str) -> Option<ProxySelection> {
     if value.is_empty() {
@@ -1037,7 +1026,7 @@ fn parse_environment_proxy_selection(value: &str) -> Option<ProxySelection> {
 
 /// 检查原始代理 authority 的 user-info 是否包含未转义密码分隔符。
 ///
-/// Go `net/url` 以最后一个 `@` 前的第一个字面 `:` 设置 `passwordSet`。这里先截掉
+/// URL parser 以最后一个 `@` 前的第一个字面 `:` 设置 `passwordSet`。这里先截掉
 /// path/query/fragment，再使用最后一个 `@`，从而允许 percent-encoded 字符且不会把
 /// host 端口冒号误当成密码。
 fn proxy_url_has_explicit_password(raw_url: &str) -> bool {
@@ -1074,7 +1063,7 @@ fn should_bypass_proxy(target: &Url, no_proxy: &str) -> bool {
         .any(|entry| no_proxy_entry_matches(entry, &host, &port, target_ip))
 }
 
-/// 匹配一条 Go `httpproxy` 规则，包括 `*`、CIDR、IP、端口和域名。
+/// 匹配一条 NO_PROXY 规则，包括 `*`、CIDR、IP、端口和域名。
 fn no_proxy_entry_matches(entry: &str, host: &str, port: &str, target_ip: Option<IpAddr>) -> bool {
     let entry = entry.trim().to_ascii_lowercase();
     if entry == "*" {
@@ -1099,7 +1088,7 @@ fn no_proxy_entry_matches(entry: &str, host: &str, port: &str, target_ip: Option
     }
 
     let entry_host = entry_host.strip_prefix("*.").map_or(entry_host, |rest| {
-        // Go 把 `*.example.com` 视为前导点规则，只匹配子域名。
+        // 把 `*.example.com` 视为前导点规则，只匹配子域名。
         // 为共用下面的后缀比较，恢复一个前导点。
         rest
     });
@@ -1134,7 +1123,7 @@ fn url_host_ip(url: &Url) -> Option<IpAddr> {
     }
 }
 
-/// 对 NO_PROXY 域名执行与 Go `idnaASCII` 等价的 IDNA ToASCII。
+/// 对 NO_PROXY 域名执行 IDNA ToASCII 规范化。
 ///
 /// 复用 `url` crate 已使用的 WHATWG/IDNA host parser，避免再引入
 /// 一套可能与目标 URL 解析不一致的 Unicode 域名规则。
@@ -1170,7 +1159,7 @@ fn split_no_proxy_host_port(entry: &str) -> (&str, Option<&str>) {
     (entry, None)
 }
 
-/// 使用整数掩码匹配 IPv4/IPv6 CIDR，无效规则按 Go 语义忽略。
+/// 使用整数掩码匹配 IPv4/IPv6 CIDR，无效规则按 忽略。
 fn cidr_contains(entry: &str, target: IpAddr) -> bool {
     let Some((network, prefix)) = entry.split_once('/') else {
         return false;
@@ -1225,10 +1214,10 @@ fn websocket_target_authority(target: &Url) -> Result<String, WebSocketError> {
     }
 }
 
-/// 按 Gorilla `proxy_FromURL` 支持的 scheme 建立透明代理连接。
+/// 按 WebSocket `proxy_FromURL` 支持的 scheme 建立透明代理连接。
 ///
 /// `http` 使用 CONNECT，`socks5` 使用 RFC 1928/1929；其他
-/// scheme 返回 Gorilla 风格的 `proxy: unknown scheme` 错误。
+/// scheme 返回 WebSocket 风格的 `proxy: unknown scheme` 错误。
 async fn connect_via_proxy(
     proxy: &ProxySelection,
     target: &Url,
@@ -1247,7 +1236,7 @@ async fn connect_via_proxy(
 
 /// 连接 HTTP proxy，发送 CONNECT 并在 200 响应后返回透明 TCP stream。
 ///
-/// Gorilla WebSocket 为 `http` 注册 CONNECT dialer；本函数只处理
+/// WebSocket 为 `http` 注册 CONNECT dialer；本函数只处理
 /// 该分支，其他 scheme 由 [`connect_via_proxy`] 分派。
 async fn connect_via_http_proxy(
     proxy: &Url,
@@ -1286,7 +1275,7 @@ async fn connect_via_http_proxy(
 
     let (status_code, reason) = read_proxy_response(&mut stream).await?;
     if status_code != 200 {
-        // Gorilla 对非 200 返回 `resp.Status` 中第一个空格后的 reason。
+        // WebSocket 对非 200 返回 `resp.Status` 中第一个空格后的 reason。
         let message = if reason.is_empty() {
             status_code.to_string()
         } else {
@@ -1300,7 +1289,7 @@ async fn connect_via_http_proxy(
 /// 使用 RFC 1928 SOCKS5（可选 RFC 1929 用户名密码）连接目标。
 ///
 /// 域名以 SOCKS5 domain address 交给代理解析，不在本地做 DNS，
-/// 与 Go `x/net/proxy.SOCKS5` 一致。成功返回的 TCP stream 会在上层
+///。成功返回的 TCP stream 会在上层
 /// 按 `ws`/`wss` 继续 WebSocket 或 rustls 握手。
 async fn connect_via_socks5_proxy(proxy: &Url, target: &Url) -> Result<TcpStream, WebSocketError> {
     let proxy_host = url_host_text(proxy).ok_or_else(|| {
@@ -1309,9 +1298,8 @@ async fn connect_via_socks5_proxy(proxy: &Url, target: &Url) -> Result<TcpStream
             "proxy URL has no host",
         ))
     })?;
-    // Gorilla 把 proxy URL 的 `u.Host` 原样交给底层 Dialer；与 HTTP
-    // proxy 不同，SOCKS5 URL 没有隐式 1080。因此在真正发起 DNS/连接前
-    // 复刻 net.Dial 的缺端口错误，避免错误地连到一个未配置的端口。
+    // SOCKS5 URL 没有隐式 1080。因此在真正发起 DNS/连接前返回缺端口错误，
+    // 避免错误地连到一个未配置的端口。
     let proxy_port = socks5_proxy_port(proxy).ok_or_else(|| {
         let authority = match proxy.host() {
             Some(Host::Ipv6(address)) => format!("[{address}]"),
@@ -1426,16 +1414,15 @@ async fn connect_via_socks5_proxy(proxy: &Url, target: &Url) -> Result<TcpStream
 
 /// 返回 SOCKS5 proxy URL 中显式声明的端口。
 ///
-/// Gorilla v1.5.3 的 `proxy_FromURL` 会把 `u.Host` 原样交给
-/// `proxy_SOCKS5`，不会应用 `httpproxy.portMap` 中的 1080；因此
-/// 未声明端口必须返回 `None`，由调用方生成底层 Dial 的缺端口错误。
+/// SOCKS5 proxy URL 不应用默认 1080 端口；未声明端口必须返回 `None`，
+/// 由调用方生成缺端口错误。
 pub(super) fn socks5_proxy_port(proxy: &Url) -> Option<u16> {
     proxy.port()
 }
 
 /// 判定 SOCKS5 greeting 是否应提供 RFC 1929 认证方法。
 ///
-/// Go 只在用户名非空且用户名/密码都可由单字节长度
+/// 只在用户名非空且用户名/密码都可由单字节长度
 /// 表示时 offer method 2；超长或空用户名会只 offer no-auth。
 pub(super) fn should_offer_socks5_auth(username: &[u8], password: &[u8]) -> bool {
     !username.is_empty() && username.len() < 256 && password.len() < 256
@@ -1448,7 +1435,7 @@ async fn authenticate_socks5(
     username: &[u8],
     password: &[u8],
 ) -> Result<(), WebSocketError> {
-    // Go 在子协议层使用 uint8 cast；正常只有 greeting 已
+    // 在子协议层使用 uint8 cast；正常只有 greeting 已
     // offer method 2 才会进入，此时长度已被限制在 255 以内。
     let username_len = username.len() as u8;
     let password_len = password.len() as u8;
@@ -1550,7 +1537,7 @@ async fn read_socks5_connect_response(
             format!("proxy: failed to read address from SOCKS5 proxy at {proxy_address}: {error}"),
         ))
     })?;
-    // Gorilla 内嵌 x_net_proxy.go 在消费 bind address 后单独 ReadFull
+    // SOCKS5 握手在消费 bind address 后单独 ReadFull
     // 两字节端口。分开读取不仅保留顺序，也确保 address 完整而 port
     // 截断时返回 `failed to read port`，不能合并成 address 错误。
     let mut port = [0_u8; 2];
@@ -1670,7 +1657,7 @@ fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
-/// 对应 Go：`addJitter`，返回 `[base, base + base/2)` 的随机时长。
+/// 返回 `[base, base + base/2)` 的随机时长。
 #[must_use]
 pub fn add_jitter(base: Duration) -> Duration {
     let window = base / 2;
@@ -1683,11 +1670,11 @@ pub fn add_jitter(base: Duration) -> Duration {
 
 /// 解码允许未知字段的 Tunnel ProtoJSON。
 ///
-/// Go 先由 `decodeTunnelValue` 支持动态 interface，再分别通过 `asHTTPRequest`、
+/// 先由 `decodeTunnelValue` 支持动态 interface，再分别通过 `asHTTPRequest`、
 /// `asHTTPCancel`、`asWSOpen`、`asWSMessage` 与 `asWSClose` 做运行时断言；Rust 在
 /// 此处一次解码为强类型 oneof，后续 match 已保证每个分支拿到正确消息类型。
 ///
-/// pbjson 默认拒绝未知字段，而 Go 明确使用 `DiscardUnknown: true`；因此先只删除消息
+/// pbjson 默认拒绝未知字段，而 明确使用 `DiscardUnknown: true`；因此先只删除消息
 /// schema 以外的 key，再交给生成的反序列化器处理别名、Base64、数值范围和 oneof 冲突。
 fn decode_tunnel_request(data: &[u8]) -> Result<TunnelRequest, TunnelError> {
     let mut value: Value = serde_json::from_slice(data)

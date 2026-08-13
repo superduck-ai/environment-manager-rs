@@ -1,7 +1,7 @@
 //! Supabase Management API client。
 //!
-//! 路径、JSON keys、Bearer 行为和错误包装逐项对应 Go client.go。响应最多读取
-//! 10 MiB，和 Go `io.LimitReader` 一样到达上限时静默截断，而不是额外报告 oversized。
+//! 路径、JSON keys、Bearer 行为和错误包装构成稳定的 Management API 边界。响应最多读取
+//! 10 MiB，并到达上限时静默截断，而不是额外报告 oversized。
 
 use futures_util::StreamExt as _;
 use reqwest::Method;
@@ -14,7 +14,7 @@ use super::{Client, MigrationResponse, QueryErrorResponse, TypesResponse};
 
 /// 生产 Management API 根 URL。
 pub const DEFAULT_MANAGEMENT_API_BASE_URL: &str = "https://api.supabase.com/v1";
-/// 普通 API 响应的 Go-compatible 读取上限。
+/// 普通 API 响应的 -compatible 读取上限。
 pub const MANAGEMENT_API_RESPONSE_LIMIT: usize = 10 * 1024 * 1024;
 
 impl Client {

@@ -1,7 +1,6 @@
 //! 后端 Tunnel、HTTP/WebSocket 转发与控制 action。
 //!
-//! 对应 Go `internal/tunnel`。本阶段先暴露已经迁移的 `actions`；Tunnel WebSocket
-//! 客户端和本地代理处理器将在同一目录继续接入这些强类型协议消息。
+//! `actions`、Tunnel WebSocket 客户端和本地代理处理器共享强类型协议消息。
 
 pub mod actions;
 mod client;

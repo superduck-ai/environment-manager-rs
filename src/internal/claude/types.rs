@@ -1,6 +1,6 @@
 //! Claude 执行器、跨子系统适配 trait 与共享错误声明。
 //!
-//! Go 结构体中仅保存而不读取的 MCP registration 和 lease manager 仍原样保存在
+//! 结构体中仅保存而不读取的 MCP registration 和 lease manager 仍原样保存在
 //! 执行器上。MCP 以无行为 marker trait 隔离，o11y 则通过逐事件
 //! adapter 暴露；没有 adapter 时不会伪造计数器或诊断落盘。
 
@@ -27,7 +27,7 @@ use super::Outcomes;
 
 /// Claude 子系统对外返回的稳定文本错误。
 ///
-/// Go 版本大量使用 `%w` 动态包装不同错误类型；Rust 边界保留最终兼容文案，
+/// 调用链使用 `source chain` 动态包装不同错误类型；边界保留最终稳定文案，
 /// 具体 I/O 原因在构造时已经进入该文本和结构化日志。
 #[derive(Debug)]
 pub struct ClaudeError {
@@ -35,7 +35,7 @@ pub struct ClaudeError {
 }
 
 impl ClaudeError {
-    /// 从已经包含兼容上下文的消息构造错误。
+    /// 从已经包含完整上下文的消息构造错误。
     #[must_use]
     pub fn message(message: impl Into<String>) -> Self {
         Self {
@@ -45,14 +45,14 @@ impl ClaudeError {
 
     /// 从可能包含非 UTF-8 子进程输出的完整错误字节构造错误。
     ///
-    /// Go error string 本身是任意字节序列；保存为 `Vec<u8>` 可让最外层 CLI 使用
+    /// 稳定错误 string 本身是任意字节序列；保存为 `Vec<u8>` 可让最外层 CLI 使用
     /// `Write::write_all` 原样输出。普通 Rust `Display` 只能提供有损的人类可读视图。
     #[must_use]
     pub(crate) fn message_bytes(message: Vec<u8>) -> Self {
         Self { message }
     }
 
-    /// 返回 Go 兼容错误的原始字节，不执行 UTF-8 替换。
+    /// 返回错误的原始字节，不执行 UTF-8 替换。
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.message
@@ -68,7 +68,7 @@ impl ClaudeError {
 impl std::fmt::Display for ClaudeError {
     /// 为只接受 `Display` 的日志/诊断接口提供 UTF-8 替换视图。
     ///
-    /// 外部兼容 stderr 不应经过此方法，应调用 `as_bytes` 或 `into_bytes`。
+    /// 原始 stderr 不应经过此方法，应调用 `as_bytes` 或 `into_bytes`。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&go_utf8_error_view(&self.message))
     }
@@ -78,8 +78,8 @@ impl std::error::Error for ClaudeError {}
 
 /// 为日志/Display 将每个无效字节分别替换为 U+FFFD。
 ///
-/// Go `encoding/json` 对 error string 使用 `utf8.DecodeRune`，每个 size=1 的坏字节
-/// 都产生一个替换字符；Rust `from_utf8_lossy` 可能合并坏字节段，因此不能直接用。
+/// 每个无效输入字节都产生一个替换字符；`from_utf8_lossy` 可能合并坏字节段，
+/// 因此不能直接使用。
 pub(super) fn go_utf8_error_view(value: &[u8]) -> String {
     let mut output = String::new();
     let mut remaining = value;
@@ -102,37 +102,36 @@ pub(super) fn go_utf8_error_view(value: &[u8]) -> String {
 
 /// MCP registry 与 Claude 执行器之间的最小不透明 registration 边界。
 ///
-/// Claude Go 执行器只保存这些对象而不读取任何字段，因此 trait 故意没有方法；
+/// Claude 执行器只保存这些对象而不读取任何字段，因此 trait 故意没有方法；
 /// 真实 MCP registration 实现该 marker，无需在 Claude 模块重复配置结构。
 pub trait McpServerRegistration: Send + Sync {}
 
 /// o11y/diag 与 Claude 执行器之间的同步事件适配接口。
 ///
-/// 方法与 Go 调用点一一对应，避免把 metric 和 diagnostic 合并成一条虚构事件。
+/// 方法与 调用点，避免把 metric 和 diagnostic 合并成一条虚构事件。
 pub trait ClaudeObservability: Send + Sync {
     /// 返回本次会话应注入 Claude 的诊断文件路径；`None` 表示诊断落盘未启用。
     fn claude_code_diagnostics_file_path(&self) -> Option<String>;
 
-    /// 对应 `o11y.Increment(ClaudeCodeStartCounter)`。
+    /// 增加 Claude Code 启动计数器。
     fn increment_claude_code_start(&self);
 
-    /// 对应无 PII 的 `claude_code_start` 诊断事件。
+    /// 记录无 PII 的 `claude_code_start` 诊断事件。
     fn log_claude_code_start(&self);
 
-    /// 对应无 PII 的 `claude_code_end` 诊断事件。
+    /// 记录无 PII 的 `claude_code_end` 诊断事件。
     fn log_claude_code_end(&self, is_error: bool, exit_code: i32, duration_ms: i64);
 
-    /// 对应带成功/失败维度的 Claude Code 结束计数器。
+    /// 增加带成功/失败维度的 Claude Code 结束计数器。
     ///
     /// `exit_code` 仅在子进程确实启动并退出时存在；启动、等待或取消错误传 `None`。
-    /// 不能只传一个失败布尔值，否则 OTel 的 `error_code` 标签会丢失 Go
-    /// `errors.As(*exec.ExitError)` 能取得的真实退出码。
+    /// 不能只传失败布尔值，否则 OTel 的 `error_code` 标签会丢失错误链中的真实退出码。
     fn increment_claude_code_end(&self, is_error: bool, exit_code: Option<i32>);
 
-    /// 对应 `claude_init_success` 或 `claude_init_failed` 诊断事件。
+    /// 记录 `claude_init_success` 或 `claude_init_failed` 诊断事件。
     fn log_claude_init(&self, succeeded: bool, exit_code: Option<i32>, duration_ms: i64);
 
-    /// 对应存在旧版本兜底时的非致命更新失败诊断。
+    /// 记录存在旧版本兜底时的非致命更新失败诊断。
     fn log_claude_update_failed_nonfatal(&self, operation: &str);
 }
 

@@ -1,6 +1,6 @@
 //! `setup` 子命令的参数模型与 Clap 元数据。
 //!
-//! 对应 Go `cmd/cmd_setup.go`。本文件既保留 Clap 参数模型，也按原顺序执行 npm
+//! 本文件既保留 Clap 参数模型，也按原顺序执行 npm
 //! 预检、可选 whoami 健康检查、Claude Code 安装和 sandbox-runtime 安装。
 
 use std::path::PathBuf;
@@ -109,10 +109,9 @@ pub(crate) fn from_matches(matches: &ArgMatches) -> Result<SetupArgs, CliError> 
     })
 }
 
-/// 对应 Go：`cmd/cmd_setup.go` 中的 `loadServiceKey`。
 ///
 /// 优先读取显式文件并清除首尾空白；文件内容为空时继续回退
-/// `ENVIRONMENT_SERVICE_KEY`。文件无法读取时返回带路径的兼容错误，且不会把 secret
+/// `ENVIRONMENT_SERVICE_KEY`。文件无法读取时返回带路径的稳定错误，且不会把 secret
 /// 写入日志。
 pub(super) fn load_service_key(
     service_key_file: Option<&std::path::Path>,
@@ -133,7 +132,6 @@ pub(super) fn load_service_key(
     Ok(service_key)
 }
 
-/// 对应 Go：`cmd/cmd_setup.go` 中的 `runAPIHealthcheck`。
 ///
 /// 使用 service key 调用 `/v1/environments/whoami`，验证认证与网络连通性。取消令牌
 /// 会中断请求；失败时保留 whoami 的状态码或解析原因，并增加 setup 层上下文。
@@ -152,7 +150,6 @@ pub(super) async fn run_api_healthcheck(
     Ok(())
 }
 
-/// 对应 Go：`cmd/cmd_setup.go` 中的 `runSetup`。
 ///
 /// 严格按“初始化 tracing → npm 预检 → 可选 API 健康检查 → Claude → SRT”的顺序执行。
 /// 两个安装都跳过时不会要求 npm；没有 service key 时健康检查也只记录跳过信息。
@@ -203,9 +200,8 @@ pub async fn run_setup(
     Ok(())
 }
 
-/// 对应 Go：`cmd/cmd_setup.go` 中的 `runPreflightChecks`。
 ///
-/// 当前预检只有 npm，但保留单独编排函数和日志顺序，方便后续与 Go 差分时准确定位
+/// 当前预检只有 npm，但保留单独编排函数和日志顺序，方便后续与 差分时准确定位
 /// 是预检框架还是 npm 探测发生变化。
 async fn run_preflight_checks(cancellation: &CancellationToken) -> Result<(), String> {
     tracing::info!("{}", "Running pre-flight checks");
@@ -214,8 +210,8 @@ async fn run_preflight_checks(cancellation: &CancellationToken) -> Result<(), St
     Ok(())
 }
 
-/// 通过 `PATH` 启动 `npm --version`，只在退出成功时视为可用。为兼容 Go，错误包含
-/// 多行安装提示；取消只终止 npm 这个直接子进程，不操作进程组。
+/// 通过 `PATH` 启动 `npm --version`，只在退出成功时视为可用。错误包含多行安装提示；
+/// 取消只终止 npm 这个直接子进程，不操作进程组。
 pub(super) async fn check_npm_available(cancellation: &CancellationToken) -> Result<(), String> {
     tracing::debug!("{}", "Checking npm availability");
     let mut command = TokioCommand::new("npm");
@@ -238,7 +234,6 @@ fn npm_preflight_error(error: &str) -> String {
     )
 }
 
-/// 对应 Go：`cmd/cmd_setup.go` 中的 `installClaudeCode`。
 ///
 /// `CLAUDE_DEFAULT_PATH` 为空时使用 `claude`，并用无操作活动记录器调用共享安装器。
 /// 安装器会根据版本决定安装或升级；这里仅增加 setup 命令的稳定错误上下文。
@@ -258,7 +253,6 @@ async fn install_claude_code(
     Ok(())
 }
 
-/// 对应 Go：`cmd/cmd_setup.go` 中的 `installSandboxRuntime`。
 ///
 /// 调用共享 SRT 安装器并保留 setup 层包装文本；安装器内部在升级失败且已有可执行
 /// 文件时继续使用旧版本，`current` 则完全跳过 npm。

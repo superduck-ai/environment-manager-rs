@@ -32,7 +32,7 @@ fn contains_chinese(value: &str) -> bool {
 
 /// 从属性集合中提取编译器保存的 `#[doc = "..."]` 文本。
 ///
-/// `///` 和 `//!` 在语法树中都会转换成 doc 属性，因此统一从属性读取可以避免依赖
+/// ` ` 和 ` ` 在语法树中都会转换成 doc 属性，因此统一从属性读取可以避免依赖
 /// 源码缩进或换行形式。
 fn has_chinese_doc(attributes: &[Attribute]) -> bool {
     attributes.iter().any(|attribute| {

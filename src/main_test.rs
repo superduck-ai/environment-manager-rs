@@ -7,7 +7,6 @@ use std::{
 
 use assert_cmd::cargo::CommandCargoExt as _;
 
-/// 对应 Go `TestProvisionPackagesBinaryDoesNotLeakRejectedSpecs`。
 #[test]
 fn test_provision_packages_binary_does_not_leak_rejected_specs() {
     let binary_path = build_environment_manager_binary();
@@ -64,9 +63,9 @@ fn test_provision_packages_binary_does_not_leak_rejected_specs() {
     }
 }
 
-/// 对应 Go `buildEnvironmentManagerBinary`，定位 Cargo 为当前测试构建的真实二进制。
+/// 定位 Cargo 为当前测试构建的真实二进制。
 ///
-/// Rust 测试 harness 已在运行测试前完成构建，因此无需像 Go helper 那样再次调用编译器；
+/// Rust 测试 harness 已在运行测试前完成构建，因此无需再次调用编译器；
 /// 返回值仍是独立子进程测试使用的绝对或 Cargo 可解析路径，不修改工作树。
 #[must_use]
 fn build_environment_manager_binary() -> PathBuf {

@@ -93,7 +93,7 @@ pub struct RecorderOptions {
 }
 
 impl Default for RecorderOptions {
-    /// 返回与 Go 构造函数默认值相同的 30 秒和 15 分钟。
+    /// 返回默认的 30 秒请求超时和 15 分钟长任务超时。
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(30),

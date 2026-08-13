@@ -1,6 +1,6 @@
 //! 固定 package-manager argv 的 Linux 子进程执行器。
 //!
-//! 对应 Go `internal/packages/executor.go`。每次调用使用 `/home/user` 工作目录、丢弃
+//! 每次调用使用 `/home/user` 工作目录、丢弃
 //! stdout/stderr，并创建独立进程组；取消时终止整个组，避免 package manager 留下
 //! 下载器或安装脚本。进程输出和错误正文都不会进入协议结果或日志。
 
@@ -37,7 +37,7 @@ impl ExecCommandRunner {
 
 #[async_trait]
 impl CommandRunner for ExecCommandRunner {
-    /// 对应 Go `execCommandRunner.Run`，执行一个无 shell 的固定 argv。
+    /// 执行一个无 shell 的固定 argv。
     ///
     /// # 副作用
     /// 创建独立 Linux 进程组并把两个输出流连接到 `/dev/null`；取消时向负 PGID 发送
@@ -67,36 +67,36 @@ impl CommandRunner for ExecCommandRunner {
         let process_id = child.id().and_then(|id| i32::try_from(id).ok());
 
         tokio::select! {
-            status = child.wait() => {
-                let mut result = completed_command_result(status);
-                // Go 在 Wait 返回后再次检查 ctx.Err，并用取消原因覆盖原结果。两者
-                // 同时就绪时不能让 Tokio select 的随机分支把已取消安装误报成成功。
-                if context.is_cancelled() {
-                    result.error = Some(cancelled_error());
-                }
-                result
-            },
-            () = context.cancelled() => {
-                let kill_error = process_id.and_then(kill_process_group);
-                match tokio::time::timeout(PROCESS_WAIT_DELAY, child.wait()).await {
-                    Ok(status) => {
-                        let mut result = completed_command_result(status);
-                        // Go CommandContext 在 context 完成后用 ctx.Err 覆盖 Wait 错误；
-                        // 应用层随后优先按 context 分类，所以这里只需确保 error 非空。
-                        result.error = Some(kill_error.unwrap_or_else(cancelled_error));
-                        result
-                    }
-                    Err(_) => CommandResult {
-                        exit_code: -1,
-                        started: true,
-                        signaled: true,
-                        error: Some(kill_error.unwrap_or_else(|| {
-                            io::Error::new(io::ErrorKind::TimedOut, "package manager wait timed out")
-                        })),
-                    },
-                }
-            }
-        }
+                   status = child.wait() => {
+                       let mut result = completed_command_result(status);
+        // 在 Wait 返回后再次检查 ctx.Err，并用取消原因覆盖原结果。两者
+        // 同时就绪时不能让 Tokio select 的随机分支把已取消安装误报成成功。
+                       if context.is_cancelled() {
+                           result.error = Some(cancelled_error());
+                       }
+                       result
+                   },
+                   () = context.cancelled() => {
+                       let kill_error = process_id.and_then(kill_process_group);
+                       match tokio::time::timeout(PROCESS_WAIT_DELAY, child.wait()).await {
+                           Ok(status) => {
+                               let mut result = completed_command_result(status);
+        // CommandContext 在 context 完成后用 ctx.Err 覆盖 Wait 错误；
+        // 应用层随后优先按 context 分类，所以这里只需确保 error 非空。
+                               result.error = Some(kill_error.unwrap_or_else(cancelled_error));
+                               result
+                           }
+                           Err(_) => CommandResult {
+                               exit_code: -1,
+                               started: true,
+                               signaled: true,
+                               error: Some(kill_error.unwrap_or_else(|| {
+                                   io::Error::new(io::ErrorKind::TimedOut, "package manager wait timed out")
+                               })),
+                           },
+                       }
+                   }
+               }
     }
 }
 
@@ -119,7 +119,7 @@ fn completed_command_result(status: io::Result<std::process::ExitStatus>) -> Com
     }
 }
 
-/// 对应 Go `processWasSignaled`，判断 Linux wait status 是否由信号结束。
+/// 判断 Linux wait status 是否由信号结束。
 ///
 /// `ExitStatusExt::signal` 只在 Unix 可用；本项目支持 Linux GNU 的任意 CPU
 /// 架构，因此这里不增加其他操作系统的退化分支。

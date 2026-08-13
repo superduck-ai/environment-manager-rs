@@ -1,9 +1,9 @@
 //! Anthropic 环境的配置、初始化和语言安装脚本。
 //!
-//! 目录逐文件对应 Go `internal/envtype/anthropic`。源码处理复用独立 `sources`
-//! 子系统；临时脚本和 Git 外部命令使用 Tokio，并保持取消只终止直接子进程。
+//! 源码处理复用独立 `sources` 子系统；临时脚本和 Git 外部命令使用 Tokio，并保持取消
+//! 只终止直接子进程。
 
-// 保留 Go `anthropic/anthropic.go` 到 Rust `anthropic/anthropic.rs` 的机械映射。
+// 允许实现模块与父模块同名。
 #[allow(clippy::module_inception)]
 mod anthropic;
 mod config;

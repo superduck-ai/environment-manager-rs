@@ -1,6 +1,6 @@
-//! 对应 Go `internal/api/retry.go` 的 HTTP 重试策略。
+//! HTTP 重试策略。
 //!
-//! 仅对 Go 明确列出的状态码和传输错误重试；请求体必须可克隆，避免重试 POST 时发送
+//! 仅对 明确列出的状态码和传输错误重试；请求体必须可克隆，避免重试 POST 时发送
 //! 空 body。等待和请求阶段都监听统一取消信号。
 
 use std::time::Duration;
@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{ApiError, HttpClient};
 
-/// HTTP 重试参数，对应 Go `RetryConfig`。
+/// HTTP 重试参数。
 #[derive(Clone, Debug, PartialEq)]
 pub struct RetryConfig {
     /// 首次请求失败后的最大重试次数，不含最初请求。
@@ -25,7 +25,7 @@ pub struct RetryConfig {
 }
 
 impl Default for RetryConfig {
-    /// 对应 Go `defaultRetryConfig`，返回 3 次、1 秒起步、10 秒封顶的策略。
+    /// 返回 3 次、1 秒起步、10 秒封顶的策略。
     fn default() -> Self {
         Self {
             max_retries: 3,
@@ -36,7 +36,7 @@ impl Default for RetryConfig {
     }
 }
 
-/// 判断响应码是否属于 Go 实现允许自动重试的集合。
+/// 判断响应码是否属于 允许自动重试的集合。
 fn is_retryable_status_code(status: StatusCode) -> bool {
     matches!(
         status,
@@ -49,7 +49,7 @@ fn is_retryable_status_code(status: StatusCode) -> bool {
     )
 }
 
-/// 对应 Go `calculateBackoff`，计算指数退避并增加 `[0, 30%)` 正 jitter。
+/// 计算指数退避并增加 `[0, 30%)` 正 jitter。
 fn calculate_backoff(attempt: usize, config: &RetryConfig) -> Duration {
     if attempt == 0 {
         return config.initial_backoff;
@@ -65,7 +65,7 @@ fn calculate_backoff(attempt: usize, config: &RetryConfig) -> Duration {
 }
 
 impl HttpClient {
-    /// 对应 Go `RetryableHTTPDo`，执行可重放请求并在明确的临时错误上退避重试。
+    /// 执行可重放请求并在明确的临时错误上退避重试。
     ///
     /// # 参数
     /// - `cancellation`：manager 统一取消信号，请求和 backoff 均会响应。
@@ -73,7 +73,7 @@ impl HttpClient {
     /// - `retry_config`：调用点覆盖策略；为空时使用 client 默认值。
     ///
     /// # 返回
-    /// 非重试状态的原始响应；传输失败、重试耗尽或取消时返回兼容错误文本。
+    /// 非重试状态的原始响应；传输失败、重试耗尽或取消时返回稳定错误文本。
     pub async fn retryable_http_do(
         &self,
         cancellation: &CancellationToken,
@@ -107,7 +107,7 @@ impl HttpClient {
                 Ok(response) => {
                     last_error =
                         format!("request failed with status {}", response.status().as_u16());
-                    // 丢弃响应会关闭连接 body；与 Go 显式 Close 的生命周期等价。
+                    // 丢弃响应会关闭连接 body，确保重试前释放本次响应。
                     drop(response);
                 }
                 Err(Some(error)) => {
@@ -124,7 +124,7 @@ impl HttpClient {
 
             let backoff = calculate_backoff(attempt + 1, config);
             tracing::warn!("attempt" = ?(attempt + 1), "backoff_ms" = ?(backoff.as_millis()), "error" = ?(&last_error), "{}", "Request failed, retrying");
-            // Go 先让当前 `http.Client.Do` 返回 context error，再在 retry backoff 的
+            // 先让当前 HTTP 请求返回取消错误，再在 retry backoff 的
             // select 中观察取消。因此只有“仍有下一次重试”时错误才是 retry
             // cancelled；最后一次 attempt 必须落入统一的 exhausted 包装。
             if cancellation.is_cancelled() {
@@ -152,7 +152,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_backoff_matches_go_range() {
+    fn first_backoff_stays_within_jitter_range() {
         let config = RetryConfig {
             max_retries: 1,
             initial_backoff: Duration::from_millis(100),

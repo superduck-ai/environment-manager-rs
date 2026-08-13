@@ -1,6 +1,6 @@
 //! `task-run` 会话模式的强类型解析。
 //!
-//! 空字符串保持 Go 的默认行为并解析为 `new`；未知值返回包含完整允许列表的错误。
+//! 空字符串保持 默认行为并解析为 `new`；未知值返回包含完整允许列表的错误。
 
 use std::{fmt, str::FromStr};
 
@@ -23,7 +23,7 @@ pub enum SessionMode {
 }
 
 impl SessionMode {
-    /// 返回与 CLI/wire 兼容的 kebab-case 字符串。
+    /// 返回 CLI/wire 使用的 kebab-case 字符串。
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -34,7 +34,7 @@ impl SessionMode {
         }
     }
 
-    /// 强类型枚举的所有实例都合法；该方法对应 Go 的 `IsValid`。
+    /// 强类型枚举的所有实例都合法。
     #[must_use]
     pub const fn is_valid(self) -> bool {
         true
@@ -44,7 +44,7 @@ impl SessionMode {
 impl fmt::Display for SessionMode {
     /// 将模式格式化为 CLI 使用的稳定字符串。
     ///
-    /// 该标准 `Display` 实现承接 Go `SessionMode.String`；所有格式化入口因此共享
+    /// 该标准 `Display` 实现承接；所有格式化入口因此共享
     /// 同一 kebab-case wire 值，而不再维护第二套字符串方法。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())

@@ -36,7 +36,7 @@ impl TagProvider for KvTagProvider {
 /// 把错误链转换为稳定的 `error` 与 `error_code` 标签。
 ///
 /// 成功返回空 map；遇到 `ProcessExitError::ExitCode` 时保留真实退出码，其他错误使用
-/// `unknown`。逐层扫描 source chain 对应 Go `errors.As`，因此包装错误不会丢失退出码。
+/// `unknown`。逐层扫描 source chain 因此包装错误不会丢失退出码。
 pub fn error_tags(error: Option<&(dyn Error + Send + Sync + 'static)>) -> KvTagProvider {
     let Some(error) = error else {
         return KvTagProvider::default();

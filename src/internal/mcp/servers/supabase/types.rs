@@ -2,7 +2,7 @@
 //!
 //! 类型保持 Management API/CCR API 的原字段名。客户端分开保存 30 秒管理 API
 //! client 和无全局 timeout 的 deploy client，使 Edge Function 的 120 秒请求窗口与
-//! Go 行为一致。
+//! 一致。
 
 use std::{path::PathBuf, sync::Arc};
 

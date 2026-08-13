@@ -1,7 +1,7 @@
-//! 对应 Go `internal/api/session_ingress_types.go` 的错误文案和事件构造器。
+//! 错误文案和事件构造器。
 //!
-//! 构造器刻意填充与 Go 相同的零值字段；UUID 和时间戳是唯一允许在差分测试中归一化
-//! 的动态值，其格式和生成时机仍保持一致。
+//! 构造器显式填充协议要求的默认字段；UUID 和时间戳是唯一允许在 wire 测试中归一化
+//! 的动态值。
 
 use std::collections::BTreeMap;
 
@@ -16,19 +16,19 @@ use super::{
 };
 
 impl SessionError for ClaudeCodeExecutionError {
-    /// 对应 Go `ClaudeCodeExecutionError.GetUserMessage`，返回稳定英文用户文案。
+    /// 返回稳定英文用户文案。
     fn get_user_message(&self) -> String {
         "An error occurred while executing Claude Code. You can try again by sending a new message or starting a new session.".to_owned()
     }
 
-    /// 对应 Go `ClaudeCodeExecutionError.IsFatal`。
+    /// 返回事件携带的 fatal 标志。
     fn is_fatal(&self) -> bool {
         self.fatal
     }
 }
 
 impl SessionError for SourceProcessingError {
-    /// 对应 Go `SourceProcessingError.GetUserMessage`，有类型时插入 source 名称。
+    /// 有类型时插入 source 名称。
     fn get_user_message(&self) -> String {
         if self.source_type.is_empty() {
             "An error occurred while processing source. You can try again by sending a new message or starting a new session.".to_owned()
@@ -40,14 +40,14 @@ impl SessionError for SourceProcessingError {
         }
     }
 
-    /// 对应 Go `SourceProcessingError.IsFatal`。
+    /// 返回事件携带的 fatal 标志。
     fn is_fatal(&self) -> bool {
         self.fatal
     }
 }
 
 impl SessionError for InitScriptError {
-    /// 对应 Go `InitScriptError.GetUserMessage`，保留换行和标点。
+    /// 保留换行和标点。
     fn get_user_message(&self) -> String {
         let mut message = format!("Setup script failed with exit code {}.", self.exit_code);
         if !self.output.is_empty() {
@@ -57,13 +57,13 @@ impl SessionError for InitScriptError {
         message
     }
 
-    /// init script 失败在 Go 中始终为 fatal。
+    /// init script 失败在 中始终为 fatal。
     fn is_fatal(&self) -> bool {
         true
     }
 }
 
-/// 对应 Go `NewEnvManagerLogEvent`，包装日志数据并生成 UUID。
+/// 包装日志数据并生成 UUID。
 pub fn new_env_manager_log_event(data: EnvManagerLogEventData) -> SessionEvent {
     SessionEvent {
         event_type: "env_manager_log".to_owned(),
@@ -73,7 +73,7 @@ pub fn new_env_manager_log_event(data: EnvManagerLogEventData) -> SessionEvent {
     }
 }
 
-/// 对应 Go `NewEnvManagerLogEventData`，使用 UTC 当前时间并把缺省 extra 变为空 map。
+/// 使用 UTC 当前时间并把缺省 extra 变为空 map。
 pub fn new_env_manager_log_event_data(
     level: LogLevel,
     category: LogCategory,
@@ -89,7 +89,7 @@ pub fn new_env_manager_log_event_data(
     }
 }
 
-/// 对应 Go `NewSyntheticAssistantMessage`，创建前端可显示的合成 assistant 错误消息。
+/// 创建前端可显示的合成 assistant 错误消息。
 pub fn new_synthetic_assistant_message(error_text: impl Into<String>) -> SessionEvent {
     SessionEvent {
         event_type: "assistant".to_owned(),
@@ -109,7 +109,7 @@ pub fn new_synthetic_assistant_message(error_text: impl Into<String>) -> Session
     }
 }
 
-/// 对应 Go `NewResultEvent`，显式填充 result 事件的数值零值和空集合。
+/// 显式填充 result 事件的数值零值和空集合。
 pub fn new_result_event(subtype: impl Into<String>, errors: Vec<String>) -> SessionEvent {
     SessionEvent {
         event_type: "result".to_owned(),

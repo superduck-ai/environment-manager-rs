@@ -1,7 +1,7 @@
 //! API 协议类型。
 //!
-//! 原 Go 文件由 DWARF 恢复；这里保留 JSON 字段和零值语义，并用 `Option` 明确表示
-//! `omitempty`。动态事件内容使用 `serde_json::Value`，以免枚举封闭后丢弃后端新增字段。
+//! 这里保留后端 JSON 字段和零值语义，并用 `Option` 明确表示字段是否省略。动态事件
+//! 内容使用 `serde_json::Value`，以免枚举封闭后丢弃后端新增字段。
 
 use std::collections::BTreeMap;
 
@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::ApiError;
 
-/// 对应 Go `Client`，获取指定 session 的环境配置。
+/// 获取指定 session 的环境配置。
 #[async_trait]
 pub trait Client: Send + Sync {
     /// 按 session ID 查询环境配置；取消信号触发时应立即停止网络请求。
@@ -57,7 +57,7 @@ pub struct SessionContext {
     /// 指定模型名。
     #[serde(default, deserialize_with = "deserialize_string_or_null")]
     pub model: String,
-    /// 原始 MCP 配置；保留未知字段以及 missing/null 的 Go RawMessage 差别。
+    /// 原始 MCP 配置；保留未知字段以及 missing/null 的 JSON 差别。
     #[serde(default, deserialize_with = "deserialize_present_json_value")]
     pub mcp_config: Option<Value>,
 }
@@ -70,7 +70,7 @@ pub struct SessionContextResponse {
     pub session_context: SessionContext,
 }
 
-/// 反序列化 Go string 字段，并把显式 JSON null 映射为空字符串零值。
+/// 反序列化 string 字段，并把显式 JSON null 映射为空字符串零值。
 fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -78,7 +78,7 @@ where
     Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
-/// 保留 `json.RawMessage` 的字段存在性，避免普通 `Option<Value>` 折叠显式 null。
+/// 保留 JSON 字段的存在性，避免普通 `Option<Value>` 折叠显式 null。
 fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
 where
     D: Deserializer<'de>,
@@ -86,7 +86,7 @@ where
     Value::deserialize(deserializer).map(Some)
 }
 
-/// 把显式 null 的嵌套 struct 还原为 Go `encoding/json` 留下的结构体零值。
+/// 把显式 null 的嵌套 struct 还原为结构体零值。
 fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
@@ -124,9 +124,8 @@ pub struct AssistantMessage {
 impl AssistantMessage {
     /// 表明该强类型消息可以放入 session event 的 message 槽位。
     ///
-    /// Go 通过无返回值的 marker `isMessageContent` 约束 interface 联合；Rust 已把
-    /// wire 字段收紧为 `Option<AssistantMessage>`，因此类型本身就是证明。这个谓词
-    /// 保留可查询的兼容表面，同时不会重新引入动态分派。
+    /// wire 字段已收紧为 `Option<AssistantMessage>`，因此类型本身就是证明。这个谓词
+    /// 保留便于调用方查询的表面，同时不会重新引入动态分派。
     #[must_use]
     pub const fn is_message_content(&self) -> bool {
         true
@@ -199,7 +198,7 @@ pub struct SessionEvent {
     /// 总费用，单位美元。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<f64>,
-    /// result 错误列表；空列表按 Go `omitempty` 省略。
+    /// result 错误列表；空列表按 JSON 空值省略 省略。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
     /// 每个模型的用量；空 map 省略。
@@ -225,14 +224,14 @@ pub struct EnvManagerLogEventData {
     /// UTC 时间戳。
     #[serde(serialize_with = "serialize_go_time_rfc3339_nano")]
     pub timestamp: DateTime<Utc>,
-    /// 附加结构化字段；BTreeMap 保持 Go JSON 的排序行为。
+    /// 附加结构化字段；BTreeMap 保持 JSON 的排序行为。
     pub extra: BTreeMap<String, Value>,
 }
 
 impl EnvManagerLogEventData {
     /// 表明该结构可以序列化到 session event 的动态 data 槽位。
     ///
-    /// Go 的空 marker `isEventData` 只承担编译期类型约束；Rust 构造函数会先把该
+    /// 空 marker `isEventData` 只承担编译期类型约束；Rust 构造函数会先把该
     /// 结构序列化为 `serde_json::Value`。返回 true 的强类型谓词表达同一事实，且
     /// 不伪造一个没有业务行为的空回调。
     #[must_use]
@@ -249,7 +248,7 @@ pub enum LogCategory {
     Init,
     /// Claude Code 主执行过程。
     ///
-    /// Go 的公开常量只声明 `init`，但 executor 通过开放字符串类型显式发送
+    /// 公开常量只声明 `init`，但 executor 通过开放字符串类型显式发送
     /// `api.LogCategory("execute")`；Rust 闭合枚举必须把该实际 wire 值列出。
     Execute,
 }
@@ -262,7 +261,7 @@ pub enum LogLevel {
     Debug,
     /// 普通信息。
     Info,
-    /// 警告；Go wire 值为 `warning`。
+    /// 警告；wire 值为 `warning`。
     #[serde(rename = "warning")]
     Warning,
     /// 错误。
@@ -279,11 +278,11 @@ pub struct DiagLogEntry {
     pub fields: BTreeMap<String, Value>,
 }
 
-/// 按 Go `time.Time.MarshalJSON` 的 RFC3339Nano 规则序列化 UTC 时间。
+/// 按 RFC 3339 纳秒格式序列化 UTC 时间，并裁剪小数部分末尾的零。
 ///
-/// Chrono 的默认 `AutoSi` 只会输出 0/3/6/9 位小数，而 Go 会删除任意数量的末尾
-/// 零，例如 120ms 必须写成 `.12Z`。事件 payload 会被后端逐字节观察，因此不能
-/// 直接依赖 Chrono 的默认 Serde 实现。Go 还会拒绝四位范围外的年份，这里同步在
+/// Chrono 的默认 `AutoSi` 只会输出 0/3/6/9 位小数，而协议会删除任意数量的末尾零，
+/// 例如 120ms 必须写成 `.12Z`。事件 payload 会被后端逐字节观察，因此不能
+/// 直接依赖 Chrono 的默认 Serde 实现。还会拒绝四位范围外的年份，这里同步在
 /// 序列化边界返回错误。
 fn serialize_go_time_rfc3339_nano<S>(
     value: &DateTime<Utc>,

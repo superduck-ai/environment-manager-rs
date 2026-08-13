@@ -1,6 +1,6 @@
 //! sandbox runtime 初始化、命令包装和配置清理。
 //!
-//! 自动配置包含 Go 版本相同的 Anthropic 域名、敏感路径 deny-list 和写入目录；
+//! 自动配置包含 相同的 Anthropic 域名、敏感路径 deny-list 和写入目录；
 //! 自定义配置只验证和引用，不改变内容、不接管所有权。
 
 use std::{
@@ -37,12 +37,12 @@ pub struct SandboxRuntime {
     custom_config: bool,
 }
 
-/// 对应 Go：`internal/sandbox/runtime.go` 中为 `/tmp/claude` 调用的
-/// `os.MkdirAll(path, 0755)`。
+/// 为 `/tmp/claude` 应用
+/// 0755 目录创建语义。
 ///
 /// 以 `0755` 作为新建目录的权限上限，并继续让进程 `umask` 收紧权限。不能使用
 /// `std::fs::create_dir_all` 的默认 `0777`，否则在 `umask 000` 的容器中会把 Claude
-/// 临时目录扩大为所有用户可写。已有目录与 Go `MkdirAll` 一样不主动 chmod。
+/// 临时目录扩大为所有用户可写。已有目录与 递归建目录 一样不主动 chmod。
 ///
 /// # 参数
 /// - `path`：需要递归创建的 Linux 目录；调用方仍负责记录失败并决定是否继续。
@@ -59,14 +59,14 @@ fn create_claude_temp_directory(path: &Path) -> io::Result<()> {
 }
 
 impl SandboxRuntime {
-    /// 对应 Go：`SandboxRuntime.srtBinary` 的只读访问。
+    /// 只读访问。
     ///
     /// 返回实际调用的 SRT executable 名称或路径，不触发 PATH 查询或日志。
     pub fn srt_binary(&self) -> &str {
         &self.srt_binary
     }
 
-    /// 对应 Go：`SandboxRuntime.configPath` 的只读访问。
+    /// 只读访问。
     ///
     /// 返回当前 settings JSON 路径；成功清理 owned 配置后该路径为空。
     pub fn config_path(&self) -> &Path {
@@ -78,7 +78,6 @@ impl SandboxRuntime {
         self.custom_config
     }
 
-    /// 对应 Go：`internal/sandbox/runtime.go` 中的 `(*SandboxRuntime).WrapCommand`。
     ///
     /// 把原始命令转换为 `srt --settings <path> -- <command> <args...>`，并记录原始及
     /// 包装后的参数数组。
@@ -103,11 +102,10 @@ impl SandboxRuntime {
         (self.srt_binary.clone(), wrapped)
     }
 
-    /// 对应 Go：`internal/sandbox/runtime.go` 中的 `(*SandboxRuntime).Cleanup`。
     ///
     /// 清理由本 runtime 自动生成的配置；空路径幂等成功，自定义配置只记录跳过。
-    /// 删除失败时先记录 Go 的内部 warning，再把原错误返回给 Hook defer，由后者记录
-    /// `sandbox cleanup failed`，两条记录都属于兼容行为。
+    /// 删除失败时先记录内部 warning，再把原错误返回给 Hook，由后者记录
+    /// `sandbox cleanup failed`。
     ///
     /// # 返回
     /// 删除成功或无需删除时返回成功；文件系统删除失败时返回 `SandboxRuntimeError`。
@@ -133,14 +131,12 @@ impl SandboxRuntime {
     }
 }
 
-/// 对应 Go：`internal/sandbox/runtime.go` 中的 `NewSandboxRuntimeWithConfig`。
 ///
-/// 初始化 SRT runtime，并选择自定义配置或生成默认配置。`_session_json` 在当前 Go
-/// 实现中未使用，但仍保留参数以便逐函数对照；`working_dir` 非空时追加到
+/// 初始化 SRT runtime，并选择自定义配置或生成默认配置。`_session_json` 当前未使用；`working_dir` 非空时追加到
 /// `allowWrite`。
 ///
 /// # 参数
-/// - `_session_json`：原始 session JSON；当前基线不解析该参数。
+/// - `_session_json`：原始 session JSON；当前实现不解析该参数。
 /// - `custom_config_path`：调用方拥有的 settings 路径；存在时只验证、不删除。
 /// - `working_dir`：自动配置额外允许写入的工作目录。
 ///
@@ -190,7 +186,7 @@ pub fn new_sandbox_runtime_with_config(
     })
 }
 
-/// 构造与 Go runtime.go 完全相同的默认网络与文件系统规则。
+/// 构造默认网络与文件系统规则。
 ///
 /// 除 runtime 自动配置外，`print-sandbox-settings` 也调用此函数，保证展示模板与
 /// 实际默认隔离规则来自同一份定义，不会在两个命令路径中漂移。
@@ -312,7 +308,7 @@ mod tests {
         );
     }
 
-    /// 验证 `umask 000` 时仍以 Go 指定的 0755 为权限上限。
+    /// 验证 `umask 000` 时仍以 指定的 0755 为权限上限。
     ///
     /// 通过 shell 只修改子进程 umask，避免并行 Rust 测试共享的进程级 umask 产生
     /// 数据竞争；子进程只运行上面的精确探针测试。

@@ -40,7 +40,7 @@ pub(crate) fn add_print_sandbox_settings_command() -> Command {
 
 /// 构造 `print-sandbox-settings` 子命令的内部短别名。
 ///
-/// 该别名只让命令树的调用点保持简洁；对照 Go 时应查看
+/// 该别名只让命令树的调用点保持简洁；实现细节见
 /// [`add_print_sandbox_settings_command`]。
 pub(crate) fn command() -> Command {
     add_print_sandbox_settings_command()
@@ -51,7 +51,6 @@ pub(crate) fn from_matches(_matches: &ArgMatches) -> Result<PrintSandboxSettings
     Ok(PrintSandboxSettingsArgs)
 }
 
-/// 对应 Go：`cmd/cmd_print_sandbox_settings.go` 中的 `runPrintSandboxSettings`。
 ///
 /// 将默认 sandbox-runtime 配置序列化成两空格缩进 JSON，并写入一个末尾换行。
 ///
@@ -59,7 +58,7 @@ pub(crate) fn from_matches(_matches: &ArgMatches) -> Result<PrintSandboxSettings
 /// - `writer`：接收完整 JSON 的同步输出目标；生产路径传入锁定后的 stdout。
 ///
 /// # 返回
-/// 序列化或写入失败时返回带 Go 兼容上下文的错误文本。
+/// 序列化或写入失败时返回带完整上下文的错误文本。
 ///
 /// # 副作用
 /// 仅写入调用方提供的 writer，不读取环境变量，也不创建文件或子进程。

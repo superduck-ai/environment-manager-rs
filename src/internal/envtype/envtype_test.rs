@@ -100,7 +100,7 @@ fn test_env_types_register_and_create() {
     assert_eq!(error.to_string(), "factory failed");
 }
 
-/// 验证缺少名称或 factory 的注册项沿用 Go 的 panic 行为。
+/// 验证缺少名称或 factory 的注册项沿用 panic 行为。
 #[test]
 fn test_env_types_register_panics_for_invalid_registration() {
     let missing_type = std::panic::catch_unwind(|| {

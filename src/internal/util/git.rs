@@ -21,7 +21,6 @@ pub struct GitRefError {
     error: String,
 }
 
-/// 对应 Go：`internal/util/git.go` 中的 `UpdateRemoteTrackingBranch`。
 ///
 /// 调用系统 `git update-ref`，将 `refs/remotes/<remote>/<branch>` 原子更新到指定
 /// revision。函数不通过 shell 拼接参数，因此 remote、branch 与 revision 不会被

@@ -1,13 +1,13 @@
 //! Claude Code 主子进程的参数、环境、FD、stdio 与生命周期实现。
 //!
-//! 对应 Go：`internal/claude/claude_code_executor.go`。本模块由 `manager` 创建，向下
-//! 调用配置、认证、会话活动记录与 tailer；结构上把 Go 的 `Cmd.Run` 拆为 Tokio
+//! 本模块由 `manager` 创建，向下
+//! 调用配置、认证、会话活动记录与 tailer；结构上把 `Cmd.Run` 拆为 Tokio
 //! child、两个有界生命周期 stream task 和显式清理阶段，但保持外部顺序与副作用。
 //!
 //! stdout/stderr 以原始字节同时写入内存和 `/tmp/claude-code.log`，因此 stream-json
 //! 与 NDJSON 不会经历解析或重编码。敏感 token 先写入匿名 pipe，再在 `pre_exec`
 //! 中安全映射到从 3 开始的固定 FD。所有取消路径仅 SIGKILL direct child，绝不
-//! 创建或终止 process group，以保留 Go `exec.CommandContext` 的孙进程语义。
+//! 创建或终止 process group，以保留孙进程语义。
 
 use std::{
     collections::BTreeMap,
@@ -78,9 +78,8 @@ pub(super) struct TokenDescriptor {
 
 /// 父进程持有的 token pipe 读端，并在释放时检查 `close(2)` 的返回值。
 ///
-/// `OwnedFd` 的标准析构会安全关闭 FD，却按 Rust 约定忽略关闭错误；Go 基线则在
-/// `Execute` 的 `filesToClose` defer 中记录该错误。这个薄包装只补回可观察日志，
-/// 不改变 FD 的所有权、CLOEXEC 标志或 child 的目标编号。
+/// `OwnedFd` 的标准析构会安全关闭 FD，却按 Rust 约定忽略关闭错误。这个薄包装记录
+/// 可观察的关闭错误，不改变 FD 的所有权、CLOEXEC 标志或 child 的目标编号。
 pub(super) struct TokenSourceFd {
     fd: Option<OwnedFd>,
 }
@@ -114,10 +113,10 @@ impl AsRawFd for TokenSourceFd {
 }
 
 impl Drop for TokenSourceFd {
-    /// 对应 Go：`ClaudeCodeExecutor.Execute` 中关闭 `filesToClose` 的 defer。
+    /// 关闭执行期间登记的文件。
     ///
     /// 先用 `into_raw_fd` 取消 `OwnedFd` 的隐式析构，再显式检查一次 `close(2)`；
-    /// 这样既不会 double-close，也能保留 Go 的 DEBUG 错误日志。
+    /// 这样既不会 double-close，也能保留 DEBUG 错误日志。
     fn drop(&mut self) {
         let Some(fd) = self.fd.take() else {
             return;
@@ -233,21 +232,21 @@ pub(super) fn add_token_via_file_descriptor(
     token_name: &str,
     descriptors: &mut Vec<TokenDescriptor>,
 ) -> Result<i32, ClaudeError> {
-    // Go 在 Linux 上的 os.Pipe 原子调用 pipe2(O_CLOEXEC)。这里不能先 pipe 再
+    // 在 Linux 上的 Linux pipe2 原子调用 pipe2(O_CLOEXEC)。这里不能先 pipe 再
     // fcntl，否则并发线程恰好 spawn 时可能把敏感 token FD 泄漏给无关子进程。
     let (read_end, write_end) = pipe2(OFlag::O_CLOEXEC).map_err(|error| {
         ClaudeError::message(format!("failed to create pipe for {token_name}: {error}"))
     })?;
     let mut writer = std::fs::File::from(write_end);
-    // Go 无论 Write 是否成功都会先关闭写端，并且关闭错误不会覆盖真正的写错误。
+    // 无论 Write 是否成功都会先关闭写端，并且关闭错误不会覆盖真正的写错误。
     // 因此这里必须把两次结果分开保存，不能用 `?` 提前离开并依赖静默 Drop。
     let write_error = writer.write_all(format!("{token}\n").as_bytes()).err();
     if let Err(error) = close_owned_fd(writer.into_raw_fd()) {
         tracing::error!(error = %error, "Failed to close write end of {token_name} pipe");
     }
     if let Some(error) = write_error {
-        // Go 只在写入失败时立即关闭读端；成功路径由 Execute 的 defer 在整个
-        // child 生命周期结束后关闭，所以不能把这个清理提前到普通路径。
+        // 只在写入失败时立即关闭读端；成功路径在整个 child 生命周期结束后关闭，
+        // 所以不能把这个清理提前到普通路径。
         if let Err(close_error) = close_owned_fd(read_end.into_raw_fd()) {
             tracing::debug!(error = %close_error, "Failed to close read end of {token_name} pipe");
         }
@@ -407,7 +406,7 @@ impl ClaudeCodeExecutor {
         Ok(path.to_owned())
     }
 
-    /// 执行完整 Claude child 生命周期，并保持 Go 参数、环境和副作用。
+    /// 执行完整 Claude child 生命周期，并保持 参数、环境和副作用。
     async fn execute_inner(&self, cancellation: &CancellationToken) -> Result<(), ClaudeError> {
         tracing::info!(session_id = %self.session_id, "Starting ClaudeCodeExecutor");
         let local_testing_mode = self.cfg.as_ref().is_some_and(|cfg| cfg.local_testing_mode);
@@ -498,7 +497,7 @@ impl ClaudeCodeExecutor {
 
         let working_dir = self.resolve_working_directory(configured_working_dir);
         if local_testing_mode {
-            // Go 在构造 `cmd.Stdin` 时立即记录此事件；实际字节仍由 Tokio 在 spawn
+            // 在构造 `cmd.Stdin` 时立即记录此事件；实际字节仍由 Tokio 在 spawn
             // 后写入匿名 stdin pipe，但日志顺序必须保持在环境和文件准备之前。
             tracing::info!("Passing user message via stdin (WebSocket disabled)");
         }
@@ -521,7 +520,7 @@ impl ClaudeCodeExecutor {
             .env_clear()
             .envs(environment)
             .kill_on_drop(true);
-        // `os.Getwd` 失败时 Go 保持 `Cmd.Dir == ""`，让 exec 继承当前目录；给 Tokio
+        // 当前目录读取 失败时 保持 `Cmd.Dir == ""`，让 exec 继承当前目录；给 Tokio
         // 传空 Path 会变成一次失败的 chdir，所以 None 分支必须完全不调用 current_dir。
         if let Some(directory) = working_dir.as_deref() {
             command.current_dir(directory);
@@ -583,11 +582,11 @@ impl ClaudeCodeExecutor {
         result
     }
 
-    /// 对应 Go：`ClaudeCodeExecutor.Execute` 中选择 `cmd.Dir` 的三分支逻辑。
+    /// 根据配置选择子进程工作目录。
     ///
     /// 配置目录存在时返回实际路径；未配置时尝试 `getcwd`。Linux 上当前目录已被
     /// 删除会使 `getcwd` 失败，此时返回 `None` 表示完全不设置 Tokio `current_dir`，
-    /// 并保留 Go 的 warning + `working_dir=unknown` 两条日志，而不是中止执行。
+    /// 并保留 warning + `working_dir=unknown` 两条日志，而不是中止执行。
     fn resolve_working_directory(&self, configured: &str) -> Option<PathBuf> {
         if !configured.is_empty() {
             let directory = if self.startup_context.sources.len() == 1 {
@@ -616,7 +615,7 @@ impl ClaudeCodeExecutor {
         }
     }
 
-    /// 按 Go append 顺序构造 child 环境，后层键覆盖前层键。
+    /// 按 append 顺序构造 child 环境，后层键覆盖前层键。
     pub(super) fn build_child_environment(&self) -> Vec<(OsString, OsString)> {
         let mut environment = filter_init_only_from_environ(std::env::vars_os());
         let mut has_anthropic_base_url = false;
@@ -681,7 +680,7 @@ impl ClaudeCodeExecutor {
         environment
     }
 
-    /// 准备 session/OAuth/API token FD 与 Bash 兼容 token 文件。
+    /// 准备 session/OAuth/API token FD 与 Bash token 文件。
     fn prepare_authentication(
         &self,
         local_testing_mode: bool,
@@ -834,7 +833,7 @@ impl ClaudeCodeExecutor {
         drop(command);
         let mut stdin = child.stdin.take().expect("stdin configured as piped");
         if local_testing_mode {
-            // Go 把 `bytes.Buffer` 交给 `os/exec`，child 提前退出造成的 EPIPE 会由
+            // 把 `bytes.Buffer` 交给 `os/exec`，child 提前退出造成的 EPIPE 会由
             // `skipStdinCopyError` 忽略，也不会产生应用日志；Rust 同样只尽力写入。
             let _ = stdin.write_all(b"update README.md with hello world").await;
         }
@@ -926,7 +925,7 @@ impl ClaudeCodeExecutor {
         }
     }
 
-    /// 写完成标记、记录活动/失败结果，并生成最终兼容错误。
+    /// 写完成标记、记录活动或失败结果，并生成最终稳定错误。
     async fn finish_execution(
         &self,
         log_file: &Arc<Mutex<File>>,
@@ -996,7 +995,7 @@ impl ClaudeCodeExecutor {
                 tracing::error!(error = %record_error, "Failed to record Claude Code failure result");
             }
             if self.cfg.as_ref().is_some_and(|cfg| cfg.print_code_logs) {
-                // 对应普通失败分支，并保留独立的 Rust 调用位置。
+                // 普通失败分支保留独立调用位置。
                 if let Err(error) = log_file.lock().await.sync_all().await {
                     tracing::warn!(error = %error, "Failed to sync log file before printing");
                 }
@@ -1022,7 +1021,7 @@ impl ClaudeCodeExecutor {
             "Claude Code execution completed"
         );
         if self.cfg.as_ref().is_some_and(|cfg| cfg.print_code_logs) {
-            // 对应 Go 的成功分支；保留第三个独立 source，不能与上面两处合并。
+            // 成功分支保留第三个独立 source，不能与上面两处合并。
             if let Err(error) = log_file.lock().await.sync_all().await {
                 tracing::warn!(error = %error, "Failed to sync log file before printing");
             }
@@ -1031,7 +1030,7 @@ impl ClaudeCodeExecutor {
         Ok(())
     }
 
-    /// 打印 `/tmp/claude-code.log`，保持 Go 的标题、分隔线和末尾换行。
+    /// 打印 `/tmp/claude-code.log`，保持 标题、分隔线和末尾换行。
     async fn print_code_logs(&self) {
         let data = match tokio::fs::read(CLAUDE_CODE_LOG_PATH).await {
             Ok(data) => data,
@@ -1113,10 +1112,9 @@ pub(super) fn install_token_descriptors(
     Ok(())
 }
 
-/// 对应 Go：`ClaudeCodeExecutor.Execute` 中的 `os.MkdirAll`。
 ///
 /// 只负责以 0700 创建缺失目录，使调用方可以把目录创建失败与 token 写入失败记录
-/// 为两个不同的兼容事件；对既有目录不主动 chmod，与 Go `MkdirAll` 保持一致。
+/// 为两个不同事件；对既有目录不主动 chmod。
 fn create_remote_session_directory() -> io::Result<()> {
     let directory = Path::new(SESSION_INGRESS_TOKEN_PATH)
         .parent()
@@ -1129,7 +1127,7 @@ fn create_remote_session_directory() -> io::Result<()> {
 /// 以 0600 创建或覆盖 session ingress token 文件。
 ///
 /// 目录必须已由 `create_remote_session_directory` 成功准备；拆分这两个阶段是为了
-/// 保留 Go 在 mkdir 和 WriteFile 失败时不同的消息、属性与分支顺序。
+/// mkdir 和写文件失败保留各自的消息、属性与分支顺序。
 fn write_session_ingress_token_file(token: &str) -> io::Result<()> {
     let path = Path::new(SESSION_INGRESS_TOKEN_PATH);
     let mut options = StdOpenOptions::new();
@@ -1148,10 +1146,10 @@ async fn open_claude_log() -> Result<File, ClaudeError> {
         .map_err(|error| ClaudeError::message(format!("failed to create claude-code.log: {error}")))
 }
 
-/// 对应 Go：`ClaudeCodeExecutor.Execute` 写入并同步执行 header 的步骤。
+/// 写入并同步执行 header。
 ///
 /// 写入或 sync 失败只记录 warning，不阻止 Claude 启动；两次 I/O 必须按顺序都尝试，
-/// 因为 Go 即使 header Write 失败也继续调用 `Sync`。
+/// 因为 即使 header Write 失败也继续调用 `Sync`。
 async fn write_log_header(
     log_file: &Arc<Mutex<File>>,
     command: &str,
@@ -1177,10 +1175,10 @@ async fn write_log_header(
     }
 }
 
-/// 对应 Go：`ClaudeCodeExecutor.Execute` 中关闭 `/tmp/claude-code.log` 的 defer。
+/// 关闭 `/tmp/claude-code.log` 并保留稳定错误上下文。
 ///
 /// 所有 stream task 与完成日志都结束后，Arc 应只剩调用方这一份。消费 Tokio File
-/// 并显式调用 `close(2)`，使罕见关闭错误也能按 Go 的 WARN 文案被观察到。
+/// 并显式调用 `close(2)`，使罕见关闭错误也能按 WARN 文案被观察到。
 async fn close_claude_log(log_file: Arc<Mutex<File>>) {
     let mutex = match Arc::try_unwrap(log_file) {
         Ok(mutex) => mutex,
@@ -1230,8 +1228,7 @@ async fn start_cc_log_tailer(session_id: &str) -> Option<ActiveTailer> {
     let (tailer, mut lines) = match initialized {
         Ok(initialized) => initialized,
         Err(error) => {
-            // Rust 的 receiver 所有权检查是 Go channel 不需要的结构步骤；无论失败
-            // 来自 metadata 还是 receiver 初始化，都汇入 Go `NewTailer` 唯一日志点。
+            // 无论失败来自 metadata 还是 receiver 初始化，都汇入唯一日志点。
             tracing::warn!(error = %error, path = CLAUDE_CODE_LOG_PATH, "Failed to start CC log tailer, logs will not stream");
             return None;
         }
@@ -1313,7 +1310,7 @@ async fn join_stream(task: JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, V
         .map_err(|error| error.to_string().into_bytes())
 }
 
-/// 对应 Go：`Execute` 内部 `writeCompletion` closure。
+/// 写入执行完成事件。
 ///
 /// 三种 child 结局共用同一 closure/source；写入失败沿用历史上略显宽泛的
 /// `Failed to write header` 文案，并且绝不覆盖取消或 child 失败的主结果。
@@ -1338,7 +1335,7 @@ fn timestamp() -> String {
         .to_string()
 }
 
-/// 把 command 与参数转换为 Go `shellCommand` 的单行表示。
+/// 把 command 与参数转换为 shell 可复制的单行表示。
 fn shell_command(command: &str, args: &[String]) -> String {
     std::iter::once(command)
         .chain(args.iter().map(String::as_str))
@@ -1347,7 +1344,7 @@ fn shell_command(command: &str, args: &[String]) -> String {
         .join(" ")
 }
 
-/// 只在 Go 实现检查的空白或引号字符出现时使用 POSIX 单引号转义。
+/// 只在 检查的空白或引号字符出现时使用 POSIX 单引号转义。
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_owned();
@@ -1361,7 +1358,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// 复刻 Go `tailString` 对任意 stderr 字节的截断与 UTF-8 处理。
+/// 实现对任意 stderr 字节的截断与 UTF-8 处理。
 ///
 /// 未截断时把无效字节写成 U+FFFD；发生截断时删除尾部切片中的所有无效字节。
 pub(super) fn tail_string(value: &[u8], max_bytes: usize) -> String {
@@ -1371,7 +1368,7 @@ pub(super) fn tail_string(value: &[u8], max_bytes: usize) -> String {
     delete_invalid_utf8(&value[value.len() - max_bytes..])
 }
 
-/// 把每个无效 UTF-8 字节替换为一个 U+FFFD，匹配 Go JSON 字符串编码。
+/// 把每个无效 UTF-8 字节替换为一个 U+FFFD，匹配 JSON 字符串编码。
 fn go_json_valid_utf8(value: &[u8]) -> String {
     let mut output = String::new();
     let mut remaining = value;
@@ -1413,7 +1410,7 @@ fn delete_invalid_utf8(value: &[u8]) -> String {
     output
 }
 
-/// 把 Tokio 子进程等待结果归一化为 Go `exitCode` 的三态返回值。
+/// 把 Tokio 子进程等待结果归一化为退出码或 `-1`。
 ///
 /// 正常退出返回系统 exit code（成功即 0）；被信号终止或等待本身失败返回 -1。
 /// 该函数只解释状态，不吞掉调用方需要记录的原始 I/O 错误。

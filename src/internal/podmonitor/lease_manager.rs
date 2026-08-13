@@ -1,4 +1,4 @@
-//! Go `lease_manager.go` 对应的异步租约实现。
+//! 异步租约实现。
 //!
 //! 协议层保持原有 heartbeat CAS、stop body、状态码分类和健康文件格式；并发层则用
 //! 单调时钟计算本地卡死阈值，用绝对 UTC 时间计算服务端租约，用 `Notify` 代替可重置
@@ -32,7 +32,7 @@ use super::types::{
 
 /// 从 `HOME` 生成默认健康文件路径；缺少 `HOME` 时回退到 `/tmp`。
 ///
-/// 当前迁移面向 Linux GNU，因此这里刻意采用 Linux 进程环境语义，不引入跨平台
+/// 当前目标平台为 Linux GNU，因此这里刻意采用 Linux 进程环境语义，不引入跨平台
 /// home-directory 依赖。
 #[must_use]
 pub fn get_default_health_file_path() -> PathBuf {
@@ -62,10 +62,10 @@ pub(super) fn claude_code_stuck_threshold_from(value: Option<&str>) -> Duration 
     DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD
 }
 
-/// 按 Go marker 规则判断 heartbeat 错误是否永久不可恢复。
+/// 按 marker 规则判断 heartbeat 错误是否永久不可恢复。
 ///
-/// `None` 对应 Go 的 `nil error`。已知 HTTP 错误优先使用状态码；未知错误仍检查原 Go
-/// 使用的英文 marker，以兼容调用方包装后的错误文本。
+/// 已知 HTTP 错误优先使用状态码；未知错误仍检查稳定的英文 marker，以支持调用方
+/// 包装后的错误文本。
 #[must_use]
 pub fn is_permanent_heartbeat_error(error: Option<&(dyn Error + 'static)>) -> bool {
     let Some(error) = error else {
@@ -106,7 +106,7 @@ pub fn is_precondition_failed_error(error: Option<&(dyn Error + 'static)>) -> bo
     text.contains("412") || text.contains("Precondition Failed")
 }
 
-/// 按 Go sentinel 规则判断 stop 失败是否可重试。
+/// 按 sentinel 规则判断 stop 失败是否可重试。
 ///
 /// 取消与 deadline 永不重试，明确的 HTTP 4xx 永不重试，HTTP 5xx 与网络/构造错误重试。
 #[must_use]
@@ -261,8 +261,8 @@ impl LeaseManager {
             let mut state = self.write_state();
             if state.lifecycle != Lifecycle::Starting {
                 if state.shutdown_started {
-                    // Go 即使 initial heartbeat 已把状态推进到 stopping，也仍会启动
-                    // heartbeatLoop；该 loop 的 defer 负责关闭 Stop 等待的 stopChan。
+                    // 即使 initial heartbeat 已把状态推进到 stopping，也仍会启动
+                    // heartbeat loop；该 loop 退出时会通知正在等待的 stop 调用。
                     self.spawn_background_tasks();
                 } else {
                     return Err(LeaseManagerError::StoppedWhileStarting);
@@ -302,14 +302,14 @@ impl LeaseManager {
         );
     }
 
-    /// 捕获 heartbeat loop panic，并复刻 Go defer 中的取消与宽限期设置。
+    /// 捕获 heartbeat loop panic，并在退出时完成取消与宽限期设置。
     async fn run_heartbeat_task(self) {
         let result = AssertUnwindSafe(self.heartbeat_loop()).catch_unwind().await;
         if let Err(payload) = result {
             tracing::error!("session_id" = ?(self.inner.session_id), "panic" = ?(panic_payload_to_string(payload.as_ref())), "{}", "heartbeat_loop_panic");
             self.set_grace_period_and_cancel();
         }
-        // 独立 token 精确对应 Go heartbeatLoop 的 `defer close(stopChan)`。
+        // 独立 token 在 heartbeat loop 退出时通知所有等待者。
         self.inner.heartbeat_loop_exited.cancel();
     }
 
@@ -317,26 +317,26 @@ impl LeaseManager {
     async fn heartbeat_loop(&self) {
         let mut ticker = tokio::time::interval(self.inner.interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        // Tokio interval 的首 tick 立即就绪；消费它以匹配 Go NewTicker 首次等待一个周期。
+        // Tokio interval 的首 tick 立即就绪；消费它以匹配 NewTicker 首次等待一个周期。
         ticker.tick().await;
 
         loop {
             tokio::select! {
-                _ = ticker.tick() => {
-                    if self.inner.cancellation.is_cancelled() {
-                        // 对应 Go `heartbeatLoop` 的 ticker 分支（lease_manager.go:331）；
-                        // 取消时仍保留该分支自身的业务日志。
-                        tracing::info!(session_id = %self.inner.session_id, error = "context canceled", "heartbeat_loop_stopped");
-                        return;
-                    }
-                }
-                _ = self.inner.cancellation.cancelled() => {
-                    // 对应 Go `heartbeatLoop` 的 context.Done 分支
-                    //（lease_manager.go:365）。不得与上方 ticker 分支合并，原因同上。
-                    tracing::info!("session_id" = ?(self.inner.session_id), "error" = ?("context canceled"), "{}", "heartbeat_loop_stopped");
-                    return;
-                }
-            }
+                           _ = ticker.tick() => {
+                               if self.inner.cancellation.is_cancelled() {
+            // 周期 heartbeat 分支；
+            // 取消时仍保留该分支自身的业务日志。
+                                   tracing::info!(session_id = %self.inner.session_id, error = "context canceled", "heartbeat_loop_stopped");
+                                   return;
+                               }
+                           }
+                           _ = self.inner.cancellation.cancelled() => {
+            // context.Done 分支
+            // Claude Code 无进展超时分支。不得与上方 heartbeat 分支合并，原因同上。
+                               tracing::info!("session_id" = ?(self.inner.session_id), "error" = ?("context canceled"), "{}", "heartbeat_loop_stopped");
+                               return;
+                           }
+                       }
 
             if let Err(error) = self.send_heartbeat().await {
                 if is_permanent_heartbeat_error(Some(&error)) {
@@ -358,8 +358,7 @@ impl LeaseManager {
                 continue;
             }
 
-            // 即便 send_heartbeat 已因 lease_not_extended 调用 stop 并取消 context，Go
-            // 仍会继续读取 terminal state、再次调用 stop，然后才返回；不能在此提前退出。
+            // 即便 send_heartbeat 已因 lease_not_extended 调用 stop 并取消 context， // 仍会继续读取 terminal state、再次调用 stop，然后才返回；不能在此提前退出。
             let state = self.read_state().instance_state.clone();
             if is_stopping_state(&state) {
                 tracing::info!("session_id" = ?(self.inner.session_id), "state" = ?(state), "{}", "session_entered_terminal_state");
@@ -437,7 +436,7 @@ impl LeaseManager {
             state.instance_state = heartbeat.state.clone();
             state.server_last_heartbeat = Some(heartbeat.last_heartbeat.clone());
             if state.last_claude_code_activity != Some(lease_updated_at) {
-                // 两种时钟必须在同一个临界区内同步推进：墙钟用于复刻 Go 日志值，
+                // 两种时钟必须在同一个临界区内同步推进：墙钟用于记录日志值，
                 // 单调时钟用于 deadline，避免 NTP 调整让卡死检测提前或延后。
                 state.last_updated_at = Some(Utc::now());
                 state.last_updated_instant = Some(Instant::now());
@@ -581,7 +580,7 @@ impl LeaseManager {
     /// 所有权/退出顺序为：持写锁写入 `Stopping` 和 grace → 释放锁 → 取消 token →
     /// `TaskTracker::close()`。当前任务随后返回，其他两个任务在 select 中观察取消；
     /// heartbeat loop 退出时再触发独立的 loop-exited token；`stop_and_wait` 先等该 token，
-    /// 再等 tracker 计数归零，因而与 Go 的 `stopChan` 关闭点一致。
+    /// 再等 tracker 计数归零。
     pub(super) fn set_grace_period_and_cancel(&self) {
         {
             let mut state = self.write_state();
@@ -627,8 +626,8 @@ impl LeaseManager {
 
     /// 返回 manager 子 token 的 clone，供 session/orchestrator 监听退出。
     ///
-    /// 这是 Go `LeaseManager.Context` 的 Tokio 等价物：克隆共享同一取消状态，不会
-    /// 创建独立生命周期，也不会把取消权限暴露成可替换的全局 context。
+    /// 克隆共享同一取消状态，不会创建独立生命周期，也不会把取消权限暴露成
+    /// 可替换的全局 context。
     #[must_use]
     pub fn cancellation_token(&self) -> CancellationToken {
         self.inner.cancellation.clone()
@@ -700,31 +699,31 @@ impl LeaseManager {
                         .body(body)
                         .send();
                     let response = tokio::select! {
-                        // Go 每轮都会创建带 context 的请求。即使 token 在不可取消的
-                        // backoff 中触发，本轮 operation 仍被调用，再由请求层返回取消
-                        // sentinel，进入统一 classifier 与 error_not_retryable 日志路径。
-                        biased;
-                        _ = cancellation.cancelled() => {
-                            return Err(StopRequestError::Cancelled {
-                                message: cancellation_message,
-                            });
-                        }
-                        response = request => response.map_err(|error| {
-                            if error.is_timeout() {
-                                StopRequestError::DeadlineExceeded
-                            } else {
-                                StopRequestError::Request(format!(
-                                    "stop API request failed: {error}"
-                                ))
-                            }
-                        })?,
-                    };
+                    // 每轮都会创建带 context 的请求。即使 token 在不可取消的
+                    // backoff 中触发，本轮 operation 仍被调用，再由请求层返回取消
+                    // sentinel，进入统一 classifier 与 error_not_retryable 日志路径。
+                                           biased;
+                                           _ = cancellation.cancelled() => {
+                                               return Err(StopRequestError::Cancelled {
+                                                   message: cancellation_message,
+                                               });
+                                           }
+                                           response = request => response.map_err(|error| {
+                                               if error.is_timeout() {
+                                                   StopRequestError::DeadlineExceeded
+                                               } else {
+                                                   StopRequestError::Request(format!(
+                                                       "stop API request failed: {error}"
+                                                   ))
+                                               }
+                                           })?,
+                                       };
                     let status = response.status();
                     if status.is_success() {
                         return Ok(());
                     }
-                    // Go 的 response body 仍绑定创建请求时的 context：收到非 2xx
-                    // headers 后若发生取消，io.ReadAll 会立即返回“已读部分 + error”，
+                    // response body 仍绑定创建请求时的 context：收到非 2xx
+                    // headers 后若发生取消，响应体读取会立即返回“已读部分 + error”，
                     // 调用方忽略 error 并继续按 HTTP status 分类。Reqwest 的 Response
                     // 不认识本项目 CancellationToken，因此逐 chunk select，取消时保留
                     // 已经收到的正文并停止等待，避免卡到五分钟 client timeout。
@@ -762,7 +761,7 @@ impl LeaseManager {
         }
     }
 
-    /// 更新健康文件；空路径无操作，内容为 UTC RFC3339Nano 加换行。
+    /// 更新健康文件；空路径无操作，内容为 UTC RFC 3339 纳秒时间戳加换行。
     pub(crate) async fn update_health_file(&self) -> Result<(), HealthFileError> {
         let path = &self.inner.health_file_path;
         if path.as_os_str().is_empty() {
@@ -824,10 +823,10 @@ impl LeaseManager {
         self.inner.activity_changed.notify_waiters();
     }
 
-    /// 对应 Go `Stop`：取消后等待 heartbeat loop 关闭信号和全部受追踪任务退出。
+    /// 取消后等待 heartbeat loop 关闭信号和全部受追踪任务退出。
     ///
-    /// Go 的 `stopChan` 只由 heartbeat loop 的 defer 关闭，因此尚未 `start` 或初始
-    /// heartbeat 失败时该方法会一直等待。独立的 `heartbeat_loop_exited` token 保留这一
+    /// `heartbeat_loop_exited` 只在 heartbeat loop 退出时触发，因此尚未 `start` 或初始
+    /// heartbeat 失败时该方法会一直等待。独立 token 保留这一
     /// 可观察行为；调用方若要限制等待时间，应在外层使用 `tokio::time::timeout`。
     pub async fn stop(&self) {
         self.stop_and_wait().await;
@@ -844,8 +843,7 @@ impl LeaseManager {
 
 /// 读取 stop API 的错误响应体，并在取消时返回已经收到的部分字节。
 ///
-/// 对应 Go `callStopAPI` 中绑定 request context 的 `io.ReadAll(resp.Body)`。Go 调用方
-/// 忽略读取错误但保留 partial body；这里把任意 stream 错误和取消都视为读取结束，
+/// 调用方忽略读取错误但保留 partial body；这里把任意 stream 错误和取消都视为读取结束，
 /// 既不把它们升级成新的请求错误，也不会等待 Reqwest 的全局超时。
 ///
 /// # 参数
@@ -872,7 +870,7 @@ where
         };
         match next {
             Some(Ok(chunk)) => response_body.extend_from_slice(chunk.as_ref()),
-            // Go 明确忽略 io.ReadAll 的读取错误；已经累积的部分正文仍参与错误文案，
+            // 明确忽略响应体读取错误；已经累积的部分正文仍参与错误文案，
             // 不能把 body read error 替换成请求错误。
             Some(Err(_)) | None => break,
         }

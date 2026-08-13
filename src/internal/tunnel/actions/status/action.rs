@@ -1,6 +1,6 @@
 //! 状态探测 action 实现。
 //!
-//! 对应 Go `internal/tunnel/actions/status/action.go`。只连接 loopback，使用一秒连接
+//! 只连接 loopback，使用一秒连接
 //! 超时，并在成功后立即关闭连接，不向被探测服务发送任何应用数据。
 
 use std::sync::Arc;
@@ -16,18 +16,17 @@ use crate::internal::tunnel::actions::{
 
 use super::types::{StatusAction, StatusRequest, StatusResult};
 
-/// 对应 Go `(*StatusAction).Timeout`：端口探测 action 最多运行五秒。
+/// 端口探测 action 最多运行五秒。
 pub const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 对应 Go：`status.NewStatusAction`。
 #[must_use]
+/// 创建使用默认 loopback 探测配置的 status action。
 pub fn new_status_action() -> StatusAction {
     StatusAction {}
 }
 
 #[async_trait]
 impl Action for StatusAction {
-    /// 对应 Go：`(*StatusAction).Execute`。
     ///
     /// 解析可选端口并尝试连接 `localhost:<port>`。连接失败不是 action 错误，而是
     /// `listening:false`；只有 JSON 或端口范围无效才返回错误。
@@ -51,7 +50,7 @@ impl Action for StatusAction {
         }
 
         let address = format!("localhost:{}", status_request.port);
-        // Go net.Dialer 同时遵守 context 与一秒 Dialer timeout；select 保持父 action
+        // net.Dialer 同时遵守 context 与一秒 Dialer timeout；select 保持父 action
         // 取消优先，避免 Registry 超时后仍残留连接尝试。
         let listening = tokio::select! {
             () = cancellation.cancelled() => false,
@@ -77,12 +76,12 @@ impl Action for StatusAction {
         })
     }
 
-    /// 对应 Go：`(*StatusAction).Name`。
+    /// 返回 control URL 使用的 action 名称。
     fn name(&self) -> &str {
         "status"
     }
 
-    /// 对应 Go：`(*StatusAction).Timeout`。
+    /// 返回端口探测的总执行预算。
     fn timeout(&self) -> Duration {
         STATUS_TIMEOUT
     }

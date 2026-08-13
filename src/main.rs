@@ -1,7 +1,7 @@
 //! `environment-manager` Linux GNU 二进制入口。
 //!
 //! 这里只规范化 argv、解析 CLI、选择 stdout/stderr 并把
-//! 强类型调用交给运行时。业务逻辑位于镜像模块树，避免入口随着迁移变成第二套实现。
+//! 强类型调用交给运行时。业务逻辑位于镜像模块树，避免入口随着功能增加变成第二套实现。
 
 use std::io::Write as _;
 
@@ -16,7 +16,7 @@ const BUILD_VERSION: &str = concat!(
     ")"
 );
 
-/// 启动 Tokio 多线程运行时，并以 Go 入口约定的退出码结束进程。
+/// 启动 Tokio 多线程运行时，并以 入口约定的退出码结束进程。
 ///
 /// `std::process::exit` 刻意只位于最外层；内部执行函数返回整数，便于后续 CLI
 /// golden 测试在不终止测试进程的情况下检查所有输出分支。
@@ -102,7 +102,7 @@ where
     }
 }
 
-/// 输出与 Go `runPrintSandboxSettings` 相同的两空格缩进 JSON 和末尾换行。
+/// 输出两空格缩进 JSON 和末尾换行。
 fn print_sandbox_settings() -> i32 {
     let mut stdout = std::io::stdout().lock();
     command_result(environment_manager::cmd::run_print_sandbox_settings(

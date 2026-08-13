@@ -1,4 +1,4 @@
-//! 对应 Go `internal/mcp/server_test.go` 的 loopback HTTP、认证和 accessor 测试。
+//! loopback HTTP、认证和 accessor 测试。
 
 use std::sync::{
     Arc,
@@ -17,13 +17,13 @@ use super::{
     new_tool_result_text,
 };
 
-/// 对应 Go `mcpHTTPResponse`，保留 HTTP 状态和原始响应文本。
+/// 保留 HTTP 状态和原始响应文本。
 struct McpHttpResponse {
     status: reqwest::StatusCode,
     body: String,
 }
 
-/// 对应 Go `failingResponseWriter`，用于把底层 body 写入失败注入测试路径。
+/// 用于把底层 body 写入失败注入测试路径。
 struct FailingResponseWriter {
     write_error: String,
     headers: http::HeaderMap,
@@ -31,23 +31,23 @@ struct FailingResponseWriter {
 }
 
 impl FailingResponseWriter {
-    /// 对应 Go `failingResponseWriter.Header`，返回可修改的真实 HeaderMap。
+    /// 返回可修改的真实 HeaderMap。
     fn header(&mut self) -> &mut http::HeaderMap {
         &mut self.headers
     }
 
-    /// 对应 Go `failingResponseWriter.Write`，每次写入都返回预先注入的 I/O 错误。
+    /// 每次写入都返回预先注入的 I/O 错误。
     fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
         Err(std::io::Error::other(self.write_error.clone()))
     }
 
-    /// 对应 Go `failingResponseWriter.WriteHeader`，记录调用状态供失败路径断言。
+    /// 记录调用状态供失败路径断言。
     fn write_header(&mut self, status: http::StatusCode) {
         self.status = Some(status);
     }
 }
 
-/// 对应 Go `postMCPJSON`，按需附加 Bearer token 并返回未解析正文。
+/// 按需附加 Bearer token 并返回未解析正文。
 async fn post_mcp_json(
     client: &reqwest::Client,
     url: &str,
@@ -253,7 +253,7 @@ async fn test_base_server_start_serves_authenticated_mcp() {
         json!(-32700)
     );
 
-    // Stop 与 Go 一样必须幂等，重复调用不能 panic 或等待五秒超时。
+    // Stop 必须幂等，重复调用不能 panic 或等待五秒超时。
     base.stop().await;
     base.stop().await;
 }
@@ -293,7 +293,7 @@ async fn test_base_server_serves_two_posts_on_same_tcp_connection() {
         second_body.len(),
         second_body
     );
-    // 先只发送两字节，覆盖 Go idle Peek(4) 仍使用 120 秒期限的分支；再补足 `POST`
+    // 先只发送两字节，覆盖 idle Peek(4) 仍使用 120 秒期限的分支；再补足 `POST`
     // 和其余 header，触发第二条请求独立的十秒 header deadline。
     stream.write_all(b"PO").await.expect("发送第二请求前缀");
     tokio::task::yield_now().await;
@@ -389,7 +389,7 @@ fn test_mcp_http_timeout_header_terminator_and_durations() {
 }
 
 /// 同一连接上的两个固定长度 POST 必须分别产生完整生命周期事件；第二条请求的
-/// `POST` 即使拆成两次 read，也要等 Go `Peek(4)` 收齐四字节后才启动 header 计时。
+/// `POST` 即使拆成两次 read，也要等 tracker 收齐四字节后才启动 header 计时。
 #[test]
 fn test_mcp_http_request_tracker_two_posts_and_fragmented_second_header() {
     let mut tracker = HttpRequestTracker::new();
@@ -442,7 +442,7 @@ fn test_mcp_http_request_tracker_chunked_and_pipelined_boundary() {
     assert_eq!(tracker.deadline_stage(), McpReadDeadlineStage::Idle);
 }
 
-/// deadline 纯状态测试覆盖 Go 的关键绝对时间：首请求从 accept 起算、整体 read 从
+/// deadline 纯状态测试覆盖 关键绝对时间：首请求从 accept 起算、整体 read 从
 /// 请求开始起算、响应进度开启新 idle 窗口、后续请求收齐四字节后重置 header/write。
 #[test]
 fn test_mcp_http_deadline_resets_for_each_keep_alive_request() {
@@ -502,7 +502,7 @@ fn test_mcp_http_deadline_resets_for_each_keep_alive_request() {
     );
 }
 
-/// 保留一个协议级定向测试，覆盖 Go 测试未包含的未知字段和排序兼容行为。
+/// 覆盖未知字段保留与工具排序的协议行为。
 #[tokio::test]
 async fn dispatch_preserves_ids_sorts_tools_and_calls_handler() {
     use tokio_util::sync::CancellationToken;

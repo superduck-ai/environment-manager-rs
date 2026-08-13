@@ -21,10 +21,10 @@ pub struct AuthConfig {
     pub token: String,
 }
 
-/// 把缺失或 JSON `null` 字符串字段还原为 Go struct 的空字符串零值。
+/// 把缺失或 JSON `null` 字符串字段还原为空字符串零值。
 ///
-/// `encoding/json` 把 `null` 解到已有 string 字段时不会报错；Serde 的 `String`
-/// 默认会拒绝 null。认证配置和嵌套部署凭据共享该 helper，以保持错误分支顺序。
+/// 认证 wire 接受 string 字段为 null，而 Serde 的 `String` 默认拒绝 null。认证配置
+/// 和嵌套部署凭据共享该 helper，以保持错误分支顺序。
 pub(crate) fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -105,7 +105,7 @@ impl AuthContext {
 
     /// 返回 Anthropic OAuth token。
     ///
-    /// Go 名称 `GetAnthropicOAuthToken` 中的 OAuth 缩写在 Rust 中按一个语义词
+    /// 名称 `GetAnthropicOAuthToken` 中的 OAuth 缩写在 Rust 中按一个语义词
     /// 写作 `oauth`；两者读取的是同一私有凭据字段，不做格式转换。
     #[must_use]
     pub fn get_anthropic_oauth_token(&self) -> &str {
@@ -172,7 +172,7 @@ impl AuthContext {
 
     /// 判断是否配置了可识别的 Supabase 项目。
     ///
-    /// 与 Go 行为一致，只检查 `project_ref`，不会要求其余三个字段同时非空。
+    /// 与 一致，只检查 `project_ref`，不会要求其余三个字段同时非空。
     #[must_use]
     pub fn has_supabase(&self) -> bool {
         !self.supabase_project_ref.is_empty()

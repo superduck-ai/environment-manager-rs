@@ -309,7 +309,7 @@ async fn bind_local_listener(address: SocketAddr) -> Result<TcpListener> {
         .context("failed to bind local upstream proxy relay")
 }
 
-/// 构造 HTTPS proxy、兼容 NO_PROXY 与各运行时 CA 环境变量。
+/// 构造 HTTPS proxy、NO_PROXY 与各运行时 CA 环境变量。
 fn proxy_environment(
     port: u16,
     ca_bundle: &Path,

@@ -25,7 +25,7 @@ pub enum SandboxInstallError {
     /// npm 启动、取消、等待或非零退出，且系统没有旧安装可回退。
     #[error("npm install failed: {error}, output: {output}")]
     NpmFailed {
-        /// Go `exec.Cmd` 风格的启动或退出错误。
+        /// 稳定的启动或退出错误文本。
         error: String,
         /// 合并后的 stdout/stderr。
         output: String,
@@ -38,13 +38,12 @@ pub enum SandboxInstallError {
     },
 }
 
-/// 对应 Go：`internal/sandbox/install.go` 中的 `InstallSandboxRuntime`。
 ///
 /// 安装指定版本的 SRT；空版本等价于 `latest`，`current` 直接跳过。安装前先保存
-/// 当前 PATH 中的 SRT 位置，因此升级失败时可以按照 Go 的规则继续使用旧版本。
+/// 当前 PATH 中的 SRT 位置，因此升级失败时可以按照 规则继续使用旧版本。
 ///
 /// # 参数
-/// - `cancellation`：与 Go `context.Context` 对应；取消只终止 npm 的直接子进程。
+/// - `cancellation`：取消令牌；取消只终止 npm 的直接子进程。
 /// - `target_version`：npm 版本或 tag；空字符串解释为 `latest`。
 ///
 /// # 返回

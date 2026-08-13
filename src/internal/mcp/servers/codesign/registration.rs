@@ -1,7 +1,7 @@
 //! code-sign registration 与启动配置解析。
 //!
 //! `SIGNING_SERVER_URL` 非空时原样优先；否则使用 startup API base URL，缺少 scheme
-//! 时按 Go 行为补 `http://`，并移除所有尾随 `/`。
+//! 时按 补 `http://`，并移除所有尾随 `/`。
 
 use std::{
     path::PathBuf,

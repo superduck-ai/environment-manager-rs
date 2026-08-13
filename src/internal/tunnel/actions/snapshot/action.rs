@@ -1,6 +1,6 @@
 //! Baku 草稿快照 action 实现。
 //!
-//! 对应 Go `internal/tunnel/actions/snapshot/action.go`。文件读取采用 `O_NOFOLLOW`、
+//! 文件读取采用 `O_NOFOLLOW`、
 //! canonical path containment、单文件 512 KiB 与总计 5 MiB 限制，防止控制请求越界
 //! 读取 project 之外的内容；Git 元数据继续通过外部 `git` 命令取得。
 
@@ -22,14 +22,13 @@ use crate::internal::{
 
 use super::types::{FileEntry, SnapshotAction, SnapshotResponse};
 
-/// 对应 Go `snapshotTimeout`：快照 action 最多运行三十秒。
+/// 快照 action 最多运行三十秒。
 pub const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
-/// 对应 Go `perFileCap`：单文件最多读取 512 KiB。
+/// 单文件最多读取 512 KiB。
 pub(super) const PER_FILE_CAP: u64 = 512 * 1024;
-/// 对应 Go `totalCap`：草稿和探索文件合计最多读取 5 MiB。
+/// 草稿和探索文件合计最多读取 5 MiB。
 pub(super) const TOTAL_CAP: usize = 5 * 1024 * 1024;
 
-/// 对应 Go：`snapshot.NewSnapshotAction`。
 ///
 /// 固定路径仅面向唯一支持的 Linux 容器布局；事件写入进程 tracing subscriber。
 #[must_use]
@@ -43,7 +42,6 @@ pub fn new_snapshot_action() -> SnapshotAction {
 
 #[async_trait]
 impl Action for SnapshotAction {
-    /// 对应 Go：`(*SnapshotAction).Execute`。
     ///
     /// 先解析 project 真路径，再读取受限目录，最后通过可取消子进程查询 Git。
     /// project 不存在是请求级错误；草稿目录或个别文件失败则记录并跳过。
@@ -86,22 +84,21 @@ impl Action for SnapshotAction {
         })
     }
 
-    /// 对应 Go：`(*SnapshotAction).Name`。
+    /// 返回 control URL 使用的 action 名称。
     fn name(&self) -> &str {
         "snapshot"
     }
 
-    /// 对应 Go：`(*SnapshotAction).Timeout`。
+    /// 返回 snapshot 收集与 Git 检查的总执行预算。
     fn timeout(&self) -> Duration {
         SNAPSHOT_TIMEOUT
     }
 }
 
 impl SnapshotAction {
-    /// 对应 Go：`(*SnapshotAction).readDir`。
     ///
-    /// 只接受 canonical 后仍位于 project 内的目录；目录条目按文件名排序以复刻
-    /// `os.ReadDir`，并在两类目录共享的总字节上限达到时标记截断。
+    /// 只接受 canonical 后仍位于 project 内的目录；目录条目按文件名排序以保留
+    /// 目录读取，并在两类目录共享的总字节上限达到时标记截断。
     pub(super) fn read_dir(
         &self,
         _cancellation: &CancellationToken,
@@ -157,7 +154,6 @@ impl SnapshotAction {
         (entries, bytes_read, false)
     }
 
-    /// 对应 Go：`(*SnapshotAction).readFileSafe`。
     ///
     /// 使用 `O_NOFOLLOW` 原子拒绝最后一个 path component 为 symlink 的竞态，随后
     /// 验证打开后的 fd 是普通文件且不超过单文件上限，再从同一 fd 读取内容。
@@ -207,9 +203,8 @@ impl SnapshotAction {
         Some(content)
     }
 
-    /// 对应 Go：`(*SnapshotAction).gitCommitCount`。
     ///
-    /// 运行 `git rev-list --count HEAD`；Git 不可用、取消或输出非法时兼容地返回零。
+    /// 运行 `git rev-list --count HEAD`；Git 不可用、取消或输出非法时返回零。
     async fn git_commit_count(&self, cancellation: &CancellationToken) -> i32 {
         let project = self.project_path.to_string_lossy();
         let arguments = ["-C", project.as_ref(), "rev-list", "--count", "HEAD"];
@@ -226,7 +221,6 @@ impl SnapshotAction {
             .unwrap_or(0)
     }
 
-    /// 对应 Go：`(*SnapshotAction).gitAppModified`。
     ///
     /// 从仓库根提交到 HEAD 检查 `src/` 是否发生变化；不足两个提交或 Git 失败返回
     /// false，不把诊断性元数据失败升级为整个快照失败。

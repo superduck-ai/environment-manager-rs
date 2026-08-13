@@ -17,7 +17,7 @@ use crate::internal::{
 };
 
 impl Hook {
-    /// 对应 Go `(*Hook).Execute`，执行不带 stdin 的 Hook。
+    /// 执行不带 stdin 的 Hook。
     ///
     /// 空命令是显式 no-op。非零退出、启动失败、取消与超时都包含 Hook 名、耗时和
     /// 已捕获输出，便于保持原命令行错误的诊断密度。
@@ -40,7 +40,7 @@ impl Hook {
         self.finish_execution(outcome)
     }
 
-    /// 对应 Go `(*Hook).ExecuteWithStdin`，向 execute Hook 传入原始 work JSON。
+    /// 向 execute Hook 传入原始 work JSON。
     ///
     /// JSON 中存在非空 `id` 时，在固定参数末尾注入 `--session <id>`。解析失败只记录
     /// warning，原始 stdin 仍完整传给命令。sandbox 启用后必须提供 adapter；缺失时
@@ -93,7 +93,7 @@ impl Hook {
                         .await
                 }
                 // 生产构造器不会缺少 adapter；保留这个可测试错误，同时让它与真实
-                // runtime 初始化失败汇聚到下面唯一的 Go 日志调用点。
+                // runtime 初始化失败汇聚到下面唯一的 日志调用点。
                 None => Err(OrchestratorError::message(
                     "sandbox adapter is not configured",
                 )),
@@ -122,7 +122,7 @@ impl Hook {
         self.finish_execution(outcome)
     }
 
-    /// 统一记录成功/失败并生成与 Go Hook 相同结构的错误。
+    /// 统一记录成功/失败并生成与 Hook 相同结构的错误。
     fn finish_execution(&self, outcome: CommandOutcome) -> OrchestratorResult<()> {
         let (duration, output, error) = match outcome {
             Ok(outcome) => {
@@ -150,7 +150,7 @@ impl Hook {
     }
 }
 
-/// 对应 Go `(*Hook).ExecuteWithStdin` 中 sandbox command 包装成功日志。
+/// 记录 sandbox command 包装成功事件。
 ///
 /// # 参数
 /// - `command`：SRT 包装后的可执行文件路径。
@@ -162,7 +162,7 @@ pub(crate) fn log_command_wrapped_with_sandbox(command: &str, arguments: &[Strin
     tracing::info!("wrapped_command" = ?(command), "wrapped_args" = ?(arguments), "{}", "command wrapped with sandbox");
 }
 
-/// 对应 Go `(*Hook).ExecuteWithStdin.func1` 中 sandbox cleanup 失败日志。
+/// 记录 sandbox cleanup 失败事件。
 ///
 /// 与 [`log_command_wrapped_with_sandbox`] 一样，本函数集中记录命令包装事件；清理
 /// 失败只记录 warning，绝不覆盖已经得到的命令执行结果。
@@ -176,7 +176,7 @@ pub(crate) fn log_sandbox_cleanup_failed(error: &str) {
     tracing::warn!("error" = ?(error), "{}", "sandbox cleanup failed");
 }
 
-/// 把 Hook 的 Go 零值超时映射为“不设置独立 deadline”。
+/// 把 Hook 的零超时映射为“不设置独立 deadline”。
 fn duration_timeout(timeout: Duration) -> Option<Duration> {
     (!timeout.is_zero()).then_some(timeout)
 }

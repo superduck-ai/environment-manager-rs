@@ -14,7 +14,7 @@ use super::{
 
 /// 创建 O11y 服务并返回安装了该服务的显式上下文。
 ///
-/// `None` cancellation 对应 Go 的 nil context，并创建独立后台 token；`None` config
+/// `None` cancellation 会创建独立后台 token；`None` config
 /// 使用零值配置。stdout exporter 优先于 OTLP endpoint，未配置 exporter 时仍创建 SDK
 /// meter provider，但没有 reader，因而记录不会离开进程。
 pub fn new_o11y_service(
@@ -51,8 +51,7 @@ pub fn get_o11y_service(context: Option<&O11yContext>) -> Arc<dyn O11yService> {
 
 /// 创建包含 SDK 默认服务名、telemetry SDK 信息与环境属性的 OTel resource。
 ///
-/// Go `resource.Default()` 本身不失败，但调用前会观察 context 取消；Rust 保留相同检查
-/// 与错误前缀，使已经取消的 session 不会继续创建 exporter 后台线程。
+/// 调用前先观察取消状态，使已经取消的 session 不会继续创建 exporter 后台线程。
 pub(crate) fn new_resource(cancellation: &CancellationToken) -> Result<Resource, O11yError> {
     if cancellation.is_cancelled() {
         return Err(O11yError::message(

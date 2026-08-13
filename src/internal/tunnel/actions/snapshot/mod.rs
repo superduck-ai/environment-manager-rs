@@ -1,6 +1,6 @@
 //! 本地 Baku 草稿快照 action。
 //!
-//! 对应 Go `internal/tunnel/actions/snapshot`。实现位于相邻 `action.rs`，并严格限制
+//! 实现位于相邻 `action.rs`，并严格限制
 //! 文件类型、symlink、单文件和总读取量。
 
 mod action;

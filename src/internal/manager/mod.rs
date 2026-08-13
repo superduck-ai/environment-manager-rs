@@ -1,9 +1,8 @@
 //! 会话管理器与跨子系统生命周期编排。
 //!
-//! 本目录机械对应 Go `internal/manager`。Tokio 主状态机编排 environment、MCP、plugin、
-//! lease、Claude executor 与 tunnel；旧 skill ZIP 解压和 symlink 准备流程已随 Go 删除。
+//! Tokio 主状态机编排 environment、MCP、plugin、lease、Claude executor 与 tunnel。
 
-// 保留 Go `internal/manager/manager.go` 的文件基名，因此允许与父模块同名。
+// 允许实现模块与父模块同名。
 #[allow(clippy::module_inception)]
 mod manager;
 mod mcp;

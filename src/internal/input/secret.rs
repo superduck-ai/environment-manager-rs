@@ -14,9 +14,9 @@ use crate::internal::config::{McpConfigFile, Source};
 
 use super::types::{V1WorkResponse, WorkSecret};
 
-/// 把 work secret 中显式 JSON `null` 的值类型字段还原为 Go 零值。
+/// 把 work secret 中显式 JSON `null` 的值类型字段还原为默认值。
 ///
-/// Serde 的 `default` 只覆盖字段缺失；Go `encoding/json` 还允许 string、int 和 bool
+/// Serde 的 `default` 只覆盖字段缺失；work secret 还允许 string、int 和 bool
 /// 字段显式为 null。统一 helper 可保证版本校验等后续分支顺序不被提前类型错误改变。
 fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -26,10 +26,10 @@ where
     Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
-/// 解析可选的 Go 值类型 slice，并把其中 null 元素转换为元素零值。
+/// 解析可选的 值类型 slice，并把其中 null 元素转换为元素零值。
 ///
-/// 整个字段为 null 时仍返回 None，以保留 nil 与显式空数组的运行时差别；auth 数组
-/// 中的 null 元素则对应一个零值 AuthConfig，随后由认证层按 Go 顺序报告未知 provider。
+/// 整个字段为 null 时仍返回 None，以保留 `None` 与显式空数组的运行时差别；auth 数组
+/// 中的 null 元素则对应一个默认 AuthConfig，随后由认证层按输入顺序报告未知 provider。
 fn deserialize_optional_null_default_vec<'de, D, T>(
     deserializer: D,
 ) -> Result<Option<Vec<T>>, D::Error>
@@ -43,7 +43,7 @@ where
 
 /// 解析可选 `map[string]T`，保留 null map，并把 null value 写成元素零值。
 ///
-/// Go 会把 `{"KEY":null}` 解为包含空字符串的 map；该细节会影响环境变量与预计算
+/// 会把 `{"KEY":null}` 解为包含空字符串的 map；该细节会影响环境变量与预计算
 /// Claude 参数是否存在，不能把整个 map 因单个 null value 判为无效 secret。
 fn deserialize_optional_null_default_map_values<'de, D, T>(
     deserializer: D,
@@ -128,14 +128,13 @@ struct RawWorkSecret {
 impl<'de> Deserialize<'de> for WorkSecret {
     /// 解析 work secret，并将显式 JSON `null` 的 source/auth 数组映射为空数组。
     ///
-    /// 该 serde trait 实现就是 Go `WorkSecret.UnmarshalJSON` 的强类型入口：先解析
-    /// 固定 wire 字段，再由 `Source` 的封闭反序列化逐项验证 source 类型；任何未知
+    /// 先解析固定 wire 字段，再由 `Source` 的封闭反序列化逐项验证 source 类型；任何未知
     /// 类型或字段类型错误都会沿当前 deserializer 返回，绝不静默构造半成品。
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // Go 把顶层 null 解进 raw struct 后继续使用全部零值，最终由 version 门禁
+        // 把顶层 null 解进 raw struct 后继续使用全部零值，最终由 version 门禁
         // 返回“unsupported”，而不是在 JSON 阶段折叠为“invalid secret”。
         let raw = Option::<RawWorkSecret>::deserialize(deserializer)?.unwrap_or_default();
         Ok(Self {

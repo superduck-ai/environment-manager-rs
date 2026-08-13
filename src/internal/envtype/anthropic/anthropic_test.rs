@@ -354,7 +354,7 @@ fn test_is_baku_environment() {
     assert!(environment.is_baku_environment());
 }
 
-/// 验证 nil config 返回稳定错误。
+/// 验证 `None` 配置 返回稳定错误。
 #[tokio::test]
 async fn test_initialize_nil_config_returns_error() {
     let mut environment = environment(None);
@@ -614,7 +614,7 @@ async fn test_install_languages_with_no_languages() {
         .unwrap();
 }
 
-/// 验证未知语言被明确视为可成功跳过的兼容分支。
+/// 验证未知语言被明确视为可成功跳过的分支。
 #[tokio::test]
 async fn test_install_language_skips_unsupported_language() {
     let environment = environment(Some(Config::default()));
@@ -660,7 +660,7 @@ fn test_copy_dir_copies_files_directories_and_symlinks() {
     );
 }
 
-/// 验证源目录遍历失败时保留 Go 的 `failed to copy directory` 上下文包装。
+/// 验证源目录遍历失败时保留 `failed to copy directory` 上下文包装。
 #[test]
 fn test_copy_dir_wraps_walk_error() {
     let source = TempDir::new().unwrap();

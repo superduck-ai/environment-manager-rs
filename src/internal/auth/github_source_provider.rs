@@ -23,8 +23,7 @@ pub fn new_github_source_auth_provider(token: impl Into<String>) -> GitHubSource
 impl GitHubSourceAuthProvider {
     /// 根据 token 前缀构造认证提供方。
     ///
-    /// 这是 Go `NewGitHubSourceAuthProvider` 的现代关联构造器；普通 token 与 git
-    /// proxy JWT 的判定仍只依赖固定前缀，空 token 也保留为可构造状态。
+    /// 普通 token 与 git proxy JWT 的判定只依赖固定前缀；空 token 也保留为可构造状态。
     #[must_use]
     pub fn new(token: impl Into<String>) -> Self {
         let token = token.into();
@@ -40,7 +39,7 @@ impl GitHubSourceAuthProvider {
         Self { auth_type, token }
     }
 
-    /// 返回构造时识别出的认证类型，主要供策略选择和兼容性测试使用。
+    /// 返回构造时识别出的认证类型，主要供策略选择和行为测试使用。
     #[must_use]
     pub fn auth_type(&self) -> GitHubAuthType {
         self.auth_type
@@ -52,7 +51,7 @@ impl SourceAuthProvider for GitHubSourceAuthProvider {
     ///
     /// 普通 token 若含第一个冒号，则冒号前后分别作为 username/password；git
     /// proxy JWT 固定使用 `unused` 作为 username。`auth_context` 和 `permission`
-    /// 当前不参与凭据选择，但保留在接口中以兼容上层调用模型。
+    /// 当前不参与凭据选择，但保留在接口中供上层传递 session ID。
     fn authenticate_url(
         &self,
         _auth_context: &AuthContext,
@@ -135,7 +134,7 @@ impl SourceAuthProvider for GitHubSourceAuthProvider {
 
 /// 输出注入凭据后的 URL，同时撤销 WHATWG parser 自动补出的根路径 `/`。
 ///
-/// Go `net/url.URL.String` 会区分 `https://host` 与 `https://host/`；`url::Url` 内部
+/// URL 序列化 会区分 `https://host` 与 `https://host/`；`url::Url` 内部
 /// 则把前者规范化为后者。Git 会在错误输出中回显该 URL，额外 `/` 会同时改变可见
 /// 文本和 `SanitizeOutput` 的精确替换，因此只有原 URL 明确带 path 时才保留根斜杠。
 fn format_authenticated_url(parsed_url: Url, source_url: &str) -> String {

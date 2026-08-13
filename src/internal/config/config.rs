@@ -1,7 +1,7 @@
 //! 配置默认值、路径计算与业务校验。
 //!
-//! 校验错误文本尽量保持 Go 版本措辞，使 CLI 错误快照和调用方的包含匹配能够
-//! 在迁移期间继续工作。
+//! 校验错误文本尽量保持 措辞，使 CLI 错误快照和调用方的包含匹配能够
+//! 在继续工作。
 
 use std::path::{Path, PathBuf};
 
@@ -56,7 +56,7 @@ pub enum ConfigError {
     InvalidStartupContext(Box<ConfigError>),
 }
 
-/// 创建与 Go `DefaultClaudeConfig` 等价的 Claude 配置。
+/// 创建供 session 使用的默认 Claude 配置。
 ///
 /// `args` 和 `environment` 会被显式初始化为空集合，其余字段采用空值或 false。
 #[must_use]
@@ -167,7 +167,7 @@ impl Source {
 impl McpServerConfig {
     /// 判断该 server 是否使用已知远端传输。
     ///
-    /// 与 Go 行为一致：只要 `type` 非空就只按 `sse|http|ws` 判断；仅当 `type`
+    /// 与 一致：只要 `type` 非空就只按 `sse|http|ws` 判断；仅当 `type`
     /// 为空时，非空 URL 才会令结果为 true。
     #[must_use]
     pub fn is_remote(&self) -> bool {

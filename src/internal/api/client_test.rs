@@ -88,9 +88,9 @@ fn test_new_http_client() {
     assert_eq!(client.base_url(), "https://api.example.com");
 }
 
-/// 验证事件时间使用 Go RFC3339Nano 的任意末尾零裁剪规则。
+/// 验证事件时间使用 RFC 3339 纳秒格式，并裁剪小数部分末尾的零。
 #[test]
-fn event_timestamps_serialize_like_go_time_marshal_json() {
+fn event_timestamps_use_trimmed_rfc3339_nanos() {
     let base = Utc.with_ymd_and_hms(2026, 7, 15, 1, 2, 3).unwrap();
     let log = EnvManagerLogEventData {
         level: LogLevel::Info,
@@ -111,7 +111,7 @@ fn event_timestamps_serialize_like_go_time_marshal_json() {
     assert_eq!(value["requested_at"], "2026-07-15T01:02:03.12345678Z");
 }
 
-/// 验证 session context 保留 Go `json.RawMessage` 的 missing/null 差别。
+/// 验证 session context 保留 原始 JSON 的 missing/null 差别。
 #[test]
 fn session_context_preserves_missing_null_and_string_zero_values() {
     let missing: SessionContextResponse =
@@ -231,7 +231,6 @@ fn endpoint_not_implemented_survives_context_wrapping() {
     );
 }
 
-/// 对应 Go `TestRetryableHTTPDoRetriesAndReplaysBody`。
 ///
 /// 第一次响应 503、第二次成功；两次请求都必须携带完整原始 body，防止 Reqwest
 /// request clone 在重试时退化成空 POST。
@@ -301,9 +300,9 @@ fn test_session_ingress_helpers() {
     assert_eq!(lines[0]["level"], json!("info"));
 }
 
-/// 覆盖 Go `url.PathEscape` 与 URL parser 最容易产生差异的动态 path 值。
+/// 覆盖 path-segment 百分号编码 与 URL parser 最容易产生差异的动态 path 值。
 #[test]
-fn test_api_uses_shared_go_path_escape_edge_cases() {
+fn test_api_uses_shared_path_segment_escape_edge_cases() {
     let cases = [
         (";", "%3B"),
         (",", "%2C"),
@@ -323,9 +322,9 @@ fn test_api_uses_shared_go_path_escape_edge_cases() {
     }
 }
 
-/// 验证 session context 的实际 GET 调用使用共享 Go path-segment 编码。
+/// 验证 session context 的实际 GET 调用使用共享 path-segment 编码。
 #[tokio::test]
-async fn test_get_session_context_escapes_session_id_like_go() {
+async fn test_get_session_context_escapes_session_id_as_path_segment() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(
@@ -349,7 +348,7 @@ async fn test_get_session_context_escapes_session_id_like_go() {
 
 /// 验证 work ACK 的 environment/work 两个动态 segment 都使用共享编码。
 #[tokio::test]
-async fn test_acknowledge_work_escapes_both_ids_like_go() {
+async fn test_acknowledge_work_escapes_both_ids_as_path_segments() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(
@@ -369,7 +368,7 @@ async fn test_acknowledge_work_escapes_both_ids_like_go() {
 
 /// 验证 CCR worker 的所有子资源共享同一个已转义 session segment。
 #[tokio::test]
-async fn test_ccr_backend_escapes_session_id_like_go() {
+async fn test_ccr_backend_escapes_session_id_as_path_segment() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(
@@ -396,10 +395,10 @@ async fn test_ccr_backend_escapes_session_id_like_go() {
     );
 }
 
-/// 验证 CCR register 的 `worker_epoch,string` 保留 Go primitive 零值规则。
+/// 验证 CCR register 的 `worker_epoch,string` 保留 primitive 零值规则。
 #[tokio::test]
-async fn ccr_register_worker_epoch_accepts_go_null_and_missing_zero_values() {
-    // encoding/json 对缺失、null 和 quoted null 都不会覆盖 int64 的初始零值；这些
+async fn ccr_register_worker_epoch_accepts_null_and_missing_defaults() {
+    // JSON 对缺失、null 和 quoted null 都不会覆盖 int64 的初始零值；这些
     // 响应虽不常见，却会决定 worker 后续事件与 OTLP URL 使用哪个 epoch。
     for body in [
         br#"{}"#.as_slice(),
@@ -488,7 +487,7 @@ async fn json_body_uses_native_gzip_decoding() {
     assert_eq!(body, br#"{"a":"\u003c\u2028\u0026\u003e","z":"last"}"#);
 }
 
-/// Go 忽略通用 POST 的 ReadAll error，但错误文案保留截断前的 partial body。
+/// 响应提前截断时，错误文案仍保留已经读到的 partial body。
 #[tokio::test]
 async fn truncated_non_ok_response_keeps_partial_body() {
     let response =
@@ -521,9 +520,9 @@ async fn truncated_non_ok_response_keeps_partial_body() {
     assert_eq!(error.to_string(), "partial responded with non-OK 418: part");
 }
 
-/// CCR event 的 map round-trip 与 diagnostics map 顺序必须逐字节等于 Go。
+/// CCR event 的 map round-trip 与 diagnostics map 顺序必须逐字节等于。
 #[tokio::test]
-async fn ccr_request_bodies_preserve_go_dynamic_json_and_map_order() {
+async fn ccr_request_bodies_preserve_sorted_dynamic_json_and_number_rules() {
     let event_response =
         b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
     let (event_base, event_request) = spawn_raw_api_response(event_response).await;

@@ -1,4 +1,4 @@
-//! 对应 Go `internal/mcp/servers/codesign/server_test.go` 的完整行为测试。
+//! 完整行为测试。
 
 use std::{
     os::unix::fs::PermissionsExt as _,
@@ -58,7 +58,7 @@ impl Drop for SigningUrlEnvironment {
     }
 }
 
-/// 对应 Go `observedSignRequest`，保存远程签名请求的可观察字段。
+/// 保存远程签名请求的可观察字段。
 struct ObservedSignRequest {
     path: String,
     authorization: String,
@@ -78,7 +78,7 @@ fn request_header(request: &Request, name: &str) -> String {
         .to_owned()
 }
 
-/// 把 wiremock 请求解析为 Go 测试使用的观测结构。
+/// 把 wiremock 请求解析为 使用的观测结构。
 fn observed_sign_request(request: &Request) -> ObservedSignRequest {
     ObservedSignRequest {
         path: request.url.path().to_owned(),
@@ -90,7 +90,7 @@ fn observed_sign_request(request: &Request) -> ObservedSignRequest {
     }
 }
 
-/// 对应 Go `startSigningTestServer`，返回固定状态和正文的 loopback server。
+/// 返回固定状态和正文的 loopback server。
 async fn start_signing_test_server(status: u16, body: &str) -> MockServer {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -101,7 +101,7 @@ async fn start_signing_test_server(status: u16, body: &str) -> MockServer {
     server
 }
 
-/// 对应 Go `newCodesignAuthContext`，构造带 session/ingress token 的真实上下文。
+/// 构造带 session/ingress token 的真实上下文。
 fn new_codesign_auth_context(session_id: &str, session_ingress_token: &str) -> Arc<AuthContext> {
     let auth = if session_ingress_token.is_empty() {
         Vec::new()
@@ -117,7 +117,7 @@ fn new_codesign_auth_context(session_id: &str, session_ingress_token: &str) -> A
     )
 }
 
-/// 对应 Go `mcpResultContains`，只检查实际返回的 MCP 文本内容。
+/// 只检查实际返回的 MCP 文本内容。
 fn mcp_result_contains(result: &CallToolResult, want: &str) -> bool {
     result
         .content

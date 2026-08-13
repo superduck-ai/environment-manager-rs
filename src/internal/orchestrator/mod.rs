@@ -1,10 +1,10 @@
 //! 环境 work 轮询与单 session 调度。
 //!
-//! 文件名和公开符号逐项对应 Go `internal/orchestrator`；同步 `context.Context` API
-//! 机械映射为 Tokio `CancellationToken` + async 方法，构造函数采用 snake_case。
+//! 取消由 Tokio `CancellationToken` 表达，I/O 接口使用 async 方法，构造函数采用
+//! snake_case。
 
 mod hooks;
-// 保留 Go `orchestrator/orchestrator.go` 的机械文件映射，模块同名是刻意的兼容边界。
+// 模块同名是刻意保留的 crate 内边界。
 #[allow(clippy::module_inception)]
 mod orchestrator;
 mod poll_hook;

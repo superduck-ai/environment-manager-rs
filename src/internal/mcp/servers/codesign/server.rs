@@ -139,8 +139,8 @@ impl CodeSignMCPServer {
                 .await?;
             output.write_all(signature.as_bytes()).await?;
             // Tokio 文件通过阻塞线程桥接异步写入；`write_all` 返回时数据可能仍
-            // 在后台写入。必须等待 flush，才能复刻 Go `os.WriteFile` 返回后读者立即
-            // 可见完整签名的同步语义，并把 flush 失败纳入同一写文件错误分支。
+            // 在后台写入。必须等待 flush，才能保证返回后读者立即看到完整签名，
+            // 并把 flush 失败纳入同一写文件错误分支。
             output.flush().await
         }
         .await;
@@ -165,7 +165,7 @@ impl CodeSignMCPServer {
                 source: None,
             };
         }
-        // Go 用同一个短路条件处理“上下文缺失”和“source 列表为空”。通过 `filter`
+        // 用同一个短路条件处理“上下文缺失”和“source 列表为空”。通过 `filter`
         // 保留一个失败分支，确保两种状态都从同一日志源位置发出完全相同的事件。
         let Some(startup_context) = self
             .startup_context
@@ -244,7 +244,7 @@ impl CodeSignMCPServer {
             "port": config.port,
             "bearer_token": config.bearer_token,
         })) {
-            // 与 Go os.WriteFile 一致：新文件以 0600 创建，已有文件只截断、不重 chmod。
+            // 新文件以 0600 创建；已有文件只截断，不修改既有权限。
             let write_result = (|| -> std::io::Result<()> {
                 let mut file = StdOpenOptions::new()
                     .create(true)

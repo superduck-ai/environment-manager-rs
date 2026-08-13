@@ -1,11 +1,11 @@
-//! Claude SDK 与 resume endpoint 的兼容 URL 拼接。
+//! Claude SDK 与 resume endpoint 的 URL 拼接规则。
 //!
-//! 这里有意不用 `url::Url`：Go 实现只是去 scheme、截断 path/query 并做字符串
+//! 这里有意不用 `url::Url`：只是去 scheme、截断 path/query 并做字符串
 //! 前后缀判断，使用标准 URL 规范化会改变端口、本地 host 和异常输入的结果。
 
 /// 根据 API base、session 与 endpoint 版本生成 SDK URL 和 resume URL。
 ///
-/// 对应 Go `buildSessionURLs`；名称只把 URL 缩写按 Rust 习惯作为完整语义词处理。
+/// 名称只把 URL 缩写按 Rust 习惯作为完整语义词处理。
 ///
 /// `use_code_sessions` 为 true 时两个返回值相同且固定走 `/v1/code/sessions`；
 /// 否则分别返回 websocket ingress 与 HTTP persistence endpoint。

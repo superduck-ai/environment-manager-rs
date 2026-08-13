@@ -80,19 +80,19 @@ impl ActivityRecorder for RecordingActivityRecorder {
     }
 }
 
-/// 对应 Go：`noopTestStopper`，安装测试没有真实长任务需要停止。
+/// 安装测试没有真实长任务需要停止。
 struct NoopTestStopper;
 
 #[async_trait]
 impl Stopper for NoopTestStopper {
-    /// 对应同步取消阶段；fixture 没有后台任务，因此保持空操作。
+    /// fixture 没有后台任务，因此同步取消保持空操作。
     fn request_stop(&self) {}
 
-    /// 对应 Go：`noopTestStopper.Stop`；空实现是该 fixture 的真实契约。
+    /// 空实现是该 fixture 的真实契约。
     async fn stop(&self) {}
 }
 
-/// 创建全部 Go 零值字段的 Claude config。
+/// 创建全部 null 或缺失字段的默认值的 Claude config。
 fn empty_config() -> ClaudeConfig {
     ClaudeConfig {
         command: String::new(),
@@ -111,7 +111,6 @@ fn empty_config() -> ClaudeConfig {
     }
 }
 
-/// 对应 Go：`writeScript`。
 ///
 /// 在给定临时目录写 mode 0700 的 fake 可执行脚本，并返回其完整路径。
 fn write_script(temp: &TempDir, name: &str, body: &str) -> PathBuf {
@@ -121,7 +120,6 @@ fn write_script(temp: &TempDir, name: &str, body: &str) -> PathBuf {
     path
 }
 
-/// 对应 Go：`writeVersionedClaudeScript`。
 ///
 /// 写一个响应 `--version` 的 fake Claude，并把其余命令交给 `extra` 脚本片段。
 fn write_versioned_claude_script(temp: &TempDir, version: &str, extra: &str) -> PathBuf {
@@ -332,7 +330,7 @@ async fn test_install_or_update_claude_code_skip_current_and_already_installed()
     }
 }
 
-/// 验证首次安装调用恢复出的 npm package target 并做安装后版本校验。
+/// 验证首次安装使用预期 npm package target，并做安装后版本校验。
 #[tokio::test]
 async fn test_install_or_update_claude_code_installs_via_npm_and_verifies() {
     if !crate::internal::enter_isolated_process_test(concat!(
@@ -436,7 +434,7 @@ async fn test_install_or_update_claude_code_upgrades_via_cli_and_falls_back_on_f
 /// 验证安装错误在有旧版本时降级为 warning，无旧版本时返回致命错误。
 ///
 /// 两个分支都通过公共安装状态机触发私有 `handleInstallError`，并断言返回值与
-/// activity 级别，从而保留 Go 调用方实际可观察的契约。
+/// activity 级别，从而保留 调用方实际可观察的契约。
 #[tokio::test]
 async fn test_handle_install_error() {
     // fatal npm 分支会替换 PATH；整项测试隔离，避免前半段断言与后半段分属两个进程。
@@ -502,7 +500,7 @@ async fn test_handle_install_error() {
 
 /// 验证 npm 捕获输出的非 UTF-8 与 NUL 字节一直保留在 ClaudeError 中。
 ///
-/// `Display` 只能产生有损 UTF-8 视图；兼容 CLI 必须使用 `ClaudeError::as_bytes()`。
+/// `Display` 只能产生有损 UTF-8 视图；CLI 必须使用 `ClaudeError::as_bytes()`。
 #[tokio::test]
 async fn npm_install_error_preserves_raw_combined_output_bytes() {
     if !crate::internal::enter_isolated_process_test(concat!(

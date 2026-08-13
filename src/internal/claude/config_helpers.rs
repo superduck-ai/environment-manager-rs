@@ -1,7 +1,7 @@
 //! Claude 可执行文件路径的三层选择逻辑。
 //!
 //! 显式 CLI/config 值优先于 `CLAUDE_DEFAULT_PATH`，两者都为空时回退到 PATH 中的
-//! `claude`。空字符串不会覆盖后续来源，与 Go `os.Getenv` 行为一致。
+//! `claude`。空字符串不会覆盖后续来源。
 
 use crate::internal::config::ClaudeConfig;
 

@@ -1,8 +1,7 @@
 //! 包安装协议的终态结果与稳定退出码。
 //!
-//! 对应 Go `internal/packages/result.go`。枚举在 Rust 内提供类型约束，序列化时仍使用
-//! Go 协议规定的 snake_case 字符串；可选字段借助 `skip_serializing_if` 复刻
-//! `omitempty`，结构体字段顺序则固定最终 JSON 的键顺序。
+//! 枚举在 Rust 内提供类型约束，序列化时使用协议规定的 snake_case 字符串；可选字段
+//! 借助 `skip_serializing_if` 省略，结构体字段顺序固定最终 JSON 的键顺序。
 
 use serde::{Deserialize, Serialize};
 
@@ -44,7 +43,7 @@ pub enum Manager {
     Cargo,
     /// Ruby Gem。
     Gem,
-    /// Go toolchain。
+    /// toolchain。
     Go,
     /// Node.js NPM。
     Npm,
@@ -53,7 +52,7 @@ pub enum Manager {
 }
 
 impl Manager {
-    /// 返回 Go 诊断文本和协议 JSON 使用的小写 manager 名称。
+    /// 返回 诊断文本和协议 JSON 使用的小写 manager 名称。
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -88,7 +87,7 @@ pub enum Stage {
 }
 
 impl Stage {
-    /// 返回 Go 诊断文本和协议 JSON 使用的小写阶段名。
+    /// 返回 诊断文本和协议 JSON 使用的小写阶段名。
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -145,7 +144,7 @@ impl Result {
         }
     }
 
-    /// 对应 Go `Result.ProcessExitCode`，返回供 shell 使用的粗粒度稳定退出码。
+    /// 返回供 shell 使用的粗粒度稳定退出码。
     ///
     /// JSON 中的 `category` 和 `exit_code` 才是完整诊断；进程退出码仅区分成功、
     /// manifest、manager、取消/超时以及执行环境/内部失败。

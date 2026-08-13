@@ -1,7 +1,6 @@
 //! 不产生副作用的 session 活动记录器。
 //!
-//! 本文件机械对应 Go 的 `noop_activity_recorder.go`，用于未启用 session
-//! ingress 的运行路径，同时保持调用方无需分支判断。
+//! 用于未启用 session ingress 的运行路径，同时保持调用方无需分支判断。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

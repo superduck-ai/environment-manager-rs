@@ -75,7 +75,7 @@ impl CommandRunner for RecordingRunner {
     }
 }
 
-/// 对应 Go `newTestProvisioner`，使用 root UID、临时可执行目录和 fake executor 构造实例。
+/// 使用 root UID、临时可执行目录和 fake executor 构造实例。
 fn new_test_provisioner(runner: Arc<dyn CommandRunner>) -> (Provisioner, TempDir) {
     let work_dir = TempDir::new().unwrap();
     let provisioner =
@@ -98,7 +98,6 @@ async fn run_manifest(
     provisioner.run(context, &mut reader).await
 }
 
-/// 对应 Go `TestProvisionerRejectsMalformedManifest`。
 #[tokio::test]
 async fn test_provisioner_rejects_malformed_manifest() {
     let (provisioner, _work_dir) = test_provisioner(Arc::new(RecordingRunner::default()));
@@ -115,7 +114,6 @@ async fn test_provisioner_rejects_malformed_manifest() {
     assert_eq!(result.process_exit_code(), 2);
 }
 
-/// 对应 Go `TestProvisionerStopsAtFirstPackageManagerFailure`。
 #[tokio::test]
 async fn test_provisioner_stops_at_first_package_manager_failure() {
     let runner = Arc::new(RecordingRunner {
@@ -145,7 +143,6 @@ async fn test_provisioner_stops_at_first_package_manager_failure() {
     assert_eq!(runner.commands.lock().unwrap().len(), 2);
 }
 
-/// 对应 Go `TestProvisionerDoesNotReportSignalAsPackageManagerExitCode`。
 #[tokio::test]
 async fn test_provisioner_does_not_report_signal_as_package_manager_exit_code() {
     let runner = Arc::new(RecordingRunner {
@@ -169,7 +166,6 @@ async fn test_provisioner_does_not_report_signal_as_package_manager_exit_code() 
     assert_eq!(result.process_exit_code(), 12);
 }
 
-/// 对应 Go `TestProvisionerClassifiesRunnerInternalFailure`。
 #[tokio::test]
 async fn test_provisioner_classifies_runner_internal_failure() {
     let runner = Arc::new(RecordingRunner {
@@ -193,7 +189,6 @@ async fn test_provisioner_classifies_runner_internal_failure() {
     assert_eq!(result.exit_code, None);
 }
 
-/// 对应 Go `TestProvisionerHandlesEmptyPackagesWithoutStartingAProcess`。
 #[tokio::test]
 async fn test_provisioner_handles_empty_packages_without_starting_a_process() {
     let runner = Arc::new(RecordingRunner::default());
@@ -210,7 +205,6 @@ async fn test_provisioner_handles_empty_packages_without_starting_a_process() {
     assert!(runner.commands.lock().unwrap().is_empty());
 }
 
-/// 对应 Go `TestProvisionerRequiresRootAndWorkingDirectory`。
 #[tokio::test]
 async fn test_provisioner_requires_root_and_working_directory() {
     let input = r#"{"version":1,"packages":{"type":"packages","npm":["typescript"]}}"#;
@@ -239,7 +233,6 @@ async fn test_provisioner_requires_root_and_working_directory() {
     }
 }
 
-/// 对应 Go `TestProvisionerDoesNotStartAProcessWhenAlreadyCancelled`。
 #[tokio::test]
 async fn test_provisioner_does_not_start_a_process_when_already_cancelled() {
     let cancellation = CancellationToken::new();
@@ -257,7 +250,6 @@ async fn test_provisioner_does_not_start_a_process_when_already_cancelled() {
     assert!(runner.commands.lock().unwrap().is_empty());
 }
 
-/// 对应 Go `TestProvisionerClassifiesExpiredDeadline`。
 #[tokio::test]
 async fn test_provisioner_classifies_expired_deadline() {
     let runner = Arc::new(RecordingRunner::default());
@@ -277,7 +269,6 @@ async fn test_provisioner_classifies_expired_deadline() {
     assert!(runner.commands.lock().unwrap().is_empty());
 }
 
-/// 对应 Go `TestProvisionerClassifiesCancellationDuringInstall`。
 #[tokio::test]
 async fn test_provisioner_classifies_cancellation_during_install() {
     let cancellation = CancellationToken::new();
@@ -303,7 +294,7 @@ async fn test_provisioner_classifies_cancellation_during_install() {
     assert_eq!(result.stage, Some(Stage::Install));
 }
 
-/// 对应 Go `TestProvisionerDiscardsPackageManagerOutput`；executor 的真实流隔离另有测试。
+/// executor 的真实流隔离另有测试。
 #[tokio::test]
 async fn test_provisioner_discards_package_manager_output() {
     let runner = Arc::new(RecordingRunner {
@@ -327,7 +318,6 @@ async fn test_provisioner_discards_package_manager_output() {
     assert!(!encoded.contains("typescript"));
 }
 
-/// 对应 Go `TestProvisionerRejectsManifestLargerThanOneMiB`。
 #[tokio::test]
 async fn test_provisioner_rejects_manifest_larger_than_one_mi_b() {
     let (provisioner, _work_dir) = test_provisioner(Arc::new(RecordingRunner::default()));
@@ -342,7 +332,6 @@ async fn test_provisioner_rejects_manifest_larger_than_one_mi_b() {
     assert_eq!(result.stage, Some(Stage::Decode));
 }
 
-/// 对应 Go `TestProvisionerClassifiesMissingPackageManagerBinary`。
 #[tokio::test]
 async fn test_provisioner_classifies_missing_package_manager_binary() {
     let runner = Arc::new(RecordingRunner {
@@ -366,7 +355,6 @@ async fn test_provisioner_classifies_missing_package_manager_binary() {
     assert_eq!(result.stage, Some(Stage::Start));
 }
 
-/// 对应 Go `TestProvisionerCancelsRunningPackageManager`。
 #[tokio::test]
 async fn test_provisioner_cancels_running_package_manager() {
     let cancellation = CancellationToken::new();
@@ -396,7 +384,7 @@ struct CommandRunnerFunc;
 
 #[async_trait]
 impl CommandRunner for CommandRunnerFunc {
-    /// 对应 Go `commandRunnerFunc.Run`，模拟在途安装直到 context 完成。
+    /// 模拟在途安装直到 context 完成。
     async fn run(&self, context: &ProvisionContext, _command: &Command) -> CommandResult {
         context.cancelled().await;
         CommandResult {
@@ -408,7 +396,6 @@ impl CommandRunner for CommandRunnerFunc {
     }
 }
 
-/// 对应 Go `TestProvisionerValidatesManifestContract`。
 #[tokio::test]
 async fn test_provisioner_validates_manifest_contract() {
     let cases = [
@@ -519,7 +506,7 @@ async fn test_provisioner_validates_manifest_contract() {
     }
 }
 
-/// 验证 Go encoding/json 会替换字符串内非法 UTF-8，而不会把完整 JSON 归为 decode 错误。
+/// 验证 manifest 解码会替换字符串内非法 UTF-8，而不会把完整 JSON 归为 decode 错误。
 #[tokio::test]
 async fn test_provisioner_replaces_invalid_utf8_inside_json_string() {
     let runner = Arc::new(RecordingRunner::default());
@@ -541,7 +528,6 @@ async fn test_provisioner_replaces_invalid_utf8_inside_json_string() {
     assert_eq!(runner.commands.lock().unwrap().len(), 1);
 }
 
-/// 对应 Go `TestProvisionerLeavesMalformedNonCredentialURLToPackageManager`。
 #[tokio::test]
 async fn test_provisioner_leaves_malformed_non_credential_url_to_package_manager() {
     let runner = Arc::new(RecordingRunner::default());
@@ -556,7 +542,6 @@ async fn test_provisioner_leaves_malformed_non_credential_url_to_package_manager
     assert_eq!(runner.commands.lock().unwrap().len(), 1);
 }
 
-/// 对应 Go `TestProvisionerAllowsAtSignOutsideURLAuthority`。
 #[tokio::test]
 async fn test_provisioner_allows_at_sign_outside_url_authority() {
     let runner = Arc::new(RecordingRunner::default());
@@ -571,7 +556,6 @@ async fn test_provisioner_allows_at_sign_outside_url_authority() {
     assert_eq!(runner.commands.lock().unwrap().len(), 1);
 }
 
-/// 对应 Go `TestProvisionerRunsPackageManagersInContractOrder`。
 #[tokio::test]
 async fn test_provisioner_runs_package_managers_in_contract_order() {
     let runner = Arc::new(RecordingRunner::default());

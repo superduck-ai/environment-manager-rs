@@ -35,10 +35,10 @@ use super::types::SharedAuthProvider;
 
 const GIT_HTTP_PROXY_AUTH_CONFIG: &str = "http.proxyAuthMethod=basic";
 
-/// 对应 Go `NewGitHandler`，保存全部配置并读取 post-clone Hook 环境变量。
+/// 保存全部配置并读取 post-clone Hook 环境变量。
 ///
 /// `POST_CLONE_HOOK_PATH` 只在构造时读取一次；之后修改进程环境不会改变已创建
-/// handler，这与 Go 对象生命周期一致。`'recorder` 原样来自调用方；返回的 handler
+/// handler，这与 对象生命周期一致。`'recorder` 原样来自调用方；返回的 handler
 /// 不能比 recorder 活得更久，因此局部初始化 recorder 无需伪装成 `'static`。
 #[allow(clippy::too_many_arguments)]
 pub fn new_git_handler<'recorder>(
@@ -72,7 +72,7 @@ pub fn new_git_handler<'recorder>(
 }
 
 impl GitHandler<'_> {
-    /// 对应 Go `CanHandle`，只接受精确的 `git_repository` 标签。
+    /// 只接受精确的 `git_repository` 标签。
     #[must_use]
     pub fn can_handle(&self, source_type: &str) -> bool {
         source_type == "git_repository"
@@ -80,7 +80,7 @@ impl GitHandler<'_> {
 
     /// 覆盖生产默认的 Git proxy factory；传 `None` 可在隔离测试中显式禁用。
     ///
-    /// 构造函数保持 Go 参数表不变，因此测试 adapter 通过单独 setter 覆盖；替换
+    /// 构造函数保持 参数表不变，因此测试 adapter 通过单独 setter 覆盖；替换
     /// factory 不会停止已经启动并存入 handler 的 manager。
     pub fn set_git_proxy_factory(&self, factory: Option<Arc<dyn GitProxyFactory>>) {
         *self
@@ -89,7 +89,7 @@ impl GitHandler<'_> {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = factory;
     }
 
-    /// 对应 Go `Process`，准备目录、认证 URL、clone/fetch 并处理 outcome branch。
+    /// 准备目录、认证 URL、clone/fetch 并处理 outcome branch。
     ///
     /// `fresh` 删除现有 clone；`allow-prefetched` 复用 `.git`；其余模式在目录检查上
     /// 都走 resume 分支，但只有精确的 `resume` 会容忍 fetch 失败后继续 branch setup。
@@ -126,8 +126,8 @@ impl GitHandler<'_> {
             None
         };
 
-        // Go 用 defer 覆盖本函数内全部 `return`。Rust 的 Drop 无法安全等待 Tokio
-        // callback，因此把业务体包进内部 future，收集结果后再异步 Stop。
+        // Stop 必须覆盖本函数内全部 `return`。Rust 的 Drop 无法安全等待 Tokio
+        // callback，因此把业务体包进内部 future，收集结果后再异步停止。
         let process_result = async {
             let git_url = self.git_url(git_source)?;
         if git_source
@@ -323,7 +323,7 @@ impl GitHandler<'_> {
         }
     }
 
-    /// 对应 Go `createSourceAuthProvider`；任何带 auth 的 GitInfo 都创建 GitHub provider。
+    /// 任何带 auth 的 GitInfo 都创建 GitHub provider。
     fn create_source_auth_provider(&self, git_info: &GitInfo) -> Option<SharedAuthProvider> {
         let auth = git_info.auth.as_ref()?;
         Some(Arc::new(new_github_source_auth_provider(
@@ -331,7 +331,7 @@ impl GitHandler<'_> {
         )))
     }
 
-    /// 对应 Go `getAuthenticatedURL`；provider 或 auth context 缺失时返回原 URL。
+    /// provider 或 auth context 缺失时返回原 URL。
     #[must_use]
     pub(crate) fn get_authenticated_url(
         &self,
@@ -347,10 +347,10 @@ impl GitHandler<'_> {
         }
     }
 
-    /// 对应 Go `runGitFetchWithRetry`，最多执行五次指数退避 fetch。
+    /// 最多执行五次指数退避 fetch。
     ///
     /// 第四、五次在原参数前加 `-c http.version=HTTP/1.1`；第五次额外设置
-    /// `GIT_TRACE_PACKET=1`。退避由 cancellation 打断时保留 Go 文案中的
+    /// `GIT_TRACE_PACKET=1`。退避由 cancellation 打断时保留 文案中的
     /// `cancelled` 双 l 拼写。
     async fn run_git_fetch_with_retry(
         &self,
@@ -426,7 +426,7 @@ impl GitHandler<'_> {
         )))
     }
 
-    /// 对应 Go `ValidateRepositoryAccess`，用 `git ls-remote` 最多验证三次。
+    /// 用 `git ls-remote` 最多验证三次。
     pub async fn validate_repository_access(
         &self,
         cancellation: &CancellationToken,
@@ -500,7 +500,7 @@ impl GitHandler<'_> {
         )))
     }
 
-    /// 对应 Go `runGitCommand`，统一追加 proxy auth 配置并捕获合并输出。
+    /// 统一追加 proxy auth 配置并捕获合并输出。
     ///
     /// 日志中的命令参数会脱敏；错误输出还会交给 auth provider 二次清理。实际 argv
     /// 始终使用原字符串直接传给 `git`，不会经过 shell 或重新编码。
@@ -515,7 +515,7 @@ impl GitHandler<'_> {
         environment: &[(String, String)],
         args: &[String],
     ) -> SourcesResult<()> {
-        // Go 在进入 `runGitCommand` 后立即启动计时，参数复制、脱敏和命令构造都属于
+        // 在进入 `runGitCommand` 后立即启动计时，参数复制、脱敏和命令构造都属于
         // `duration_ms`；起点不能下移到 spawn，否则短命令的毫秒边界会产生差分。
         let command_started = Instant::now();
         let mut git_args = vec!["-c".to_owned(), GIT_HTTP_PROXY_AUTH_CONFIG.to_owned()];
@@ -571,10 +571,10 @@ impl GitHandler<'_> {
         Ok(())
     }
 
-    /// 对应 Go `cloneRepository`，执行 clone/fetch 主流程，并在返回前恢复公开 origin。
+    /// 执行 clone/fetch 主流程，并在返回前恢复公开 origin。
     ///
-    /// Go 使用 `defer` 恢复 URL；Rust 不能在 async `Drop` 中 await，因此把主体结果
-    /// 先保存，再执行同一恢复命令，最后原样返回主体错误。恢复失败只记录 warning。
+    /// Rust 不能在 async `Drop` 中 await，因此先保存主体结果，再执行恢复命令，
+    /// 最后原样返回主体错误。恢复失败只记录 warning。
     #[allow(clippy::too_many_arguments)]
     async fn clone_repository(
         &self,
@@ -897,7 +897,7 @@ impl GitHandler<'_> {
         .await?;
 
         let clone_duration_ms = elapsed_milliseconds(clone_started);
-        // Go 在 goroutine 中计算 pack size，并与 post-clone Hook 并行。这里用
+        // 在 后台任务 中计算 pack size，并与 post-clone Hook 并行。这里用
         // spawn_blocking 保持相同时序，也避免同步目录遍历占住 Tokio worker。
         let pack_path = repo_path.to_owned();
         let pack_task = tokio::task::spawn_blocking(move || {
@@ -912,7 +912,7 @@ impl GitHandler<'_> {
             Err(error) => (0, 0, Some(error.to_string())),
         };
         if let Some(error) = pack_error {
-            // Go 只有一个 `result.err != nil` 日志调用点；即便 Tokio worker 自身异常，
+            // 只有一个 `result.err != `None`` 日志调用点；即便 Tokio worker 自身异常，
             // 也汇入同一调用点，避免 Rust 分支凭空增加一条记录。
             tracing::warn!("error" = ?(error), "{}", "Failed to calculate repo size");
             pack_size_bytes = -1;
@@ -976,10 +976,10 @@ impl GitHandler<'_> {
         .await
     }
 
-    /// 对应 Go `runPostCloneHook`，执行 `bash <hook> <repo>` 并始终写诊断文件。
+    /// 执行 `bash <hook> <repo>` 并始终写诊断文件。
     ///
     /// Hook 非零退出、启动失败或取消都只记录 warning，不改变 clone 结果；输出文件
-    /// 使用 Go `os.WriteFile(..., 0644)` 的 create/truncate 权限语义。
+    /// 使用 create/truncate 语义。
     async fn run_post_clone_hook(&self, cancellation: &CancellationToken, repo_path: &Path) {
         if self.post_clone_hook_path.is_empty() {
             return;
@@ -1022,7 +1022,7 @@ impl GitHandler<'_> {
         }
     }
 
-    /// 对应 Go `isEmptyRepository`，以空的 `ls-remote --symref ... HEAD` 判断空仓库。
+    /// 以空的 `ls-remote --symref ... HEAD` 判断空仓库。
     async fn is_empty_repository(
         &self,
         cancellation: &CancellationToken,
@@ -1066,7 +1066,7 @@ impl GitHandler<'_> {
         false
     }
 
-    /// 对应 Go `sanitizeURL`，把 URL userinfo 固定替换为 `<token>`。
+    /// 把 URL userinfo 固定替换为 `<token>`。
     #[must_use]
     pub(crate) fn sanitize_url(&self, url_string: &str) -> String {
         let Ok(parsed) = url::Url::parse(url_string) else {
@@ -1086,8 +1086,8 @@ impl GitHandler<'_> {
             return parsed.into();
         }
 
-        // `url::Url::set_username` 会把 `<token>` 编码成 `%3Ctoken%3E`，而 Go
-        // `url.URL` 的手工字段拼接会输出字面占位符；因此按解析后的组件重建结果。
+        // `url::Url::set_username` 会把 `<token>` 编码成 `%3Ctoken%3E`；这里要求日志中
+        // 保留字面占位符，因此按解析后的组件重建结果。
         let authority = &parsed[url::Position::BeforeHost..url::Position::AfterPort];
         let mut sanitized = format!("{}://<token>@{authority}{}", parsed.scheme(), parsed.path());
         if let Some(query) = parsed.query() {
@@ -1101,7 +1101,7 @@ impl GitHandler<'_> {
         sanitized
     }
 
-    /// 对应 Go `branchExistsOnRemote`，只在命令成功且 stdout 非空时返回 true。
+    /// 只在命令成功且 stdout 非空时返回 true。
     pub(crate) async fn branch_exists_on_remote(
         &self,
         cancellation: &CancellationToken,
@@ -1162,7 +1162,7 @@ impl GitHandler<'_> {
         }
     }
 
-    /// 对应 Go `fetchAndCheckoutRemoteBranch`，fetch `<branch>:<branch>` 后 checkout。
+    /// fetch `<branch>:<branch>` 后 checkout。
     ///
     /// authenticated URL 与公开 URL 不同时，临时修改 origin；无论 fetch/checkout
     /// 成败都在返回前 best-effort 恢复公开 URL。
@@ -1267,10 +1267,9 @@ impl GitHandler<'_> {
         result
     }
 
-    /// 对应 Go：`internal/sources/git.go` 中的 `createLocalBranch`。
     ///
     /// 从当前 HEAD 创建本地目标 branch，随后通过 `internal/util/git.rs` 的统一封装
-    /// 创建 `refs/remotes/origin/<branch>`。checkout 时关闭 hooks，避免迁移实现意外
+    /// 创建 `refs/remotes/origin/<branch>`。checkout 时关闭 hooks，避免实现意外
     /// 执行仓库脚本。
     ///
     /// # 参数
@@ -1279,11 +1278,10 @@ impl GitHandler<'_> {
     /// - `target_branch`：要创建的 branch 名称，不经 shell 解释。
     ///
     /// # 返回
-    /// checkout 和 remote-tracking ref 都成功时返回 `Ok(())`；任一步失败时保留 Go
-    /// `%w` 包装文本并返回 [`SourcesError`]。
+    /// checkout 和 remote-tracking ref 都成功时返回 `Ok(())`；任一步失败时保留 `source chain` 包装文本并返回 [`SourcesError`]。
     ///
     /// # 副作用
-    /// 创建 Git 子进程、修改本地 branch/ref，并按 Go 的消息、级别和属性顺序记录
+    /// 创建 Git 子进程、修改本地 branch/ref，并按 消息、级别和属性顺序记录
     /// 创建前、失败或成功事件。失败 `output` 保留捕获输出的尾随换行。
     async fn create_local_branch(
         &self,
@@ -1343,7 +1341,7 @@ impl GitHandler<'_> {
         Ok(())
     }
 
-    /// 对应 Go `setupBranchFromOutcomes`，按 repo 名查找唯一目标 branch。
+    /// 按 repo 名查找唯一目标 branch。
     #[allow(clippy::too_many_arguments)]
     async fn setup_branch_from_outcomes(
         &self,
@@ -1413,7 +1411,7 @@ impl GitHandler<'_> {
         Ok(())
     }
 
-    /// 对应 Go `UpdateRemoteURL`；无自定义 URL 或 repo 不存在时成功 no-op。
+    /// 无自定义 URL 或 repo 不存在时成功 no-op。
     pub async fn update_remote_url(
         &self,
         cancellation: &CancellationToken,
@@ -1480,7 +1478,7 @@ impl GitHandler<'_> {
         Ok(())
     }
 
-    /// 对应 Go `SetupGitProxyAfterSourcesProcessed`，收集有 token 的 Git source 并启动 proxy。
+    /// 收集有 token 的 Git source 并启动 proxy。
     ///
     /// 没有带认证仓库时成功 no-op。确实需要 proxy 却未注入 factory 时返回带
     /// `failed to create git proxy manager` 前缀的错误，保持原调用层包装语义。
@@ -1591,7 +1589,7 @@ impl GitHandler<'_> {
         Ok(())
     }
 
-    /// 对应 Go `setupLocalGitProxy`，把单个 origin 改为 manager 生成的本地 URL。
+    /// 把单个 origin 改为 manager 生成的本地 URL。
     async fn setup_local_git_proxy(
         &self,
         cancellation: &CancellationToken,
@@ -1679,7 +1677,7 @@ impl GitRemoteUpdater for GitHandler<'_> {
     }
 }
 
-/// 对应 Go `packSize`，只累计 `.git/objects/pack` 下的普通 `.pack` 文件。
+/// 只累计 `.git/objects/pack` 下的普通 `.pack` 文件。
 pub(crate) fn pack_size(repo_path: &Path) -> SourcesResult<i64> {
     let pack_dir = repo_path.join(".git").join("objects").join("pack");
     let entries = std::fs::read_dir(&pack_dir).map_err(|error| {
@@ -1717,12 +1715,12 @@ pub(super) struct ActivityStopGuard {
 }
 
 impl ActivityStopGuard {
-    /// 包装可选 stopper；`None` 保持 Go nil stopper 的 no-op 语义。
+    /// 包装可选 stopper；`None` 保持 no-op 语义。
     pub(super) fn new(stopper: Option<Arc<dyn Stopper>>) -> Self {
         Self { stopper }
     }
 
-    /// 对应 Go defer 中的 `stopper.Stop()`；正常控制流返回前取消并等待在途 callback。
+    /// 正常控制流返回前取消 stopper 并等待在途 callback。
     pub(super) async fn stop(mut self) {
         if let Some(stopper) = self.stopper.take() {
             stopper.stop().await;
@@ -1765,7 +1763,7 @@ async fn run_external_command(
     run_command(command, cancellation, None, None, capture).await
 }
 
-/// 用 0755 创建目录树，并保留 Go `MkdirAll` 的 umask 行为。
+/// 用 0755 创建目录树，并保留递归创建时的 umask 行为。
 async fn create_dir_all_0755(path: &Path) -> io::Result<()> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
@@ -1776,7 +1774,7 @@ async fn create_dir_all_0755(path: &Path) -> io::Result<()> {
     .map_err(io::Error::other)?
 }
 
-/// 删除目录、普通文件或符号链接，等价于 Go `os.RemoveAll` 的目标类型覆盖面。
+/// 删除目录、普通文件或符号链接。
 async fn remove_all(path: &Path) -> io::Result<()> {
     let metadata = tokio::fs::symlink_metadata(path).await?;
     if metadata.file_type().is_dir() {
@@ -1786,7 +1784,7 @@ async fn remove_all(path: &Path) -> io::Result<()> {
     }
 }
 
-/// 以 create/truncate 和 0644 mode 写文件，匹配 Go `os.WriteFile`。
+/// 以 create/truncate 和 0644 mode 写文件。
 async fn write_file_0644(path: &Path, contents: Vec<u8>) -> io::Result<()> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
@@ -1802,14 +1800,14 @@ async fn write_file_0644(path: &Path, contents: Vec<u8>) -> io::Result<()> {
     .map_err(io::Error::other)?
 }
 
-/// 计算当前 Unix 纳秒时间对小整数的余数，复刻 Go 的 retry jitter。
+/// 计算当前 Unix 纳秒时间对小整数的余数，实现retry jitter。
 fn unix_nanos_mod(modulus: u64) -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| u64::from(duration.subsec_nanos()) % modulus)
 }
 
-/// 把单调时钟经过的时长转换成 Go `time.Duration.Milliseconds()` 的 `int64`。
+/// 把单调时钟经过的时长转换成截断的 `i64` 毫秒数。
 ///
 /// 正常 Git 操作不可能接近 `i64::MAX` 毫秒；饱和转换仅避免 Rust `u128 -> i64`
 /// 截断在异常长进程上生成负数，并不改变实际可观察范围内的数值。

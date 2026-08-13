@@ -1,10 +1,7 @@
 //! 命令面测试。
 //!
-//! 这些测试保留 Go `cmd/cmd_cli_test.go` 的精确测试名，并补充迁移最容易回归的
-//! argv0、默认值和显式 flag 来源。HTTP 路径使用 loopback mock
+//! 测试覆盖 argv0、默认值和显式 flag 来源。HTTP 路径使用 loopback mock
 //! server；安装路径只验证 skip/current 与 PATH 预检，不访问公网或真实安装 npm 包。
-
-#![allow(non_snake_case, reason = "保留 Go cmd_cli_test.go 的精确测试名称")]
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -124,9 +121,9 @@ fn boolean_flags_use_native_clap_syntax() {
     assert!(!args.skip_sandbox_runtime);
 }
 
-/// orchestrator 默认值必须逐项对应 Go 命令。
+/// orchestrator 默认值必须命令。
 #[test]
-fn orchestrator_defaults_match_go_command() {
+fn orchestrator_defaults_match_cli_contract() {
     let Invocation::Orchestrator(args) = parse_from("dev", ["environment-runner", "orchestrator"])
         .expect("orchestrator defaults must parse")
     else {
@@ -206,7 +203,7 @@ fn orchestrator_overrides_are_typed() {
     assert!(args.skip_container_lock);
 }
 
-/// poll 与 setup 的默认值和主要覆盖值应保持 Go 接口。
+/// poll 与 setup 的默认值和主要覆盖值应保持 接口。
 #[test]
 fn poll_and_setup_parse_without_runtime_side_effects() {
     let Invocation::Poll(poll) = parse_from(
@@ -300,7 +297,7 @@ fn code_sign_preserves_and_interprets_raw_arguments() {
     assert_eq!(sign.namespace, Some(OsString::from("git")));
 }
 
-/// 非 SSH sign 调用应保留旧实现的明确失败，而不是形成伪成功操作。
+/// 非 SSH sign 调用应保留当前命令的明确失败，而不是形成伪成功操作。
 #[test]
 fn code_sign_rejects_unsupported_operation() {
     let args = CodeSignArgs {
@@ -312,9 +309,9 @@ fn code_sign_rejects_unsupported_operation() {
     assert!(error.contains("currently only SSH-style signing"));
 }
 
-/// Go duration 解析器应覆盖默认值、组合、小数和微秒拼写。
+/// duration 解析器应覆盖默认值、组合、小数和微秒拼写。
 #[test]
-fn go_duration_parser_supports_legacy_syntax() {
+fn duration_parser_supports_cli_syntax() {
     assert_eq!(parse_go_duration("0").unwrap(), Duration::ZERO);
     assert_eq!(
         parse_go_duration("500ms").unwrap(),
@@ -335,9 +332,9 @@ fn go_duration_parser_supports_legacy_syntax() {
     assert!(parse_go_duration("-1s").is_err());
 }
 
-/// 日志级别应严格接受四个旧值并返回兼容错误。
+/// 日志级别应严格接受四个受支持值并返回稳定错误。
 #[test]
-fn log_level_parser_matches_go_values() {
+fn log_level_parser_accepts_supported_values() {
     assert_eq!(parse_log_level("debug"), Ok(LogLevel::Debug));
     assert_eq!(parse_log_level("info"), Ok(LogLevel::Info));
     assert_eq!(parse_log_level("warn"), Ok(LogLevel::Warn));
@@ -391,9 +388,9 @@ fn print_sandbox_settings_is_a_real_invocation() {
     );
 }
 
-/// 替代 Go `TestParseLogLevelAndMarkRequiredFlags`：保留日志解析，并由 Clap 直接验证必填参数。
+/// 替代：保留日志解析，并由 Clap 直接验证必填参数。
 #[test]
-fn TestParseLogLevelAndRequiredSession() {
+fn parse_log_level_and_require_session() {
     for (value, expected) in [
         ("debug", LogLevel::Debug),
         ("info", LogLevel::Info),
@@ -412,13 +409,13 @@ fn TestParseLogLevelAndRequiredSession() {
     assert!(error.rendered().contains("--session"));
 }
 
-/// 对应 Go `TestLoadServiceKeyReadsFileOrEnvironment`，包括空文件回退环境变量。
+/// 包括空文件回退环境变量。
 #[test]
-fn TestLoadServiceKeyReadsFileOrEnvironment() {
+fn load_service_key_reads_file_or_environment() {
     // 父测试进程只启动隔离子进程，不在自身读写全局环境。
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::TestLoadServiceKeyReadsFileOrEnvironment"
+        "::load_service_key_reads_file_or_environment"
     )) {
         return;
     }
@@ -455,9 +452,9 @@ fn TestLoadServiceKeyReadsFileOrEnvironment() {
     assert!(error.contains(&format!("{:?}", missing.display().to_string())));
 }
 
-/// 对应 Go `TestRunAPIHealthcheck`，验证 whoami 路径、认证头和失败包装。
+/// 验证 whoami 路径、认证头和失败包装。
 #[tokio::test(flavor = "current_thread")]
-async fn TestRunAPIHealthcheck() {
+async fn run_api_healthcheck_requests_whoami() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/environments/whoami"))
@@ -489,16 +486,15 @@ async fn TestRunAPIHealthcheck() {
     failing.verify().await;
 }
 
-/// 对应 Go `TestRunSetupSkipInstallationsAndPreflight`。
 ///
-/// 把 PATH 清空可以证明两个安装都 skip 时不会偷偷运行 npm；非法日志值在 Rust 中
-/// 由 Clap value parser 提前拒绝，等价于 Go `runSetup` 的首个检查。
+/// 把 PATH 清空可以证明两个安装都 skip 时不会偷偷运行 npm；非法日志值由 Clap
+/// value parser 提前拒绝。
 #[tokio::test(flavor = "current_thread")]
-async fn TestRunSetupSkipInstallationsAndPreflight() {
+async fn run_setup_skip_installations_and_preflight() {
     // 父测试进程只启动隔离子进程，不在自身读写全局环境。
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::TestRunSetupSkipInstallationsAndPreflight"
+        "::run_setup_skip_installations_and_preflight"
     )) {
         return;
     }
@@ -536,13 +532,12 @@ async fn TestRunSetupSkipInstallationsAndPreflight() {
     assert!(error.rendered().contains("invalid log level"));
 }
 
-/// 对应 Go `TestCheckNpmAvailableUsesPath`。
 #[tokio::test(flavor = "current_thread")]
-async fn TestCheckNpmAvailableUsesPath() {
+async fn check_npm_available_uses_path() {
     // 父测试进程只启动隔离子进程，不在自身读写全局环境。
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::TestCheckNpmAvailableUsesPath"
+        "::check_npm_available_uses_path"
     )) {
         return;
     }
@@ -567,9 +562,8 @@ async fn TestCheckNpmAvailableUsesPath() {
     assert!(error.contains("npm not found in PATH"));
 }
 
-/// 对应 Go `TestInstallSandboxRuntimeCurrentSkipsInstallation`。
 #[tokio::test(flavor = "current_thread")]
-async fn TestInstallSandboxRuntimeCurrentSkipsInstallation() {
+async fn current_sandbox_runtime_skips_installation() {
     let cancellation = CancellationToken::new();
     cancellation.cancel();
     install_sandbox_runtime(&cancellation, "current")
@@ -577,13 +571,12 @@ async fn TestInstallSandboxRuntimeCurrentSkipsInstallation() {
         .expect("current must skip npm even when already cancelled");
 }
 
-/// 对应 Go `TestAddSetupCommandRegistersAndRunsSkipMode`。
 #[tokio::test(flavor = "current_thread")]
-async fn TestAddSetupCommandRegistersAndRunsSkipMode() {
+async fn setup_command_registers_and_runs_skip_mode() {
     // 父测试进程只启动隔离子进程，不在自身读写全局环境。
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::TestAddSetupCommandRegistersAndRunsSkipMode"
+        "::setup_command_registers_and_runs_skip_mode"
     )) {
         return;
     }
@@ -619,12 +612,11 @@ async fn TestAddSetupCommandRegistersAndRunsSkipMode() {
         .expect("setup skip mode must run");
 }
 
-/// 对应 Go `TestAddPollCommandPrintsWorkAndNull`。
 ///
-/// 这里使用精确 stdout 快照，额外覆盖 Go map key 排序、float64 数字舍入和 HTML
-/// 转义；仅断言包含字段无法发现这些迁移差异。
+/// 这里使用精确 stdout 快照，额外覆盖 map key 排序、float64 数字舍入和 HTML
+/// 转义；仅断言包含字段无法发现这些格式差异。
 #[tokio::test(flavor = "current_thread")]
-async fn TestAddPollCommandPrintsWorkAndNull() {
+async fn poll_command_prints_work_and_null() {
     let directory = TempDir::new().unwrap();
     let key_path = write_service_key(&directory, "service-key\n");
     let server = MockServer::start().await;
@@ -690,9 +682,8 @@ async fn TestAddPollCommandPrintsWorkAndNull() {
     empty.verify().await;
 }
 
-/// 对应 Go `TestAddPollCommandServiceKeyAndIdentityErrors`。
 #[tokio::test(flavor = "current_thread")]
-async fn TestAddPollCommandServiceKeyAndIdentityErrors() {
+async fn poll_command_reports_service_key_and_identity_errors() {
     let directory = TempDir::new().unwrap();
     let empty_key = write_service_key(&directory, " \n");
     let mut output = Vec::new();
@@ -725,9 +716,8 @@ async fn TestAddPollCommandServiceKeyAndIdentityErrors() {
     server.verify().await;
 }
 
-/// 对应 Go `TestPollCommandFallsBackToProvidedIdentityWhenWhoamiFails`。
 #[tokio::test(flavor = "current_thread")]
-async fn TestPollCommandFallsBackToProvidedIdentityWhenWhoamiFails() {
+async fn poll_command_uses_provided_identity_when_whoami_fails() {
     let directory = TempDir::new().unwrap();
     let key_path = write_service_key(&directory, "file-key\n");
     let server = MockServer::start().await;
@@ -756,9 +746,8 @@ async fn TestPollCommandFallsBackToProvidedIdentityWhenWhoamiFails() {
     server.verify().await;
 }
 
-/// 对应 Go `TestPollCommandReportsInvalidWorkJSON`。
 #[tokio::test(flavor = "current_thread")]
-async fn TestPollCommandReportsInvalidWorkJSON() {
+async fn poll_command_reports_invalid_work_json() {
     let directory = TempDir::new().unwrap();
     let key_path = write_service_key(&directory, "service-key\n");
     let server = MockServer::start().await;
@@ -785,7 +774,7 @@ async fn TestPollCommandReportsInvalidWorkJSON() {
 
 /// code-sign 的原始 argv 解析测试，特别保护 Git/OpenSSH 传入的字面 `--`。
 #[test]
-fn TestRunCodeSignParsesSSHArguments() {
+fn code_sign_parses_ssh_arguments() {
     let Invocation::CodeSign(arguments) = parse_from(
         "dev",
         [
@@ -835,7 +824,7 @@ fn TestRunCodeSignParsesSSHArguments() {
 
 /// code-sign 指数退避的边界测试；抖动只能增加基础值，不能超过 30%。
 #[test]
-fn TestCalculateBackoff() {
+fn calculate_backoff_uses_capped_positive_jitter() {
     let config = RetryConfig {
         max_retries: 2,
         initial_backoff: Duration::from_millis(100),
@@ -855,11 +844,11 @@ fn TestCalculateBackoff() {
 
 /// code-sign 配置优先读取成对环境变量，并保持 `fmt.Fscanf("%d")` 的前缀语义。
 #[test]
-fn TestReadCodeSignConfigFromEnvironment() {
+fn code_sign_config_reads_environment() {
     // 父测试进程只启动隔离子进程，不在自身读写全局环境。
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::TestReadCodeSignConfigFromEnvironment"
+        "::code_sign_config_reads_environment"
     )) {
         return;
     }
@@ -879,7 +868,7 @@ fn TestReadCodeSignConfigFromEnvironment() {
 
 /// 单次 MCP HTTP 调用必须验证 header、状态码、JSON-RPC error 和 result 存在性。
 #[tokio::test(flavor = "current_thread")]
-async fn TestDoSingleAttemptValidatesJSONRPC() {
+async fn single_sign_attempt_validates_json_rpc() {
     let server = MockServer::start().await;
     for (endpoint, body) in [
         (
@@ -974,7 +963,7 @@ async fn TestDoSingleAttemptValidatesJSONRPC() {
 
 /// 重试必须总共尝试 `max_retries + 1` 次，并在第三次成功后返回 result。
 #[tokio::test(flavor = "current_thread")]
-async fn TestDoAttemptsWithRetry() {
+async fn signing_attempts_retry_transient_failures() {
     let server = MockServer::start().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     let observed = attempts.clone();
@@ -1013,13 +1002,13 @@ async fn TestDoAttemptsWithRetry() {
     server.verify().await;
 }
 
-/// 端到端 code-sign 单测：请求协议、tool error 和 `.sig` 副作用都必须与 Go 一致。
+/// 端到端 code-sign 单测：请求协议、tool error 和 `.sig` 副作用都必须与 一致。
 #[tokio::test(flavor = "current_thread")]
-async fn TestHandleSSHSignCallsServerAndChecksSignature() {
+async fn ssh_sign_calls_server_and_checks_signature() {
     // 父测试进程只启动隔离子进程，不在自身读写全局环境。
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::TestHandleSSHSignCallsServerAndChecksSignature"
+        "::ssh_sign_calls_server_and_checks_signature"
     )) {
         return;
     }
@@ -1155,7 +1144,7 @@ fn write_service_key(directory: &TempDir, contents: &str) -> PathBuf {
     path
 }
 
-/// 对应 Go `executeCommandWithStdout`，把命令写入的原始 stdout 缓冲转成文本快照。
+/// 把命令写入的原始 stdout 缓冲转成文本快照。
 ///
 /// Rust 命令层把 writer 显式注入 `run_poll`，因此无需替换进程全局 stdout；仍在同一
 /// helper 统一执行 UTF-8 校验，确保测试不会用有损转换掩盖字节差异。

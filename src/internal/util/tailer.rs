@@ -129,7 +129,7 @@ impl Tailer {
 
     /// 取出行接收端。
     ///
-    /// Tokio `mpsc::Receiver` 是单消费者，与 Go 的 channel 使用方式一致；
+    /// Tokio `mpsc::Receiver` 是单消费者，与 channel 使用方式一致；
     /// 因此该方法只能成功一次。
     pub fn take_lines(&self) -> Result<mpsc::Receiver<TailLine>, TailerError> {
         self.receiver
@@ -139,7 +139,6 @@ impl Tailer {
             .ok_or(TailerError::ReceiverAlreadyTaken)
     }
 
-    /// 对应 Go：`tailer.go` 中的 `(*Tailer).Lines`。
     ///
     /// Tokio channel 明确要求单一消费者，所以第一次调用转移 receiver 所有权；
     /// 后续调用返回 [`TailerError::ReceiverAlreadyTaken`]，而不是复制消费端。
@@ -214,7 +213,7 @@ impl Tailer {
             && let Err(error) = task.await
             && error.is_panic()
         {
-            // Go 的 tailer goroutine 若 panic 会终止整个进程；Tokio 会把 panic
+            // tailer 后台任务 若 panic 会终止整个进程；Tokio 会把 panic
             // 收进 JoinError，因此必须在会合点重新抛出，不能额外写 Rust-only 日志。
             std::panic::resume_unwind(error.into_panic());
         }
@@ -318,9 +317,8 @@ impl Tailer {
     }
 }
 
-/// 对应 Go：`tailer.go` 中的 `NewTailer`。
 ///
-/// 保留自由函数机械命名，并把路径所有权和零间隔默认规则委托给
+/// 保留自由函数命名，并把路径所有权和零间隔默认规则委托给
 /// [`Tailer::new`]；不会在构造阶段打开长期文件描述符或启动任务。
 pub fn new_tailer(path: impl AsRef<Path>, poll_interval: Duration) -> Result<Tailer, TailerError> {
     Tailer::new(path, poll_interval)

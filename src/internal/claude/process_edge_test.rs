@@ -1,7 +1,7 @@
 //! Linux ARM64 低层进程语义回归测试。
 //!
 //! 覆盖原始输出、取消/reap/pipe 和继承文件描述符。
-//! 这些曾由外部 Go 对照程序验证的场景现在直接作为普通 Rust 测试执行。
+//! 这些曾由外部辅助程序验证的场景现在直接作为普通 Rust 测试执行。
 
 use std::{
     ffi::{OsStr, OsString},
@@ -392,7 +392,7 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// 把字节编码为与 Go `%x` 相同的小写十六进制。
+/// 把字节编码为与 小写十六进制 相同的小写十六进制。
 fn hex(value: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut output = String::with_capacity(value.len() * 2);

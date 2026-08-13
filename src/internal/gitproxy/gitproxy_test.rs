@@ -1,7 +1,7 @@
-//! Git proxy 的 Linux ARM64 行为兼容测试。
+//! Git proxy 的 Linux ARM64 行为测试。
 //!
-//! 用例逐项对应 Go `gitproxy_test.go`，并补充恢复出的禁重定向回调与取消后再次
-//! 清理语义。测试服务器同样使用 Axum，避免引入 OpenSSL 或平台专属网络依赖。
+//! 用例覆盖禁止重定向与取消后再次清理的语义。测试服务器同样使用 Axum，避免引入
+//! OpenSSL 或平台专属网络依赖。
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 

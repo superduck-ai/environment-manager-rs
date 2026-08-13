@@ -1,7 +1,7 @@
-//! 从 Go `shared/embedded.go` 机械迁移的内置字节资源。
+//! 环境初始化使用的内置字节资源。
 //!
 //! 这些常量会原样写入用户目录，因此包括尾随换行在内的所有字节
-//! 都是兼容性的一部分。
+//! 都是外部脚本接口的一部分。
 
 /// BYOC 环境缺少 `~/.claude/settings.json` 时写入的默认配置。
 pub const DEFAULT_SETTINGS_JSON: &[u8] = br#"{

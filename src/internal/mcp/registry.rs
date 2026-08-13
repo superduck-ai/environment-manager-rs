@@ -1,6 +1,6 @@
 //! MCP server 注册表与 Claude CLI 注册流程。
 //!
-//! 注册表保留 Go 的插入顺序和 nil 跳过规则。工厂第一次看到非空工具列表时缓存
+//! 注册表保留 插入顺序和 `None` 跳过规则。工厂第一次看到非空工具列表时缓存
 //! `mcp__<server>__<tool>` 名称；启动和 `claude mcp add` 则改为可取消的 Tokio
 //! 子进程/网络流程，取消仍只终止直接子进程。
 
@@ -42,7 +42,7 @@ fn registry() -> &'static RegistrationStore {
     REGISTRY.get_or_init(|| RegistrationStore::new(Vec::new()))
 }
 
-/// 按调用顺序追加一个 registration；`None` 对应 Go 可写入的 nil 指针。
+/// 按调用顺序追加一个 registration；`None` 表示空 registration。
 pub fn register_server(registration: Option<Arc<MCPServerRegistration>>) {
     registry()
         .write()
@@ -52,7 +52,7 @@ pub fn register_server(registration: Option<Arc<MCPServerRegistration>>) {
 
 /// 创建并立即加入注册表的 MCP registration。
 ///
-/// configurator 使用 `Option` 显式表达 Go nil function；factory 会保留原始的错误
+/// configurator 使用 `Option` 显式表达 `None` callback；factory 会保留原始的错误
 /// 包装层级。`allowed_tools` 只有在非空工具列表产生后才真正缓存，零工具 server 的
 /// 后续 factory 调用仍会重新计算。
 pub fn new_registration(
@@ -166,7 +166,7 @@ pub fn get_mcp_registrations(
 /// 使用 Claude CLI 删除同名旧条目并添加 HTTP MCP server。
 ///
 /// `mcp list` 和 `mcp remove` 失败都只降级为继续 add；最终 add 失败才返回错误。
-/// argv 与 Go 完全一致，URL 固定为 loopback `/mcp`，header 使用精确 Bearer 文本。
+/// argv 与 完全一致，URL 固定为 loopback `/mcp`，header 使用精确 Bearer 文本。
 pub async fn register_with_claude(
     cancellation: &CancellationToken,
     server_name: &str,
@@ -195,7 +195,7 @@ pub async fn register_with_claude(
     }) {
         tracing::info!("server_name" = ?(server_name), "{}", "MCP server already registered, removing and re-adding");
 
-        // remove 失败与 Go 一致只记录诊断，随后仍然执行 add。失败结果先统一成
+        // remove 失败与 一致只记录诊断，随后仍然执行 add。失败结果先统一成
         // `(error, output)`，以便所有失败共享唯一日志源位置。
         let remove_failure = match run_claude(cancellation, ["mcp", "remove", server_name]).await {
             Ok(output) if output.status.success() => {

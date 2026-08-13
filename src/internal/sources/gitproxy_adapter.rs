@@ -1,7 +1,7 @@
 //! `sources` 的 Git proxy trait 到生产 `internal::gitproxy` 的薄适配。
 //!
 //! sources 保留可替换 factory 以隔离 Git 测试，但生产 `GitHandler` 必须默认使用
-//! 已迁移的 Tokio/Axum proxy，不能依赖上层调用方再次手工注入。
+//! 当前 Tokio/Axum proxy，不能依赖上层调用方再次手工注入。
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ impl ProductionGitProxyFactory {
 }
 
 impl GitProxyFactory for ProductionGitProxyFactory {
-    /// 保留 Go `gitproxy.NewManager` 的字段映射；端口 0 交给内核分配。
+    /// 保留字段映射；端口 0 交给内核分配。
     fn create(&self, config: GitProxyConfig) -> SourcesResult<Arc<dyn GitProxyManager>> {
         let manager = gitproxy::new_manager(Some(gitproxy::Config {
             session_ingress_url: config.session_ingress_url,

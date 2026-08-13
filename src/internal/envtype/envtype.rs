@@ -2,7 +2,7 @@
 //!
 //! 本文件实现环境类型注册表的创建、覆盖注册以及按类型名称调用 Factory。
 //!
-//! 注册表保留 Go 的覆盖语义：相同名称后注册者覆盖前者。无效注册仍 panic，
+//! 注册表保留 覆盖语义：相同名称后注册者覆盖前者。无效注册仍 panic，
 //! 因为它属于启动期程序配置错误；运行时未知类型和工厂错误则使用类型化错误。
 
 use thiserror::Error;
@@ -22,7 +22,7 @@ pub enum EnvTypeError {
     },
     /// 注册工厂拒绝配置或无法构造环境。
     ///
-    /// 使用 transparent 保留 Go `Create` 直接返回 factory 错误的文本。
+    /// 使用 transparent 原样保留 factory 错误文本。
     #[error(transparent)]
     Factory(BoxError),
 }
@@ -36,7 +36,7 @@ pub fn new_env_types() -> EnvTypes {
 impl EnvTypes {
     /// 注册或覆盖一个环境类型。
     ///
-    /// 空 `type_name` 或缺少 factory 是静态组装错误，与 Go 一样立即 panic。
+    /// 空 `type_name` 或缺少 factory 是静态组装错误，会立即 panic。
     pub fn register(&mut self, registration: Registration) {
         assert!(
             !registration.type_name.is_empty(),
@@ -50,7 +50,6 @@ impl EnvTypes {
             .insert(registration.type_name.clone(), registration);
     }
 
-    /// 对应 Go：`internal/envtype/envtype.go` 中的 `EnvTypes.Create`。
     ///
     /// 使用命中的工厂原样传递 JSON 字节，并创建环境实例。
     ///

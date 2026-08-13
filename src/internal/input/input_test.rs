@@ -1,4 +1,4 @@
-//! `internal/input` 的行为回归测试，机械对应 Go 的 `input_test.go`。
+//! `internal/input` 的行为回归测试。
 
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -11,7 +11,6 @@ use serde_json::{Value, json};
 use super::*;
 use crate::internal::auth::AuthConfig;
 
-/// 对应 Go：`TestWorkSecretUnmarshalAndDecode`。
 ///
 /// 验证 work secret 的 URL-safe Base64、source、auth 和全部 gateway 字段。
 #[test]
@@ -49,9 +48,8 @@ fn test_work_secret_unmarshal_and_decode() {
     assert!(secret.use_code_sessions);
 }
 
-/// 对应 Go：`TestDecodeWorkSecretReportsErrors`。
 ///
-/// 验证空值、Base64、JSON、版本和 source 类型错误都被折叠成 Go 兼容错误。
+/// 验证空值、Base64、JSON、版本和 source 类型错误都被折叠成稳定错误。
 #[test]
 fn test_decode_work_secret_reports_errors() {
     assert_eq!(
@@ -88,10 +86,10 @@ fn test_decode_work_secret_reports_errors() {
     );
 }
 
-/// 对应 Go：`WorkSecret.UnmarshalJSON` 对顶层 null 与值类型 null 的处理。
+/// 验证顶层 null 与值类型 null 的处理。
 ///
 /// 顶层 null 或 null version 都先形成 version=0 的零值 secret，再由版本门禁返回
-/// UnsupportedVersion；不能提前折叠成 Invalid，否则 CLI 的兼容错误文本会变化。
+/// UnsupportedVersion；不能提前折叠成 Invalid，否则 CLI 的错误分类和文本会变化。
 #[test]
 fn test_work_secret_top_level_and_version_null_reach_version_gate() {
     for encoded in [
@@ -105,12 +103,12 @@ fn test_work_secret_top_level_and_version_null_reach_version_gate() {
     }
 }
 
-/// 验证 V1 secret 的 null slice 元素、map value 与 MCP 文件字段采用 Go 零值。
+/// 验证 V1 secret 的 null slice 元素、map value 与 MCP 文件字段采用默认值。
 ///
 /// auth 中的 null 必须保留为一个默认 AuthConfig，供后续认证层按 provider 顺序
 /// 报错；可选 map 仍保持 Some，以免把“已提供但值为空”误当成字段缺失。
 #[test]
-fn test_work_secret_explicit_null_values_match_go_encoding_json() {
+fn test_work_secret_explicit_null_values_use_defaults() {
     let secret = decode_work_secret(&encoded_work_secret(json!({
         "version": 1,
         "session_ingress_token": null,
@@ -152,7 +150,6 @@ fn test_work_secret_explicit_null_values_match_go_encoding_json() {
     assert!(optional_nulls.environment_variables.is_none());
 }
 
-/// 对应 Go：`TestParseV1WorkResponseValidation`。
 ///
 /// 验证 session/healthcheck 两个合法联合体分支，并逐项检查 envelope 校验顺序。
 #[test]
@@ -342,7 +339,7 @@ async fn test_v1_parser_fetches_session_context_and_builds_result() {
     );
 }
 
-/// 验证 V1 parser 不折叠 Go RawMessage 的显式 null 与缺失字段。
+/// 验证 V1 parser 不折叠 原始 JSON 的显式 null 与缺失字段。
 #[tokio::test]
 async fn test_v1_parser_preserves_explicit_null_session_fields() {
     let observed = Arc::new(Mutex::new(Vec::new()));
@@ -468,7 +465,7 @@ fn v0_missing_startup_context_preserves_parser_panic_and_cli_sentinel() {
     assert!(matches!(error, V0ParseError::StartupContextRequired));
 }
 
-/// 断言 parser panic payload 保持 Go runtime nil dereference 文本。
+/// 断言 parser panic payload 保持 runtime 空值解引用 文本。
 fn assert_nil_dereference_panic<T>(outcome: std::thread::Result<T>) {
     let payload = match outcome {
         Ok(_) => panic!("普通 V0 parser 入口必须继续 panic"),
@@ -529,12 +526,12 @@ fn encoded_work_secret(value: Value) -> String {
     URL_SAFE.encode(work_secret_json(&value))
 }
 
-/// 对应 Go：`workSecretJSON`，通过统一 JSON helper 生成 secret 明文字节。
+/// 通过统一 JSON helper 生成 secret 明文字节。
 fn work_secret_json(fields: &Value) -> Vec<u8> {
     must_json(fields)
 }
 
-/// 对应 Go：`v1WorkResponseJSON`，构造完整 V1 work envelope JSON 字节。
+/// 构造完整 V1 work envelope JSON 字节。
 fn v1_work_response_json(
     work_id: &str,
     environment_id: &str,
@@ -553,7 +550,7 @@ fn v1_work_response_json(
     }))
 }
 
-/// 对应 Go：`mustJSON`，让所有 fixture 通过相同的 Serde wire 编码路径。
+/// 让所有 fixture 通过相同的 Serde wire 编码路径。
 fn must_json(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).expect("测试 JSON 必须能够序列化")
 }

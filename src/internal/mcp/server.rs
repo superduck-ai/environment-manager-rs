@@ -1,8 +1,8 @@
-//! loopback Streamable HTTP 与 JSON-RPC 兼容适配层。
+//! loopback Streamable HTTP 与 JSON-RPC 协议适配层。
 //!
-//! 这里实现 mcp-go v0.37 在本项目实际使用的协议面：`initialize`、`ping`、
+//! 这里实现 MCP wire 在本项目实际使用的协议面：`initialize`、`ping`、
 //! `tools/list`、`tools/call` 和通知。业务服务器只看到稳定的本地类型；官方 `rmcp`
-//! SDK 被限制在 `rmcp_adapter.rs` 的模型校验边界，不会改变 mcp-go 的 wire 细节。
+//! SDK 被限制在 `rmcp_adapter.rs` 的模型校验边界，不会改变 wire 细节。
 
 use std::{
     convert::Infallible,
@@ -43,21 +43,18 @@ const JSON_RPC_VERSION: &str = "2.0";
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
 const VALID_PROTOCOL_VERSIONS: [&str; 3] = [LATEST_PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
 const MAX_REQUEST_BODY: usize = 10 * 1024 * 1024;
-/// 对应 Go `http.Server.ReadHeaderTimeout`。
 pub(super) const MCP_READ_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
-/// 对应 Go `http.Server.ReadTimeout`。
 pub(super) const MCP_READ_TIMEOUT: Duration = Duration::from_secs(2 * 60);
-/// 对应 Go `http.Server.WriteTimeout`。
 pub(super) const MCP_WRITE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 /// 仅为识别请求边界而缓存的最大 header 字节数。
 ///
-/// Go `net/http` 默认允许约 1 MiB header；额外的 4 KiB 为内部读取缓冲余量。
+/// HTTP/1 默认允许约 1 MiB header；额外的 4 KiB 为内部读取缓冲余量。
 /// 超过该界限后仍把原始字节交给 Hyper，但停止自行推断后续请求边界，避免攻击者
-/// 通过一个永不结束的 header 让兼容层无限分配内存。
+/// 通过一个永不结束的 header 让协议跟踪器无限分配内存。
 const MAX_TRACKED_HEADER_BYTES: usize = 1024 * 1024 + 4096;
 /// chunk-size 或单行 trailer 的边界跟踪上限。
 ///
-/// 这不是 HTTP 接收上限；超出后由 Hyper 决定协议错误。兼容层只停止继续缓存该行。
+/// 这不是 HTTP 接收上限；超出后由 Hyper 决定协议错误。跟踪器只停止继续缓存该行。
 const MAX_TRACKED_CHUNK_LINE_BYTES: usize = 8192;
 
 /// 跨 socket read 边界识别 HTTP header 结束标记。
@@ -101,7 +98,7 @@ enum HttpRequestBodyKind {
     Fixed(u64),
     /// `Transfer-Encoding: chunked` 指定的分块 body。
     Chunked,
-    /// header 非法或使用了本兼容层不负责解释的 framing。
+    /// header 非法或使用了本跟踪器不负责解释的 framing。
     Untrackable,
 }
 
@@ -123,7 +120,7 @@ enum HttpRequestReadPhase {
     ChunkDataTerminator { matched: usize },
     /// 已读到零长度 chunk，正在逐行消费可选 trailer。
     ChunkTrailers { line: Vec<u8> },
-    /// 上一个请求已完成；按 Go `net/http` 的 idle `Peek(4)` 语义等待四字节。
+    /// 上一个请求已完成；按 HTTP/1 的 idle `Peek(4)` 语义等待四字节。
     Idle { prefix: Vec<u8> },
     /// 无法可靠追踪当前消息；原始 I/O 继续交给 Hyper 处理和报错。
     Untrackable,
@@ -297,7 +294,7 @@ impl HttpRequestTracker {
                     }
                 }
                 HttpRequestReadPhase::Idle { mut prefix } => {
-                    // Go 在响应完成后先用 idle deadline 执行 Peek(4)，只有收齐四字节
+                    // 在响应完成后先用 idle deadline 执行 Peek(4)，只有收齐四字节
                     // 才进入下一次 readRequest 并启动新的十秒 header deadline。
                     let needed = 4 - prefix.len();
                     let consumed = needed.min(bytes.len() - offset);
@@ -312,7 +309,7 @@ impl HttpRequestTracker {
                     self.phase = Self::new_header_phase(prefix);
                 }
                 HttpRequestReadPhase::Untrackable => {
-                    // Hyper 仍会读取并验证所有剩余字节；兼容层不在无法证明边界时
+                    // Hyper 仍会读取并验证所有剩余字节；跟踪器不在无法证明边界时
                     // 猜测下一请求，否则可能错误地延长攻击流量的 deadline。
                     self.phase = HttpRequestReadPhase::Untrackable;
                     return events;
@@ -364,7 +361,7 @@ impl HttpRequestTracker {
 
 /// 根据完整原始 header 选择请求 body framing。
 ///
-/// 与 Go 一样，合法 `Transfer-Encoding: chunked` 优先于 `Content-Length`；重复且相同
+/// 合法 `Transfer-Encoding: chunked` 优先于 `Content-Length`；重复且相同
 /// 的 Content-Length 可以接受，冲突值或无法解析的 framing 交回 Hyper 判定。
 fn request_body_kind(header: &[u8]) -> HttpRequestBodyKind {
     let Some(header) = header.strip_suffix(b"\r\n\r\n") else {
@@ -404,7 +401,7 @@ fn request_body_kind(header: &[u8]) -> HttpRequestBodyKind {
     }
 
     if let Some(value) = transfer_encoding {
-        // Go HTTP/1 server 对请求只接受单一的 chunked 编码；其他组合由协议层拒绝。
+        // HTTP/1 server 对请求只接受单一的 chunked 编码；其他组合由协议层拒绝。
         if value.eq_ignore_ascii_case(b"chunked") {
             return HttpRequestBodyKind::Chunked;
         }
@@ -435,7 +432,7 @@ fn parse_chunk_size(line: &[u8]) -> Option<u64> {
     u64::from_str_radix(size, 16).ok()
 }
 
-/// 当前 read deadline 所属的 Go `net/http` 阶段。
+/// 当前 read deadline 所属的 HTTP/1 阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum McpReadDeadlineStage {
     /// 正在读取请求 header。
@@ -478,7 +475,7 @@ impl McpDeadlineState {
             request_started_at: accepted_at,
             read_deadline: accepted_at + MCP_READ_HEADER_TIMEOUT,
             // header 完成前不会有正常业务写入；该值只是安全占位，并在
-            // `HeaderComplete` 事件发生时按 Go 语义覆盖。
+            // `HeaderComplete` 事件发生时按 覆盖。
             write_deadline: accepted_at + MCP_WRITE_TIMEOUT,
         }
     }
@@ -507,7 +504,7 @@ impl McpDeadlineState {
     ///
     /// Hyper 在固定响应结束处完成最后一次写入/flush；长时间 handler 因而不会消耗
     /// 下一条 keep-alive 请求的 idle 窗口。流式响应的每次进度也会续期，但在响应
-    /// 结束前 Hyper 不会分派下一请求，与 Go 的串行 HTTP/1 生命周期一致。
+    /// 结束前 Hyper 不会分派下一请求，与 串行 HTTP/1 生命周期一致。
     pub(super) fn observe_response_progress(&mut self, now: Instant) {
         if self.tracker.is_idle() {
             self.read_deadline = now + MCP_READ_TIMEOUT;
@@ -530,7 +527,7 @@ impl McpDeadlineState {
     }
 }
 
-/// 为单条 MCP TCP 连接实施 Go `http.Server` 的逐请求 header/read/write deadline。
+/// 为单条 MCP TCP 连接实施 HTTP/1 server 的逐请求 header/read/write deadline。
 ///
 /// 该包装不改变网络字节，仅把 [`McpDeadlineState`] 计算出的绝对时间同步到 Tokio
 /// `Sleep`。每条 keep-alive 请求都会重新经历 idle、header、body 三阶段；超时作为
@@ -629,7 +626,7 @@ impl AsyncWrite for McpTimeoutStream {
         }
     }
 
-    /// flush 也属于 Go write deadline 覆盖的 socket 写阶段。
+    /// flush 也属于 write deadline 覆盖的 socket 写阶段。
     fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         if this.write_deadline.as_mut().poll(context).is_ready() {
@@ -726,7 +723,7 @@ struct RpcServerState {
 /// JSON-RPC dispatcher 的 HTTP 级输出。
 #[derive(Debug)]
 pub struct RpcDispatch {
-    /// mcp-go 对通知使用 202，其余 JSON-RPC 响应使用 200。
+    /// MCP wire 对通知使用 202，其余 JSON-RPC 响应使用 200。
     pub status: StatusCode,
     /// 通知没有 body；请求结果始终是 JSON object。
     pub body: Option<Value>,
@@ -734,8 +731,8 @@ pub struct RpcDispatch {
 
 /// 在 Axum response 构造前记录首个状态码和已写 body。
 ///
-/// 这保留 Go `responseWriter` 的“第一次 WriteHeader 生效、首次 Write 隐式 200”
-/// 语义；内存 body 写入不会产生 Go 底层 socket writer 的 I/O 错误，真正发送错误
+/// 这保留 response writer 的“第一次 WriteHeader 生效、首次 Write 隐式 200”
+/// 语义；内存 body 写入不会产生底层 socket writer 的 I/O 错误，真正发送错误
 /// 仍由 Hyper 连接层管理。
 struct ResponseWriter {
     status_code: StatusCode,
@@ -744,7 +741,7 @@ struct ResponseWriter {
 }
 
 impl ResponseWriter {
-    /// 对应 Go `responseWriter` 的零值初始化语义。
+    /// 零值初始化语义。
     ///
     /// 首次写入前预置 200，但仍把 `written` 保持为 false，使显式 `WriteHeader`
     /// 可以覆盖默认状态；body 从空缓冲开始，不产生网络副作用。
@@ -776,7 +773,7 @@ impl ResponseWriter {
 
     /// 把已记录的状态码和 body 一次性转换为 Axum response。
     ///
-    /// 该转换消费 writer，避免转换后继续写入导致 Go `ResponseWriter` 不存在的状态；
+    /// 该转换消费 writer，避免转换后继续写入导致 response writer 不存在的状态；
     /// 状态码来自 `http::StatusCode`，因此 builder 失败只代表内部不变量被破坏。
     fn into_response(self) -> Response<Body> {
         Response::builder()
@@ -801,7 +798,7 @@ pub async fn dispatch_json_rpc(
         Ok(Value::Object(value)) => Value::Object(value),
         _ => {
             return RpcDispatch {
-                // mcp-go Streamable HTTP 在 JSON decoder 失败时同时使用 HTTP 400
+                // MCP wire Streamable HTTP 在 JSON decoder 失败时同时使用 HTTP 400
                 // 和 JSON-RPC Parse error；只回 200 会让客户端误判为成功 transport。
                 status: StatusCode::BAD_REQUEST,
                 body: Some(json_rpc_error(
@@ -825,7 +822,7 @@ pub async fn dispatch_json_rpc(
         };
     }
 
-    // mcp-go 把所有没有 ID 的消息当通知；未知通知也只返回 202。
+    // MCP wire 把所有没有 ID 的消息当通知；未知通知也只返回 202。
     if id.is_null() {
         return RpcDispatch {
             status: StatusCode::ACCEPTED,
@@ -851,7 +848,7 @@ pub async fn dispatch_json_rpc(
             let capabilities = if tools.is_empty() {
                 json!({})
             } else {
-                // AddTool 会隐式启用 listChanged=true，这是 mcp-go v0.37 的默认值。
+                // AddTool 会隐式启用 listChanged=true，这是 既有 MCP wire 的默认值。
                 json!({"tools": {"listChanged": true}})
             };
             Ok(json!({
@@ -918,7 +915,7 @@ pub async fn dispatch_json_rpc(
     }
 }
 
-/// 创建字段集合和序列化顺序均与 mcp-go 一致的 JSON-RPC error。
+/// 创建字段集合和序列化顺序均与 MCP wire 一致的 JSON-RPC error。
 fn json_rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({
         "jsonrpc": JSON_RPC_VERSION,
@@ -942,7 +939,7 @@ async fn handle_http(
         .get(header::USER_AGENT)
         // 非法 UTF-8 以替换字符记录。不能使用 `HeaderValue::to_str` 后回退为空串，
         // 否则诊断值
-        // 会在包含 obs-text 的合法 HTTP/1 请求上与 Go 不同。
+        // 会在包含 obs-text 的合法 HTTP/1 请求上与 不同。
         .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
         .unwrap_or_default();
     tracing::info!("server_name" = ?(&state.name), "method" = ?(&method), "path" = ?(&path), "remote_addr" = ?(&remote_address), "user_agent" = ?(&user_agent), "port" = ?(state.port), "{}", "Incoming MCP request");
@@ -969,7 +966,7 @@ async fn handle_http(
                 .status(StatusCode::OK)
                 .body(Body::empty())
                 .expect("static status is valid"),
-            // mcp-go 的 GET notification stream 在 client 断开前保持连接；这里用 pending
+            // MCP wire 的 GET notification stream 在 client 断开前保持连接；这里用 pending
             // body 表达同一生命周期，并仍由 HTTP server cancellation 统一回收。
             Method::GET => Response::builder()
                 .status(StatusCode::OK)
@@ -1053,7 +1050,7 @@ fn has_json_content_type(headers: &HeaderMap) -> bool {
         .is_some_and(|media_type| media_type.trim() == "application/json")
 }
 
-/// 构造 Go `http.Error` 风格的纯文本响应。
+/// 构造 HTTP 纯文本错误 风格的纯文本响应。
 fn text_response(status: StatusCode, body: &'static str) -> Response<Body> {
     let mut writer = ResponseWriter::new();
     writer.write_header(status);
@@ -1070,7 +1067,7 @@ fn text_response(status: StatusCode, body: &'static str) -> Response<Body> {
     response
 }
 
-/// 序列化 JSON 并追加 Go `json.Encoder.Encode` 产生的换行。
+/// 序列化 JSON 并追加协议要求的换行。
 fn json_response(status: StatusCode, value: &Value) -> Response<Body> {
     let mut bytes = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
     bytes.push(b'\n');
@@ -1129,7 +1126,7 @@ impl MCPServer for BaseServer {
             }
         };
         // 成功 bind 后 `local_addr` 对 Tokio TCP listener 是稳定内核元数据；若这一
-        // 不变量被平台破坏，仍返回原有启动错误，但不伪造 Go `net.Listen` 失败日志。
+        // 不变量被平台破坏，仍返回原有启动错误，不额外伪造失败日志。
         let listener_address = listener
             .local_addr()
             .map_err(|error| McpError::message(format!("Failed to create listener: {error}")))?;
@@ -1153,7 +1150,7 @@ impl MCPServer for BaseServer {
         let serve_shutdown = server_cancellation.clone();
         let server_name = self.name.clone();
         let server_address = listener_address.to_string();
-        // `net.OpError.Addr` 以 `any` 进入 Go JSONHandler 时会按 `net.TCPAddr`
+        // `net.OpError.Addr` 以 `any` 进入 JSONHandler 时会按 `net.TCPAddr`
         // 的导出字段编码，而不是调用 String；保留同样的嵌套值形状和字段顺序。
         let server_log_address = json!({
             "IP": listener_address.ip().to_string(),
@@ -1188,14 +1185,14 @@ impl MCPServer for BaseServer {
             }
         });
 
-        // Go 在 `Stop` 中先完成 HTTP shutdown/显式 listener close，之后才关闭
+        // 在 `Stop` 中先完成 HTTP shutdown/显式 listener close，之后才关闭
         // heartbeat channel。使用独立 token，避免一个广播取消把日志阶段顺序颠倒。
         let heartbeat_cancellation = CancellationToken::new();
         let heartbeat_shutdown = heartbeat_cancellation.clone();
         let heartbeat_name = self.name.clone();
         let heartbeat_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
-            // Tokio 的首个 tick 立即完成；Go ticker 要等一个完整周期，所以先消费它。
+            // Tokio 的首个 tick 立即完成；ticker 要等一个完整周期，所以先消费它。
             interval.tick().await;
             loop {
                 tokio::select! {
@@ -1235,7 +1232,7 @@ impl MCPServer for BaseServer {
         let mut listener_address = None;
         let mut heartbeat_runtime = None;
         if let Some(runtime) = runtime {
-            // Go `http.Server.Shutdown` 先关闭 listener 并等待 HTTP server；heartbeat
+            //  先关闭 listener 并等待 HTTP server；heartbeat
             // channel 要到显式 listener close 之后才关闭，因此这里只触发 server token。
             runtime.server_cancellation.cancel();
             let mut server_task = runtime.server_task;
@@ -1253,7 +1250,7 @@ impl MCPServer for BaseServer {
         }
 
         if let Some(listener_address) = listener_address {
-            // Go 先调用 `http.Server.Shutdown`（它关闭 listener），随后再次显式 Close；
+            // 先调用 HTTP server 优雅关闭（它关闭 listener），随后再次显式 Close；
             // 第二次 close 固定返回 use-of-closed-network-connection，并被记录为 warning。
             tracing::warn!("server_name" = ?(&self.name), "error" = ?(format!(
                             "close tcp {listener_address}: use of closed network connection"
@@ -1261,7 +1258,7 @@ impl MCPServer for BaseServer {
         }
         if let Some((heartbeat_cancellation, _)) = heartbeat_runtime.as_ref() {
             heartbeat_cancellation.cancel();
-            // Go 在关闭 channel 后不等待 goroutine；先记录 stopped，再在函数返回前
+            // 在关闭 channel 后不等待 后台任务；先记录 stopped，再在函数返回前
             // 回收 Tokio task，既保留日志阶段顺序，也不把后台任务泄漏给测试运行时。
         }
         tracing::info!("server_name" = ?(&self.name), "{}", "MCP server stopped");
@@ -1280,7 +1277,7 @@ impl MCPServer for BaseServer {
     }
 }
 
-/// 让专用 server 不经 trait object 也能机械调用 Go 风格方法。
+/// 让专用 server 不经 trait object 也能调用 风格方法。
 impl BaseServer {
     /// 返回 server 名称。
     #[must_use]

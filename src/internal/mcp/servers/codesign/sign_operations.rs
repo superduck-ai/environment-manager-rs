@@ -19,9 +19,9 @@ use super::{
     CodeSignMCPServer, RemoteSignRequest, RemoteSignResponse, SignRequest, SignResponse, SourceInfo,
 };
 
-/// 空内容错误的稳定 Go 文案。
+/// 空内容错误的稳定 文案。
 pub const ERR_EMPTY_CONTENT: &str = "content to sign cannot be empty";
-/// 远程签名失败包装层的稳定 Go 文案。
+/// 远程签名失败包装层的稳定 文案。
 pub const ERR_SIGNING_FAILED: &str = "signing operation failed";
 
 impl CodeSignMCPServer {
@@ -190,7 +190,7 @@ pub fn sanitize_source(source: &Source) -> Value {
     }
 }
 
-/// 读取完整文件内容；无效 UTF-8 按 Go `json.Marshal(string)` 的替换字符语义处理。
+/// 读取完整文件内容；无效 UTF-8 按替换字符语义处理。
 pub async fn read_file_content(path: &std::path::Path) -> McpResult<String> {
     let bytes = tokio::fs::read(path).await.map_err(|error| {
         McpError::message(format!("cannot open file {}: {error}", path.display()))

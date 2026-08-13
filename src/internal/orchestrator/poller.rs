@@ -1,7 +1,7 @@
 //! 后端 `/work/poll` 的非阻塞 HTTP poller。
 //!
 //! 每次请求独立设置 30 秒超时，并复用 Reqwest 连接池。认证、beta、runner 版本、
-//! Claude Code 版本和 worker header 与 Go 版本保持一致。
+//! Claude Code 版本和 worker header 与 保持一致。
 
 use std::time::{Duration, Instant};
 
@@ -18,7 +18,7 @@ use crate::internal::util::{claude_code_version, duration_nanoseconds, version};
 const ENVIRONMENTS_BETA: &str = "environments-2025-11-01";
 const POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 对应 Go `NewPollerWithWorkerID`，创建后端 HTTP poller。
+/// 创建后端 HTTP poller。
 ///
 /// base URL 没有 scheme 时补 `https://`。空 worker ID 在 Linux 上优先读取 kernel
 /// hostname，随后回退 `HOSTNAME`；读取失败仍允许不发送 worker header。
@@ -51,7 +51,7 @@ pub fn new_poller_with_worker_id(
 }
 
 impl Poller {
-    /// 对应 Go `(*Poller).Poll`，非阻塞查询一次 work 队列。
+    /// 非阻塞查询一次 work 队列。
     ///
     /// HTTP 200 的空 body 或精确 `null` 返回 `None`。非空响应先保留原始字节，再解析
     /// envelope 验证 `type == "work"`，成功时原样返回，避免反序列化/重序列化改变 secret。
@@ -158,7 +158,7 @@ impl Poller {
         Ok(Some(body.to_vec()))
     }
 
-    /// 对应 Go `(*Poller).SleepWithJitter`，空队列后随机等待 1–3 秒。
+    /// 空队列后随机等待 1–3 秒。
     pub async fn sleep_with_jitter(
         &self,
         cancellation: &CancellationToken,

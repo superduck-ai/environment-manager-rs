@@ -1,7 +1,7 @@
 //! orchestrator 轮询、超时 Hook、指数退避与 session 交付状态机。
 //!
 //! 状态机只依赖 `PollerInterface`、Hook、observer 和输出 trait；HTTP、命令轮询及
-//! stdout 都是可替换边界。这样既保持 Go 控制流，也能用 Tokio 测试精确验证时序。
+//! stdout 都是可替换边界。这样既保持 控制流，也能用 Tokio 测试精确验证时序。
 
 use std::{
     sync::Arc,
@@ -22,7 +22,7 @@ use crate::internal::util::duration_nanoseconds;
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_LOOP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// 对应 Go `NewOrchestrator`，验证配置并填充五分钟默认超时。
+/// 验证配置并填充五分钟默认超时。
 pub fn new_orchestrator(mut config: OrchestratorConfig) -> OrchestratorResult<Orchestrator> {
     if config.poller.is_none() {
         return Err(OrchestratorError::message("poller is required"));
@@ -44,7 +44,7 @@ pub fn new_orchestrator(mut config: OrchestratorConfig) -> OrchestratorResult<Or
 }
 
 impl Orchestrator {
-    /// 对应 Go `(*Orchestrator).handleLoopTimeout`，计算本轮剩余时间并触发 timeout Hook。
+    /// 计算本轮剩余时间并触发 timeout Hook。
     ///
     /// timeout Hook 失败只写日志：它通常用于刷新仓库或依赖，不能让一次维护失败永久
     /// 停止取任务。Hook 完成后才重置 loop 起点，因此 Hook 自身耗时不侵占下一轮预算。
@@ -69,10 +69,10 @@ impl Orchestrator {
         (Instant::now(), self.config.loop_timeout)
     }
 
-    /// 对应 Go `(*Orchestrator).pollForSession`，在一个 poll 窗口内寻找 session。
+    /// 在一个 poll 窗口内寻找 session。
     ///
     /// 失败次数跨 poll 窗口保存，成功（包括空队列）才清零。第 N 次连续失败退避
-    /// `min(2^N, 60)` 秒，所以第一次是 2 秒。与 Go 一致，deadline 只在循环顶部检查；
+    /// `min(2^N, 60)` 秒，所以第一次是 2 秒。与 一致，deadline 只在循环顶部检查；
     /// 已开始的退避或 jitter 不会被 deadline 截短，但始终可被取消令牌中断。
     pub async fn poll_for_session(
         &self,
@@ -146,7 +146,7 @@ impl Orchestrator {
         Ok(None)
     }
 
-    /// 对应 Go `(*Orchestrator).outputSession`，把原始 JSON 加换行写 stdout。
+    /// 把原始 JSON 加换行写 stdout。
     pub async fn output_session(&self, session_json: &[u8]) -> OrchestratorResult<()> {
         tracing::info!("{}", "received session task, writing to stdout");
         self.observer()
@@ -165,7 +165,7 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// 对应 Go `(*Orchestrator).Run`，运行到收到并交付一条 session 或发生终止错误。
+    /// 运行到收到并交付一条 session 或发生终止错误。
     ///
     /// 每轮有效 poll timeout 是配置窗口与 loop 剩余时间的较小值。execute Hook 存在时
     /// work JSON 只送 stdin，不写 stdout；Hook 失败记录 session end error 并立即返回。

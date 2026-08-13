@@ -1,8 +1,8 @@
 //! package manifest 解码、预检与固定安装计划的应用层。
 //!
-//! 对应 Go `internal/packages/application.go`。本模块不记录 package spec、不拼接 shell，
+//! 本模块不记录 package spec、不拼接 shell，
 //! 只生成固定 argv 并顺序调用 executor；首个失败立即终止。Tokio cancellation 与可选
-//! deadline 机械表达 Go `context.Context`，最终只返回不含 manifest 或子进程输出的结果。
+//! deadline 表达取消边界，最终只返回不含 manifest 或子进程输出的结果。
 
 use std::{
     io,
@@ -60,7 +60,7 @@ pub(super) trait CommandRunner: Send + Sync {
     async fn run(&self, context: &ProvisionContext, command: &Command) -> CommandResult;
 }
 
-/// Go `context.Context` 在 package provisioning 内需要的取消与 deadline 子集。
+/// 取消上下文 在 package provisioning 内需要的取消与 deadline 子集。
 #[derive(Debug, Clone)]
 pub(crate) struct ProvisionContext {
     cancellation: CancellationToken,
@@ -77,7 +77,7 @@ impl ProvisionContext {
         }
     }
 
-    /// 创建带 deadline 的上下文，供嵌入调用和 Go timeout 行为测试使用。
+    /// 创建带 deadline 的上下文，供嵌入调用和 timeout 行为测试使用。
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_deadline(
@@ -114,7 +114,6 @@ impl ProvisionContext {
 
     /// 返回当前取消原因的稳定协议分类；到期 deadline 优先于普通 token。
     ///
-    /// 对应 Go `contextCategory`。
     #[must_use]
     pub(super) fn category(&self) -> Category {
         if self
@@ -136,7 +135,7 @@ pub struct Provisioner {
 }
 
 impl Provisioner {
-    /// 对应 Go `NewProvisioner`，创建固定 `/home/user`、真实 UID 与 Tokio executor。
+    /// 创建固定 `/home/user`、真实 UID 与 Tokio executor。
     #[must_use]
     pub fn new() -> Self {
         Self::with_dependencies(
@@ -148,7 +147,7 @@ impl Provisioner {
 
     /// 注入 executor、UID 和工作目录，供无 root/无真实安装副作用的单元测试使用。
     ///
-    /// 对应 Go `newProvisioner`；Rust 用关联构造器承载同一依赖注入边界。
+    /// Rust 用关联构造器承载同一依赖注入边界。
     #[must_use]
     pub(super) fn with_dependencies(
         runner: Arc<dyn CommandRunner>,
@@ -162,9 +161,8 @@ impl Provisioner {
         }
     }
 
-    /// 对应 Go `Provisioner.Run`，读取 stdin、严格校验并顺序执行安装计划。
-    /// Go `interruptReaderOnCancellation` 的行为折叠在 manifest 解码的取消分支中，
-    /// 不再为单个调用点保留独立 reader 类型或转发函数。
+    /// 读取 stdin、严格校验并顺序执行安装计划。
+    /// manifest 解码直接处理取消，不为单个调用点保留独立 reader 类型或转发函数。
     ///
     /// # 参数
     /// - `context`：取消 token 与可选 deadline；decode 错误发生时若已取消，优先报告取消。
@@ -184,10 +182,10 @@ impl Provisioner {
 
         // 取消只与 manifest 解码竞争，不能包围整个 provisioning future：安装阶段由
         // executor 自己终止并回收进程组，直接丢弃该 future 会绕过这条清理路径。
-        // `biased` 让已经就绪的解码优先：Go 总是先调用 decodeManifest，合法的内存
+        // `biased` 让已经就绪的解码优先：总是先调用 decodeManifest，合法的内存
         // reader 即使 context 已取消也会继续走到 preflight；只有仍为 Pending 的 stdin
-        // 才由取消分支打断。若解码报错，下面仍再次检查 context，复刻 Go 在 Read
-        // 返回后读取 ctx.Err 的竞态语义。
+        // 才由取消分支打断。若解码报错，下面仍再次检查取消状态，使同时发生的取消
+        // 优先于解码错误。
         let manifest = tokio::select! {
             biased;
             manifest = decode_manifest(input) => manifest,
@@ -287,7 +285,6 @@ enum ManifestSchemaError {
 }
 
 impl std::fmt::Display for ManifestSchemaError {
-    /// 对应 Go `manifestSchemaError.Error`。
     ///
     /// CLI 不展示该正文，避免底层 decoder 的输入片段进入诊断；这里仅满足标准错误接口。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -299,7 +296,6 @@ impl std::fmt::Display for ManifestSchemaError {
 }
 
 impl std::error::Error for ManifestSchemaError {
-    /// 对应 Go `manifestSchemaError.Unwrap`。
     ///
     /// Rust 在完成 decode/schema 分类后主动丢弃可能包含用户输入的底层错误，因此错误链终止。
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
@@ -307,7 +303,7 @@ impl std::error::Error for ManifestSchemaError {
     }
 }
 
-/// 对应 Go `decodeManifest`，读取有界 stdin 并分两遍区分 decode/schema 错误。
+/// 读取有界 stdin 并分两遍区分 decode/schema 错误。
 async fn decode_manifest<R>(input: &mut R) -> std::result::Result<Manifest, ManifestSchemaError>
 where
     R: AsyncRead + Unpin + Send + ?Sized,
@@ -324,9 +320,9 @@ where
 
     // 第一遍只判断“是否恰好一个完整 JSON 值”；这样字段类型等 schema 错误不会被
     // 错误归到 decode。第二遍的手写 visitor 再拒绝未知、重复和大小写不匹配字段。
-    // Go encoding/json 会把 JSON 字符串内的非法 UTF-8 字节替换为 U+FFFD，而不是把
-    // 整份输入判成语法错误。先做同样的有损转换，避免相同原始 stdin 在两端分别落入
-    // validate/decode，或 Rust 拒绝 Go 会继续交给 package manager 的合法结构。
+    // manifest 协议会把 JSON 字符串内的非法 UTF-8 字节替换为 U+FFFD，而不是把整份
+    // 输入判成语法错误。先做同样的有损转换，避免输入错误地落入 decode 分支，或在
+    // package manager 处理前被拒绝。
     let data = String::from_utf8_lossy(&data);
     serde_json::from_str::<serde_json::Value>(&data).map_err(|_| ManifestSchemaError::Decode)?;
     serde_json::from_str(&data).map_err(|_| ManifestSchemaError::Schema)
@@ -346,13 +342,13 @@ fn is_executable_directory(path: &Path) -> bool {
 }
 
 impl PackageManifest {
-    /// 对应 Go `PackageManifest.count`，统计六个列表的 spec 总数。
+    /// 统计六个列表的 spec 总数。
     #[must_use]
     fn count(&self) -> usize {
         self.lists().iter().map(|specs| specs.values.len()).sum()
     }
 
-    /// 对应 Go `PackageManifest.plan`，生成严格固定顺序且完全不经过 shell 的 argv。
+    /// 生成严格固定顺序且完全不经过 shell 的 argv。
     #[must_use]
     fn plan(&self) -> Vec<Command> {
         let mut commands = Vec::new();
@@ -412,7 +408,7 @@ impl PackageManifest {
     }
 }
 
-/// 对应 Go `appendBatchCommand`，为非空列表追加一个批量安装命令。
+/// 为非空列表追加一个批量安装命令。
 fn append_batch_command(
     commands: &mut Vec<Command>,
     manager: Manager,

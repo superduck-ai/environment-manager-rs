@@ -1,7 +1,6 @@
 //! session 活动事件的真实记录器。
 //!
-//! 本文件机械对应 Go 的 `session_activity_recorder.go`。即时日志使用 Tokio
-//! 后台任务，长任务复用 `PeriodicInvoker`，失败结果则在脱离父取消信号的
+//! 即时日志使用 Tokio 后台任务，长任务复用 `PeriodicInvoker`，失败结果则在脱离父取消信号的
 //! 五秒窗口内按顺序发送。
 
 use std::collections::BTreeMap;
@@ -27,7 +26,7 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_DURATION: Duration = Duration::from_secs(15 * 60);
 const FAILURE_RESULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 创建 session 活动记录器，并对每个零值时序选项分别应用 Go 默认值。
+/// 创建 session 活动记录器，并对每个零值时序选项分别应用 默认值。
 #[must_use]
 pub fn new_activity_recorder(
     cancellation: CancellationToken,
@@ -84,7 +83,7 @@ impl SessionActivityRecorder {
         let poster = Arc::clone(&self.poster);
         let cancellation = self.cancellation.clone();
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            // 正常入口始终位于 Tokio runtime。这里没有对应的 Go 日志调用点，
+            // 正常入口始终位于 Tokio runtime。这里没有日志调用点，
             // 因此不能为 Rust 结构性误用额外制造一条外部可见日志。
             return;
         };
@@ -102,7 +101,7 @@ impl SessionActivityRecorder {
     ) -> Result<(), ActivityRecorderError> {
         let user_message = session_error.get_user_message();
         let poster = Arc::clone(&self.poster);
-        // 新 token 不继承父 token 的已取消状态，对应 Go 的 context.WithoutCancel。
+        // 新 token 不继承父 token 的已取消状态，避免活动日志被 session 取消截断。
         let detached_cancellation = CancellationToken::new();
         let operation = async {
             let assistant_event = new_synthetic_assistant_message(user_message.clone());
@@ -175,8 +174,8 @@ impl SessionActivityRecorder {
         );
 
         if let Err(error) = invoker.start() {
-            // Go 的 Start 在重复启动时 panic；新建实例正常不会失败。Rust 的
-            // NoRuntime 同样属于编程错误，不能降级成 Go 中不存在的日志和 noop。
+            // Start 在重复启动时 panic；新建实例正常不会失败。Rust 的
+            // NoRuntime 同样属于编程错误，不能降级成 中不存在的日志和 noop。
             panic!("{error}");
         }
 
@@ -187,7 +186,7 @@ impl SessionActivityRecorder {
         tokio::spawn(async move {
             tokio::time::sleep(max_duration).await;
 
-            // Stop 与定时器可能同时发生；此检查复刻 Go 对已停止任务不再终报的语义。
+            // Stop 与定时器可能同时发生；此检查保证已停止任务不再发送终态事件。
             if !timer_invoker.is_running() {
                 return;
             }
@@ -204,13 +203,13 @@ impl SessionActivityRecorder {
                 content.clone(),
                 None,
             ));
-            // Go 明确忽略最后一次发送错误；无论后端结果如何都必须停止周期任务。
+            // 明确忽略最后一次发送错误；无论后端结果如何都必须停止周期任务。
             let _ = timer_poster.post_event(&timer_cancellation, &event).await;
             tracing::warn!("category" = ?(serde_json::to_value(&category)
                         .expect("LogCategory always serializes as a string")), "content" = ?(content), "{}", format!(
                 "Automatically stopping logging long-running activity after {elapsed_minutes} minutes"
             ));
-            // Go `Stop` 会等待 invoker goroutine 完全退出；定时器任务本身可以异步
+            //  会等待 invoker 后台任务 完全退出；定时器任务本身可以异步
             // 等待，因此这里不能只发送 cancellation 后提前结束。
             timer_invoker.stop().await;
         });

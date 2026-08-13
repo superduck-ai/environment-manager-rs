@@ -1,6 +1,6 @@
 //! Supabase MCP server。
 //!
-//! 模块同时覆盖 Management API client、迁移/查询/type generation、Edge Function
+//! 模块同时覆盖 Management API client、数据库迁移/查询/type generation、Edge Function
 //! multipart deploy，以及 baku session 的按需数据库 provisioning。
 
 mod client;

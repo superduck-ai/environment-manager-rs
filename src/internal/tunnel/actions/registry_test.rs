@@ -1,6 +1,6 @@
 //! Registry 的 NDJSON、互斥和 panic 隔离测试。
 //!
-//! 对应 Go `internal/tunnel/actions/registry_test.go`。mock sender 保存强类型 Proto，
+//! mock sender 保存强类型 Proto，
 //! 测试能同时验证内容和跨 header/chunk 的全局顺序号。
 
 use std::sync::{Arc, Mutex};
@@ -55,7 +55,7 @@ enum FakeActionBehavior {
     },
 }
 
-/// 对应 Go：`fakeAction`，以枚举保存各测试所需的确定性执行行为。
+/// 以枚举保存各测试所需的确定性执行行为。
 struct FakeAction {
     name: &'static str,
     timeout: Duration,
@@ -64,7 +64,7 @@ struct FakeAction {
 
 #[async_trait]
 impl Action for FakeAction {
-    /// 对应 Go：`fakeAction.Execute`，执行当前 fixture 配置的真实测试行为。
+    /// 执行当前 fixture 配置的真实测试行为。
     async fn execute(
         &self,
         _cancellation: CancellationToken,
@@ -99,12 +99,12 @@ impl Action for FakeAction {
         }
     }
 
-    /// 对应 Go：`fakeAction.Name`，返回注册表路径使用的固定名称。
+    /// 返回注册表路径使用的固定名称。
     fn name(&self) -> &str {
         self.name
     }
 
-    /// 对应 Go：`fakeAction.Timeout`，返回该 fixture 的执行预算。
+    /// 返回该 fixture 的执行预算。
     fn timeout(&self) -> Duration {
         self.timeout
     }
@@ -258,7 +258,6 @@ async fn test_registry_execute_converts_action_panic_to_final_chunk() {
     assert_eq!(payload["error"], "internal error: action panicked");
 }
 
-/// 对应 Go：`TestSequencedSenderWrapsSendErrors`。
 #[tokio::test]
 async fn test_sequenced_sender_wraps_send_errors() {
     let sender = Arc::new(RecordingSender {
@@ -273,7 +272,7 @@ async fn test_sequenced_sender_wraps_send_errors() {
     assert_eq!(error.to_string(), "sequenced send chunk: write failed");
 }
 
-/// 对应 Go：`decodeJSONChunk`，解析 Registry 产生的 NDJSON chunk。
+/// 解析 Registry 产生的 NDJSON chunk。
 fn decode_json_chunk(chunk: &HttpTunnelResponseChunk) -> serde_json::Value {
     serde_json::from_slice(&chunk.data).expect("Registry chunk 应为 JSON")
 }

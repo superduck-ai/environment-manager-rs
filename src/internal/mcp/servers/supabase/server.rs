@@ -36,11 +36,11 @@ use super::{
 pub const ERR_PROVISIONING_FAILED: &str = "supabase provisioning failed";
 const CONTROL_RESPONSE_LIMIT: usize = 1024;
 
-/// 使用 `0755` 创建目录树，对齐 Go `os.MkdirAll(path, 0755)`。
+/// 使用 `0755` 创建目录树，对齐 递归建目录。
 ///
 /// 显式 mode 很重要：Rust `create_dir_all` 默认请求 `0777`，在宽松 umask 下会让
 /// migrations 或生成类型的父目录额外可写。这里仍让内核应用当前 umask，且不会
-/// 修改已经存在的目录权限，与 Go 的创建语义一致。
+/// 修改已经存在的目录权限，与 创建语义一致。
 ///
 /// # 错误
 /// 任一级目录不能创建，或路径组件被普通文件占用时返回底层 I/O 错误。
@@ -770,7 +770,7 @@ fn is_migration_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-/// 递归按 key 排序 object，使 pretty JSON 与 Go encoding/json 的 map 顺序一致。
+/// 递归按 key 排序 object，使 pretty JSON 的对象顺序稳定。
 fn sort_json_object_keys(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -786,7 +786,7 @@ fn sort_json_object_keys(value: &mut Value) {
     }
 }
 
-/// 创建/截断文件并保留 Go WriteFile 的 mode 语义。
+/// 创建或截断文件，并应用指定 Unix mode。
 fn write_file_with_mode(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     let mut file = OpenOptions::new()
         .create(true)

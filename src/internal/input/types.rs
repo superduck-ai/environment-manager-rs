@@ -1,8 +1,7 @@
 //! 输入解析子系统的数据声明与跨模块适配边界。
 //!
-//! `EnvironmentConfigResponse`、`SessionContext` 与 `Outcomes` 暂时位于本模块，
-//! 对应 Go 中来自 `api`/`claude` 包的类型；完成相邻模块迁移后可通过 `From`
-//! 或 type alias 接线，而无需改变 wire 格式。
+//! `EnvironmentConfigResponse`、`SessionContext` 与 `Outcomes` 位于输入边界，并通过
+//! `From` 或 type alias 与 API/Claude 模块接线，而不改变 wire 格式。
 
 use std::collections::HashMap;
 use std::fmt;
@@ -89,7 +88,7 @@ pub struct SessionContext {
     pub mcp_config: Option<Value>,
 }
 
-/// 保留 session context 中 `json.RawMessage` 的 missing/null 差别。
+/// 保留 session context 中 原始 JSON 的 missing/null 差别。
 fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
 where
     D: Deserializer<'de>,
@@ -148,7 +147,7 @@ impl Outcomes {
 
     /// 将每个仓库的多个分支截断为第一个分支。
     ///
-    /// 空分支列表会被保留，以匹配 Go `ValidateWithLogger` 的领域行为。
+    /// 空分支列表会被保留。
     #[must_use]
     pub fn validate(&self) -> Self {
         let repositories = self

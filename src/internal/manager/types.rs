@@ -27,11 +27,11 @@ use crate::internal::{
     util::BoxError,
 };
 
-/// Manager 对外返回的 Go 兼容错误字节。
+/// Manager 对外返回的原始错误字节。
 ///
 /// Claude/npm 的捕获输出可能包含任意字节，并会把
-/// 子进程输出直接拼入 `%w` 错误链。这里不能用 `String`，否则还未到 CLI 就会把无效
-/// UTF-8 永久替换。日志与 JSON 通过 [`Display`] 取得 Go `encoding/json` 风格的视图，
+/// 子进程输出直接拼入 `source chain` 错误链。这里不能用 `String`，否则还未到 CLI 就会把无效
+/// UTF-8 永久替换。日志与 JSON 通过 [`Display`] 取得有效 UTF-8 视图，
 /// 最终 stderr 则通过 [`ManagerError::as_bytes`] 原样输出。
 #[derive(Debug)]
 pub struct ManagerError {
@@ -62,7 +62,7 @@ impl ManagerError {
 
     /// 给下层错误添加 ASCII 阶段前缀，同时保留下层的全部原始字节。
     ///
-    /// `prefix` 应包含 Go `fmt.Errorf("...: %w")` 在 `%w` 前产生的完整静态文本；
+    /// `prefix` 应包含 错误 source chain 在 `source chain` 前产生的完整静态文本；
     /// 返回值仅执行一次连续拼接，不经过 `Display`，因此无效 UTF-8 不会丢失。
     #[must_use]
     pub(crate) fn prefixed(prefix: &[u8], error: &[u8]) -> Self {
@@ -86,10 +86,10 @@ impl ManagerError {
 }
 
 impl Display for ManagerError {
-    /// 为日志、指标和诊断系统生成 Go `encoding/json` 可接受的 UTF-8 文本视图。
+    /// 为日志、指标和诊断系统生成有效的 UTF-8 文本视图。
     ///
-    /// 每个单独的无效输入字节都替换为一个 U+FFFD；这与 Go `utf8.DecodeRune`
-    /// 的 size=1 行为一致，也避免 `String::from_utf8_lossy` 合并连续坏字节。
+    /// 每个单独的无效输入字节都替换为一个 U+FFFD，避免
+    /// `String::from_utf8_lossy` 合并连续坏字节。
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(&go_utf8_error_view(&self.message))
     }
@@ -97,7 +97,7 @@ impl Display for ManagerError {
 
 impl std::error::Error for ManagerError {}
 
-/// 将任意错误字节转换成 Go `encoding/json` 采用的逐坏字节替换文本。
+/// 将任意错误字节转换成逐坏字节替换的 UTF-8 文本。
 fn go_utf8_error_view(value: &[u8]) -> String {
     let mut output = String::new();
     let mut remaining = value;
@@ -122,7 +122,7 @@ fn go_utf8_error_view(value: &[u8]) -> String {
 
 /// Manager 使用的 API client 能力集合。
 ///
-/// `api::Client` 只声明环境配置请求；Go 运行时还通过可选 interface 取得 auth context
+/// `api::Client` 只声明环境配置请求；运行时还通过可选 interface 取得 auth context
 /// 和 outcomes。Rust 在 manager 边界显式声明这两项，避免 `Any` downcast。
 #[async_trait]
 pub trait ManagerApiClient: Send + Sync {
@@ -133,7 +133,7 @@ pub trait ManagerApiClient: Send + Sync {
         session_id: &str,
     ) -> Result<GetEnvironmentConfigResponse, ApiError>;
 
-    /// 返回已解析的认证上下文；`None` 保留 Go 缺失时 panic 的配置错误语义。
+    /// 返回已解析的认证上下文；`None` 保留 缺失时 panic 的配置错误语义。
     fn get_auth_context(&self) -> Option<AuthContext>;
 
     /// 返回 API/work 层预先计算的 repository outcomes；空值使用新建空集合。
@@ -190,7 +190,7 @@ impl ManagerApiClient for ManagerApiClientAdapter {
 
 /// Claude executor 的同步构造闭包。
 ///
-/// 参数顺序与 Go `ClaudeExecutorFactory` 一致；Rust 使用 owned clone 让闭包无需跨 await
+/// 参数顺序；Rust 使用 owned clone 让闭包无需跨 await
 /// 借用 manager。Lease 采用最小 handle，因为具体 podmonitor 类型属于 envtype adapter。
 pub type ClaudeExecutorFactory = Arc<
     dyn Fn(
@@ -240,7 +240,7 @@ impl TunnelClient for crate::internal::tunnel::Client {
     }
 }
 
-/// 创建 tunnel client 的可替换闭包，对应 Go `createTunnelClientFuncType`。
+/// 创建 tunnel client 的可替换闭包。
 pub type CreateTunnelClientFunc = Arc<
     dyn Fn(
             &Manager,
@@ -308,7 +308,7 @@ pub trait EnvironmentLeaseAdapter: Send + Sync {
 
 /// Manager 内部使用的无 PII 诊断出口。
 ///
-/// 名称和字段与 Go `diag.LogEnvManagerNoPII` 一一对应；没有注入实现时仅省略诊断，
+/// 没有注入实现时仅省略诊断，
 /// 不把同一事件伪装成普通业务日志。
 pub trait ManagerObservability: Send + Sync {
     /// 记录一个稳定事件名及不含用户数据的结构化字段。
@@ -317,7 +317,7 @@ pub trait ManagerObservability: Send + Sync {
 
 /// Environment manager 的全部运行依赖和会话状态。
 ///
-/// 字段顺序机械对应 Go `Manager`；末尾三个 adapter 是 Rust 为缺失的动态 interface
+/// 字段顺序末尾三个 adapter 是 Rust 为缺失的动态 interface
 /// 查询增加的显式能力。所有可跨任务对象都由 `Arc` 共享。
 #[derive(Clone)]
 pub struct Manager {

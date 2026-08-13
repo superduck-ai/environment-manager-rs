@@ -1,6 +1,6 @@
 //! 本地服务端口状态 action。
 //!
-//! 对应 Go `internal/tunnel/actions/status`，用于后端通过控制 Tunnel 判断本地开发
+//! 用于后端通过控制 Tunnel 判断本地开发
 //! 服务是否已经监听。
 
 mod action;

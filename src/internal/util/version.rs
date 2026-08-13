@@ -1,6 +1,6 @@
 //! 进程版本信息。
 //!
-//! Go 实现通过可变包级变量在启动阶段写入版本。Rust 版本改用 `OnceLock`，
+//! 通过可变包级变量在启动阶段写入版本。Rust 版本改用 `OnceLock`，
 //! 既允许入口在启动时注入构建版本，也避免并发读取可变静态变量的数据竞争。
 
 use std::sync::{OnceLock, RwLock};
@@ -66,8 +66,8 @@ pub fn claude_code_version() -> Option<&'static str> {
 
 /// 更新本进程后续请求使用的 Claude Code 版本。
 ///
-/// 对应 Go 在安装成功后写入包级 `ClaudeCodeVersion`。ACK 可能在安装前读取过版本，
-/// 因此这里不能使用“只初始化一次”的值；更新只影响后续构造的 HTTP 请求。字符串
+/// ACK 可能在安装前读取过版本，因此这里不能使用“只初始化一次”的值；更新只影响
+/// 后续构造的 HTTP 请求。字符串
 /// 最多按安装结果泄漏一次并与进程同寿命，从而允许读侧在释放锁后安全返回静态引用。
 pub fn set_claude_code_version(version: impl Into<String>) {
     let version = version.into();

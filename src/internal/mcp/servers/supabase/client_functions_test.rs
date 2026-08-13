@@ -1,4 +1,4 @@
-//! 对应 Go `internal/mcp/servers/supabase/client_functions_test.go` 的 API 与部署测试。
+//! API 与部署测试。
 
 use std::{collections::BTreeMap, os::unix::fs::symlink};
 
@@ -14,7 +14,7 @@ use super::{
     require_dir_under,
 };
 
-/// 对应 Go `supabaseAPIRequest`，便于逐请求断言 method/path/header/body。
+/// 便于逐请求断言 method/path/header/body。
 struct SupabaseApiRequest {
     method: String,
     path: String,
@@ -23,7 +23,7 @@ struct SupabaseApiRequest {
     body: String,
 }
 
-/// 对应 Go `deployRequest`，保存 multipart 部署请求的完整可观察面。
+/// 保存 multipart 部署请求的完整可观察面。
 struct DeployRequest {
     path: String,
     query: String,
@@ -33,7 +33,7 @@ struct DeployRequest {
     files: BTreeMap<String, String>,
 }
 
-/// 从捕获请求中读取一个 header；缺失值按 Go Header.Get 返回空字符串。
+/// 从捕获请求中读取一个 header；缺失值按 Header.Get 返回空字符串。
 fn request_header(request: &Request, name: &str) -> String {
     request
         .headers
@@ -62,11 +62,10 @@ fn quoted_parameter(headers: &str, name: &str) -> Option<String> {
     Some(headers[start..end].to_owned())
 }
 
-/// 对应 Go `readMultipartDeployRequest`。
 ///
 /// Reqwest 在测试中产生的 multipart body 使用 CRLF 和随机 boundary；解析器只依赖
-/// MIME 的 boundary/header/body 分隔规则，不固定随机值。这样既能核对 metadata 的
-/// Go `Encoder.Encode` 换行，也能逐一验证 function/shared 文件名和正文。
+/// MIME 的 boundary/header/body 分隔规则，不固定随机值。这样既能核对 metadata
+/// JSON，也能逐一验证 function/shared 文件名和正文。
 fn read_multipart_deploy_request(
     request: &Request,
 ) -> (FunctionDeployMetadata, BTreeMap<String, String>) {
@@ -356,12 +355,12 @@ fn test_collect_function_files_and_trust_root_validation() {
     assert!(error.to_string().contains("outside trust root"));
 }
 
-/// 对应 Go：`url.QueryEscape` 的字节转义边界。
+/// 字节转义边界。
 ///
-/// 特别固定 WHATWG form encoder 与 Go 不同的 `*`/`~`，并验证空格、保留字符和
-/// UTF-8 都按 Go 的大写十六进制字节序列写入 URL 或 `.env.local`。
+/// 特别固定 WHATWG form encoder 与 不同的 `*`/`~`，并验证空格、保留字符和
+/// UTF-8 都按 大写十六进制字节序列写入 URL 或 `.env.local`。
 #[test]
-fn query_escape_matches_go_url_query_escape() {
+fn query_escape_uses_form_urlencoding_rules() {
     let cases = [
         ("", ""),
         ("abcXYZ09-_.~", "abcXYZ09-_.~"),

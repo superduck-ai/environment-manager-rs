@@ -17,10 +17,10 @@ use crate::internal::util::{claude_code_version, version};
 
 use super::RetryConfig;
 
-/// API 层统一错误；`EndpointNotImplemented` 保留 Go sentinel 的可判定语义。
+/// API 层统一错误；`EndpointNotImplemented` 保留 sentinel 的可判定语义。
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
-    /// 普通兼容错误文本。
+    /// 普通稳定错误文本。
     #[error("{0}")]
     Message(String),
     /// HTTP 501，调用方可降级到旧端点。
@@ -34,15 +34,15 @@ impl ApiError {
         Self::Message(message.into())
     }
 
-    /// 判断错误是否对应 Go `ErrEndpointNotImplemented` sentinel。
+    /// 判断错误是否为可降级的 501 sentinel。
     pub fn is_endpoint_not_implemented(&self) -> bool {
         matches!(self, Self::EndpointNotImplemented(_))
     }
 
-    /// 增加与 Go `fmt.Errorf("context: %w", err)` 等价的文本上下文。
+    /// 增加稳定的文本上下文，同时保留错误分类。
     ///
     /// 普通错误保持普通 variant；501 sentinel 则在增加前缀后继续保持
-    /// `EndpointNotImplemented`，确保诊断上传层仍能可靠执行兼容降级。
+    /// `EndpointNotImplemented`，确保诊断上传层仍能可靠降级到旧端点。
     pub fn with_context(self, context: &str) -> Self {
         match self {
             Self::Message(message) => Self::Message(format!("{context}: {message}")),
@@ -53,10 +53,10 @@ impl ApiError {
     }
 }
 
-/// `HttpClient` 构造选项，对应 Go `ClientOptions`。
+/// `HttpClient` 构造选项。
 #[derive(Clone, Debug)]
 pub struct ClientOptions {
-    /// 整个请求的超时；`None` 或零值使用 Go 默认 5 分钟。
+    /// 整个请求的超时；`None` 或零值使用 默认 5 分钟。
     pub timeout: Option<Duration>,
     /// 重试策略；`None` 使用默认值。
     pub retry_config: Option<RetryConfig>,
@@ -65,7 +65,7 @@ pub struct ClientOptions {
 }
 
 impl Default for ClientOptions {
-    /// 返回与 Go 零值 options 相同的构造参数。
+    /// 返回空超时、默认重试策略和空 header 的构造参数。
     fn default() -> Self {
         Self {
             timeout: None,
@@ -92,8 +92,8 @@ impl HttpClient {
     /// 缺少 scheme 时补 `https://` 并创建 HTTP client。
     ///
     /// # 参数
-    /// - `base_url`：后端根 URL；未显式提供 HTTP(S) scheme 时按 Go 行为补 HTTPS。
-    /// - `retry_config`：可选重试策略；为空时使用 Go 的三次指数退避默认值。
+    /// - `base_url`：后端根 URL；未显式提供 HTTP(S) scheme 时按 补 HTTPS。
+    /// - `retry_config`：可选重试策略；为空时使用 三次指数退避默认值。
     ///
     /// # 返回
     /// 成功时返回共享连接池；HTTP client 配置失败时返回稳定的 API 错误。
@@ -112,11 +112,11 @@ impl HttpClient {
         )
     }
 
-    /// 对应 Go `NewHttpClientWithOptions`，创建带 30 秒连接超时的连接池。
+    /// 创建带 30 秒连接超时的连接池。
     ///
     /// 重试 attempt/backoff 事件直接写入进程 tracing subscriber。
     pub fn with_options(base_url: &str, options: ClientOptions) -> Result<Self, ApiError> {
-        // Go 把 `ClientOptions.Timeout == 0` 当作未配置，而不是“立即超时”。Rust 用
+        // 把 `ClientOptions.Timeout == 0` 当作未配置，而不是“立即超时”。Rust 用
         // Option 表达缺省，但调用方仍可能显式传入 Duration::ZERO，必须合并处理。
         let timeout = options
             .timeout
@@ -149,7 +149,7 @@ impl HttpClient {
 
     /// 使用调用方已经配置好的 Reqwest 连接池构造共享 API client。
     ///
-    /// 对应 Go 中把自定义 `*http.Client` 直接传给 `podmonitor.NewLeaseManager` 的路径。
+    /// 把共享 HTTP client 直接传给 podmonitor lease manager。
     /// 这里不会重建连接池，也不会覆盖 client 自带的默认 header、代理或超时；仅保存
     /// 去除尾部 `/` 的 base URL，以及 podmonitor 不会使用到的通用重试默认值。
     ///
@@ -158,7 +158,7 @@ impl HttpClient {
     /// - `http_client`：所有权转入返回值的已配置 Reqwest client；clone 仍共享连接池。
     /// - `retry_config`：通用 JSON API 的可选重试参数；为空时采用默认值。
     ///
-    /// # 兼容性
+    /// # Transport 约束
     /// BYOC transport 把认证信息放在 Reqwest client 的 default headers 中，因此这里
     /// 必须保留原 client，不能只复制 timeout 后重新构造，否则 heartbeat/stop 会丢失认证。
     #[must_use]
@@ -180,7 +180,7 @@ impl HttpClient {
         &self.base_url
     }
 
-    /// 对应 Go `setAuthHeader`，设置 Bearer header 并拒绝非法控制字符。
+    /// 设置 Bearer header 并拒绝非法控制字符。
     pub(crate) fn set_auth_header(
         &self,
         request: &mut Request,
@@ -192,7 +192,7 @@ impl HttpClient {
         Ok(())
     }
 
-    /// 对应 Go `PostJSON`，发送 JSON 并忽略成功响应 body。
+    /// 发送 JSON 并忽略成功响应 body。
     pub async fn post_json<T: Serialize + ?Sized>(
         &self,
         cancellation: &CancellationToken,
@@ -212,7 +212,7 @@ impl HttpClient {
         .map(|_| ())
     }
 
-    /// 对应 Go `PostJSONWithResponse`，成功后反序列化响应 body。
+    /// 成功后反序列化响应 body。
     pub async fn post_json_with_response<T, R>(
         &self,
         cancellation: &CancellationToken,
@@ -241,7 +241,7 @@ impl HttpClient {
         })
     }
 
-    /// 对应 Go `doPostJSON`，构造兼容 header、执行重试并解释 HTTP 状态码。
+    /// 构造协议 header、执行重试并解释 HTTP 状态码。
     pub(crate) async fn do_post_json<T: Serialize + ?Sized>(
         &self,
         cancellation: &CancellationToken,
@@ -259,9 +259,9 @@ impl HttpClient {
             .await
     }
 
-    /// 发送调用方已经按 Go `encoding/json` 规则编码好的 JSON body。
+    /// 发送调用方已经按 wire 规则编码好的 JSON body。
     ///
-    /// 该入口只供 CCR 的 marshal→`map[string]any`→marshal 兼容路径使用；普通调用
+    /// 该入口只供 CCR 的动态 JSON 二次编码路径使用；普通调用
     /// 应使用 `do_post_json`，由后者负责序列化错误上下文。认证、默认 header、重试、
     /// 状态码和响应读取仍集中在这里，避免预编码分支悄悄偏离共享 HTTP 行为。
     pub(crate) async fn do_post_json_bytes(
@@ -393,10 +393,10 @@ async fn read_response_body_outcome(
     ResponseBodyOutcome { body, error }
 }
 
-/// 使用 Serde 编码强类型值，并补齐 Go `json.Marshal` 默认 HTML 转义。
+/// 使用 Serde 编码强类型值，并补齐协议要求的 HTML 安全转义。
 ///
-/// 该函数不擅自重排 struct 字段；Go 对 struct 也保持声明顺序。调用方若对应 Go map，
-/// 必须传入 `BTreeMap`。输出没有末尾换行，与 `json.Marshal` 一致。
+/// 该函数不擅自重排 struct 字段，而是保持声明顺序。调用方若要求 map 键有序，
+/// 必须传入 `BTreeMap`。输出没有末尾换行。
 pub(crate) fn marshal_go_json<T: Serialize + ?Sized>(
     value: &T,
 ) -> Result<Vec<u8>, serde_json::Error> {
@@ -404,7 +404,7 @@ pub(crate) fn marshal_go_json<T: Serialize + ?Sized>(
     Ok(escape_go_json_html(encoded).into_bytes())
 }
 
-/// 把一棵来自 Go `json.Unmarshal(..., *any)` 的动态 JSON 值编码为紧凑 JSON。
+/// 把一棵动态 JSON 值编码为紧凑 JSON。
 ///
 /// 动态 object 的键必须递归排序，number 必须先收窄到 IEEE-754 float64；CCR event
 /// 正好经历这次 round-trip，不能沿用强类型 Serde 的字段顺序和 64 位整数精度。
@@ -414,7 +414,7 @@ pub(crate) fn marshal_go_dynamic_json(value: &Value) -> Result<Vec<u8>, serde_js
     Ok(output.into_bytes())
 }
 
-/// 递归写入一项紧凑的 Go `any` JSON 值。
+/// 递归写入一项紧凑的动态 JSON 值。
 fn write_go_dynamic_json_value(
     value: &Value,
     output: &mut String,
@@ -452,12 +452,12 @@ fn write_go_dynamic_json_value(
     Ok(())
 }
 
-/// 使用 Serde 完成控制字符转义，再补 Go 默认启用的 HTML/行分隔符转义。
+/// 使用 Serde 完成控制字符转义，再补 HTML 和行分隔符转义。
 fn go_json_string(value: &str) -> Result<String, serde_json::Error> {
     serde_json::to_string(value).map(escape_go_json_html)
 }
 
-/// 对一段已经合法的紧凑 JSON 补齐 Go `encodeState.string` 的额外转义。
+/// 对一段已经合法的紧凑 JSON 补齐 HTML 和行分隔符转义。
 fn escape_go_json_html(encoded: String) -> String {
     encoded
         .replace('&', "\\u0026")
@@ -467,7 +467,7 @@ fn escape_go_json_html(encoded: String) -> String {
         .replace('\u{2029}', "\\u2029")
 }
 
-/// 把动态 JSON number 模拟为 Go `json.Unmarshal` 的 float64 后按 JSON 阈值编码。
+/// 把动态 JSON number 收窄为 float64 后按 JSON 指数阈值编码。
 fn format_go_dynamic_number(number: &serde_json::Number) -> String {
     let value = number
         .as_f64()

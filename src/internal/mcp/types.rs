@@ -1,8 +1,8 @@
-//! MCP 迁移边界的数据类型与异步接口。
+//! MCP 边界的数据类型与异步接口。
 //!
 //! MCP server、tool 与 JSON 请求类型。JSON 类型使用 `serde(flatten)` 保存未知
 //! 字段，避免代理或新协议版本经过本服务时被旧结构无意裁剪；运行期资源使用 Arc、
-//! Tokio cancellation token 与显式 async trait，替代 Go interface、goroutine 和 channel。
+//! Tokio cancellation token 与显式 async trait，替代 trait object、后台任务 和 channel。
 
 use std::{
     fmt,
@@ -28,18 +28,18 @@ use crate::internal::{
     session::ActivityRecorder,
 };
 
-/// 对应 Go 包级 `debugHardcodedToken`：进程首次使用 MCP 类型时只读取一次环境变量。
+/// 进程首次使用 MCP 类型时只读取一次调试 token 环境变量。
 #[cfg(not(test))]
 static DEBUG_HARDCODED_TOKEN: OnceLock<bool> = OnceLock::new();
 
 /// 返回进程启动配置中的 MCP 调试 token 开关。
 ///
-/// Go 在 package init 时缓存 `MCP_DEBUG_TOKEN`；`OnceLock` 保持同一“运行期间不随
+/// 在 package init 时缓存 `MCP_DEBUG_TOKEN`；`OnceLock` 保持同一“运行期间不随
 /// 环境变量修改而变化”的约束，并避免并行 server 启动互相影响。
 fn debug_hardcoded_token() -> bool {
     #[cfg(test)]
     {
-        // Go 测试会直接覆盖包变量；Rust 单元测试默认关闭，再通过实例 setter 定向开启，
+        // 会直接覆盖包变量；Rust 单元测试默认关闭，再通过实例 setter 定向开启，
         // 避免测试宿主偶然携带环境变量导致并行场景不确定。
         false
     }
@@ -57,7 +57,7 @@ pub struct McpError {
 }
 
 impl McpError {
-    /// 从已经带有 Go 兼容上下文的文本构造错误。
+    /// 从已经带有完整上下文的文本构造错误。
     #[must_use]
     pub fn message(message: impl Into<String>) -> Self {
         Self {
@@ -108,7 +108,7 @@ pub struct CallToolParams {
     /// 被调用工具名称。
     #[serde(default)]
     pub name: String,
-    /// 原始参数对象；非 object 值被 getter 按 Go 行为视为空参数集合。
+    /// 原始参数对象；非 object 值被 getter 按 视为空参数集合。
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub arguments: Value,
     /// params 中未识别字段，例如后续协议的 `_meta` 扩展。
@@ -148,7 +148,7 @@ impl CallToolRequest {
             .map_or_else(|| default_value.to_owned(), str::to_owned)
     }
 
-    /// 返回必需字符串参数，错误文案与 mcp-go `RequireString` 一致。
+    /// 返回必需字符串参数，错误文案与 MCP wire `RequireString` 一致。
     pub fn require_string(&self, key: &str) -> McpResult<String> {
         let Some(arguments) = self.params.arguments.as_object() else {
             return Err(McpError::message(format!(
@@ -204,7 +204,7 @@ pub struct CallToolResult {
     pub extra: Map<String, Value>,
 }
 
-/// 创建与 mcp-go `NewToolResultText` 相同的单文本成功结果。
+/// 创建与 MCP wire `NewToolResultText` 相同的单文本成功结果。
 #[must_use]
 pub fn new_tool_result_text(text: impl Into<String>) -> CallToolResult {
     CallToolResult {
@@ -217,7 +217,7 @@ pub fn new_tool_result_text(text: impl Into<String>) -> CallToolResult {
     }
 }
 
-/// 创建与 mcp-go `NewToolResultError` 相同的单文本工具错误。
+/// 创建与 MCP wire `NewToolResultError` 相同的单文本工具错误。
 #[must_use]
 pub fn new_tool_result_error(text: impl Into<String>) -> CallToolResult {
     CallToolResult {
@@ -305,7 +305,7 @@ pub trait MCPServer: Send + Sync {
 pub type ConfiguratorFuture =
     Pin<Box<dyn Future<Output = McpResult<Arc<dyn MCPServer>>> + Send + 'static>>;
 
-/// Go `MCPServerConfigurator` 的异步 Rust 边界。
+/// MCP server configurator 的异步边界。
 pub type MCPServerConfigurator = Arc<
     dyn Fn(
             Arc<BaseServer>,
@@ -322,7 +322,7 @@ pub type MCPServerConfigurator = Arc<
 pub type FactoryFuture =
     Pin<Box<dyn Future<Output = McpResult<Arc<dyn MCPServer>>> + Send + 'static>>;
 
-/// Go `MCPServerFactory` 的异步 Rust 边界。
+/// MCP server factory 的异步边界。
 pub type MCPServerFactory = Arc<
     dyn Fn(
             CancellationToken,
@@ -337,8 +337,7 @@ pub type MCPServerFactory = Arc<
 
 /// 根据启动上下文和 Claude 配置判断 registration 是否启用的共享谓词。
 ///
-/// 独立命名该边界既避免注册构造函数与元数据结构重复复杂闭包类型，也保留 Go
-/// `ShouldRegister` 可捕获运行期配置且能跨 Tokio 任务共享的语义。
+/// 独立命名该边界既避免注册构造函数与元数据结构重复复杂闭包类型，也保留 `ShouldRegister` 可捕获运行期配置且能跨 Tokio 任务共享的语义。
 pub type ShouldRegister =
     Arc<dyn Fn(Option<&StartupContext>, Option<&ClaudeConfig>) -> bool + Send + Sync>;
 
@@ -358,7 +357,7 @@ pub struct MCPServerRegistration {
     pub get_tools: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 }
 
-/// 让真实 MCP registration 可直接传入 Claude 执行器的兼容边界。
+/// 让真实 MCP registration 可直接传入 Claude 执行器的适配边界。
 ///
 /// Claude 当前只保存 registration 的生命周期引用，并不读取额外方法；因此这个
 /// 空 marker 实现不会复制配置，也不会把 MCP 工厂降级成另一套中间 DTO。
@@ -379,13 +378,13 @@ impl fmt::Debug for MCPServerRegistration {
 pub(crate) struct ServerRuntime {
     /// 通知 HTTP accept loop 开始优雅退出。
     pub server_cancellation: CancellationToken,
-    /// 在 listener 关闭后通知 heartbeat 退出，保留 Go `Stop` 的阶段顺序。
+    /// 在 listener 关闭后通知 heartbeat 退出，保留阶段顺序。
     pub heartbeat_cancellation: CancellationToken,
     /// HTTP accept loop。
     pub server_task: JoinHandle<()>,
     /// 周期健康日志任务。
     pub heartbeat_task: JoinHandle<()>,
-    /// Go `net.Listener.Close` 诊断所需的实际 loopback 地址。
+    /// 诊断所需的实际 loopback 地址。
     pub listener_address: String,
 }
 
@@ -397,7 +396,7 @@ pub struct BaseServer {
     pub version: String,
     /// Bearer token；debug 模式可在启动前预置。
     pub(crate) bearer_token: RwLock<String>,
-    /// 构造时从 Go 兼容的进程级开关捕获，后续启动不再读取可变环境。
+    /// 构造时从进程级 debug 开关捕获，后续启动不再读取可变环境。
     pub(crate) debug_hardcoded_token: bool,
     /// 当前监听端口；未启动时为零。
     pub(crate) port: RwLock<u16>,
@@ -427,7 +426,7 @@ impl BaseServer {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = token.into();
     }
 
-    /// 测试中对应 Go 测试直接改写包级 `debugHardcodedToken` 的能力。
+    /// 测试中直接改写实例的 hardcoded-token 开关。
     ///
     /// 仅在构造后、共享前调用，不改变生产 API，也不会修改进程环境或影响并行测试。
     #[cfg(test)]

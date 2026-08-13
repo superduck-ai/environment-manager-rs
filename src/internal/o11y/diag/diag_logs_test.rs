@@ -74,7 +74,7 @@ impl LogFlusher for RecordingFlusher {
     }
 }
 
-/// 验证环境变量仅接受 Go `strconv.ParseBool` 的 true 取值。
+/// 验证环境变量只接受受支持的 true 取值。
 #[tokio::test]
 async fn test_logs_enabled() {
     // 环境变量解析在独立进程内覆盖全部输入，父 libtest 仍可安全并行启动子进程。
@@ -131,7 +131,7 @@ async fn test_new_diag_service_context_and_shutdown_flushes() {
         .await
         .expect("shutdown diag service");
     assert!(get_claude_code_diag_file_path(Some(&context)).is_empty());
-    // Go 在 shutdown 后收到事件时写一条无属性 WARN，并且不会重新打开文件或入队。
+    // 在 shutdown 后收到事件时写一条无属性 WARN，并且不会重新打开文件或入队。
     log_env_manager_no_pii(Some(&context), "after_shutdown", None);
 
     let logs = flusher.all_logs();

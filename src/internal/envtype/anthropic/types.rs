@@ -1,11 +1,10 @@
 //! Anthropic 环境的数据类型与稳定错误载体。
 //!
-//! 对应 Go：`internal/envtype/anthropic/anthropic.go` 与同目录配置声明。该文件集中
-//! 保存 JSON DTO、环境生命周期字段及错误包装，供 `anthropic.rs` 的副作用实现使用；
-//! 拆分仅为控制 Rust 模块规模，不改变外部 JSON 或调用顺序。
+//! 集中保存 JSON DTO、环境生命周期字段及错误包装，供 `anthropic.rs` 的副作用实现
+//! 使用；模块拆分不改变外部 JSON 或调用顺序。
 //!
-//! `Option<Config>` 保留 Go 测试可构造 nil config 的能力；正常工厂始终填充配置。
-//! JSON 字段继续接受 `null` 并落为 Go 对应零值。
+//! `Option<Config>` 允许测试构造 `None` 配置；正常工厂始终填充配置。JSON 字段接受
+//! `null` 并落为类型默认值。
 
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
@@ -23,7 +22,7 @@ use crate::internal::{
 /// Anthropic 环境 JSON 配置。
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct Config {
-    /// 环境类型标签；Go 实现只保存而不额外验证。
+    /// 环境类型标签；只保存而不额外验证。
     pub environment_type: String,
     /// 配置版本；空值表示未指定。
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -57,7 +56,7 @@ pub struct Language {
 }
 
 impl<'de> Deserialize<'de> for Config {
-    /// 逐键解码以保留 Go 的大小写不敏感字段名、重复字段和 null 零值语义。
+    /// 逐键解码以保留 大小写不敏感字段名、重复字段和 null 零值语义。
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -66,7 +65,7 @@ impl<'de> Deserialize<'de> for Config {
     }
 }
 
-/// `Config` 的 Go `encoding/json` 兼容 visitor。
+/// `Config` 的宽容 JSON visitor。
 struct ConfigVisitor;
 
 impl<'de> Visitor<'de> for ConfigVisitor {
@@ -142,7 +141,7 @@ impl<'de> Deserialize<'de> for Language {
     }
 }
 
-/// `Language` 的 Go `encoding/json` 兼容 visitor。
+/// `Language` 的宽容 JSON visitor。
 struct LanguageVisitor;
 
 impl<'de> Visitor<'de> for LanguageVisitor {
@@ -178,7 +177,7 @@ impl<'de> Visitor<'de> for LanguageVisitor {
 
 /// Anthropic 环境的可变 session 状态。
 pub struct AnthropicEnvironmentType {
-    /// 正常构造时存在；`None` 只用于保留 Go nil-config 错误路径。
+    /// 正常构造时存在；`None` 只用于保留 `None` 配置 错误路径。
     pub(crate) config: Option<Config>,
     /// stdin/work secret 解码出的启动上下文。
     pub(crate) startup_context: Option<StartupContext>,
@@ -214,7 +213,7 @@ pub(crate) struct HookConfig {
 
 /// Anthropic 构造或初始化错误。
 ///
-/// 恢复源码大量使用 `fmt.Errorf("prefix: %w")`。统一错误载体既保留最终稳定文本，
+/// 既定接口大量使用 错误 source chain。统一错误载体既保留最终稳定文本，
 /// 也保留可遍历的 source 链，不把 Tokio/平台错误枚举泄漏到公共 API。
 #[derive(Debug)]
 pub struct AnthropicError {
@@ -232,7 +231,7 @@ impl AnthropicError {
         }
     }
 
-    /// 创建 `前缀: source` 形式的 Go `%w` 兼容错误。
+    /// 创建 `前缀: source` 形式的稳定错误链。
     pub fn with_source<E>(prefix: impl AsRef<str>, source: E) -> Self
     where
         E: Error + Send + Sync + 'static,
@@ -256,14 +255,14 @@ impl AnthropicError {
 }
 
 impl fmt::Display for AnthropicError {
-    /// 输出与 Go 调用方比较的稳定错误文本。
+    /// 输出与 调用方比较的稳定错误文本。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
     }
 }
 
 impl Error for AnthropicError {
-    /// 暴露 `%w` 对应的下层错误链。
+    /// 暴露 `source chain` 的下层错误。
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         self.source.as_deref().map(|source| source as _)
     }
@@ -281,7 +280,7 @@ pub struct RunScriptError {
 }
 
 impl fmt::Display for RunScriptError {
-    /// 错误正文完全转发内层兼容文本。
+    /// 错误正文完全转发内层稳定文本。
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.error.fmt(formatter)
     }

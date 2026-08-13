@@ -1,4 +1,4 @@
-//! 对应 Go `cmd/cmd_poll.go` 的单次取工作命令。
+//! 单次取工作命令。
 //!
 //! 本文件完整保留参数、service key 来源、whoami 身份发现/回退、poll 请求以及
 //! stdout JSON 输出顺序。网络细节复用 `internal::orchestrator` 的同源客户端。
@@ -98,7 +98,7 @@ fn optional_string(matches: &ArgMatches, id: &str) -> Option<String> {
         .cloned()
 }
 
-/// 对应 Go：`cmd/cmd_poll.go` 中 `AddPollCommand` 的 `RunE` 实现。
+/// `RunE` 实现。
 ///
 /// 读取 service key 后先调用 whoami。whoami 失败时，只有调用方同时提供组织和环境
 /// ID 才允许继续；成功时则逐项校验显式 ID。随后执行一次非阻塞 poll，并把空队列
@@ -107,7 +107,7 @@ fn optional_string(matches: &ArgMatches, id: &str) -> Option<String> {
 /// # 参数
 /// - `arguments`：已经通过 Clap 校验的命令参数。
 /// - `cancellation`：覆盖 whoami 和 poll 两次 HTTP 请求的取消令牌。
-/// - `output`：stdout 兼容输出目标；写失败与 Go 的 `fmt.Fprintln` 忽略返回值一致。
+/// - `output`：stdout 输出目标；写失败不会覆盖 poll 结果。
 ///
 /// # 副作用
 /// 读取文件或 `ENVIRONMENT_SERVICE_KEY`、追加日志文件并访问后端 HTTP 接口。
@@ -183,8 +183,8 @@ pub async fn run_poll(
         return Ok(());
     };
 
-    // Poller 已经验证 work envelope；这里仍按 Go 命令重新解码为动态 JSON，只为
-    // 复刻 `json.MarshalIndent` 的人类可读 stdout，而不改变请求校验的职责边界。
+    // Poller 已经验证 work envelope；这里仍按 命令重新解码为动态 JSON，只为
+    // 实现缩进 JSON 编码 的人类可读 stdout，而不改变请求校验的职责边界。
     // 不能直接调用 `serde_json::to_vec_pretty`：本 crate 为其他协议启用了
     // 对象会递归按 key 排序，并把
     // 所有数字先转换成 float64。下面的专用 formatter 保留这些可观察差异。
@@ -209,18 +209,18 @@ pub async fn run_poll(
     Ok(())
 }
 
-/// 按 Go `json.MarshalIndent` 对 `any` 的规则生成两空格缩进 JSON。
+/// 按动态 JSON 的 wire 规则生成两空格缩进 JSON。
 ///
 /// 三个容易被普通 serde pretty printer 忽略的细节：对象键按 UTF-8 字典序排序、
 /// 动态 JSON 数字先经过 IEEE-754 float64、字符串中的 `<`/`>`/`&` 和行分隔符被
-/// 转义。返回 `Result` 是为了保留原 Go 分支结构；合法 JSON 动态值通常不会失败。
+/// 转义。合法 JSON 动态值通常不会编码失败。
 fn format_go_pretty_json(value: &Value) -> Result<Vec<u8>, serde_json::Error> {
     let mut output = String::new();
     write_go_json_value(value, 0, &mut output)?;
     Ok(output.into_bytes())
 }
 
-/// 递归写入一个 Go 风格 JSON 值；`depth` 表示当前值所在的缩进层级。
+/// 递归写入一个 风格 JSON 值；`depth` 表示当前值所在的缩进层级。
 fn write_go_json_value(
     value: &Value,
     depth: usize,
@@ -274,14 +274,14 @@ fn write_go_json_value(
     Ok(())
 }
 
-/// Go 的 indent 固定为空 prefix、两个 ASCII 空格。
+/// indent 固定为空 prefix、两个 ASCII 空格。
 fn write_indent(output: &mut String, depth: usize) {
     for _ in 0..depth {
         output.push_str("  ");
     }
 }
 
-/// 使用 serde 完成 JSON 字符串的控制字符转义，再补齐 Go 默认的 HTML 转义。
+/// 使用 serde 完成 JSON 字符串的控制字符转义，再补齐 默认的 HTML 转义。
 fn go_json_string(value: &str) -> Result<String, serde_json::Error> {
     let encoded = serde_json::to_string(value)?;
     Ok(encoded
@@ -292,7 +292,7 @@ fn go_json_string(value: &str) -> Result<String, serde_json::Error> {
         .replace('\u{2029}', "\\u2029"))
 }
 
-/// 把 JSON number 模拟为 Go `json.Unmarshal(..., *any)` 得到的 float64 后再编码。
+/// 把 JSON number 收窄为 IEEE-754 float64 后再编码。
 fn format_go_json_number(number: &serde_json::Number) -> String {
     let value = number
         .as_f64()
@@ -310,7 +310,7 @@ fn format_go_json_number(number: &serde_json::Number) -> String {
     let mut digits = mantissa.replace('.', "");
     let first_non_zero = digits.find(|character| character != '0');
 
-    // float64 的正负零必须保留符号；Go 的 `strconv.AppendFloat` 会输出 `-0`。
+    // float64 的正负零必须保留符号；紧凑浮点格式化 会输出 `-0`。
     let Some(first_non_zero) = first_non_zero else {
         return if negative { "-0" } else { "0" }.to_owned();
     };

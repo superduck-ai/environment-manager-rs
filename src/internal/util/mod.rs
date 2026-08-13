@@ -1,8 +1,7 @@
 //! 通用基础设施。
 //!
-//! 本模块对应 Go 项目的 `internal/util`。迁移时保留了外部可观察行为，
-//! 同时把手工清理闭包、goroutine 和 `context.Context` 分别替换为 RAII、
-//! Tokio 任务与 [`tokio_util::sync::CancellationToken`]。
+//! 资源清理由 RAII 管理，周期工作使用 Tokio 任务，取消统一通过
+//! [`tokio_util::sync::CancellationToken`] 传播。
 
 mod duration;
 mod git;

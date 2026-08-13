@@ -1,7 +1,6 @@
-//! Claude Code 安装、初始化与会话执行兼容层。
+//! Claude Code 安装、初始化与会话执行层。
 //!
-//! 模块逐文件对应 Go `internal/claude`，并以 Tokio 子进程和取消令牌替代
-//! `exec.CommandContext`。所有取消路径只终止直接子进程，不创建或清理进程组；
+//! 子进程由 Tokio 与取消令牌管理。所有取消路径只终止直接子进程，不创建或清理进程组；
 //! token 仍通过从 3 开始的继承文件描述符传递，避免进入 argv 或普通环境变量。
 
 mod agent_proxy;

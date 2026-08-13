@@ -1,7 +1,7 @@
 //! Manager 的默认 Tunnel client 与内置 control action 注册。
 //!
-//! 本文件机械对应 Go `internal/manager/tunnel_register.go`。HTTP(S) API URL 只替换
-//! scheme，status/snapshot 始终注册；Baku 环境仅在 Vercel 或 Antspace 凭据完整时
+//! HTTP(S) API URL 只替换 scheme，status/snapshot 始终注册；Baku 环境仅在 Vercel
+//! 或 Antspace 凭据完整时
 //! 注册 deploy action，并按可用凭据选择默认部署目标。
 
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use super::types::{CreateTunnelClientFunc, Manager, ManagerError, TunnelClient};
 
 /// 创建 Manager 构造函数安装的默认 tunnel factory。
 ///
-/// Go 依赖包级 `init` 修改可变函数指针；Rust 在 `Manager` 构造期间显式取得该
+/// 依赖包级 `init` 修改可变函数指针；Rust 在 `Manager` 构造期间显式取得该
 /// factory，从而让初始化顺序可见、可测试，并避免全局可变状态。
 #[must_use]
 pub(super) fn default_create_tunnel_client_func() -> CreateTunnelClientFunc {

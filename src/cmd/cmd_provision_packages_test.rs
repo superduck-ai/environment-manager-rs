@@ -42,7 +42,7 @@ struct PackageProvisionerFunc;
 
 #[async_trait]
 impl PackageProvisioner for PackageProvisionerFunc {
-    /// 对应 Go `packageProvisionerFunc.Run`，模拟一直运行到 SIGINT/SIGTERM 的安装流程。
+    /// 模拟一直运行到 SIGINT/SIGTERM 的安装流程。
     async fn run(
         &self,
         context: &ProvisionContext,
@@ -57,7 +57,7 @@ impl PackageProvisioner for PackageProvisionerFunc {
     }
 }
 
-/// 在第一次读取前通知测试任务的 reader，复刻 Go 取消时序 fixture。
+/// 在第一次读取前通知测试任务的 reader，用于构造取消时序 fixture。
 struct NotifyingReadCloser<R> {
     inner: R,
     read_started: Option<oneshot::Sender<()>>,
@@ -67,7 +67,7 @@ impl<R> AsyncRead for NotifyingReadCloser<R>
 where
     R: AsyncRead + Unpin,
 {
-    /// 对应 Go `notifyingReadCloser.Read`，保证测试只在 stdin 已进入阻塞读取后取消。
+    /// 保证测试只在 stdin 已进入阻塞读取后取消。
     fn poll_read(
         self: Pin<&mut Self>,
         context: &mut Context<'_>,
@@ -89,7 +89,6 @@ fn valid_arguments() -> ProvisionPackagesArgs {
     }
 }
 
-/// 对应 Go `TestProvisionPackagesCommandWritesOneFinalJSON`。
 #[tokio::test]
 async fn test_provision_packages_command_writes_one_final_json() {
     let provisioner = StubPackageProvisioner {
@@ -118,7 +117,6 @@ async fn test_provision_packages_command_writes_one_final_json() {
     );
 }
 
-/// 对应 Go `TestProvisionPackagesCommandReturnsStableFailureExit`。
 #[tokio::test]
 async fn test_provision_packages_command_returns_stable_failure_exit() {
     let provisioner = StubPackageProvisioner {
@@ -155,7 +153,6 @@ async fn test_provision_packages_command_returns_stable_failure_exit() {
     assert!(!String::from_utf8_lossy(&output).contains("typescript"));
 }
 
-/// 对应 Go `TestProvisionPackagesCommandReportsMissingProtocolFlagsAsJSON`。
 #[tokio::test]
 async fn test_provision_packages_command_reports_missing_protocol_flags_as_json() {
     let cases = [
@@ -194,7 +191,6 @@ async fn test_provision_packages_command_reports_missing_protocol_flags_as_json(
     }
 }
 
-/// 对应 Go `TestProvisionPackagesCommandEmitsInvalidManifestResult`。
 #[tokio::test]
 async fn test_provision_packages_command_emits_invalid_manifest_result() {
     let context = ProvisionContext::new(CancellationToken::new());
@@ -229,7 +225,6 @@ fn test_provision_packages_command_maps_unknown_flag_to_cli_exit() {
     assert!(error.rendered().contains("unexpected argument"));
 }
 
-/// 对应 Go `TestProvisionPackagesCommandConvertsInterruptToCancelledResult`。
 #[tokio::test]
 async fn test_provision_packages_command_converts_interrupt_to_cancelled_result() {
     let cancellation = CancellationToken::new();
@@ -257,7 +252,6 @@ async fn test_provision_packages_command_converts_interrupt_to_cancelled_result(
     );
 }
 
-/// 对应 Go `TestProvisionPackagesCommandCancelsBlockedStdinRead`。
 #[tokio::test]
 async fn test_provision_packages_command_cancels_blocked_stdin_read() {
     let cancellation = CancellationToken::new();

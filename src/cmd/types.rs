@@ -1,7 +1,7 @@
 //! 命令层共享类型。
 //!
-//! code-sign 的 JSON-RPC DTO 与重试参数保留在原文件基名中；TaskContext 和 stdin
-//! client 则承载 task-run 已接线的 v0/v1 统一上下文。所有 JSON 字段显式保持 Go 拼写。
+//! code-sign 的 JSON-RPC DTO 与重试参数保留在对应模块中；TaskContext 和 stdin
+//! client 则承载 task-run 已接线的 v0/v1 统一上下文。所有 JSON 字段显式保持 wire 拼写。
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -15,8 +15,8 @@ use crate::internal::{
 
 /// stdin v0/v1 解析后交给 `task-run` 主流程的统一上下文。
 ///
-/// 对应 Go `TaskContext`。指针字段使用 `Option` 保留 healthcheck 和错误注入测试中的
-/// nil 语义；普通 session 在进入 manager 前会再次完成必需字段校验。
+/// 指针字段使用 `Option` 保留 healthcheck 和错误注入测试中的
+/// `None` 语义；普通 session 在进入 manager 前会再次完成必需字段校验。
 #[derive(Clone, Debug)]
 pub(super) struct TaskContext {
     /// 会话启动配置；healthcheck 也至少携带仅含 API base URL 的上下文。
@@ -39,7 +39,7 @@ pub(super) struct TaskContext {
 
 /// 把 stdin 中已经取得的配置适配成 manager 的 API client。
 ///
-/// 对应 Go `stdinConfigClient`；它不再次访问网络，所有 getter 返回深拷贝，以免
+/// 它不再次访问网络，所有 getter 返回深拷贝，以免
 /// manager 对 session ID 或环境配置的修改反向污染原始 stdin 上下文。
 pub(super) struct StdinConfigClient {
     /// stdin 环境配置；普通 session 必须存在。
@@ -105,7 +105,7 @@ pub(super) struct McpRequest {
 /// MCP response 的可恢复字段模型。
 ///
 /// 实际解码需要区分缺失 `result` 与显式 `null`，因此执行代码会先读取 JSON object；
-/// 本类型仍保留原 Go 声明，供符号映射和协议文档直接对照。
+/// 本类型仍保留原 声明，供符号映射和协议文档。
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub(super) struct McpResponse {
@@ -142,7 +142,7 @@ pub(super) struct McpToolResult {
     pub(super) is_error: bool,
 }
 
-/// Go `encoding/json` 把显式 `null` 解到标量字段时保留其零值；serde 默认会报类型
+/// task context 协议把显式 `null` 标量字段视为零值；serde 默认会报类型
 /// 错误。这个适配器只放宽 `null`，数字到字符串等真正的类型错误仍然会失败。
 fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -152,7 +152,7 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-/// Go 允许 `content: null`，也允许数组中的 `null` 作为一个零值结构体；两者都在
+/// 允许 `content: null`，也允许数组中的 `null` 作为一个零值结构体；两者都在
 /// 签名失败文案中回退到 `unknown error`，不能被 serde 的严格 Vec 解码提前截断。
 fn deserialize_content_list<'de, D>(deserializer: D) -> Result<Vec<McpContent>, D::Error>
 where

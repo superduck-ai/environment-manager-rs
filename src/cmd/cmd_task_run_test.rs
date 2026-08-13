@@ -1,6 +1,6 @@
 //! `task-run` 命令解析与运行时测试。
 //!
-//! 对应 Go `cmd/cmd_task_run_test.go`；CCR 使用 loopback 真 HTTP，manager
+//! CCR 使用 loopback 真 HTTP，manager
 //! 仅在信号包装边界使用 fake，不伪造生产 backend 成功路径。
 
 use std::{sync::Arc, time::Instant};
@@ -62,7 +62,7 @@ fn task_run_defaults_preserve_explicitness() {
     assert_eq!(args.claude_agent_version, "latest");
 }
 
-/// 已废弃的 Go 升级布尔参数应被移除。
+/// 已废弃的 升级布尔参数应被移除。
 #[test]
 fn task_run_rejects_legacy_upgrade_flag() {
     let error = parse_from(
@@ -100,7 +100,7 @@ fn task_run_accepts_explicit_claude_agent_version() {
     assert_eq!(args.claude_agent_version, "stable");
 }
 
-/// local-testing 应在解析结果中应用旧 RunE 的 verbose/git 派生行为。
+/// local-testing 应在解析结果中应用 verbose/git 派生行为。
 #[test]
 fn task_run_local_testing_applies_effective_flags() {
     let Invocation::TaskRun(args) = parse_from(
@@ -129,7 +129,7 @@ fn task_run_local_testing_applies_effective_flags() {
     assert!(args.session_mode_was_set);
 }
 
-/// 构造一个保留 Go 零值语义的 task context。
+/// 构造所有字段均为空的 task context。
 fn empty_task_context() -> TaskContext {
     TaskContext {
         startup_context: None,
@@ -151,7 +151,7 @@ fn new_task_run_auth_context(session_id: &str, token: &str) -> AuthContext {
     context
 }
 
-/// 对应 Go `TestValidateAPIBaseURL`，区分空值、无 host 和真正 URL 语法错误。
+/// 区分空值、无 host 和真正 URL 语法错误。
 #[test]
 fn test_validate_api_base_url() {
     for valid in ["https://api.example.com", "http://localhost:8080"] {
@@ -167,7 +167,7 @@ fn test_validate_api_base_url() {
     }
 }
 
-/// 对应 Go `TestStdinConfigClient`，验证配置、outcomes 和缺失 auth 的返回语义。
+/// 验证配置、outcomes 和缺失 auth 的返回语义。
 #[tokio::test]
 async fn test_stdin_config_client() {
     let environment = GetEnvironmentConfigResponse {
@@ -194,7 +194,7 @@ async fn test_stdin_config_client() {
     assert!(client.get_auth_context().is_none());
 }
 
-/// 对应 Go `TestAcknowledgeWorkIfNeededSkipAndValidation`，跳过分支不得误触发网络。
+/// 跳过分支不得误触发网络。
 #[tokio::test]
 async fn test_acknowledge_work_if_needed_skip_and_validation() {
     let cancellation = CancellationToken::new();
@@ -221,7 +221,7 @@ async fn test_acknowledge_work_if_needed_skip_and_validation() {
     assert!(error.contains("missing auth context"));
 }
 
-/// 对应 Go `TestBuildTaskRunBackendNoopModes`，跳过 Claude 和 setup-only 都使用空端点。
+/// 跳过 Claude 和 setup-only 都使用空端点。
 #[tokio::test]
 async fn test_build_task_run_backend_noop_modes() {
     for (mode, skip_claude_code) in [
@@ -237,7 +237,7 @@ async fn test_build_task_run_backend_noop_modes() {
     }
 }
 
-/// 对应 Go `TestBuildTaskRunBackendSessionIngress`，验证普通 backend 的端点与 header。
+/// 验证普通 backend 的端点与 header。
 #[tokio::test]
 async fn test_build_task_run_backend_session_ingress() {
     let mut task_context = empty_task_context();
@@ -322,7 +322,7 @@ async fn start_ccr_register_fixture() -> (String, tokio::task::JoinHandle<String
     (format!("http://{address}"), handle)
 }
 
-/// 对应 Go `TestBuildTaskRunBackendCCRRegistersWorker`，真实校验 register wire 和 epoch 传递。
+/// 真实校验 register wire 和 epoch 传递。
 #[tokio::test]
 async fn test_build_task_run_backend_ccr_registers_worker() {
     let (base_url, request_handle) = start_ccr_register_fixture().await;
@@ -373,7 +373,7 @@ async fn test_build_task_run_backend_ccr_registers_worker() {
     );
 }
 
-/// 对应 Go `TestTaskRunClaudePath`，验证 flag、环境变量和默认值的优先级。
+/// 验证 flag、环境变量和默认值的优先级。
 #[tokio::test]
 async fn test_task_run_claude_path() {
     // 父测试进程只启动隔离子进程，不在自身读写全局环境。
@@ -469,7 +469,7 @@ impl TaskRunManager for FakeTaskRunManager {
     }
 }
 
-/// 对应 Go `TestRunTaskRunManagerWrapsFailure`，普通失败必须添加稳定前缀。
+/// 普通失败必须添加稳定前缀。
 #[tokio::test]
 async fn test_run_task_run_manager_wraps_failure() {
     // Tokio Unix signal driver 会安装进程级 handler；隔离后不会改变父 libtest 的状态。
@@ -521,7 +521,7 @@ async fn test_run_task_run_manager_does_not_parse_cancellation_text() {
     );
 }
 
-/// 验证 manager 原始错误经过 task-run `%w` 包装后仍逐字节一致。
+/// 验证 manager 原始错误经过 task-run `source chain` 包装后仍逐字节一致。
 ///
 /// `ff fe 00` 同时覆盖连续非法 UTF-8 与 NUL；日志/Display 应逐字节替换前两者，
 /// 但最终 stderr 中的错误正文必须保留原值。
@@ -574,7 +574,7 @@ async fn task_run_preserves_raw_manager_error_through_rendering() {
     );
 }
 
-/// 对应 Go `TestInitDiagLoggingDisabled`，关闭开关时不创建文件或后台任务。
+/// 关闭开关时不创建文件或后台任务。
 #[tokio::test]
 async fn test_init_diag_logging_disabled() {
     // 父测试进程只启动隔离子进程，不在自身读写全局环境。

@@ -24,7 +24,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// 创建两个持久临时文件、启动 Claude Code tailer 与周期 flusher。
 ///
 /// 文件模式由 `tempfile` 保持为 `0600`。创建后的文件通过 `keep()` 脱离 RAII 自动删除，
-/// 对应 Go `os.CreateTemp`：shutdown 只关闭 fd，不删除路径，调用方仍可读取诊断文件。
+/// shutdown 只关闭 fd，不删除路径，调用方仍可读取诊断文件。
 pub async fn new_diag_service(
     cancellation: CancellationToken,
     flusher: Arc<dyn LogFlusher>,
@@ -78,7 +78,7 @@ pub async fn new_diag_service_with_backend(
     new_diag_service(cancellation, flusher).await
 }
 
-/// 对应 Go：`createDiagFile`，在系统临时目录创建 `{prefix}-*.diag.log` 持久文件。
+/// 在系统临时目录创建 `{prefix}-*.diag.log` 持久文件。
 ///
 /// 成功后先以 `file` 为唯一属性写 INFO，再返回仍打开的文件与路径；创建或 `keep`
 /// 失败时保留 `error creating file {prefix}` 前缀且不写成功日志。文件权限由 tempfile
@@ -119,7 +119,7 @@ impl DiagService {
     /// 停止 collector，触发最终 flush，受调用方 token 约束等待，并显式关闭两份文件。
     ///
     /// 第一次调用会先将 `is_shutdown` 置位；后续调用立即成功。即使最终 flush 超时或
-    /// 失败，本地文件仍会被关闭，多个错误按 Go `errors.Join` 的换行形式汇总。
+    /// 失败，本地文件仍会被关闭，多个错误按 多错误合并 的换行形式汇总。
     pub async fn shutdown(&self, cancellation: &CancellationToken) -> Result<(), DiagError> {
         {
             let mut state = self
@@ -145,25 +145,25 @@ impl DiagService {
             .take();
         if let Some(mut task) = task {
             tokio::select! {
-                result = &mut task => match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => errors.push(error),
-                    Err(error) if error.is_panic() => {
-                        // Go flusher goroutine 的 panic 会终止进程；Tokio 只把它保存在
-                        // JoinError 中，因此这里恢复 unwind，不能返回 Rust 独有错误。
-                        std::panic::resume_unwind(error.into_panic());
-                    }
-                    Err(error) => errors.push(DiagError::message(format!(
-                        "diag log flusher task failed: {error}"
-                    ))),
-                },
-                _ = cancellation.cancelled() => {
-                    tracing::warn!("{}", "Shutdown timed out waiting for diag log flusher to stop");
-                    errors.push(DiagError::message(
-                        "shutdown timed out waiting for final flush: context canceled"
-                    ));
-                }
-            }
+                           result = &mut task => match result {
+                               Ok(Ok(())) => {}
+                               Ok(Err(error)) => errors.push(error),
+                               Err(error) if error.is_panic() => {
+            // flusher 后台任务 的 panic 会终止进程；Tokio 只把它保存在
+            // JoinError 中，因此这里恢复 unwind，不能返回 Rust 独有错误。
+                                   std::panic::resume_unwind(error.into_panic());
+                               }
+                               Err(error) => errors.push(DiagError::message(format!(
+                                   "diag log flusher task failed: {error}"
+                               ))),
+                           },
+                           _ = cancellation.cancelled() => {
+                               tracing::warn!("{}", "Shutdown timed out waiting for diag log flusher to stop");
+                               errors.push(DiagError::message(
+                                   "shutdown timed out waiting for final flush: context canceled"
+                               ));
+                           }
+                       }
         }
 
         let (env_manager_file, cc_file) = {
@@ -248,7 +248,7 @@ impl DiagService {
     async fn flush_periodically(&self) -> Result<(), DiagError> {
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // Tokio interval 的首个 tick 立即完成；先消费它以匹配 Go ticker 首次等待 5 秒。
+        // Tokio interval 的首个 tick 立即完成；先消费它以匹配 ticker 首次等待 5 秒。
         ticker.tick().await;
         let mut pending = Vec::new();
 
@@ -331,11 +331,11 @@ pub fn log_env_manager_no_pii(
     }
 }
 
-/// 对应 Go：`appendAndCapLogs`，追加日志并把总数限制为 5000。
+/// 追加日志并把总数限制为 5000。
 ///
 /// 未超限时原样保留插入顺序；超限时先按 `discarded_count`、`max_entries` 顺序写一条
 /// WARN，再删除最早插入项。该函数不按时间排序，排序只发生在远端 flush 前，避免
-/// 改变 Go 在多个来源分别触发 cap 时的丢弃对象。
+/// 改变 在多个来源分别触发 cap 时的丢弃对象。
 pub(super) fn append_and_cap_logs(
     mut existing: Vec<DiagLogEntry>,
     new_logs: Vec<DiagLogEntry>,
@@ -355,7 +355,7 @@ pub(super) fn append_and_cap_logs(
     existing
 }
 
-/// 解析 `ENV_MANAGER_ENABLE_DIAG_LOGS`，保持 Go `strconv.ParseBool` 的接受集合。
+/// 解析 `ENV_MANAGER_ENABLE_DIAG_LOGS`，接受常见的 true 表示。
 pub fn logs_enabled() -> bool {
     let Ok(value) = std::env::var("ENV_MANAGER_ENABLE_DIAG_LOGS") else {
         return false;
@@ -368,7 +368,7 @@ fn close_diag_file(file: DiagFile) -> Result<(), std::io::Error> {
     nix::unistd::close(file.file).map_err(std::io::Error::from)
 }
 
-/// 将零个、一个或多个错误转为与 Go `errors.Join` 等价的结果。
+/// 将零个、一个或多个错误合并为单一结果。
 fn join_errors(mut errors: Vec<DiagError>) -> Result<(), DiagError> {
     match errors.len() {
         0 => Ok(()),

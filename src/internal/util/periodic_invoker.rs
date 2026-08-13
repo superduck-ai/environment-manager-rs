@@ -1,6 +1,6 @@
 //! 可启动、停止并可重复启动的周期异步任务。
 //!
-//! Go 实现会立即调用一次函数，随后按固定间隔调用。这里保持该时序，
+//! 会立即调用一次函数，随后按固定间隔调用。这里保持该时序，
 //! 并用 `CancellationToken` 和受控 `JoinHandle` 保证停止后没有遗留任务。
 
 use std::{
@@ -54,7 +54,7 @@ pub struct PeriodicInvoker {
 impl PeriodicInvoker {
     /// 创建周期调用器。
     ///
-    /// 与 Go 构造函数的 panic 不同，配置错误通过 `Result` 返回，避免配置输入
+    /// 配置错误通过 `Result` 返回，避免配置输入
     /// 导致整个服务崩溃。函数使用 async future，网络调用无需阻塞 Tokio worker。
     pub fn new<F, Fut, E>(interval: Duration, function: F) -> Result<Self, PeriodicInvokerError>
     where
@@ -79,7 +79,7 @@ impl PeriodicInvoker {
 
     /// 启动后台任务，并保证函数在等待第一个间隔前先执行一次。
     ///
-    /// 该方法同步返回，便于与 Go `Start` 以及 session 初始化路径直接对应；
+    /// 该方法同步返回，便于 session 初始化路径直接调用；
     /// 它只负责 spawn，实际 callback 始终在 Tokio worker 上异步执行。
     pub fn start(&self) -> Result<(), PeriodicInvokerError> {
         let runtime =
@@ -110,9 +110,9 @@ impl PeriodicInvoker {
 
     /// 同步请求后台周期任务停止，但不等待在途 callback 返回。
     ///
-    /// 该入口对应 Go `cancel()` 阶段，供无法 `.await` 的 `Drop` guard 使用。取消后
-    /// 仍保留全部 `JoinHandle`，因此正常控制流稍后调用 [`Self::stop`] 时仍可恢复 Go
-    /// `wg.Wait()` 的完成边界。方法可重复调用，不会重新启动或提前丢弃任务。
+    /// 该入口供无法 `.await` 的 `Drop` guard 使用。取消后仍保留全部 `JoinHandle`，
+    /// 因此正常控制流稍后调用 [`Self::stop`] 时仍能等待全部任务完成。方法可重复调用，
+    /// 不会重新启动或提前丢弃任务。
     pub fn request_stop(&self) {
         let mut state = self
             .state
@@ -124,11 +124,9 @@ impl PeriodicInvoker {
         state.running = false;
     }
 
-    /// 对应 Go：`periodic_invoker.go` 中的 `(*PeriodicInvoker).Stop`。
     ///
     /// 先把 `running` 置为 false，再发送取消，并等待所有已启动 callback 完整返回。
-    /// 等待使用 async JoinHandle 而不是阻塞 Tokio worker，但返回边界与 Go 的
-    /// `cancel(); wg.Wait()` 相同：调用方继续执行时不会再收到本 invoker 的副作用。
+    /// 等待使用 async JoinHandle 而不是阻塞 Tokio worker，但返回边界与 `cancel(); wg.Wait()` 相同：调用方继续执行时不会再收到本 invoker 的副作用。
     pub async fn stop(&self) {
         let tasks = {
             let mut state = self
@@ -147,7 +145,7 @@ impl PeriodicInvoker {
         Self::wait_for_tasks(tasks).await;
     }
 
-    /// 兼容迁移期调用点的显式名称；语义与 [`Self::stop`] 完全相同。
+    /// 显式表达“停止并等待”的别名；语义与 [`Self::stop`] 完全相同。
     pub async fn stop_and_wait(&self) {
         self.stop().await;
     }
@@ -156,7 +154,7 @@ impl PeriodicInvoker {
     async fn wait_for_tasks(tasks: Vec<JoinHandle<()>>) {
         for task in tasks {
             if let Err(error) = task.await {
-                // Go goroutine 中未恢复的 panic 会终止进程。Tokio 默认把 panic 包进
+                // 后台任务中未恢复的 panic 会终止进程。Tokio 默认把 panic 包进
                 // JoinError；这里重新抛出，不能静默降级为一条 Rust-only warning。
                 if error.is_panic() {
                     std::panic::resume_unwind(error.into_panic());
@@ -173,7 +171,6 @@ impl PeriodicInvoker {
             .running
     }
 
-    /// 对应 Go：`periodic_invoker.go` 中的 `(*PeriodicInvoker).run`。
     ///
     /// 立即调用一次 callback，随后按固定间隔持续执行；单次错误只记录而不终止。
     /// `cancellation` 被触发后退出循环，JoinHandle 由 `stop` 汇合。
@@ -188,19 +185,18 @@ impl PeriodicInvoker {
 
         loop {
             tokio::select! {
-                _ = cancellation.cancelled() => break,
-                _ = ticker.tick() => {
-                    if let Err(error) = function().await {
-                        // 与首次调用保留独立事件，便于区分两个停止分支。
-                        tracing::error!(error = %error, interval_ms = interval.as_millis(), "periodic function failed");
-                    }
-                },
-            }
+                           _ = cancellation.cancelled() => break,
+                           _ = ticker.tick() => {
+                               if let Err(error) = function().await {
+            // 与首次调用保留独立事件，便于区分两个停止分支。
+                                   tracing::error!(error = %error, interval_ms = interval.as_millis(), "periodic function failed");
+                               }
+                           },
+                       }
         }
     }
 }
 
-/// 对应 Go：`periodic_invoker.go` 中的 `NewPeriodicInvoker`。
 ///
 /// 自由函数构造入口；间隔配置错误由 [`PeriodicInvoker::new`] 的类型化结果返回。
 pub fn new_periodic_invoker<F, Fut, E>(

@@ -1,6 +1,6 @@
 //! 将 wire auth 数组解析为运行时认证上下文。
 //!
-//! 解析规则保持 Go 实现的“按数组顺序覆盖”语义：同一提供方出现多次时，后一个
+//! 解析规则保持 的“按数组顺序覆盖”语义：同一提供方出现多次时，后一个
 //! 值胜出；未知提供方和空 token 会立即终止解析。
 
 use serde::Deserialize;
@@ -53,7 +53,7 @@ struct SupabaseCredentials {
 /// 解析 auth JSON，并附加调用方已知的会话 ID。
 ///
 /// 空切片表示没有认证配置并返回一个只含 session ID 的上下文。函数刻意不检查
-/// Antspace/Supabase 嵌套对象中的单个字段是否为空，以保持恢复后的 Go 行为。
+/// Antspace/Supabase 嵌套对象中的单个字段是否为空，以保持恢复后的。
 pub fn new_auth_context_with_session_id(
     auth_json: &[u8],
     session_id: impl Into<String>,
@@ -72,7 +72,7 @@ fn parse_auth_context(auth_json: &[u8], session_id: String) -> Result<AuthContex
         return Ok(context);
     }
 
-    // Go 把顶层 `null` 解为 nil slice，也允许数组元素 `null` 先落成 AuthConfig
+    // 把顶层 `null` 解为 null 数组，也允许数组元素 `null` 先落成 AuthConfig
     // 零值；后者随后按既有顺序触发 unknown provider，而不是 JSON 类型错误。
     let configurations: Option<Vec<Option<AuthConfig>>> =
         serde_json::from_slice(auth_json).map_err(AuthError::InvalidConfiguration)?;
@@ -140,7 +140,7 @@ fn parse_auth_context(auth_json: &[u8], session_id: String) -> Result<AuthContex
     Ok(context)
 }
 
-/// 验证已知提供方的 token 非空，并生成与 Go 兼容的错误文本。
+/// 验证已知提供方的 token 非空，并生成稳定错误文本。
 fn require_token(provider: &'static str, token: &str) -> Result<(), AuthError> {
     if token.is_empty() {
         return Err(AuthError::MissingToken(provider));

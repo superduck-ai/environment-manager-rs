@@ -1,6 +1,6 @@
-//! Deploy 迁移的行为测试。
+//! Deploy 行为测试。
 //!
-//! 覆盖 Go 测试中的命名、目录边界、文件索引、tar.gz、Antspace multipart、Vercel
+//! 覆盖 中的命名、目录边界、文件索引、tar.gz、Antspace multipart、Vercel
 //! 两类请求与轮询，并额外锁定取消只能终止直接构建子进程的约束。
 
 use std::collections::{BTreeMap, HashMap};
@@ -58,7 +58,7 @@ fn new_test_vercel_client(server: &MockServer) -> VercelClient {
     }
 }
 
-/// 对应 Go `TestNewDeployAction`，验证凭据、client、target 和 action 元数据。
+/// 验证凭据、client、target 和 action 元数据。
 #[test]
 fn test_new_deploy_action() {
     let antspace = new_antspace_client("https://control.example", "token");
@@ -71,7 +71,7 @@ fn test_new_deploy_action() {
     assert_eq!(action.timeout(), DEPLOY_TIMEOUT);
 }
 
-/// 对应 Go `TestNewAntspaceClient`，验证控制面地址、凭据和 HTTP client 初始化。
+/// 验证控制面地址、凭据和 HTTP client 初始化。
 #[test]
 fn test_new_antspace_client() {
     let antspace = new_antspace_client("https://control.example", "token");
@@ -89,7 +89,7 @@ fn test_project_name() {
         "baku-abcdefghijklmnopqrst"
     );
     assert_eq!(project_name("Already-OK"), "baku-already-ok");
-    // 20 字节边界截断一个三字节 rune；Go range 会把剩余两个非法字节各变成 `-`。
+    // 20 字节边界截断一个三字节 rune；range 会把剩余两个非法字节各变成 `-`。
     assert_eq!(
         project_name("123456789012345678€"),
         "baku-123456789012345678--"
@@ -360,7 +360,7 @@ async fn test_vercel_create_deployment() {
     assert!(error.contains("deployment failed (status 403): forbidden"));
 }
 
-/// 对应 Go `TestVercelUploadFile`，验证上传 header/body 与 API 错误正文。
+/// 验证上传 header/body 与 API 错误正文。
 #[tokio::test]
 async fn test_vercel_upload_file() {
     let upload_server = MockServer::start().await;
@@ -395,7 +395,7 @@ async fn test_vercel_upload_file() {
     assert!(error.contains("file upload failed (status 500): upload failed"));
 }
 
-/// 对应 Go `TestVercelWaitForReady`，覆盖 READY、失败、HTTP 错误和预取消。
+/// 覆盖 READY、失败、HTTP 错误和预取消。
 #[tokio::test]
 async fn test_vercel_wait_for_ready() {
     let ready_server = MockServer::start().await;
@@ -462,7 +462,7 @@ async fn test_vercel_wait_for_ready() {
     );
 }
 
-/// 对应 Go `TestGetCommitSHA`，验证仓库 HEAD 和非仓库降级为空字符串。
+/// 验证仓库 HEAD 和非仓库降级为空字符串。
 #[tokio::test]
 async fn test_get_commit_sha() {
     let _process_state = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -611,14 +611,14 @@ async fn cancelling_build_kills_only_direct_child() {
     );
 }
 
-/// 对应 Go `mustWriteFile`，创建父目录并写入测试文件。
+/// 创建父目录并写入测试文件。
 fn must_write_file(path: impl AsRef<Path>, data: &[u8]) {
     let path = path.as_ref();
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, data).unwrap();
 }
 
-/// 对应 Go `assertCollectedFile`，核对名称、SHA-1、长度和内容映射。
+/// 核对名称、SHA-1、长度和内容映射。
 fn assert_collected_file(
     files: &[FileEntry],
     data: &HashMap<String, Vec<u8>>,
@@ -638,7 +638,7 @@ fn assert_collected_file(
     assert_eq!(data.get(&entry.sha).unwrap(), content);
 }
 
-/// 对应 Go `assertVercelRequest`，核对方法、路径、teamId 和 bearer header。
+/// 核对方法、路径、teamId 和 bearer header。
 fn assert_vercel_request(request: &wiremock::Request, expected_method: &str, expected_path: &str) {
     assert_eq!(request.method.as_str(), expected_method);
     assert_eq!(request.url.path(), expected_path);
@@ -661,7 +661,7 @@ fn assert_vercel_request(request: &wiremock::Request, expected_method: &str, exp
     );
 }
 
-/// 对应 Go `assertDeploymentPayload`，核对 deployment JSON 的兼容字段和值。
+/// 核对 deployment JSON 的 wire 字段和值。
 fn assert_deployment_payload(
     request: &wiremock::Request,
     expected_project: &str,
@@ -690,7 +690,7 @@ fn assert_deployment_payload(
     assert_eq!(payload["projectSettings"]["outputDirectory"], ".");
 }
 
-/// 对应 Go `readTarball`，解压 tar.gz 并只返回普通文件内容。
+/// 解压 tar.gz 并只返回普通文件内容。
 fn read_tarball(tarball: &[u8]) -> BTreeMap<String, Vec<u8>> {
     let decoder = GzDecoder::new(tarball);
     let mut archive = Archive::new(decoder);
@@ -708,7 +708,7 @@ fn read_tarball(tarball: &[u8]) -> BTreeMap<String, Vec<u8>> {
     contents
 }
 
-/// 对应 Go `runGit`，在 fixture 仓库执行 Git 并返回 combined output。
+/// 在 fixture 仓库执行 Git 并返回 combined output。
 fn run_git(directory: &Path, arguments: &[&str]) -> String {
     let output = Command::new("git")
         .args(arguments)

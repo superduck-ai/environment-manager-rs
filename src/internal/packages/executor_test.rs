@@ -11,13 +11,12 @@ use super::{
     result::{Manager, Stage},
 };
 
-/// 对应 Go `TestExecCommandRunnerDiscardsProcessOutput`。
 #[tokio::test]
 async fn test_exec_command_runner_discards_process_output() {
     run_executor_output_helper().await;
 }
 
-/// 对应 Go `runExecutorOutputHelper`，执行会同时写 stdout/stderr 的受控脚本。
+/// 执行会同时写 stdout/stderr 的受控脚本。
 async fn run_executor_output_helper() {
     let directory = TempDir::new().unwrap();
     let executable = directory.path().join("test-package-manager");

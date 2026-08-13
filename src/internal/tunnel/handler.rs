@@ -32,16 +32,16 @@ use super::{
     HttpTunnelResponseHeaders, ResponseSender, TunnelError, flatten_http_headers,
 };
 
-/// 对应 Go `httpTunnelChunkSize`：每个响应数据分片最多 32 KiB。
+/// 每个响应数据分片最多 32 KiB。
 pub const HTTP_TUNNEL_CHUNK_SIZE: usize = 32 * 1024;
 
-/// 对应 Go `http.Transport.ResponseHeaderTimeout`：本地服务必须在 30 秒内返回 header。
+/// 本地服务必须在 30 秒内返回 header。
 const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 已注册活动请求的作用域守卫。
 ///
-/// Go 使用 `defer` 保证请求无论正常返回、错误返回还是 goroutine 展开都取消 context
-/// 并删除 map 项。Rust future 可能被 `JoinHandle::abort` 直接丢弃，因此清理必须放在
+/// guard 保证请求无论正常返回、错误返回还是后台任务展开都取消 token 并删除 map 项。
+/// Rust future 可能被 `JoinHandle::abort` 直接丢弃，因此清理必须放在
 /// `Drop` 中，不能依赖 `await` 后面的普通语句。
 struct ActiveRequestGuard<'a> {
     handler: &'a Handler,
@@ -50,7 +50,7 @@ struct ActiveRequestGuard<'a> {
 }
 
 impl Drop for ActiveRequestGuard<'_> {
-    /// 对应 Go `HandleRequest` 中的延迟清理闭包。
+    /// 请求结束时执行延迟清理。
     ///
     /// 先取消本请求拥有的令牌，再删除 request ID。删除操作不跨 `await`，且 poisoned
     /// mutex 仍取回内部值，以免一次 panic 永久泄漏后续请求状态。
@@ -66,10 +66,10 @@ impl Drop for ActiveRequestGuard<'_> {
     }
 }
 
-/// 对应 Go `NewClient` 内部的默认 HTTP Handler 构造。
+/// 构造默认的本地 HTTP handler。
 ///
-/// Hyper 客户端不实现自动 redirect，也不会读取 `HTTP_PROXY`/`NO_PROXY`，因此和 Go
-/// 中专用于本地端口的显式 `http.Transport` 一样始终直连 loopback。请求本身通过
+/// Hyper 客户端不实现自动 redirect，也不会读取 `HTTP_PROXY`/`NO_PROXY`，因此始终
+/// 直连 loopback。请求本身通过
 /// `CancellationToken` 管理，只对响应 header 设置 30 秒门限，不截断长响应 body。
 ///
 /// # 返回
@@ -84,7 +84,7 @@ pub fn new_handler() -> Result<Handler, TunnelError> {
 
 /// 构造带可控计时参数的 HTTP Tunnel 处理器，仅供单元测试使用。
 ///
-/// Go 的 `ResponseHeaderTimeout` 从完整请求写入成功后才开始。生产值固定为 30 秒，
+/// `ResponseHeaderTimeout` 从完整请求写入成功后才开始。生产值固定为 30 秒，
 /// 无法在测试中快速覆盖“慢连接”和“慢上传不消耗 header timeout”。这个构造器只
 /// 缩短测试时间并在拨号前注入确定延迟，传输状态机与生产构造完全相同。
 ///
@@ -108,10 +108,10 @@ pub(crate) fn new_handler_with_timing_for_test(
 
 /// 观察并改写 Hyper HTTP/1 请求行的 loopback TCP 流。
 ///
-/// Hyper 的 `http::Uri` 会拒绝 Go `RawQuery` 允许写出的部分可打印字节。该适配器让
+/// Hyper 的 `http::Uri` 会拒绝 request-target 中的部分可打印字节。该适配器让
 /// Hyper 使用安全占位 URI 构造请求，再仅替换首行的 request-target；响应读取仍完全
 /// 交给 Hyper。它还在字节真正被内核 socket 接收后通知计时状态机，不能把“Hyper 已
-/// 接受 body buffer”误当成 Go `Request.Write` 已完成。
+/// 接受 body buffer”误当成 socket 写入已完成。
 struct RequestTargetIo {
     stream: TcpStream,
     wire_target: Vec<u8>,
@@ -243,7 +243,7 @@ impl AsyncRead for RequestTargetIo {
 }
 
 impl AsyncWrite for RequestTargetIo {
-    /// 接收 Hyper 输出；header 完成前先累计，完成后以 Go request-target 改写并写线。
+    /// 接收 Hyper 输出；header 完成前先累计，完成后以 request-target 改写并写线。
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -303,7 +303,6 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 impl Handler {
-    /// 对应 Go：`(*Handler).HandleRequest`。
     ///
     /// 校验目标后把请求发送到 `http://localhost:<port><path>`，注册 request ID 供
     /// cancel 消息查找。网络失败通过协议 error 回传并视为已处理；sender 写失败则
@@ -361,9 +360,9 @@ impl Handler {
             .await
     }
 
-    /// 对应 Go `HandleRequest` 中创建 `http.Request` 后的转发主体。
+    /// 转发已完成解析的 HTTP 请求。
     ///
-    /// 请求构造严格保持 Go 的阶段边界：非法 method/URL 属于
+    /// 请求构造严格保持 阶段边界：非法 method/URL 属于
     /// `failed to create request` 并向调用方返回原始错误；非法 header 和网络错误属于
     /// `request failed`，写回协议错误后视为已经处理。响应 header 成功发出后，每次
     /// `AsyncRead::read` 的 `n > 0` 数据立即成为一个 Tunnel chunk。
@@ -375,7 +374,7 @@ impl Handler {
     ///
     /// # 返回
     /// 完整读取并发送 final chunk 时返回成功；构造、body 读取或 sender 写入失败时
-    /// 返回错误。连接/响应 header 错误写回后按 Go 行为返回成功。
+    /// 返回错误。连接/响应 header 错误写回后按 返回成功。
     async fn forward_request(
         &self,
         cancellation: &CancellationToken,
@@ -508,57 +507,57 @@ impl Handler {
         // 响应可能在完整请求写入前到达；只有“写成功”通知先到时才启动
         // response-header timeout。
         let response = tokio::select! {
-            () = cancellation.cancelled() => {
-                connection_task.abort();
-                send_http_error(
-                    sender,
-                    &request.request_id,
-                    "request canceled",
-                ).await?;
-                return Ok(());
-            }
-            response = &mut response_future => response,
-            request_written = &mut request_written_receiver => {
-                if request_written.is_err() {
-                    // IO 驱动退出时 sender 被丢弃；真正原因由 response future 的 Hyper
-                    // 错误携带，不能把 oneshot closed 暴露给后端。
-                    tokio::select! {
-                        () = cancellation.cancelled() => {
-                            connection_task.abort();
-                            send_http_error(
-                                sender,
-                                &request.request_id,
-                                "request canceled",
-                            ).await?;
-                            return Ok(());
-                        }
-                        response = &mut response_future => response,
-                    }
-                } else {
-                    tokio::select! {
-                        () = cancellation.cancelled() => {
-                            connection_task.abort();
-                            send_http_error(
-                                sender,
-                                &request.request_id,
-                                "request canceled",
-                            ).await?;
-                            return Ok(());
-                        }
-                        response = &mut response_future => response,
-                        () = tokio::time::sleep(self.response_header_timeout) => {
-                            connection_task.abort();
-                            send_http_error(
-                                sender,
-                                &request.request_id,
-                                "request failed: response header timeout",
-                            ).await?;
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        };
+                   () = cancellation.cancelled() => {
+                       connection_task.abort();
+                       send_http_error(
+                           sender,
+                           &request.request_id,
+                           "request canceled",
+                       ).await?;
+                       return Ok(());
+                   }
+                   response = &mut response_future => response,
+                   request_written = &mut request_written_receiver => {
+                       if request_written.is_err() {
+        // IO 驱动退出时 sender 被丢弃；真正原因由 response future 的 Hyper
+        // 错误携带，不能把 oneshot closed 暴露给后端。
+                           tokio::select! {
+                               () = cancellation.cancelled() => {
+                                   connection_task.abort();
+                                   send_http_error(
+                                       sender,
+                                       &request.request_id,
+                                       "request canceled",
+                                   ).await?;
+                                   return Ok(());
+                               }
+                               response = &mut response_future => response,
+                           }
+                       } else {
+                           tokio::select! {
+                               () = cancellation.cancelled() => {
+                                   connection_task.abort();
+                                   send_http_error(
+                                       sender,
+                                       &request.request_id,
+                                       "request canceled",
+                                   ).await?;
+                                   return Ok(());
+                               }
+                               response = &mut response_future => response,
+                               () = tokio::time::sleep(self.response_header_timeout) => {
+                                   connection_task.abort();
+                                   send_http_error(
+                                       sender,
+                                       &request.request_id,
+                                       "request failed: response header timeout",
+                                   ).await?;
+                                   return Ok(());
+                               }
+                           }
+                       }
+                   }
+               };
         let mut response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -729,10 +728,10 @@ impl Handler {
         Ok(())
     }
 
-    /// 对应 Go body read 非 EOF 错误分支。
+    /// 处理 body read 的非 EOF 错误。
     ///
     /// 先发送协议级错误；sender 成功时仍返回原始 body 错误，使上层记录
-    /// `http_tunnel_request_failed`。sender 失败则优先返回发送错误，与 Go 一致。
+    /// `http_tunnel_request_failed`。sender 失败则优先返回发送错误。
     ///
     /// # 参数
     /// - `sender`：Tunnel 响应发送器。
@@ -749,7 +748,6 @@ impl Handler {
         Err(TunnelError::message(error))
     }
 
-    /// 对应 Go：`(*Handler).CancelRequest`。
     ///
     /// 原子移除并取消指定请求；空 ID 或未知 ID 是幂等 no-op。
     ///
@@ -772,7 +770,7 @@ impl Handler {
         }
     }
 
-    /// 对应 Go 成功读取 EOF 后的 `http_tunnel_request_complete` 日志。
+    /// 成功读取 EOF 后记录 `http_tunnel_request_complete`。
     ///
     /// duration 使用纳秒整数并保留字段名 `duration`；不能改成毫秒字段，否则日志
     /// 消费者会看到不同 schema。

@@ -251,7 +251,7 @@ where
     }
 }
 
-/// 将 parser 单调耗时转换为 Go `Duration.Milliseconds()` 的截断毫秒数。
+/// 将 parser 单调耗时转换为截断的 `i64` 毫秒数。
 fn duration_milliseconds(started: Instant) -> i64 {
     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
@@ -274,7 +274,7 @@ where
 
 /// 为缺少 scheme 的 API base URL 补 `https://`。
 ///
-/// 与 Go 实现一致，仅做字符串前缀判断，不在此处验证 URL、去除尾斜杠或改写大小写。
+/// 与 一致，仅做字符串前缀判断，不在此处验证 URL、去除尾斜杠或改写大小写。
 #[must_use]
 pub fn normalize_api_base_url(api_base_url: &str) -> String {
     if api_base_url.starts_with("http://") || api_base_url.starts_with("https://") {

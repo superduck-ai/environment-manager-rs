@@ -1,8 +1,7 @@
 //! source 获取、Git clone/fetch、outcome branch 与远端 URL 后处理。
 //!
-//! 文件和符号保持 Go `internal/sources` 的机械映射；所有外部 Git 操作继续调用
-//! 系统 `git`，不嵌入 libgit2。同步 `context.Context` 映射为
-//! [`tokio_util::sync::CancellationToken`]，并保持只终止直接子进程的语义。
+//! 所有外部 Git 操作调用系统 `git`，不嵌入 libgit2。取消通过
+//! [`tokio_util::sync::CancellationToken`] 传播，并且只终止直接子进程。
 
 mod git;
 mod gitproxy_adapter;

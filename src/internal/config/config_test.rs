@@ -1,4 +1,4 @@
-//! `internal/config` 的行为回归测试，机械对应 Go 的 `config_test.go`。
+//! `internal/config` 的行为回归测试。
 
 use std::path::PathBuf;
 
@@ -192,13 +192,13 @@ fn test_startup_context_reports_validation_errors() {
     );
 }
 
-/// 对应 Go：`RawStartupContext` 通过 `encoding/json` 接收显式 null 的零值语义。
+/// 验证 `RawStartupContext` 将显式 null 解码为字段默认值。
 ///
-/// V0 stdin 来自旧客户端，历史 payload 可能把所有值类型字段写成 null。Go 会继续
+/// V0 stdin 来自旧客户端，历史 payload 可能把所有值类型字段写成 null。会继续
 /// 构造一个全零值 startup context，领域校验随后才报告缺失 API URL；Rust 不能在
 /// Serde 类型检查阶段提前失败，否则错误阶段和对外文本都会发生变化。
 #[test]
-fn test_startup_context_explicit_null_fields_use_go_zero_values() {
+fn test_startup_context_explicit_null_fields_use_defaults() {
     let startup: StartupContext = serde_json::from_value(json!({
         "sources": null,
         "api_base_url": null,
@@ -226,12 +226,12 @@ fn test_startup_context_explicit_null_fields_use_go_zero_values() {
     assert_eq!(top_level_null, StartupContext::default());
 }
 
-/// 验证嵌套配置 DTO 的 null、null 元素和 null map value 都遵循 Go 零值规则。
+/// 验证嵌套配置 DTO 的 null、null 元素和 null map value 都映射为默认值。
 ///
 /// 这些字段会同时出现在 V0 stdin、V1 session context 与 secret 中。测试刻意保留
-/// Option 字段的 None 语义，并只把 Go 值类型转换为空字符串、false、0 或默认结构。
+/// Option 字段的 None 语义，并只把值类型转换为空字符串、false、0 或默认结构。
 #[test]
-fn test_nested_config_explicit_null_values_match_go_encoding_json() {
+fn test_nested_config_explicit_null_values_use_defaults() {
     let git_info: GitInfo = serde_json::from_value(json!({
         "type": null,
         "repo": null,

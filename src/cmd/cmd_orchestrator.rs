@@ -1,6 +1,6 @@
-//! 对应 Go `cmd/cmd_orchestrator.go` 的常驻轮询命令。
+//! 常驻轮询命令。
 //!
-//! 本文件逐项映射 Go `cmd/cmd_orchestrator.go` 的 flag、默认值、长帮助和示例。
+//! 本文件定义 orchestrator 的 flag、默认值、长帮助和示例。
 //! 解析后按原顺序完成容器锁、身份发现、poller/hook、sandbox、自调用和信号关闭。
 
 use std::fmt::{self, Display, Formatter};
@@ -68,7 +68,7 @@ const EXAMPLES: &str = r#"Examples:
 /// 执行 hook 时使用的沙箱后端。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxBackend {
-    /// 明确禁用沙箱；旧实现会输出安全警告。
+    /// 明确禁用沙箱；当前命令会输出安全警告。
     None,
     /// 使用 `@anthropic-ai/sandbox-runtime`，也是默认值。
     SandboxRuntime,
@@ -223,7 +223,7 @@ fn optional_path_arg(id: &'static str, help: &'static str) -> Arg {
         .value_parser(value_parser!(PathBuf))
 }
 
-/// 构造 Go duration 兼容的超时 flag。
+/// 构造接受紧凑 duration 语法的超时 flag。
 fn duration_arg(id: &'static str, default: &'static str, help: &'static str) -> Arg {
     Arg::new(id)
         .long(id)
@@ -233,7 +233,7 @@ fn duration_arg(id: &'static str, default: &'static str, help: &'static str) -> 
         .value_parser(ValueParser::new(parse_go_duration))
 }
 
-/// 构造默认值为零且允许 Go `int` 负数语法的整型 flag。
+/// 构造默认值为零且允许负数语法的整型 flag。
 fn integer_arg(id: &'static str, help: &'static str) -> Arg {
     Arg::new(id)
         .long(id)
@@ -268,7 +268,7 @@ fn optional_clone(matches: &ArgMatches, id: &str) -> Option<String> {
 
 /// 默认 sandbox-runtime 与 orchestrator Hook 之间的窄适配器。
 ///
-/// Go Hook 直接依赖 sandbox 包；Rust 用 trait 隔离测试，本实现把生产路径重新接回
+/// Hook 直接依赖 sandbox 包；Rust 用 trait 隔离测试，本实现把生产路径重新接回
 /// 真实 SRT，并确保自动配置在任何执行结果之后、返回 Hook 之前完成清理。
 #[derive(Debug, Default)]
 struct SandboxRuntimeAdapter;
@@ -277,7 +277,7 @@ struct SandboxRuntimeAdapter;
 impl SandboxAdapter for SandboxRuntimeAdapter {
     /// 初始化 SRT、包装原命令、执行并在返回前清理自动生成的配置。
     ///
-    /// cleanup 失败与 Go defer 一样只记录 warning，不覆盖命令本身的成功或失败结果。
+    /// cleanup 失败只记录 warning，不覆盖命令本身的成功或失败结果。
     async fn execute(&self, request: SandboxRequest) -> OrchestratorResult<CommandOutcome> {
         let custom_config = (!request.sandbox_config_path.is_empty())
             .then(|| Path::new(&request.sandbox_config_path));
@@ -304,7 +304,7 @@ impl SandboxAdapter for SandboxRuntimeAdapter {
     }
 }
 
-/// 对应 Go：`cmd/cmd_orchestrator.go` 中 `AddOrchestratorCommand` 的 `RunE`。
+/// 运行 orchestrator 命令。
 ///
 /// 严格保持初始化顺序：先持有容器锁，再读取 service key 和 whoami，随后创建 poller、
 /// 安装 sandbox、构造 execute Hook，最后启动 orchestrator 并监听 SIGINT/SIGTERM。
@@ -511,10 +511,9 @@ fn load_orchestrator_service_key(service_key_file: Option<&Path>) -> Result<Stri
     Ok(key)
 }
 
-/// 运行 orchestrator，并复刻 SIGINT/SIGTERM 后最多等待 30 秒的优雅关闭窗口。
+/// 运行 orchestrator，并实现SIGINT/SIGTERM 后最多等待 30 秒的优雅关闭窗口。
 ///
-/// 状态机自行结束时传播非取消错误；信号路径无论最终错误或超时都返回成功，这与 Go
-/// 命令为了容器编排器正常停止而采用的退出码策略一致。
+/// 状态机自行结束时传播非取消错误；信号路径无论最终错误或超时都返回成功，这与 命令为了容器编排器正常停止而采用的退出码策略一致。
 async fn run_orchestrator_until_signal(
     orchestrator: &crate::internal::orchestrator::Orchestrator,
 ) -> Result<(), String> {

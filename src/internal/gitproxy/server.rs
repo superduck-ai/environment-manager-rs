@@ -1,9 +1,9 @@
 //! Loopback HTTP server 的启动、随机端口发现与优雅关闭。
 //!
-//! 本文件机械对应 Go `server.go`。监听地址固定为 `127.0.0.1`，端口 `0` 由内核
-//! 分配；每次启动都会冻结一份仓库 token map 并创建禁止重定向的 rustls 客户端。
+//! 监听地址固定为 `127.0.0.1`，端口 `0` 由内核分配；每次启动都会冻结一份仓库 token
+//! map 并创建禁止重定向的 rustls 客户端。
 //! 关闭信号与等待完成分离，使调用方取消 `Stop` 后仍可再次进入并完成资源回收，
-//! 对应 `http.Server.Shutdown(ctx)` 已关闭 listener 但可能尚有活跃连接的语义。
+//! 关闭 listener 后仍允许活跃连接完成回收。
 
 use std::{
     collections::HashMap,
@@ -31,7 +31,7 @@ struct ServerState {
     serve_task: Option<JoinHandle<()>>,
 }
 
-/// Go 私有 `server` 的 Tokio 对应实现。
+/// 基于 Tokio/Axum 的私有 proxy server 实现。
 pub(super) struct ServerImpl {
     config: Arc<Config>,
     state: Mutex<ServerState>,
@@ -50,9 +50,9 @@ impl ServerImpl {
     }
 }
 
-/// 对应 Go `NewServer`，逐项验证配置并返回共享 server 接口。
+/// 逐项验证配置并返回共享 server 接口。
 ///
-/// 传入 `None` 明确表示 Go nil config。验证顺序和英文错误文本保持一致，调用方可
+/// 传入 `None` 明确表示 `None` 配置。验证顺序和英文错误文本保持一致，调用方可
 /// 继续依赖第一项失败；端口不在构造时校验，而是在 `Start` 的实际 bind 中报错。
 pub fn new_server(config: Option<Config>) -> GitProxyResult<SharedServer> {
     let config = config.ok_or_else(|| GitProxyError::message("config is required"))?;
@@ -111,7 +111,7 @@ impl Server for ServerImpl {
 
         let mut repo_tokens = HashMap::with_capacity(self.config.repo_auths.len());
         for repo_auth in &self.config.repo_auths {
-            // 与 Go map 赋值一致，重复 repo 的后一项覆盖前一项。
+            // 重复 repo 的后一项覆盖前一项。
             repo_tokens.insert(repo_auth.repo.clone(), repo_auth.auth_token.clone());
         }
         let handler = Handler::new(Arc::clone(&self.config), new_http_client()?, repo_tokens);
@@ -148,13 +148,13 @@ impl Server for ServerImpl {
         }
 
         if let Some(shutdown) = &state.shutdown {
-            // Shutdown 与 Go 一样先关闭 listener；等待阶段被取消不会撤销关闭动作。
+            // Shutdown 先关闭 listener；等待阶段被取消不会撤销关闭动作。
             shutdown.cancel();
         }
 
         if let Some(serve_task) = state.serve_task.as_mut() {
-            // 无活跃连接时让 serve loop 先观察关闭信号，可复刻 Go 在检查 ctx 前先
-            // 判断连接已经 quiescent 的行为。
+            // 无活跃连接时先让 serve loop 观察关闭信号，以便在检查调用方取消前
+            // 确认服务已经退出。
             tokio::task::yield_now().await;
             if !serve_task.is_finished() {
                 tokio::select! {

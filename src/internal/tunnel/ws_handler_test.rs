@@ -1,4 +1,4 @@
-//! `internal/tunnel/ws_handler.go` 对应的本地 WebSocket 转发测试。
+//! 本地 WebSocket 转发测试。
 
 use std::sync::{Arc, Mutex};
 
@@ -22,9 +22,9 @@ use super::{
     WsTunnelOpen, WsTunnelOpened, apply_websocket_tunnel_headers, new_ws_handler,
 };
 
-/// Gorilla 必须在联网前拒绝调用方重复声明由握手器负责生成的保留头。
+/// WebSocket 必须在联网前拒绝调用方重复声明由握手器负责生成的保留头。
 #[test]
-fn test_websocket_headers_reject_gorilla_reserved_duplicates() {
+fn test_websocket_headers_reject_reserved_handshake_duplicates() {
     let cases = [
         ("Upgrade", "Upgrade"),
         ("connection", "Connection"),
@@ -85,7 +85,6 @@ struct RecordingWsSender {
 }
 
 impl RecordingWsSender {
-    /// 对应 Go：`recordingWSSender.waitMessage`。
     ///
     /// 等待 reader task 投递首条消息；先检查缓冲再注册通知，循环可避免消息恰好
     /// 落在检查与 `notified()` 之间时丢失唤醒。
@@ -192,9 +191,9 @@ async fn test_open_tunnel_rejects_invalid_port() {
     assert!(errors[0].error_message.contains("invalid port"));
 }
 
-/// 本地服务器拒绝升级时，错误必须复刻 Go `resp.Status + ErrBadHandshake`。
+/// 本地服务器拒绝升级时，错误必须实现。
 #[tokio::test]
-async fn test_open_tunnel_formats_bad_handshake_like_gorilla() {
+async fn test_open_tunnel_reports_rejected_websocket_handshake() {
     let router = Router::new().fallback(|| async { axum::http::StatusCode::FORBIDDEN });
     let (port, server) = start_server(router).await;
     let handler = new_ws_handler();
@@ -223,7 +222,7 @@ async fn test_open_tunnel_formats_bad_handshake_like_gorilla() {
     server.abort();
 }
 
-/// 本地 peer 未发 close frame 就 EOF 时，Gorilla 上报 1006 close 而非普通错误。
+/// 本地 peer 未发 close frame 就 EOF 时，WebSocket 上报 1006 close 而非普通错误。
 #[tokio::test]
 async fn test_local_websocket_abnormal_eof_is_reported_as_close_1006() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -672,9 +671,9 @@ async fn test_open_tunnel_send_message_and_close() {
     server.abort();
 }
 
-/// Go 把越界 close code 直接 cast 为 uint16，Rust 不得新增校验错误。
+/// 把越界 close code 直接 cast 为 uint16，Rust 不得新增校验错误。
 #[test]
-fn test_websocket_close_message_wraps_code_like_go() {
+fn test_websocket_close_message_wraps_code_to_u16() {
     for (input, expected) in [(-1, u16::MAX), (65_536, 0), (1000, 1000)] {
         let TungsteniteMessage::Close(Some(frame)) = websocket_close_message(input, "reason")
         else {

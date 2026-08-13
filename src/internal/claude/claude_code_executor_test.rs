@@ -35,7 +35,7 @@ use super::{
     },
 };
 
-/// 创建全部 Go 零值字段的 Claude config。
+/// 创建全部 null 或缺失字段的默认值的 Claude config。
 fn empty_config() -> ClaudeConfig {
     ClaudeConfig {
         command: String::new(),
@@ -78,7 +78,6 @@ fn make_executor(cfg: ClaudeConfig, startup: StartupContext) -> super::ClaudeCod
     .unwrap()
 }
 
-/// 对应 Go：`TestWriteMCPConfigFileFromGateway`。
 ///
 /// 验证 gateway MCP Base64 内容、默认 mode 与显式 path。
 #[tokio::test]
@@ -108,7 +107,6 @@ async fn test_write_mcp_config_file_from_gateway() {
     );
 }
 
-/// 对应 Go：`TestAddTokenViaFileDescriptor`。
 ///
 /// 验证首个 token 获得 FD 3，pipe 内容带唯一换行。
 #[test]
@@ -125,9 +123,9 @@ fn test_add_token_via_file_descriptor() {
     assert_eq!(content, "secret-token\n");
 }
 
-/// 验证 stderr tail 在截断前后使用 Go 的两套无效 UTF-8 规则。
+/// 验证 stderr tail 在截断前后使用 两套无效 UTF-8 规则。
 #[test]
-fn stderr_tail_matches_go_invalid_utf8_rules() {
+fn stderr_tail_replaces_each_invalid_utf8_byte() {
     assert_eq!(tail_string(b"\xff\xfe", 8), "\u{fffd}\u{fffd}");
     assert_eq!(tail_string(b"a\xff\xfeb", 3), "b");
     assert_eq!(tail_string("有效\u{fffd}".as_bytes(), 64), "有效\u{fffd}");
@@ -135,8 +133,8 @@ fn stderr_tail_matches_go_invalid_utf8_rules() {
 
 /// 验证三个 token 在真实 exec 后固定继承为 FD 3/4/5，且高位中转 FD 被关闭。
 ///
-/// 第一段 `pre_exec` 先用 stdin 占据 FD 3/4，模拟 Go `ExtraFiles` 安装时目标槽位
-/// 已被 runtime 内部 FD 使用的情况；生产映射必须随后用 `dup2` 正确覆盖它们。
+/// 第一段 `pre_exec` 先用 stdin 占据 FD 3/4，模拟目标槽位已被 runtime 内部 FD
+/// 使用的情况；生产映射必须随后用 `dup2` 正确覆盖它们。
 #[tokio::test]
 async fn token_descriptors_survive_exec_without_leaking_source_fds() {
     let mut descriptors = Vec::new();
@@ -321,7 +319,6 @@ fn test_write_ccr_upstream_proxy_token_rejects_empty_inputs() {
     assert!(executor.remove_stale_agent_proxy_token(&directory).is_err());
 }
 
-/// 对应 Go：`TestBuildArgsFromGatewayConfigMergesAppendSystemPrompt`。
 ///
 /// 验证 gateway prompt 与本地 prompt 合并，同时跳过空 gateway 值。
 #[tokio::test]
@@ -355,7 +352,6 @@ async fn test_build_args_from_gateway_config_merges_append_system_prompt() {
     assert!(!has_flag(&args, "--empty"));
 }
 
-/// 对应 Go：`TestBuildArgsFromGatewayConfigAppendsLocalPrompt`。
 ///
 /// 当 gateway 未提供 append prompt 时，验证本地 prompt 仍作为独立 flag 附加。
 #[tokio::test]
@@ -384,7 +380,7 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
         .map(|window| window[1].as_str())
 }
 
-/// 对应 Go：`assertFlagValue`，断言一个双参数 flag 存在且值完全相同。
+/// 断言一个双参数 flag 存在且值完全相同。
 fn assert_flag_value(args: &[String], flag: &str, expected: &str) {
     assert_eq!(
         flag_value(args, flag),
@@ -393,7 +389,7 @@ fn assert_flag_value(args: &[String], flag: &str, expected: &str) {
     );
 }
 
-/// 对应 Go：`hasFlag`，判断参数列表中是否出现指定 flag。
+/// 判断参数列表中是否出现指定 flag。
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|argument| argument == flag)
 }
@@ -506,8 +502,8 @@ async fn cancellation_does_not_kill_process_group() {
 
 /// 验证 Claude direct child 被取消后，继承 stdio 的孙进程会延迟 Execute 返回。
 ///
-/// Go `Cmd.Run` 会等待 stdout/stderr copy goroutine；只有显式结束孙进程、让两个
-/// pipe 到达 EOF 后，Rust 才能返回取消错误，不能擅自关闭 reader。
+/// 执行器会等待 stdout/stderr copy 后台任务；只有显式结束孙进程、让两个 pipe
+/// 到达 EOF 后，才能返回取消错误，不能擅自关闭 reader。
 #[tokio::test]
 async fn claude_cancellation_waits_for_descendant_pipe_eof() {
     // pipe-holder fixture 同样依赖 PATH 中的 sleep/mv，必须保护到孙进程清理完成。
@@ -575,7 +571,7 @@ fn init_only_environment_filter_is_exact() {
 
 /// 验证远端、本地、path/query 和 code-session URL 拼接。
 #[test]
-fn session_urls_match_go_string_semantics() {
+fn session_urls_use_literal_string_transforms() {
     assert_eq!(
         build_session_urls("https://api.example.com/path?q=1", "s", "v2", false),
         (

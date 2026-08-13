@@ -1,6 +1,6 @@
 //! Claude Code 版本探测、npm 安装与内置 CLI 升级。
 //!
-//! 版本识别复刻 Go 正则 `[0-9]+\.[0-9]+\.[0-9]+` 的“任意位置首个匹配”语义，
+//! 版本识别使用正则 `[0-9]+\.[0-9]+\.[0-9]+` 的“任意位置首个匹配”语义，
 //! 不引入额外 regex 依赖。所有命令使用 Tokio，取消只 kill direct child；升级失败
 //! 且已有版本时继续使用旧安装，这是调用方可观察的非致命回退。
 
@@ -26,7 +26,7 @@ pub(super) fn is_specific_version(version: &str) -> bool {
     find_version(version).is_some()
 }
 
-/// 找到 ASCII 文本中第一个 `数字.数字.数字` 子串，行为等价于 Go regexp。
+/// 找到 ASCII 文本中第一个匹配 `[0-9]+\.[0-9]+\.[0-9]+` 的子串。
 fn find_version(value: &str) -> Option<&str> {
     let bytes = value.as_bytes();
     let mut start = 0;
@@ -84,7 +84,7 @@ pub(super) async fn get_installed_version(
             let (stdout, _) = output.output.expect_separate();
             stdout
         }
-        // Go 忽略 `Cmd.Output` 的 error 但仍扫描非零退出前产生的 stdout。
+        // 忽略版本探测错误，但仍扫描非零退出前产生的 stdout。
         Err(error) => {
             let (stdout, _) = error.output.expect_separate();
             stdout
@@ -160,7 +160,7 @@ pub async fn install_or_update_claude_code(
     .await
 }
 
-/// 安装或更新 Claude Code，并把 Go o11y 调用交给显式 adapter。
+/// 安装或更新 Claude Code，并把 o11y 调用交给显式 adapter。
 pub async fn install_or_update_claude_code_with_observability(
     cancellation: &CancellationToken,
     claude_path: &str,

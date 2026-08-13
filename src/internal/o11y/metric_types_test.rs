@@ -1,4 +1,4 @@
-//! `metric_types.go` 的标签分类与覆盖合并回归测试。
+//! 指标标签分类与覆盖合并回归测试。
 
 use std::io;
 
@@ -6,7 +6,7 @@ use crate::internal::process::ProcessExitError;
 
 use super::{KvTagProvider, TagProvider, error_tags, merge_tags};
 
-/// 验证成功、普通错误和子进程退出错误的标签保持 Go 语义。
+/// 验证成功、普通错误和子进程退出错误的标签保持。
 #[test]
 fn test_error_tags() {
     assert!(error_tags(None).tags().is_empty());

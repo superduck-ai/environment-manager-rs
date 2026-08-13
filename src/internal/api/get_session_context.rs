@@ -1,4 +1,4 @@
-//! 对应 Go `internal/api/get_session_context.go` 的 session context 查询。
+//! session context 查询。
 //!
 //! 状态码分支和错误文本保持独立，调用方可以区分鉴权失败、session 不存在和普通后端
 //! 错误，而不需要依赖 Reqwest 内部错误类型。
@@ -28,7 +28,7 @@ impl SessionsClient {
         }
     }
 
-    /// 对应 Go `GetSessionContext`，查询并解析一个 session 的启动上下文。
+    /// 查询并解析一个 session 的启动上下文。
     pub async fn get_session_context(
         &self,
         cancellation: &CancellationToken,
@@ -78,15 +78,15 @@ impl SessionsClient {
         }
     }
 
-    /// 解释 `GetSessionContext` 已读取的响应 body，并保持 Go 状态码错误文本。
+    /// 解释 `GetSessionContext` 已读取的响应 body，并保持 状态码错误文本。
     ///
     /// # 参数
     /// - `status`：后端返回的 HTTP 状态码。
-    /// - `body`：已经按 Go transport 规则解压并完整读取的响应字节。
+    /// - `body`：已经按 transport 规则解压并完整读取的响应字节。
     /// - `session_id`：未经 URL 转义的原始 session 标识，用于日志和错误文本。
     ///
     /// # 返回
-    /// 200 时返回 session context；JSON 无效或状态码非 200 时返回兼容错误。
+    /// 200 时返回 session context；JSON 无效或状态码非 200 时返回稳定错误。
     fn parse_session_context_response(
         &self,
         status: StatusCode,
@@ -101,8 +101,8 @@ impl SessionsClient {
                             "failed to parse session context response: {error}"
                         ))
                     })?;
-                // Go 把顶层 JSON null 解进预先分配的 response struct 后保留零值；
-                // serde 对 struct 的默认行为会报错，因此这里显式恢复该兼容语义。
+                // 把顶层 JSON null 解进预先分配的 response struct 后保留零值；
+                // serde 对 struct 的默认行为会报错，因此这里显式映射为默认结构。
                 let response = response.unwrap_or_default();
                 tracing::debug!("session_id" = ?(session_id), "cwd" = ?(&response.session_context.cwd), "has_outcomes" = ?(response.session_context.outcomes.is_some()), "has_mcp_config" = ?(response.session_context.mcp_config.is_some()), "{}", "Successfully fetched session context");
                 Ok(response.session_context)

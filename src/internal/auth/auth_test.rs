@@ -1,10 +1,7 @@
-//! `internal/auth` 的行为回归测试，机械对应 Go 的 `auth_test.go`。
-//!
-//! 测试覆盖 provider 解析、凭据访问和错误边界。
+//! `internal/auth` 的行为回归测试，覆盖 provider 解析、凭据访问和错误边界。
 
 use super::*;
 
-/// 对应 Go：`authConfigJSON`。
 ///
 /// 将测试认证配置编码成生产解析器实际接收的 JSON 字节，避免 fixture 手写 JSON 时
 /// 绕过 `type` 字段 rename 或意外改变序列化行为。
@@ -12,9 +9,8 @@ fn auth_config_json(configurations: &[AuthConfig]) -> Vec<u8> {
     serde_json::to_vec(configurations).expect("测试认证配置必须能够序列化")
 }
 
-/// 对应 Go：`TestNewAuthContextWithSessionIDParsesAllRecoveredProviders`。
 ///
-/// 验证全部恢复的 provider、getter，以及 session 与 ingress token 的覆盖 setter。
+/// 验证全部 provider、getter，以及 session 与 ingress token 的覆盖 setter。
 #[test]
 fn test_new_auth_context_with_session_id_parses_all_providers() {
     let auth_json = auth_config_json(&[
@@ -70,9 +66,8 @@ fn test_new_auth_context_with_session_id_parses_all_providers() {
     assert_eq!(context.get_session_ingress_token(), "new-ingress-token");
 }
 
-/// 对应 Go：`TestNewAuthContextWithSessionIDHandlesEmptyAuth`。
 ///
-/// 验证 nil/空 auth wire 值只保留 session ID，不凭空产生任何 provider 凭据。
+/// 验证 `None`/空 auth wire 值只保留 session ID，不凭空产生任何 provider 凭据。
 #[test]
 fn test_new_auth_context_with_session_id_handles_empty_auth() {
     let context = new_auth_context_with_session_id(&[], "session-123").expect("空 auth 必须被接受");
@@ -82,9 +77,9 @@ fn test_new_auth_context_with_session_id_handles_empty_auth() {
     assert!(!context.has_supabase());
 }
 
-/// 补充 Go `encoding/json` 的零值边界：顶层 null、嵌套 null 和缺失凭据字段。
+/// 覆盖认证 JSON 的零值边界：顶层 null、嵌套 null 和缺失凭据字段。
 #[test]
-fn auth_null_and_missing_nested_fields_keep_go_zero_values() {
+fn auth_null_and_missing_nested_fields_use_defaults() {
     let top_level_null = new_auth_context_with_session_id(b"null", "session-null")
         .expect("顶层 null 等同 nil slice");
     assert_eq!(top_level_null.get_session_id(), "session-null");
@@ -112,10 +107,9 @@ fn auth_null_and_missing_nested_fields_keep_go_zero_values() {
     assert_eq!(null_element.to_string(), "unknown auth provider type: ");
 }
 
-/// 对应 Go：`TestNewAuthContextWithSessionIDReportsErrors`。
 ///
 /// 对非法顶层 JSON、每种 provider 的空 token、嵌套凭据 JSON 和未知 provider
-/// 逐项校验兼容错误文本，防止错误归类顺序在迁移中变化。
+/// 逐项校验稳定错误文本，防止错误归类顺序在重构中变化。
 #[test]
 fn test_new_auth_context_with_session_id_reports_errors() {
     let invalid =
@@ -203,7 +197,6 @@ fn test_new_auth_context_with_session_id_reports_errors() {
     }
 }
 
-/// 对应 Go：`TestGitHubSourceAuthProviderAuthenticatesHTTPSURLs`。
 ///
 /// 验证普通 token 与 username/password token 都只注入 HTTPS URL，且路径、host
 /// 与 scheme 不发生变化。
@@ -254,7 +247,6 @@ fn test_git_hub_source_auth_provider_authenticates_https_urls() {
     assert_eq!(explicit_root, "https://ghp-secret@github.com/");
 }
 
-/// 对应 Go：`TestGitHubSourceAuthProviderHandlesProxyJWTAndUnsupportedURLs`。
 ///
 /// 验证 git proxy JWT 的固定用户名，以及 SSH、HTTP、非法 URL 和空 token 均
 /// 原样返回并报告未认证。
@@ -295,7 +287,6 @@ fn test_git_hub_source_auth_provider_handles_proxy_jwt_and_unsupported_urls() {
     );
 }
 
-/// 对应 Go：`TestGitHubSourceAuthProviderSanitizesOutput`。
 ///
 /// 验证认证 URL、proxy userinfo 与裸 token 都不会从 git 子进程输出中泄漏，同时
 /// 保留公开仓库 URL 以便诊断。

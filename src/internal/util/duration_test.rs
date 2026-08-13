@@ -1,12 +1,12 @@
-//! Go duration 兼容格式与纳秒日志编码的表驱动测试。
+//! 紧凑 duration 格式与纳秒日志编码的表驱动测试。
 
 use std::time::Duration;
 
 use super::{duration_nanoseconds, format_go_duration};
 
-/// 覆盖 Go `time.Duration.String()` 的全部单位切换和复合时长边界。
+/// 覆盖紧凑 duration 格式的全部单位切换和复合时长边界。
 #[test]
-fn format_go_duration_matches_go_positive_duration_strings() {
+fn format_duration_uses_compact_positive_syntax() {
     let cases = [
         (Duration::ZERO, "0s"),
         (Duration::from_nanos(1), "1ns"),

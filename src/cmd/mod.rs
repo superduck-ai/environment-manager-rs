@@ -43,9 +43,9 @@ const ROOT_LONG_ABOUT: &str = "Environment Runner handles the lifecycle of agent
 
 /// 一次已经完成 CLI 校验、但尚未执行的命令调用。
 ///
-/// 该枚举是 CLI 与异步运行时之间唯一需要依赖的接线面。每个分支都保留了 Go
-/// 命令的默认值和“flag 是否由用户显式提供”等语义；执行层不需要再次读取 Clap
-/// 的 `ArgMatches`，也不会因命令尚未迁移而得到一个空的成功结果。
+/// 该枚举是 CLI 与异步运行时之间唯一需要依赖的接线面。每个分支都保留命令默认值
+/// 和“flag 是否由用户显式提供”等语义；执行层不需要再次读取 Clap 的 `ArgMatches`，
+/// 也不会因命令未实现而得到一个空的成功结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Invocation {
     /// 为指定 shell 生成自动补全脚本。
@@ -97,7 +97,7 @@ pub fn command(version: &'static str) -> Command {
         .subcommand(code_sign::add_code_sign_command())
 }
 
-/// 按 Go 入口的 argv0 规则规范化原始参数。
+/// 按 入口的 argv0 规则规范化原始参数。
 ///
 /// Git 把 `gpg.ssh.program` 配成名为 `code-sign` 的可执行文件时，不会再传入
 /// `code-sign` 子命令。入口检查 `argv[0]` 的 basename，并在它后面插入
@@ -134,7 +134,7 @@ where
     let argv = normalize_argv_for_codesign(argv);
     // Git 会把 OpenSSH 参数原样交给这个包装器；Clap 即使给位置
     // 参数开启 `allow_hyphen_values`，仍会消费 `--` 这个分隔符。code-sign 是 Git
-    // 调用的 argv 兼容入口，因此在识别到隐藏子命令后直接截取原始 OsString，避免
+    // 调用的原始 argv 入口，因此在识别到隐藏子命令后直接截取 OsString，避免
     // `--`、非 UTF-8 路径或未来 OpenSSH flag 被解析器改写。普通命令仍走完整 Clap
     // 校验，父级的 orchestrator/setup 等接线不受影响。
     if argv.get(1).is_some_and(|argument| argument == "code-sign") {

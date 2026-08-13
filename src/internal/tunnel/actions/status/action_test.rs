@@ -1,5 +1,4 @@
-//! status action 的 Linux loopback 测试，对应 Go `action_test.go`。
-
+//! status action 的 Linux loopback 测试，
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -21,19 +20,19 @@ impl ProgressReporter for NoopProgress {
     }
 }
 
-/// 对应 Go：`newTestStatusAction`，构造无日志副作用的 status action。
+/// 构造无日志副作用的 status action。
 fn new_test_status_action() -> StatusAction {
     new_status_action()
 }
 
-/// 对应 Go：`listenOnLocalhost`，监听 Linux loopback 随机端口。
+/// 监听 Linux loopback 随机端口。
 async fn listen_on_localhost() -> TcpListener {
     TcpListener::bind("127.0.0.1:0")
         .await
         .expect("loopback listener 应创建成功")
 }
 
-/// 对应 Go：`executeStatus`，使用两秒取消预算执行成功请求。
+/// 使用两秒取消预算执行成功请求。
 async fn execute_status(action: &StatusAction, body: Vec<u8>) -> ActionResult {
     let cancellation = CancellationToken::new();
     let timeout = cancellation.clone();
@@ -57,14 +56,13 @@ async fn execute_status(action: &StatusAction, body: Vec<u8>) -> ActionResult {
     result
 }
 
-/// 对应 Go：`assertStatusBody`，验证响应 JSON 中的端口和监听状态。
+/// 验证响应 JSON 中的端口和监听状态。
 fn assert_status_body(body: &[u8], listening: bool, port: u16) {
     let payload: serde_json::Value = serde_json::from_slice(body).expect("status body 应为 JSON");
     assert_eq!(payload["listening"], listening);
     assert_eq!(payload["port"], port);
 }
 
-/// 对应 Go：`TestStatusActionExecuteReportsListeningPort`。
 #[tokio::test]
 async fn test_status_action_execute_reports_listening_port() {
     let listener = listen_on_localhost().await;
@@ -75,7 +73,6 @@ async fn test_status_action_execute_reports_listening_port() {
     assert_status_body(&result.body, true, port);
 }
 
-/// 对应 Go：`TestStatusActionExecuteReportsClosedPort`。
 #[tokio::test]
 async fn test_status_action_execute_reports_closed_port() {
     let listener = listen_on_localhost().await;
@@ -87,7 +84,6 @@ async fn test_status_action_execute_reports_closed_port() {
     assert_status_body(&result.body, false, port);
 }
 
-/// 对应 Go：`TestStatusActionExecuteRejectsInvalidJSON`。
 #[tokio::test]
 async fn test_status_action_execute_rejects_invalid_json() {
     let action = new_test_status_action();
@@ -105,7 +101,6 @@ async fn test_status_action_execute_rejects_invalid_json() {
     assert!(error.to_string().starts_with("invalid request body:"));
 }
 
-/// 对应 Go：`TestStatusActionExecuteRejectsInvalidPort`。
 #[tokio::test]
 async fn test_status_action_execute_rejects_invalid_port() {
     let action = new_test_status_action();

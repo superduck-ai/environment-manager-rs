@@ -1,6 +1,6 @@
 //! `deploy` tunnel action 的编排实现。
 //!
-//! Vercel 流程保持 Go 的构建、收集、首次创建、缺失文件上传、再次创建和轮询顺序；
+//! Vercel 流程保持 构建、收集、首次创建、缺失文件上传、再次创建和轮询顺序；
 //! Antspace 流程保持先打包完整项目再 multipart 上传的顺序。外部命令继承父进程环境，
 //! stdout/stderr 共用同一 pipe 保留交错顺序，取消时只终止直接子进程。
 
@@ -24,7 +24,7 @@ use super::vercel::{collect_files, project_name, validate_project_dir};
 
 /// 空请求使用的固定 Baku 项目目录。
 const DEFAULT_PROJECT_DIR: &str = "/home/claude/project";
-/// 对应 Go：`(*DeployAction).Timeout` 的五分钟 action 上限。
+/// 五分钟 action 上限。
 pub const DEPLOY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// 失败构建最多回传 combined output 的最后 10 KiB。
 const BUILD_ERROR_OUTPUT_LIMIT: usize = 10 * 1024;
@@ -33,7 +33,7 @@ const VERCEL_READY_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 /// Antspace action 最终响应。
 ///
-/// `error` 不使用 `skip_serializing_if`，因此成功时仍编码为空字符串，匹配 Go 匿名
+/// `error` 不使用 `skip_serializing_if`，因此成功时仍编码为空字符串，匹配 匿名
 /// struct 的字段行为。
 #[derive(Serialize)]
 struct AntspaceActionResponse {
@@ -45,9 +45,8 @@ struct AntspaceActionResponse {
     error: &'static str,
 }
 
-/// 对应 Go：`NewDeployAction`。
 ///
-/// 构造函数不验证凭据或 target；Go 在每次执行时才根据请求 target 做相应检查，允许
+/// 构造函数不验证凭据或 target；在每次执行时才根据请求 target 做相应检查，允许
 /// 同一个 action 同时持有 Vercel 与 Antspace 配置。
 #[must_use]
 pub fn new_deploy_action(
@@ -66,11 +65,10 @@ pub fn new_deploy_action(
 
 #[async_trait]
 impl Action for DeployAction {
-    /// 对应 Go：`(*DeployAction).Execute`。
     ///
     /// 请求体为空时使用零值参数；随后先检查 project_dir 边界，再选择 target。Vercel
     /// 路径的构建子进程与 HTTP 均遵守取消令牌，文件遍历通过 blocking pool 执行但不
-    /// 人为加入 Go 不具备的中途取消点。
+    /// 人为加入 不具备的中途取消点。
     async fn execute(
         &self,
         cancellation: CancellationToken,
@@ -174,8 +172,8 @@ impl Action for DeployAction {
                     distribution_directory.display()
                 )
             })?;
-        // `collect_files` 已有一层同名包装；Go Execute 再包装一次，故这里刻意保留双层
-        // `collect files from ...`，让错误链文本与原实现一致。
+        // `collect_files` 已有一层同名包装；Execute 再包装一次，故这里刻意保留双层
+        // `collect files from ...`，让错误链文本与当前行为一致。
         let (files, file_data) = collected.map_err(|error| {
             format!(
                 "collect files from {}: {error}",
@@ -278,22 +276,21 @@ impl Action for DeployAction {
         })
     }
 
-    /// 对应 Go：`(*DeployAction).Name`。
+    /// 返回 control URL 使用的 action 名称。
     fn name(&self) -> &str {
         "deploy"
     }
 
-    /// 对应 Go：`(*DeployAction).Timeout`。
+    /// 返回构建、上传与部署轮询共享的总执行预算。
     fn timeout(&self) -> Duration {
         DEPLOY_TIMEOUT
     }
 }
 
 impl DeployAction {
-    /// 对应 Go：`(*DeployAction).executeAntspace`。
     ///
     /// 整个项目在 blocking pool 中打包，随后上传；客户端理论上永远返回 `Some`，但仍
-    /// 保留 Go 防御性 nil-result 检查对应的 `None` 错误。
+    /// 对缺失的执行结果返回显式 `None` 错误。
     async fn execute_antspace(
         &self,
         cancellation: &CancellationToken,
@@ -364,7 +361,7 @@ impl DeployAction {
 
 /// 向可选 reporter 发送一次进度更新。
 ///
-/// 对应 Go `sendProgress` 的 nil-safe 边界；Rust 的生产 action 总会提供 reporter，
+/// `None`-safe 边界；Rust 的生产 action 总会提供 reporter，
 /// `Option` 仍允许独立调用方明确关闭进度而无需伪造空实现。
 async fn send_progress(
     progress: Option<&dyn ProgressReporter>,
@@ -376,10 +373,9 @@ async fn send_progress(
     progress.send_progress(update).await
 }
 
-/// 对应 Go：`getCommitSHA`。
 ///
 /// 仅捕获 stdout，忽略 stderr；任何 spawn、取消或非零退出都返回空字符串。命令继承
-/// 完整父进程环境并以项目目录为 cwd；取消只杀 direct child，随后像 Go `Output` 一样
+/// 完整父进程环境并以项目目录为 cwd；取消只杀 direct child，随后
 /// 等待 child 和 stdout pipe 清理完成。
 pub(super) async fn get_commit_sha(cancellation: &CancellationToken, directory: &Path) -> String {
     let mut command = Command::new("git");

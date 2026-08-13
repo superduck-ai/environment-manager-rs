@@ -1,8 +1,7 @@
 //! 控制 action 注册表和 NDJSON 调度实现。
 //!
-//! 对应 Go `internal/tunnel/actions/registry.go`。Rust 使用 async trait、
-//! `CancellationToken` 和 Tokio timeout 替代 goroutine/context，同时保持响应顺序号、
-//! 同名互斥、panic 隔离以及 Go `encoding/json` 的 Base64 字节行为。
+//! Rust 使用 async trait、`CancellationToken` 和 Tokio timeout，并保持响应顺序号、
+//! 同名互斥、panic 隔离以及协议规定的 Base64 字节行为。
 
 use std::any::Any;
 use std::backtrace::Backtrace;
@@ -26,10 +25,9 @@ use crate::r#gen::proto::anthropic::sessions::tunnel::v1alpha::{
     Header, HttpTunnelResponseChunk, HttpTunnelResponseError, HttpTunnelResponseHeaders,
 };
 
-/// 对应 Go `DefaultActionTimeout`：action 未声明超时时使用五分钟。
+/// action 未声明超时时使用五分钟。
 pub const DEFAULT_ACTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
-/// 对应 Go：`actions.NewRegistry`。
 ///
 /// 创建空 action 表和运行集合。
 #[must_use]
@@ -41,7 +39,6 @@ pub fn new_registry() -> Registry {
 }
 
 impl Registry {
-    /// 对应 Go：`(*Registry).Register`。
     ///
     /// 以 action 的稳定名称覆盖已有注册项。写锁不会跨异步边界持有；正在执行的旧
     /// action 已经持有自己的 `Arc`，因此覆盖不会中断它。
@@ -54,11 +51,10 @@ impl Registry {
         tracing::info!("action" = ?(name), "{}", "control_action_registered");
     }
 
-    /// 对应 Go：`(*Registry).Execute`。
     ///
     /// 从 `/__control/<name>` 提取 action，拒绝同名并发，发送 NDJSON header 后执行
     /// action，最终总会释放运行占位。调用方取消、action 超时和 panic 都会转换成
-    /// 最终错误分片；sender 在发送 header 前失败时与 Go 一样直接停止。
+    /// 最终错误分片；sender 在发送 header 前失败时直接停止。
     pub async fn execute(
         &self,
         cancellation: CancellationToken,
@@ -117,8 +113,8 @@ impl Registry {
         )
         .await;
 
-        // Go 通过 defer 删除 running 标记；这里把清理放在所有错误都已被内部吸收的
-        // 单一出口，确保 sender 错误、超时和 panic 都不会永久锁死 action。
+        // 在所有错误都已被内部吸收的单一出口删除 running 标记，确保 sender 错误、
+        // 超时和 panic 都不会永久锁死 action。
         self.running
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -176,8 +172,8 @@ impl Registry {
             request_id: request_id.to_owned(),
         });
 
-        // `catch_unwind` 覆盖 action future 的每次 poll，而不只覆盖 future 的创建；
-        // 这才等价于 Go defer/recover 对整个 Execute 调用栈的保护。
+        // `catch_unwind` 覆盖 action future 的每次 poll，而不只覆盖 future 的创建，
+        // 因而能保护整个 execute 调用栈。
         let future =
             AssertUnwindSafe(action.execute(action_cancellation.clone(), request, reporter))
                 .catch_unwind();
@@ -202,7 +198,7 @@ impl Registry {
             }
         };
 
-        // 三个终态在这里机械展开：日志必须直接从 Go 对应控制分支调用 facade，才能让
+        // 三个终态在这里展开：日志必须直接从各自控制分支调用 facade，才能让
         // `#[track_caller]` 保留各自的 source，而不是统一落到一个动态 helper。
         let (payload, is_error, panicked) = match outcome {
             ActionOutcome::Success(result) => {
@@ -247,14 +243,13 @@ impl Registry {
             })
             .await;
 
-        // Go 的 recover defer 在 panic 后直接返回，不会执行函数尾部 complete 事件。
+        // panic 后直接返回，不执行函数尾部 complete 事件。
         if panicked {
             return;
         }
         tracing::info!(action = %action_name, is_error, session_id = %session_id, "control_action_complete");
     }
 
-    /// 对应 Go：`(*Registry).sendJSONResponse`。
     ///
     /// 未知或并发冲突在执行 action 前返回普通 JSON；header/chunk 仍共享顺序号。
     async fn send_json_response(
@@ -289,22 +284,22 @@ impl Registry {
     }
 }
 
-/// action future 的三种终态；panic 与普通错误需要不同兼容文本。
+/// action future 的三种终态；panic 与普通错误使用不同的稳定文本。
 enum ActionOutcome {
     /// 正常返回业务结果。
     Success(ActionResult),
     /// action 错误、取消或超时。
     Error(String),
-    /// action 内发生 panic；保存 Go panic 日志所需的值文本与栈文本。
+    /// action 内发生 panic；保存 panic 日志所需的值文本与栈文本。
     Panic {
-        /// panic payload 的兼容文本。
+        /// panic payload 的稳定文本。
         value: String,
         /// 捕获到 panic 后立即取得的 Rust backtrace。
         stack: String,
     },
 }
 
-/// 把 Rust panic payload 转成 Go `fmt.Sprintf("%v", rec)` 对字符串 panic 的文本。
+/// 把 Rust panic payload 转成稳定文本。
 ///
 /// Rust 的 `Any` 对任意用户类型不提供格式化能力；生产 action 只使用字符串 panic，
 /// 其他类型使用稳定占位文本，仍确保日志和错误响应不会再次 panic。
@@ -318,7 +313,7 @@ fn panic_value(payload: &(dyn Any + Send)) -> String {
     }
 }
 
-/// 从控制 URL 中提取第一个 path segment，保持 Go 的 TrimPrefix/Cut 语义。
+/// 从控制 URL 中提取第一个 path segment，保持 TrimPrefix/Cut 语义。
 fn action_name_from_path(path: &str) -> String {
     path.strip_prefix("/__control/")
         .unwrap_or(path)
@@ -349,7 +344,7 @@ impl SequencedSender {
 
 #[async_trait]
 impl ResponseSender for SequencedSender {
-    /// 对应 Go：`(*sequencedSender).SendHeaders`，写入下一个序号并包装错误。
+    /// 写入下一个序号并包装错误。
     async fn send_headers(
         &self,
         mut response: HttpTunnelResponseHeaders,
@@ -361,7 +356,7 @@ impl ResponseSender for SequencedSender {
             .map_err(|error| format!("sequenced send headers: {error}").into())
     }
 
-    /// 对应 Go：`(*sequencedSender).SendChunk`，写入下一个序号并包装错误。
+    /// 写入下一个序号并包装错误。
     async fn send_chunk(&self, mut chunk: HttpTunnelResponseChunk) -> Result<(), ActionError> {
         set_sequence_number(&self.sequence_number, &mut chunk.sequence_number);
         self.inner
@@ -370,7 +365,7 @@ impl ResponseSender for SequencedSender {
             .map_err(|error| format!("sequenced send chunk: {error}").into())
     }
 
-    /// 对应 Go：`(*sequencedSender).SendError`；协议错误没有 sequence 字段。
+    /// 协议错误没有 sequence 字段。
     async fn send_error(&self, response: HttpTunnelResponseError) -> Result<(), ActionError> {
         self.inner
             .send_error(response)
@@ -381,8 +376,8 @@ impl ResponseSender for SequencedSender {
 
 /// 为带 sequence_number 字段的强类型响应分配下一个序号。
 ///
-/// 对应 Go `setSequenceNumber` 的反射 helper；Rust 在调用点传入确定的 protobuf
-/// 字段引用，因此不接受 nil、非结构体或错误字段类型，编译期即可排除这些分支。
+/// 反射 helper；Rust 在调用点传入确定的 protobuf
+/// 字段引用，因此不接受 `None`、非结构体或错误字段类型，编译期即可排除这些分支。
 fn set_sequence_number(counter: &AtomicU32, destination: &mut u32) {
     *destination = counter.fetch_add(1, Ordering::SeqCst);
 }
@@ -395,7 +390,7 @@ struct TunnelProgressReporter {
 
 #[async_trait]
 impl ProgressReporter for TunnelProgressReporter {
-    /// 对应 Go：`(*tunnelProgressReporter).SendProgress`。
+    /// 将进度更新编码为带单调序号的 NDJSON chunk。
     async fn send_progress(&self, update: ProgressUpdate) -> Result<(), ActionError> {
         let mut payload = BTreeMap::new();
         payload.insert("message", Value::String(update.message));

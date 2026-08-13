@@ -64,7 +64,7 @@ impl Client {
             name: slug.to_owned(),
             verify_jwt: true,
         };
-        // Go json.Encoder.Encode 在 metadata 后附带换行，保留这一 multipart 字节行为。
+        // JSON encoder 在 metadata 后附带换行，保留这一 multipart 字节行为。
         let metadata_json = format!(
             "{}\n",
             serde_json::to_string(&metadata)
@@ -148,7 +148,7 @@ pub fn collect_function_files(
     .map_err(|error| McpError::message(format!("walk funcDir: {error}")))?;
 
     if let Some(shared_directory) = shared_directory {
-        // EvalSymlinks on a missing/broken shared directory returns ErrNotExist; Go ignores it.
+        // EvalSymlinks on a missing/broken shared directory returns ErrNotExist; ignores it.
         match std::fs::canonicalize(shared_directory) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(McpError::message(format!("sharedDir: {error}"))),
@@ -231,14 +231,14 @@ pub(crate) fn is_function_slug(value: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-/// 复刻 Go `url.QueryEscape`（空格写成 `+`）。
+/// 实现form URL 编码（空格写成 `+`）。
 pub(crate) fn query_escape(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
     let mut escaped = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
-            // Go 的 encodeQueryComponent 只保留 RFC 3986 unreserved 字节；
+            // encodeQueryComponent 只保留 RFC 3986 unreserved 字节；
             // WHATWG form serializer 会额外保留 `*` 并转义 `~`，不能在这里复用。
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 escaped.push(char::from(byte));

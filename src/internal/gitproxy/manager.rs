@@ -1,7 +1,6 @@
 //! Git proxy manager 的幂等生命周期与仓库 URL 生成。
 //!
-//! 本文件机械对应 Go `manager.go`。启动和停止通过 Tokio mutex 串行化，快速状态
-//! 查询使用原子值；只有底层操作成功后才切换 running。仓库 URL 固定注入
+//! 启动和停止通过 Tokio mutex 串行化，快速状态查询使用原子值；只有底层操作成功后才切换 running。仓库 URL 固定注入
 //! `local_proxy@` 用户名，让 Git 在 `info/refs` challenge 后自动发送 Basic 认证头。
 
 use std::sync::{
@@ -17,7 +16,7 @@ use super::{
     Config, GitProxyError, GitProxyResult, Manager, SharedManager, SharedServer, new_server,
 };
 
-/// Go 私有 `manager` 的 Tokio 对应实现。
+/// 基于 Tokio 的私有 proxy manager 实现。
 pub(super) struct ManagerImpl {
     server: SharedServer,
     config: Arc<Config>,
@@ -37,10 +36,10 @@ impl ManagerImpl {
     }
 }
 
-/// 对应 Go `NewManager`，验证 config 并包装 server 构造错误。
+/// 验证 config 并包装 server 构造错误。
 ///
 /// `None` 在进入 server 前直接返回 `config is required`；其他验证错误统一添加
-/// `failed to create server:` 前缀，与 Go `%w` 形成的可观察文本一致。
+/// `failed to create server:` 前缀，与 错误 source chain 形成的可观察文本一致。
 pub fn new_manager(config: Option<Config>) -> GitProxyResult<SharedManager> {
     let config = config.ok_or_else(|| GitProxyError::message("config is required"))?;
     let server = new_server(Some(config.clone()))

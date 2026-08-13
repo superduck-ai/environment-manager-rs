@@ -1,7 +1,7 @@
 //! `rmcp` 隔离适配层的 wire 保真测试。
 //!
-//! 这些测试验证官方 SDK 参与模型校验时，不会裁剪 mcp-go 接受的未知字段，也不会
-//! 改写 `omitempty` 结果。它们补充 `server_test.rs` 的 HTTP/JSON-RPC 端到端断言。
+//! 这些测试验证官方 SDK 参与模型校验时，不会裁剪 MCP wire 接受的未知字段，也不会
+//! 改写字段省略结果。它们补充 `server_test.rs` 的 HTTP/JSON-RPC 端到端断言。
 
 use serde_json::{Map, json};
 
@@ -9,7 +9,7 @@ use super::{CallToolResult, TextContent, Tool, rmcp_adapter};
 
 /// 验证工具声明经过 SDK 校验后仍原样保留未知扩展字段。
 #[test]
-fn tool_declaration_preserves_go_extensions() {
+fn tool_declaration_preserves_protocol_extensions() {
     let mut tool = Tool::new(
         "inspect",
         "检查环境",
@@ -49,7 +49,7 @@ fn tool_declaration_rejects_non_object_schema() {
     );
 }
 
-/// 验证成功结果保持 mcp-go 的 `isError` 省略规则和扩展字段。
+/// 验证成功结果保持 MCP wire 的 `isError` 省略规则和扩展字段。
 #[test]
 fn call_tool_result_preserves_omitempty_and_extensions() {
     let mut extra = Map::new();

@@ -1,6 +1,6 @@
 //! Vercel 文件索引、上传与部署轮询。
 //!
-//! 该实现保留 Go 的 100 MiB 上限、SHA-1 content-addressed 上传、只接受 HTTP 200、
+//! 该实现保留 100 MiB 上限、SHA-1 content-addressed 上传、只接受 HTTP 200、
 //! 429/5xx 轮询重试，以及未经额外转义直接拼接 `teamId` 的请求形状。
 
 use std::collections::HashMap;
@@ -17,11 +17,11 @@ use crate::internal::{tunnel::actions::ActionError, util::format_go_duration};
 
 use super::types::{Deployment, FileEntry, VercelClient, VercelErrorResponse};
 
-/// 对应 Go `maxDeploymentBytes`：单次部署所有普通文件合计最多 100 MiB。
+/// 单次部署所有普通文件合计最多 100 MiB。
 pub const MAX_DEPLOYMENT_BYTES: usize = 100 * 1024 * 1024;
 /// `collect_files` 的文件索引与按 SHA-1 去重内容映射返回值。
 ///
-/// 使用命名别名仅为降低公开签名复杂度；wire 数据和 Go 的“双返回值”语义不变。
+/// 使用命名别名仅为降低公开签名复杂度；wire 数据和 “双返回值”语义不变。
 pub type CollectedFiles = (Vec<FileEntry>, HashMap<String, Vec<u8>>);
 /// Vercel HTTP 客户端的整次请求超时。
 const VERCEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -30,7 +30,7 @@ const DEPLOYMENT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// deployment API 请求体。
 ///
-/// 字段按 Go `encoding/json` 对 map key 的字典序排列，既保持 wire 值，也让原始 JSON
+/// 字段按字典序排列，既保持 wire 值，也让原始 JSON
 /// 字节在诊断和录制测试中稳定。
 #[derive(Serialize)]
 struct DeploymentRequest<'a> {
@@ -57,8 +57,7 @@ struct ProjectSettings {
 impl VercelClient {
     /// 创建生产 Vercel 客户端。
     ///
-    /// 固定 API base URL 与一分钟请求超时分别对应 Go action 中的字面量和
-    /// `http.Client{Timeout: time.Minute}`。
+    /// 使用固定 API base URL 和一分钟请求超时。
     #[must_use]
     pub fn new(token: impl Into<String>, team_id: impl Into<String>) -> Self {
         let http_client = reqwest::Client::builder()
@@ -73,7 +72,6 @@ impl VercelClient {
         }
     }
 
-    /// 对应 Go：`(*VercelClient).CreateDeployment`。
     ///
     /// 成功返回 deployment；Vercel 的 `missing_files` 错误即使使用非 200 状态也不算
     /// action 失败，而是返回待上传 SHA 列表。其他非 200 状态保留完整响应体。
@@ -132,10 +130,9 @@ impl VercelClient {
         Ok((Some(deployment), Vec::new()))
     }
 
-    /// 对应 Go：`(*VercelClient).UploadFile`。
     ///
     /// 原始文件字节通过 `/v2/files` 上传，SHA 放在 `x-vercel-digest`；只有精确的 200
-    /// 被接受。成功响应体被消费但消费错误与 Go `io.Copy(io.Discard)` 一样忽略。
+    /// 被接受。成功响应体被消费，但消费错误会被忽略。
     pub async fn upload_file(
         &self,
         cancellation: &CancellationToken,
@@ -173,11 +170,10 @@ impl VercelClient {
         Ok(())
     }
 
-    /// 对应 Go：`(*VercelClient).WaitForReady`。
     ///
     /// 每次循环先检查 deadline 和取消，再查询 deployment。429 与所有 5xx 等待两秒
     /// 后重试；`READY` 返回，`ERROR`/`CANCELED` 立即失败，其他状态继续轮询。两秒等待
-    /// 不会被剩余 deadline 截短，保持 Go 可能略微越过 deadline 的行为。
+    /// 不会被剩余 deadline 截短，保持 可能略微越过 deadline 的行为。
     pub async fn wait_for_ready(
         &self,
         cancellation: &CancellationToken,
@@ -241,10 +237,9 @@ impl VercelClient {
     }
 }
 
-/// 对应 Go：`CollectFiles`。
 ///
 /// 以目录项名称排序做深度优先遍历；目录与 symlink 不进入文件列表。每个普通/特殊
-/// 非目录项完整读取后才累计上限，复刻 Go 在发现超限前已经读取当前文件的行为。
+/// 非目录项完整读取后才累计上限，因此发现超限时当前文件已经读取完毕。
 /// 相同内容共享 `file_data` 中的一份 SHA 映射，但文件索引仍逐项保留。
 pub fn collect_files(directory: impl AsRef<Path>) -> Result<CollectedFiles, ActionError> {
     let directory = directory.as_ref();
@@ -309,10 +304,9 @@ pub fn collect_files(directory: impl AsRef<Path>) -> Result<CollectedFiles, Acti
     Ok((files, file_data))
 }
 
-/// 对应 Go：`ValidateProjectDir`。
 ///
 /// 只做词法 clean 和前缀判断，不解析 symlink；这既允许
-/// `/home/claude/project/../project`，也保留原实现由后续文件操作决定 symlink 目标的
+/// `/home/claude/project/../project`，也保留当前行为由后续文件操作决定 symlink 目标的
 /// 行为。
 pub fn validate_project_dir(directory: &str) -> Result<(), ActionError> {
     let clean = clean_unix_path(directory);
@@ -322,11 +316,10 @@ pub fn validate_project_dir(directory: &str) -> Result<(), ActionError> {
     Ok(())
 }
 
-/// 对应 Go：`ProjectName`。
 ///
 /// 最多保留去前缀后的前 20 个 UTF-8 **字节**，随后做 Unicode simple lowercase；
 /// ASCII 小写字母、数字和连字符之外的每个 rune 都变成一个连字符。无效或被截断的
-/// UTF-8 字节按 Go range 规则逐字节变成连字符。
+/// UTF-8 字节按 range 规则逐字节变成连字符。
 #[must_use]
 pub fn project_name(session_id: &str) -> String {
     let stripped = session_id
@@ -366,7 +359,7 @@ pub fn project_name(session_id: &str) -> String {
     format!("baku-{normalized}")
 }
 
-/// 把一个 Unicode rune 依照 Go `strings.ToLower` 后的 allow-list 写入项目名。
+/// 把一个 Unicode scalar value 按 allow-list 写入项目名。
 fn push_project_character(output: &mut String, character: char) {
     let lower = character.to_lowercase().next().unwrap_or(character);
     if lower.is_ascii_lowercase() || lower.is_ascii_digit() || lower == '-' {
@@ -378,7 +371,7 @@ fn push_project_character(output: &mut String, character: char) {
 
 /// 对单次 HTTP 请求施加 action 取消令牌。
 ///
-/// 丢弃 reqwest future 会关闭本次请求；错误文本使用 Go context 的稳定
+/// 丢弃 reqwest future 会关闭本次请求；错误文本使用 取消上下文 的稳定
 /// `context canceled`，由各 API 方法再加各自的外层操作说明。
 async fn execute_request(
     client: &reqwest::Client,
@@ -406,7 +399,7 @@ async fn read_response(
     }
 }
 
-/// 固定等待一次 deployment poll；取消时返回 Go 的原始错误包装文本。
+/// 固定等待一次 deployment poll；取消时返回 原始错误包装文本。
 async fn wait_for_deployment_poll(cancellation: &CancellationToken) -> Result<(), ActionError> {
     tokio::select! {
         () = tokio::time::sleep(DEPLOYMENT_POLL_INTERVAL) => Ok(()),
@@ -416,7 +409,7 @@ async fn wait_for_deployment_poll(cancellation: &CancellationToken) -> Result<()
     }
 }
 
-/// 在 URL 后按 Go 字符串拼接方式附加 team ID，不额外 percent-encode。
+/// 在 URL 后按 字符串拼接方式附加 team ID，不额外 percent-encode。
 fn append_team_id(url: &mut String, team_id: &str) {
     if !team_id.is_empty() {
         url.push_str("?teamId=");
@@ -424,7 +417,7 @@ fn append_team_id(url: &mut String, team_id: &str) {
     }
 }
 
-/// 实现 Unix `filepath.Clean` 的词法部分，供项目目录边界检查使用。
+/// 实现 Unix 词法路径归一化 的词法部分，供项目目录边界检查使用。
 fn clean_unix_path(path: &str) -> String {
     let absolute = path.starts_with('/');
     let mut components: Vec<&str> = Vec::new();

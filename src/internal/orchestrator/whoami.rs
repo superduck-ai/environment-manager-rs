@@ -18,9 +18,9 @@ use crate::{
 const ENVIRONMENTS_BETA: &str = "environments-2025-11-01";
 const WHOAMI_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Whoami 的 Go `encoding/json` 兼容 wire 结构。
+/// Whoami 的 wire 结构。
 ///
-/// Go string 字段对 missing 与显式 null 都保留空零值；普通 Rust `String` 即使带
+/// string 字段对 missing 与显式 null 都保留空零值；普通 Rust `String` 即使带
 /// `#[serde(default)]` 仍会拒绝 null。先用 Option 接住两种空值，再转换为公开 DTO。
 #[derive(Default, Deserialize)]
 #[serde(default)]
@@ -31,7 +31,7 @@ struct GoWhoamiResponse {
     environment_id: Option<String>,
 }
 
-/// 对应 Go `NewWhoamiClient`，创建身份发现客户端。
+/// 创建身份发现客户端。
 pub fn new_whoami_client(
     api_base_url: impl Into<String>,
     auth_token: impl Into<String>,
@@ -41,7 +41,7 @@ pub fn new_whoami_client(
         api_base_url = format!("https://{api_base_url}");
     }
     WhoamiClient {
-        // Go 的 Whoami 构造器只补 scheme，不清理调用方给出的尾随斜杠。虽然正常
+        // Whoami 构造器只补 scheme，不清理调用方给出的尾随斜杠。虽然正常
         // 配置通常没有 `/`，保留它才能让 `base/ + /v1` 继续产生可观察的 `//v1`。
         api_base_url,
         auth_token: auth_token.into(),
@@ -52,7 +52,7 @@ pub fn new_whoami_client(
 }
 
 impl WhoamiClient {
-    /// 对应 Go `(*WhoamiClient).GetIdentity`，获取 service key 对应身份。
+    /// 获取 service key 对应身份。
     ///
     /// 取消令牌同时覆盖发送与 body 读取，避免只取消到“收到响应头”为止。非 200 响应
     /// 保留 body 文本，便于启动失败时展示服务端解释。
@@ -114,7 +114,7 @@ impl WhoamiClient {
             serde_json::from_slice(&body).map_err(|error| {
                 OrchestratorError::message(format!("failed to unmarshal whoami response: {error}"))
             })?;
-        // `json.Unmarshal("null", &struct)` 不报错且保留整份 struct 零值；Option 只在
+        // JSON 解码 不报错且保留整份 struct 零值；Option 只在
         // 本地 wire 边界表达该语义，公开 WhoamiResponse 仍保持稳定的 String 字段。
         let response = response.unwrap_or_default();
         let response = WhoamiResponse {

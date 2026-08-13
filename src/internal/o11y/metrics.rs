@@ -10,7 +10,7 @@ use super::{
     error_tags, increment, merge_tags, record_gauge,
 };
 
-/// 记录环境管理器启动，并使用兼容字段名 `session_mode`。
+/// 记录环境管理器启动，并使用稳定字段名 `session_mode`。
 pub fn increment_env_manager_start(context: &O11yContext, mode: SessionMode) {
     let mode_tags = KvTagProvider::one("session_mode", mode.as_str());
     increment(context, Some(&ENV_MANAGER_START_COUNTER), &[&mode_tags]);
@@ -18,7 +18,7 @@ pub fn increment_env_manager_start(context: &O11yContext, mode: SessionMode) {
 
 /// 记录环境管理器结束。
 ///
-/// Go 版本在启动和结束指标上分别使用 `session_mode` 与 `mode`；这里有意保留这一
+/// 在启动和结束指标上分别使用 `session_mode` 与 `mode`；这里有意保留这一
 /// 不对称，避免现有 dashboard 的标签维度发生变化。
 pub fn increment_env_manager_end(
     context: &O11yContext,
@@ -59,7 +59,7 @@ pub fn increment_orchestrator_session_end(
 /// 将一次函数执行同时记录为调用次数与毫秒耗时。
 ///
 /// 错误标签最后合并，因此会覆盖调用方误传的同名 `error`/`error_code`。耗时使用
-/// `Duration::as_millis`，与 Go `Duration.Milliseconds()` 一样舍弃不足 1ms 的部分。
+/// `Duration::as_millis` 舍弃不足 1ms 的部分。
 pub fn record_duration(
     context: &O11yContext,
     metric: Option<&O11yFunctionMetric>,

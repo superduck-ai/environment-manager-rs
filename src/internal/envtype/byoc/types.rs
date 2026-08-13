@@ -1,8 +1,8 @@
 //! BYOC 配置、认证 transport 以及外部子系统适配边界。
 //!
-//! 对应 Go：`internal/envtype/byoc/byoc.go` 中的配置、环境、认证 RoundTripper 和
-//! lease 创建参数。`SourceProcessor` 与 `LeaseManagerFactory` 是 Rust 为隔离测试
-//! 增加的最小接口；生产仍调用真实 clone/proxy 和 heartbeat 状态机。
+//! 保存配置、环境、认证 transport 和 lease 创建参数。`SourceProcessor` 与
+//! `LeaseManagerFactory` 是隔离外部副作用的最小接口；生产仍调用真实 clone/proxy 和
+//! heartbeat 状态机。
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -38,7 +38,7 @@ pub struct ByocConfig {
     pub environment: BTreeMap<String, String>,
 }
 
-/// 将 Go `encoding/json` 对 null string 的“保留零值”语义映射到 Rust。
+/// 将 JSON null string 映射为空字符串零值。
 fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -46,7 +46,7 @@ where
     Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
-/// 接受 null map 和 null string value，与 Go `map[string]string` 反序列化零值一致。
+/// 接受 null map，并把 null string value 映射为空字符串。
 fn deserialize_nullable_environment<'de, D>(
     deserializer: D,
 ) -> Result<BTreeMap<String, String>, D::Error>
@@ -132,7 +132,7 @@ pub enum ByocError {
         #[source]
         source: crate::internal::process::ProcessExitError,
     },
-    /// initialize 在 task setup 边界追加的 Go 兼容错误上下文。
+    /// initialize 在 task setup 边界追加的稳定错误上下文。
     #[error("task setup script failed: {0}")]
     TaskSetup(#[source] BoxError),
     /// 用户 home 目录不可用。
@@ -141,7 +141,7 @@ pub enum ByocError {
     /// Claude 设置目录或文件无法准备。
     #[error("{operation}: {source}")]
     FileSystem {
-        /// 兼容 Go 错误前缀的操作文本。
+        /// 构成稳定错误前缀的操作文本。
         operation: &'static str,
         /// 原始 I/O 错误。
         #[source]
@@ -231,7 +231,7 @@ impl fmt::Debug for SourceProcessRequest {
     }
 }
 
-/// source adapter 用于让 BYOC 保留 Go 的分阶段错误边界。
+/// source adapter 用于让 BYOC 保留 分阶段错误边界。
 #[derive(Debug, Error)]
 pub enum SourceProcessorError {
     /// `SourceHandlerManager` 构造失败，尚未开始 source 或 proxy 副作用。
@@ -284,9 +284,9 @@ impl fmt::Debug for ContainProvideAuthRoundTripper {
     }
 }
 
-/// 早期 Rust 调用方使用的兼容别名。
+/// 公开的 BYOC environment 类型别名。
 ///
-/// 新名称与 Go 的 `containProvideAuthRoundTripper` 对齐；别名保留已经采用
+/// 新名称与 `containProvideAuthRoundTripper` 对齐；别名保留已经采用
 /// `Transport` 术语的内部调用面。
 pub type ContainProvideAuthTransport = ContainProvideAuthRoundTripper;
 
@@ -326,7 +326,7 @@ impl fmt::Debug for LeaseManagerRequest {
     }
 }
 
-/// podmonitor 迁移后接入的 lease manager 工厂。
+/// podmonitor 使用的 lease manager 工厂。
 pub trait LeaseManagerFactory: Send + Sync {
     /// 使用 BYOC 已认证 transport 构造句柄，不在本模块重复 heartbeat 状态机。
     fn create(&self, request: LeaseManagerRequest)
@@ -373,7 +373,7 @@ impl fmt::Debug for ByocEnvironmentType {
 }
 
 impl ContainProvideAuthRoundTripper {
-    /// 构造带 30 秒超时的 Reqwest client，保留 Go `http.Client` 语义。
+    /// 构造带 30 秒超时的 Reqwest client，保留 HTTP client 语义。
     pub fn new(
         token: impl Into<String>,
         organization_uuid: impl Into<String>,
@@ -405,7 +405,7 @@ impl ContainProvideAuthRoundTripper {
     pub fn authorize_request(&self, request: &mut Request) -> Result<(), ByocError> {
         let headers = authentication_headers(&self.token, &self.organization_uuid)?;
         for (name, value) in &headers {
-            // `insert` 而不是 append，保留 Go Header.Set 覆盖调用方同名值的语义。
+            // `insert` 而不是 append，保留 Header.Set 覆盖调用方同名值的语义。
             request.headers_mut().insert(name.clone(), value.clone());
         }
         Ok(())

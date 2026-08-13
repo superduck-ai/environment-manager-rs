@@ -1,6 +1,6 @@
 //! `task-run` 子命令的参数模型、stdin 协议和完整会话运行时。
 //!
-//! 本文件迁移 Go `cmd/cmd_task_run.go`：Clap 只解析参数，运行层仍按 Go 顺序完成
+//! Clap 只解析参数，运行层依次完成
 //! session flock、无条件 stdin 读取、work ACK、后端选择、Claude 安装、诊断与 OTel、
 //! environment manager 以及信号关闭。所有外部命令取消只终止 direct child。
 
@@ -106,7 +106,7 @@ impl crate::internal::input::SessionContextProvider for ApiSessionContextProvide
     /// 为每份 work secret 使用其中的 base URL 与 ingress token 获取 session context。
     ///
     /// token 只进入 Authorization header；返回 DTO 会保留 RawMessage 字段的
-    /// missing/null 差别，供 V1 parser 复刻 Go 的 MCP 指针和 outcomes 日志语义。
+    /// missing/null 差别，供 V1 parser 实现MCP 指针和 outcomes 日志语义。
     fn get_session_context<'a>(
         &'a self,
         request: crate::internal::input::SessionContextRequest<'a>,
@@ -148,7 +148,7 @@ pub(super) struct TaskRunObservability {
 }
 
 impl TaskRunObservability {
-    /// 向已启用的诊断服务写入一条不含 PII 的事件；未启用时保持 Go no-op。
+    /// 向已启用的诊断服务写入一条不含 PII 的事件；未启用时保持 no-op。
     fn log_diag(&self, event: &str, fields: Option<BTreeMap<String, Value>>) {
         o11y::diag::log_env_manager_no_pii(self.diag.as_ref(), event, fields);
     }
@@ -173,7 +173,7 @@ impl ClaudeObservability for TaskRunObservability {
         self.log_diag("claude_code_start", None);
     }
 
-    /// 写入 Claude 退出状态和毫秒耗时，字段名保持 Go lower_snake_case。
+    /// 写入 Claude 退出状态和毫秒耗时，字段名保持 lower_snake_case。
     fn log_claude_code_end(&self, is_error: bool, exit_code: i32, duration_ms: i64) {
         self.log_diag(
             "claude_code_end",
@@ -259,7 +259,7 @@ impl Display for InputFormat {
 impl FromStr for InputFormat {
     type Err = String;
 
-    /// 严格解析 Go stdin loader 支持的两个格式。
+    /// 严格解析 stdin loader 支持的两个格式。
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "v0" => Ok(Self::V0),
@@ -299,7 +299,7 @@ impl Display for SessionMode {
 impl FromStr for SessionMode {
     type Err = String;
 
-    /// 按 Go `config.ParseSessionMode` 的值域和错误文本解析。
+    /// 按值域和错误文本解析。
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "new" | "" => Ok(Self::New),
@@ -313,7 +313,7 @@ impl FromStr for SessionMode {
     }
 }
 
-/// 已验证并完成兼容默认值解析的 task-run 参数。
+/// 已验证并完成默认值解析的 task-run 参数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRunArgs {
     /// 必填会话 ID。
@@ -424,7 +424,7 @@ pub(crate) fn from_matches(matches: &ArgMatches) -> Result<TaskRunArgs, CliError
     })
 }
 
-/// 对应 Go `getDefaultWorkingDirectory`，HOME 不可用时回退 `/root`。
+/// HOME 不可用时回退 `/root`。
 pub(crate) fn get_default_working_directory() -> PathBuf {
     std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
@@ -472,7 +472,7 @@ impl ManagerApiClient for StdinConfigClient {
     }
 }
 
-/// 对应 Go `loadContextFromStdin`，无条件读取 stdin 到 EOF 后按 v0/v1 解析。
+/// 无条件读取 stdin 到 EOF 后按 v0/v1 解析。
 ///
 /// # 副作用
 /// 阻塞读取进程 stdin。读取放入 blocking pool，避免管道长时间未关闭时占用 Tokio
@@ -506,7 +506,7 @@ async fn load_context_from_stdin(
     Ok(context)
 }
 
-/// 解析调用方提供的完整 stdin 字节，供运行时和无全局 stdin 的兼容测试共用。
+/// 解析调用方提供的完整 stdin 字节，供运行时和无全局 stdin 的测试共用。
 pub(super) async fn load_context_from_bytes(
     cancellation: &CancellationToken,
     session_id: &str,
@@ -536,7 +536,7 @@ pub(super) async fn load_context_from_bytes(
     Ok(task_context_from_parsed(parsed))
 }
 
-/// 把 input 层的解析结果转换成 Go `TaskContext` 对应类型。
+/// 把 input 层的解析结果转换成命令层的 task context。
 fn task_context_from_parsed(parsed: crate::internal::input::ParsedContext) -> TaskContext {
     let environment = parsed
         .environment
@@ -562,7 +562,7 @@ fn task_context_from_parsed(parsed: crate::internal::input::ParsedContext) -> Ta
     }
 }
 
-/// 对应 Go `validateAPIBaseURL`，拒绝空值、非法 URL 和缺少 host 的相对 URL。
+/// 拒绝空值、非法 URL 和缺少 host 的相对 URL。
 pub(super) fn validate_api_base_url(api_base_url: &str) -> Result<(), String> {
     if api_base_url.is_empty() {
         return Err("empty API base URL".to_owned());
@@ -576,7 +576,7 @@ pub(super) fn validate_api_base_url(api_base_url: &str) -> Result<(), String> {
     }
 }
 
-/// 对应 Go `acknowledgeWorkIfNeeded`，仅对完整 v1 work 发送一次 30 秒 ACK。
+/// 仅对完整 v1 work 发送一次 30 秒 ACK。
 pub(super) async fn acknowledge_work_if_needed(
     cancellation: &CancellationToken,
     task_context: &TaskContext,
@@ -626,7 +626,7 @@ pub(super) async fn acknowledge_work_if_needed(
     Ok(())
 }
 
-/// 对应 Go `buildTaskRunBackend`，选择 Noop、SessionIngress 或 CCR v2。
+/// 选择 Noop、SessionIngress 或 CCR v2。
 pub(super) async fn build_task_run_backend(
     task_context: &TaskContext,
     session_id: &str,
@@ -708,7 +708,7 @@ fn selected_backend(
     })
 }
 
-/// 对应 Go `applyCCRBackendClaudeEnvironment`，为 CCR child 注入协议开关和 epoch。
+/// 为 CCR child 注入协议开关和 epoch。
 pub(super) fn apply_ccr_backend_claude_environment(
     claude_config: &mut config::ClaudeConfig,
     ccr_backend: Option<&CCRBackend>,
@@ -725,7 +725,7 @@ pub(super) fn apply_ccr_backend_claude_environment(
     );
 }
 
-/// 对应 Go `taskRunClaudePath`，CLI flag 优先于 ambient 默认路径。
+/// CLI flag 优先于 ambient 默认路径。
 pub(super) fn task_run_claude_path(claude_path_flag: Option<&std::path::Path>) -> String {
     if let Some(path) = claude_path_flag {
         let path = path.to_string_lossy().into_owned();
@@ -738,7 +738,7 @@ pub(super) fn task_run_claude_path(claude_path_flag: Option<&std::path::Path>) -
         .unwrap_or_else(|| "claude".to_owned())
 }
 
-/// 对应 Go `ensureClaudeCodeAvailableForTaskRun`，在共享 60 秒预算内安装或验证 Claude。
+/// 在共享 60 秒预算内安装或验证 Claude。
 async fn ensure_claude_code_available_for_task_run(
     cancellation: &CancellationToken,
     claude_path_flag: Option<&std::path::Path>,
@@ -783,17 +783,17 @@ async fn ensure_claude_code_available_for_task_run(
 
 /// 为 Claude 安装失败添加 task-run 阶段前缀并保留任意子进程输出字节。
 ///
-/// 对应 Go `fmt.Errorf("failed to ensure Claude Code is available: %w", err)`；调用方
+/// 调用方
 /// 必须把返回值继续交给原始字节 renderer，日志若需要文本可使用其 `Display` 视图。
 pub(super) fn wrap_claude_code_availability_error(error: &claude::ClaudeError) -> RuntimeError {
-    // Go 的 `%w` 只拼接 error string 字节；format!/Display 会提前替换非法 UTF-8。
+    // `source chain` 只拼接 error string 字节；format!/Display 会提前替换非法 UTF-8。
     RuntimeError::prefixed(
         b"failed to ensure Claude Code is available: ",
         error.as_bytes(),
     )
 }
 
-/// 把单调耗时安全转换为 Go `Duration.Milliseconds()` 对应的整数。
+/// 把单调耗时安全转换为整毫秒整数。
 fn duration_milliseconds(started: Instant) -> i64 {
     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
@@ -807,7 +807,7 @@ struct TaskRunTelemetry {
 
 /// 执行完整 `task-run` 命令。
 ///
-/// 对应 Go `AddTaskRunCommand` 的 RunE。参数已经由 Clap 校验，但 stdin 仍无条件读取；
+/// RunE。参数已经由 Clap 校验，但 stdin 仍无条件读取；
 /// session/work/environment ID 以 stdin 为准，随后严格按 ACK、backend、安装、telemetry、
 /// manager 的顺序推进。
 ///
@@ -936,11 +936,11 @@ pub async fn run_task_run(arguments: &TaskRunArgs) -> Result<(), RuntimeError> {
     result
 }
 
-/// 对应 Go `AddTaskRunCommand.func1` 中 session 校验之后的运行时组装。
+/// 在 session 校验后组装运行时依赖。
 ///
 /// 函数依次注册 Anthropic/BYOC environment、构造 stdin API adapter、生成
 /// Claude executor factory，再把这些依赖交给 manager。将组装与前置 ACK、
-/// 安装和 telemetry 分开，是为了保留 Go RunE 的错误顺序。
+/// 安装和 telemetry 分开，是为了保留 RunE 的错误顺序。
 ///
 /// # 副作用
 /// 可创建 environment 资源、MCP server、lease、tunnel 和 Claude direct child；
@@ -991,7 +991,7 @@ async fn execute_task_run_manager(
         .local_append_system_prompt
         .clone()
         .unwrap_or_default();
-    // Go 的 ClaudeConfig.ClaudePath 只保存 flag；ambient CLAUDE_DEFAULT_PATH 仅在
+    // ClaudeConfig.ClaudePath 只保存 flag；ambient CLAUDE_DEFAULT_PATH 仅在
     // 安装和 executor 内部解析，不能在这里反写进配置快照。
     claude_config.claude_path = arguments
         .claude_path
@@ -1069,7 +1069,7 @@ async fn execute_task_run_manager(
     .await
 }
 
-/// Go `taskRunManager` 的 Rust 适配边界，使信号包装可独立注入失败与取消。
+/// task-run 的 manager 适配边界，使信号包装可独立注入失败与取消。
 #[async_trait]
 pub(super) trait TaskRunManager: Send {
     /// 执行 manager；返回值同时保留日志文本视图和最终 stderr 原始字节。
@@ -1084,7 +1084,7 @@ impl TaskRunManager for Manager {
     }
 }
 
-/// 对应 Go `runTaskRunManager`，监听 SIGINT/SIGTERM 并给 manager 最多十秒清理。
+/// 监听 SIGINT/SIGTERM 并给 manager 最多十秒清理。
 ///
 /// manager 自然完成时直接返回结果；收到信号时只取消它的 token。
 /// 只有结构化取消令牌触发才按正常结束记录指标；错误文本不会参与取消分类，
@@ -1130,7 +1130,7 @@ pub(super) async fn run_task_run_manager(
     {
         tracing::error!("error" = ?(error.to_string()), "total_duration_ms" = ?(duration_milliseconds(process_started)), "{}", "Environment manager execution failed");
         if let Some(metrics) = &observability.metrics {
-            // 指标接口只接受标准 UTF-8 Error；这里使用 Go 风格替换视图，但下面返回
+            // 指标接口只接受标准 UTF-8 Error；这里使用 风格替换视图，但下面返回
             // 给 CLI 的 RuntimeError 仍从原始字节构造，两条用途不能共用 String。
             let metric_error = std::io::Error::other(error.to_string());
             o11y::increment_env_manager_end(metrics, session_mode, Some(&metric_error));
@@ -1150,12 +1150,12 @@ pub(super) async fn run_task_run_manager(
     Ok(())
 }
 
-/// 对应 Go `runTaskRunManager` 收到 Unix signal 后的唯一日志调用点。
+/// 收到 Unix signal 后的唯一日志调用点。
 ///
 /// Tokio 的两个 signal stream 汇合后记录统一的 shutdown tracing 事件。
 ///
 /// # 参数
-/// - `signal`：Go `os.Signal.String()` 对应的 `interrupt` 或 `terminated`。
+/// - `signal`：Unix signal 的 `interrupt` 或 `terminated` 文本。
 fn log_task_run_shutdown_signal(signal: &'static str) {
     tracing::info!("signal" = ?(signal), "{}", "Received signal, shutting down gracefully");
 }
@@ -1175,7 +1175,7 @@ async fn wait_for_task_run_manager_shutdown(
     }
 }
 
-/// 对应 Go `logTaskRunStart`，只记录不含 secret 的 session 摘要。
+/// 只记录不含 secret 的 session 摘要。
 fn log_task_run_start(session_config: &config::Session) {
     let sources_count = session_config
         .startup_context
@@ -1184,7 +1184,7 @@ fn log_task_run_start(session_config: &config::Session) {
     tracing::info!("has_startup_context" = ?(session_config.startup_context.is_some()), "session_id" = ?(&session_config.session_id), "sources_count" = ?(sources_count), "{}", "Starting environment manager");
 }
 
-/// 对应 Go `logTaskRunEnvironmentFromStdin`，避免记录 environment config 正文。
+/// 避免记录 environment config 正文。
 fn log_task_run_environment_from_stdin(task_context: &TaskContext) {
     let environment_type = task_context
         .environment
@@ -1193,7 +1193,7 @@ fn log_task_run_environment_from_stdin(task_context: &TaskContext) {
     tracing::info!("environment_type" = ?(environment_type), "{}", "Using environment configuration from stdin");
 }
 
-/// 对应 Go `logTaskRunClaudeConfig`，逐个复刻非敏感开关的条件日志。
+/// 逐个保留非敏感开关的条件日志。
 fn log_task_run_claude_config(claude_config: &config::ClaudeConfig) {
     if !claude_config.allowed_tools.is_empty() {
         tracing::info!("tools" = ?(&claude_config.allowed_tools), "{}", "Configured allowed tools for Claude");
@@ -1215,7 +1215,7 @@ fn log_task_run_claude_config(claude_config: &config::ClaudeConfig) {
     }
 }
 
-/// 将 CLI 枚举机械转换为配置层枚举，防止两个公开协议类型互相泄漏。
+/// 将 CLI 枚举转换为配置层枚举，防止两个公开协议类型互相泄漏。
 const fn config_session_mode(mode: SessionMode) -> ConfigSessionMode {
     match mode {
         SessionMode::New => ConfigSessionMode::New,
@@ -1244,7 +1244,7 @@ fn log_loaded_context_from_stdin(
     tracing::info!("environment_id" = ?(environment_id), "environment_type" = ?(environment_type), "has_auth" = ?(task_context.auth_context.is_some()), "session_id" = ?(session_id), "startup_sources_count" = ?(source_count), "stdin_parse_duration_ms" = ?(duration.as_millis()), "work_id" = ?(work_id), "{}", "Loaded context from stdin");
 }
 
-/// 对应 Go `runTaskRunHealthcheck`，仅记录成功且不创建 backend/manager。
+/// 仅记录成功且不创建 backend/manager。
 fn run_task_run_healthcheck(
     session_id: &str,
     parse_duration: Duration,
@@ -1290,7 +1290,7 @@ fn init_task_run_o11y(
     .map_err(|error| format!("failed to initialize observability service: {error}"))
 }
 
-/// 按 Go 顺序初始化 diag 后再安装 OTel 上下文和启动指标。
+/// 先初始化 diag，再安装 OTel 上下文和启动指标。
 async fn initialize_task_run_telemetry(
     cancellation: &CancellationToken,
     backend: Arc<dyn SessionBackend>,
@@ -1372,13 +1372,13 @@ async fn shutdown_diag_service(service: &Arc<o11y::diag::DiagService>) {
         Err(_) => Some("context deadline exceeded".to_owned()),
     };
     if let Some(error) = error {
-        // 与 Go cleanup closure 一样，超时只是 `Shutdown` 的一种 error，不创建
+        // 与 cleanup closure 一样，超时只是 `Shutdown` 的一种 error，不创建
         // 第二个日志 source。
         tracing::error!("error" = ?(error), "{}", "Failed to shutdown diagnostic logging service");
     }
 }
 
-/// 按 Go defer 的 LIFO 顺序先关 OTel，再关诊断服务。
+/// 按 LIFO 清理顺序先关 OTel，再关诊断服务。
 async fn shutdown_task_run_telemetry(telemetry: TaskRunTelemetry) {
     if let Some(service) = &telemetry.o11y_service {
         shutdown_task_run_o11y(service).await;

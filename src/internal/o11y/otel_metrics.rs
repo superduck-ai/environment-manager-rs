@@ -24,8 +24,8 @@ const METER_SCOPE: &str =
 
 /// 对任意 instrument kind 选择 cumulative temporality。
 ///
-/// OTel Rust 0.32 将 Go 的 selector callback 简化为 exporter 级 `Temporality`；保留本
-/// 函数名以便逐符号对照，并由两个 exporter 构造函数共同调用。
+/// OTel Rust 0.32 将 selector callback 简化为 exporter 级 `Temporality`；保留本
+/// 函数名以便，并由两个 exporter 构造函数共同调用。
 pub(crate) const fn cumulative_temporality_selector(
     _instrument_kind: InstrumentKind,
 ) -> Temporality {
@@ -34,7 +34,7 @@ pub(crate) const fn cumulative_temporality_selector(
 
 /// 创建 SDK meter provider，并在配置 exporter 时挂载默认 60 秒 PeriodicReader。
 ///
-/// 对应 Go `initOTelMetrics`；OTel 缩写按 Rust 单词命名，provider、resource 与
+/// OTel 缩写按 Rust 单词命名，provider、resource 与
 /// exporter 的组装行为仍集中在此唯一入口。
 pub(crate) fn init_otel_metrics(
     resource: Option<Resource>,
@@ -196,11 +196,11 @@ impl O11yMetricsProvider {
         Ok(Some(gauge))
     }
 
-    /// 对应 Go：`o11yMetricsProvider.increment`，记录一次 counter 增量。
+    /// 记录一次 counter 增量。
     ///
     /// 缺少 metric 时静默返回；instrument 创建或 cache 类型错误按 `metric`、`error`
     /// 顺序写 ERROR 并吞掉错误；成功时增加 1。日志 handler 故障和 OTel 记录均不会
-    /// 反向改变业务控制流，保持 Go 无返回值方法的副作用边界。
+    /// 反向改变业务控制流，保持 无返回值方法的副作用边界。
     pub(crate) fn increment(&self, metric: Option<&O11yMetric>, tags: Option<&MetricTags>) {
         let counter = match self.get_or_create_counter(metric) {
             Ok(counter) => counter,
@@ -215,7 +215,7 @@ impl O11yMetricsProvider {
         }
     }
 
-    /// 对应 Go：`o11yMetricsProvider.recordGauge`，记录一次同步 gauge 读数。
+    /// 记录一次同步 gauge 读数。
     ///
     /// 缺少 metric 时静默返回；instrument 创建或 cache 类型错误按 `metric`、`error`
     /// 顺序写 ERROR 并吞掉错误；成功时记录调用方给出的 `f64`。该路径不重试，也不会
@@ -282,7 +282,7 @@ pub fn record_gauge(
 
 /// 创建一个结束闭包，在调用时读取共享错误的最终值并记录函数耗时。
 ///
-/// Go 可以捕获 `*error` 并在函数返回前修改；Rust 用 `SharedMetricError` 的
+/// 可以捕获 `*error` 并在函数返回前修改；Rust 用 `SharedMetricError` 的
 /// `Arc<Mutex<Option<Arc<dyn Error>>>>` 明确同步边界。基础标签在创建闭包时快照，错误
 /// 则在执行闭包时读取，从而精确保留“晚到失败”语义。
 pub fn record_function_deferred(

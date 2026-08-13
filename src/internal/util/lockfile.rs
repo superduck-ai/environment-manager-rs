@@ -1,7 +1,6 @@
 //! 基于 `flock(2)` 语义的进程互斥锁。
 //!
-//! `fs2::FileExt::try_lock_exclusive` 在 Unix 上使用非阻塞 `flock`，与 Go 的
-//! `LOCK_EX | LOCK_NB` 一致。锁通过 RAII guard 释放，避免错误路径漏掉清理闭包。
+//! `fs2::FileExt::try_lock_exclusive` 在 Unix 上使用非阻塞 `flock`，与 `LOCK_EX | LOCK_NB` 一致。锁通过 RAII guard 释放，避免错误路径漏掉清理闭包。
 
 use std::{
     fmt,
@@ -60,7 +59,7 @@ pub enum LockError {
     /// 同一 session 已被另一个进程持有。
     #[error("session {session_id} already running (lock held)")]
     SessionAlreadyHeld {
-        /// 原始 session ID，必须保留 Go 错误文本中的未转义形式。
+        /// 原始 session ID，必须保留 错误文本中的未转义形式。
         session_id: String,
         /// 冲突的锁文件路径；仅供结构化诊断。
         path: PathBuf,
@@ -78,7 +77,7 @@ pub enum LockError {
 
 /// 不带业务上下文的底层 open/flock 失败。
 ///
-/// 容器锁与 session 锁共用同一套系统调用，但 Go 对两者有
+/// 容器锁与 session 锁共用同一套系统调用，但 对两者有
 /// 不同的外部错误文本。该私有类型先保留失败阶段，再由入口
 /// 函数映射成 [`LockError`]，避免把 Rust 的通用 path 文本泄露给 CLI。
 #[derive(Debug)]
@@ -93,7 +92,7 @@ enum AcquirePathError {
 
 /// 已持有的文件锁。
 ///
-/// guard 被丢弃时先解锁、再关闭文件、最后删除锁文件，顺序与 Go 清理闭包一致。
+/// guard 被丢弃时先解锁、再关闭文件、最后删除锁文件，顺序与 清理闭包一致。
 /// 锁的正确性来自打开文件描述上的 `flock`，不是锁文件是否存在。
 pub struct FileLockGuard {
     file: Option<File>,
@@ -101,7 +100,7 @@ pub struct FileLockGuard {
     scope: LockScope,
 }
 
-/// 区分两个 Go 清理闭包各自的消息、属性和级别。
+/// 区分两个 清理闭包各自的消息、属性和级别。
 #[derive(Debug)]
 enum LockScope {
     /// `/tmp/environment-manager-container.lock` 的容器级互斥。
@@ -141,7 +140,7 @@ impl FileLockGuard {
             if let Err(error) = FileExt::unlock(&file) {
                 self.log_unlock_error(&error);
             }
-            // `File` 的 Drop 无法观察 close(2) 的返回值，而 Go 清理闭包会记录该
+            // `File` 的 Drop 无法观察 close(2) 的返回值，而 清理闭包会记录该
             // 错误。转移 fd 所有权后使用 nix 的安全封装关闭，既避免 double-close，
             // 也保留这条极少出现但外部可见的 warning。
             if let Err(error) = nix::unistd::close(file.into_raw_fd()) {
@@ -156,7 +155,7 @@ impl FileLockGuard {
         }
     }
 
-    /// 记录 Go 清理闭包中的 `Flock(LOCK_UN)` 失败。
+    /// 记录 清理闭包中的 `Flock(LOCK_UN)` 失败。
     fn log_unlock_error(&self, error: &dyn fmt::Display) {
         let path = self.path.display().to_string();
         match &self.scope {
@@ -169,7 +168,7 @@ impl FileLockGuard {
         }
     }
 
-    /// 记录 Go 清理闭包中的文件描述符关闭失败。
+    /// 记录 清理闭包中的文件描述符关闭失败。
     fn log_close_error(&self, error: &dyn fmt::Display) {
         let path = self.path.display().to_string();
         match &self.scope {
@@ -182,7 +181,7 @@ impl FileLockGuard {
         }
     }
 
-    /// 记录锁文件删除失败；不存在与 Go `os.IsNotExist` 一样保持静默。
+    /// 记录锁文件删除失败；不存在与 not-found 判定 一样保持静默。
     fn log_remove_error(&self, error: &dyn fmt::Display) {
         let path = self.path.display().to_string();
         match &self.scope {
@@ -195,7 +194,7 @@ impl FileLockGuard {
         }
     }
 
-    /// 记录成功释放；该事件在 panic 展开期间也必须进入 Go 兼容 stderr JSON。
+    /// 记录成功释放；该事件在 panic 展开期间也必须进入 stderr JSON。
     fn log_released(&self) {
         let path = self.path.display().to_string();
         match &self.scope {
@@ -218,7 +217,7 @@ impl Drop for FileLockGuard {
 
 /// 获取容器级全局锁。
 ///
-/// 锁路径固定为 Go 实现使用的 `/tmp/environment-manager-container.lock`，
+/// 锁路径固定为 使用的 `/tmp/environment-manager-container.lock`，
 /// 用于阻止同一容器同时运行多个 orchestrator/session。
 pub fn acquire_container_lock() -> Result<FileLockGuard, LockError> {
     let path = PathBuf::from(CONTAINER_LOCK_PATH);
@@ -243,7 +242,7 @@ pub fn acquire_container_lock() -> Result<FileLockGuard, LockError> {
 ///
 /// session ID 按 URL path segment 规则转义，避免 `/`、Unicode 或 `..` 改变
 /// 锁文件目录。竞争时立即返回 [`LockError::SessionAlreadyHeld`]，
-/// 不会阻塞 Tokio worker，错误文本保留 Go 中的原始 session ID。
+/// 不会阻塞 Tokio worker，错误文本保留 中的原始 session ID。
 pub fn acquire_lock(session_id: &str) -> Result<FileLockGuard, LockError> {
     let path = get_lock_path(session_id);
     let file = acquire_path(path.clone()).map_err(|error| match error {
@@ -366,9 +365,9 @@ mod tests {
         drop(first);
     }
 
-    /// 验证 `umask 000` 下新锁文件仍以 Go 指定的 0644 为权限上限。
+    /// 验证 `umask 000` 下新锁文件仍以 指定的 0644 为权限上限。
     #[test]
-    fn lockfile_mode_matches_go_with_zero_umask() {
+    fn lockfile_mode_is_0600_with_zero_umask() {
         let unique = format!("mode-{}-{}", std::process::id(), line!());
         let output = run_lock_probe(&unique, "mode-0644", true);
         assert_probe_succeeded(&output);

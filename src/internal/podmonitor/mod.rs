@@ -1,8 +1,6 @@
 //! 环境工作租约、心跳和停止请求的生命周期管理。
 //!
-//! 本模块机械对应 Go `internal/podmonitor`。Go 版分别用 ticker、两个可重置
-//! `time.Timer` 与 `context.Context` 管理心跳、租约过期和 Claude Code 卡死检测；
-//! Rust 版保留相同协议与判定规则，但把它们收敛到一个
+//! 心跳、租约过期和 Claude Code 卡死检测由可重置定时器与取消令牌管理，并收敛到一个
 //! [`tokio_util::task::TaskTracker`] 和一个子
 //! [`tokio_util::sync::CancellationToken`] 下，以便确定性等待所有后台任务退出。
 

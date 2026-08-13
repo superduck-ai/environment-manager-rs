@@ -1,6 +1,6 @@
 //! podmonitor 的共享状态、wire DTO 与可判定错误类型。
 //!
-//! 与旧实现把所有字段直接放进一个结构体不同，
+//! 与当前命令把所有字段直接放进一个结构体不同，
 //! Rust 用 `Arc<LeaseManagerInner>` 共享只读配置，用 `RwLock<LeaseState>` 保护短时状态，
 //! 并让网络请求和定时等待永远不持有锁。
 
@@ -48,7 +48,7 @@ pub(super) struct HeartbeatResponse {
     pub(super) lease_updated_at: DateTime<Utc>,
 }
 
-/// 返回 Go `time.Time{}` 对应的公元一年 UTC 零值。
+/// 返回公元一年 UTC 零值。
 fn go_zero_time() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(1, 1, 1, 0, 0, 0)
         .single()
@@ -62,12 +62,12 @@ pub(super) struct StopRequest {
     pub(super) force: bool,
 }
 
-/// 对应 Go `stopAPIError`，保留 HTTP 状态码供重试分类。
+/// 保留 HTTP 状态码供重试分类。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StopApiError {
     /// 非 2xx HTTP 状态码。
     pub status_code: u16,
-    /// 与 Go `Error()` 完全相同的稳定文本。
+    /// 稳定文本。
     pub message: String,
 }
 
@@ -83,9 +83,7 @@ impl StopApiError {
 }
 
 impl std::fmt::Display for StopApiError {
-    /// 输出服务端 stop 错误正文，对应 Go `stopAPIError.Error`。
-    ///
-    /// 状态码只用于重试分类，不拼入展示文本，保持被包装后的错误链与 Go 一致。
+    /// 输出服务端 stop 错误正文；状态码只用于重试分类，不拼入展示文本。
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)
     }
@@ -99,7 +97,7 @@ pub enum HeartbeatError {
     /// base URL 或 path segment 无法构造请求 URL。
     #[error("failed to create heartbeat request: {0}")]
     InvalidRequest(String),
-    /// 请求传输失败；文本仍参与 Go 兼容的 marker 分类。
+    /// 请求传输失败；文本仍参与 marker 分类。
     #[error("heartbeat request failed: {0}")]
     Request(String),
     /// manager token 已取消。
@@ -132,13 +130,13 @@ impl HeartbeatError {
 /// stop 请求及其重试过程的稳定错误集合。
 #[derive(Debug, Error)]
 pub enum StopRequestError {
-    /// `CancellationToken` 已被触发，对应 Go `context.Canceled` sentinel。
+    /// `CancellationToken` 已被触发，形成取消错误 sentinel。
     #[error("{message}")]
     Cancelled {
-        /// 保留 Go `http.Client.Do` 经 `fmt.Errorf` 包装后的完整错误文本。
+        /// 保留 HTTP client 经 source chain 包装后的完整错误文本。
         message: String,
     },
-    /// 供 deadline 驱动的调用方保留 Go `context.DeadlineExceeded` sentinel 语义。
+    /// 供 deadline 驱动的调用方保留 deadline 错误 sentinel 语义。
     #[error("operation deadline exceeded")]
     DeadlineExceeded,
     /// URL、序列化或网络传输错误；网络错误默认可重试。
@@ -220,13 +218,13 @@ pub(super) struct LeaseState {
     pub(super) last_heartbeat: Option<DateTime<Utc>>,
     /// 当前绝对租约过期时间。
     pub(super) lease_expires_at: Option<DateTime<Utc>>,
-    /// 最近 TTL；主要用于日志和对照 Go 状态。
+    /// 最近 TTL；主要用于日志和运行状态。
     pub(super) lease_ttl: Duration,
     /// 最近服务端状态。
     pub(super) instance_state: String,
     /// 最近一次发现 `lease_updated_at` 变化的本地墙钟时间。
     ///
-    /// Go 的同名字段既参与 `time.Since`，又会原样写入结构化日志；Rust 将日志值
+    /// 同名字段既参与 `time.Since`，又会原样写入结构化日志；Rust 将日志值
     /// 单独保留为 UTC 墙钟，从而确保 `last_updated_at` 仍是绝对时间而不是 elapsed。
     pub(super) last_updated_at: Option<DateTime<Utc>>,
     /// 与 `last_updated_at` 同时更新的单调时钟，用于抵抗系统时间跳变。
@@ -267,7 +265,7 @@ pub(super) struct LeaseManagerInner {
     pub(super) cancellation: CancellationToken,
     /// 统一追踪 heartbeat、expiry 和 stuck 三个任务。
     pub(super) tasks: TaskTracker,
-    /// 对应 Go `stopChan` 的关闭信号；只有 heartbeat loop 真正退出才触发。
+    /// 关闭信号；只有 heartbeat loop 真正退出才触发。
     pub(super) heartbeat_loop_exited: CancellationToken,
     /// heartbeat 更新租约后唤醒 expiry 任务重新计算 deadline。
     pub(super) expiry_changed: Notify,

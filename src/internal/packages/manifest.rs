@@ -1,6 +1,6 @@
 //! `provision-packages` v1 stdin manifest 的严格 schema 与安全校验。
 //!
-//! 对应 Go `internal/packages/manifest.go`。Serde 默认会忽略重复键或允许别名式字段
+//! Serde 默认会忽略重复键或允许别名式字段
 //! 处理，因此这里手写 map visitor：字段名区分大小写、未知字段和重复字段均失败；
 //! manager 显式为 `null` 也与省略字段分开记录。package spec 只作为 argv 传递，
 //! 仍拒绝 option 前缀和 URL authority 凭据，防止参数注入与 secret 泄露。
@@ -9,7 +9,7 @@ use std::fmt::{self, Formatter};
 
 use serde::{Deserialize, Deserializer, de};
 
-/// stdin manifest 的最大字节数，与 Go 的 `1 << 20` 完全一致。
+/// stdin manifest 的最大字节数，与 `1 << 20` 完全一致。
 pub(super) const MAX_MANIFEST_BYTES: usize = 1 << 20;
 
 /// 顶层版本化 package manifest。
@@ -32,7 +32,7 @@ pub(super) struct PackageManifest {
     pub cargo: SpecList,
     /// Ruby Gem package spec。
     pub gem: SpecList,
-    /// Go module package spec。
+    /// module package spec。
     pub go: SpecList,
     /// NPM package spec。
     pub npm: SpecList,
@@ -50,7 +50,7 @@ pub(super) struct SpecList {
 }
 
 impl<'de> Deserialize<'de> for SpecList {
-    /// 对应 Go `SpecList.UnmarshalJSON`，将 `null` 与省略字段区分并拒绝非字符串数组。
+    /// 将 `null` 与省略字段区分并拒绝非字符串数组。
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -92,8 +92,8 @@ impl<'de> de::Visitor<'de> for ManifestVisitor {
 
     /// 逐字段解析顶层对象，在读取值前拒绝未知或重复字段。
     ///
-    /// 对应 Go `validateManifestFieldNames` 和 `discardJSONValue`；Serde 的 map visitor
-    /// 已同时承担字段扫描与安全跳过职责，所以不再另外保留只为 decoder 服务的 helper。
+    /// Serde 的 map visitor 同时承担字段扫描与安全跳过职责，不需要额外的
+    /// decoder helper。
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
     where
         A: de::MapAccess<'de>,
@@ -146,8 +146,7 @@ impl<'de> de::Visitor<'de> for PackageManifestVisitor {
 
     /// 逐字段解析 package 子对象并维护位掩码，以最低开销拒绝重复键。
     ///
-    /// 对应 Go `validatePackageFieldNames`、`rememberJSONField` 和
-    /// `isPackageFieldName`；字段白名单和重复检测在同一遍 map 读取中完成，避免二次解析。
+    /// 字段白名单和重复检测在同一遍 map 读取中完成，避免二次解析。
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
     where
         A: de::MapAccess<'de>,
@@ -189,7 +188,7 @@ impl<'de> de::Visitor<'de> for PackageManifestVisitor {
 }
 
 impl PackageManifest {
-    /// 按 Go 固定顺序返回六个 manager 列表，供校验和计数共享。
+    /// 按 固定顺序返回六个 manager 列表，供校验和计数共享。
     #[must_use]
     pub(super) fn lists(&self) -> [&SpecList; 6] {
         [
@@ -203,7 +202,7 @@ impl PackageManifest {
     }
 }
 
-/// 对应 Go `validateManifest`，执行版本、discriminator 和 spec 安全校验。
+/// 执行版本、discriminator 和 spec 安全校验。
 ///
 /// # 返回
 /// 任一字段违反 v1 schema 时返回不含用户输入的静态错误；错误正文不会进入协议输出。
@@ -240,17 +239,17 @@ pub(super) fn validate_manifest(manifest: &Manifest) -> Result<(), &'static str>
     Ok(())
 }
 
-/// 对应 Go `isPackageManagerOption`，拒绝去除前导空白后以 `-` 开头的 spec。
+/// 拒绝去除前导空白后以 `-` 开头的 spec。
 #[must_use]
 fn is_package_manager_option(spec: &str) -> bool {
     spec.trim_start().starts_with('-')
 }
 
-/// 复刻 Go `credentialURLPattern`，判断任意 URL authority 中是否出现 `@`。
+/// 判断任意 URL authority 中是否出现 `@`。
 ///
 /// 这里只实现固定正则 `[a-z][a-z0-9+.-]*://[^/\s?#]*@` 的状态机，避免为单个安全
-/// 检查增加 regex 依赖。Go `(?i)` 的 Unicode simple-fold 特例和 RE2 的 ASCII
-/// `\s` 均显式保留；percent-encoding 是否有效不影响凭据判定。
+/// 检查增加 regex 依赖。实现显式支持 Kelvin sign、long s 和 RE2 的 ASCII `\s`；
+/// percent-encoding 是否有效不影响凭据判定。
 #[must_use]
 fn contains_url_credentials(spec: &str) -> bool {
     for (start, first) in spec.char_indices() {
@@ -284,7 +283,7 @@ fn contains_url_credentials(spec: &str) -> bool {
     false
 }
 
-/// 判断字符是否属于 Go `(?i)[a-z]` 的 simple-fold 闭包。
+/// 判断字符是否属于 URL scheme 首字母的 simple-fold 闭包。
 ///
 /// ASCII K/S 的 Unicode simple-fold 轨道额外包含 Kelvin sign 与 long s；其他 ASCII
 /// 字母只有普通大小写两项。这里不能用 `is_alphabetic`，否则会错误接受任意 Unicode
@@ -294,7 +293,7 @@ fn is_go_ascii_fold_letter(character: char) -> bool {
     character.is_ascii_alphabetic() || matches!(character, '\u{212a}' | '\u{017f}')
 }
 
-/// 判断字符是否属于 Go regexp/RE2 的 Perl `\s` 字节集合。
+/// 判断字符是否属于 RE2 Perl `\s` 的 ASCII 字节集合。
 #[must_use]
 fn is_go_regexp_space(character: char) -> bool {
     matches!(character, ' ' | '\t' | '\n' | '\r' | '\u{000c}')

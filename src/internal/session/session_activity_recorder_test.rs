@@ -73,7 +73,7 @@ impl RecordingEventPoster {
     }
 }
 
-/// 对应 Go：`newRecordingEventPoster`，创建没有失败注入且缓冲区为空的 poster。
+/// 创建没有失败注入且缓冲区为空的 poster。
 fn new_recording_event_poster() -> Arc<RecordingEventPoster> {
     Arc::new(RecordingEventPoster::new())
 }
@@ -235,7 +235,7 @@ async fn test_record_failure_result_wraps_poster_errors() {
     ));
     assert_eq!(poster.wait_for_events(1).await.len(), 1);
 
-    // Go 用同一个 table-driven 场景验证第二次发送失败；这里重新创建 recorder，
+    // 用同一个 table-driven 场景验证第二次发送失败；这里重新创建 recorder，
     // 避免首个失败注入留下的事件计数影响 result 阶段断言。
     let poster = new_recording_event_poster();
     poster.fail_on_call(2);

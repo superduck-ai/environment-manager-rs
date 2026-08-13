@@ -2,13 +2,13 @@
 //!
 //! 该组件可直接交给要求 `std::io::Write` 的库，也可包在 process streamer 中。
 //! 半行跨 write 保留，完整行去掉 `\n` 后记录；超过 1 MiB 的无换行内容会整段
-//! 附加截断标记后发送并清空，保持恢复 Go 实现的边界条件。
+//! 附加截断标记后发送并清空，保持恢复 的边界条件。
 
 use std::io::{self, Write};
 
 use tracing::Level;
 
-/// 无换行单行允许保留的最大字节数，与 Go 实现一致为 1 MiB。
+/// 无换行单行允许保留的最大字节数，与 一致为 1 MiB。
 pub const MAX_LOG_WRITER_BUFFERED_LINE: usize = 1 << 20;
 
 /// 面向字节流的逐行日志 writer。
@@ -31,8 +31,8 @@ impl LogWriter {
     /// 记录一行字节，并按构造参数附加 prefix、属性和可选截断标记。
     ///
     /// Rust 字符串必须是合法 UTF-8，因此非法字节在进入结构化记录前使用替换
-    /// 字符；这与最终 JSON 编码时的容错结果一致。caller 会继续传到外层
-    /// `Write::write`，使 source 对应 Go 的 `LogWriter.Write` 而不是内部 helper。
+    /// 字符，与最终 JSON 编码时的容错结果一致。caller 会继续传到外层
+    /// `Write::write`，使 source 指向公开写入口而不是内部 helper。
     #[track_caller]
     fn emit(&self, bytes: &[u8], truncated: bool) {
         let mut message = String::with_capacity(self.prefix.len() + bytes.len() + 32);
@@ -67,7 +67,7 @@ impl Write for LogWriter {
             std::mem::swap(&mut self.buffer, &mut rest);
         }
         if self.buffer.len() > MAX_LOG_WRITER_BUFFERED_LINE {
-            // Go 代码虽称其为 truncated line，却会保留并发送触发阈值的全部字节；
+            // 虽称其为 truncated line，却会保留并发送触发阈值的全部字节；
             // 这里不能只保留前 1 MiB，否则诊断内容和消息长度都会发生变化。
             self.emit(&self.buffer, true);
             self.buffer.clear();

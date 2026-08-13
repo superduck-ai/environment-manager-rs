@@ -1,4 +1,4 @@
-//! `internal/sources` 的行为回归测试，机械对应 Go `git_test.go`。
+//! `internal/sources` 的行为回归测试。
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -26,7 +26,7 @@ use crate::internal::{
     util::Stopper,
 };
 
-/// 只记录同步停止请求的 fixture，用于验证 Git defer guard 的丢弃路径。
+/// 只记录同步停止请求的 fixture，用于验证 Git guard 的丢弃路径。
 struct RequestTrackingStopper(Arc<AtomicUsize>);
 
 #[async_trait]
@@ -311,7 +311,7 @@ fn test_pack_size() {
     );
 }
 
-/// 验证 manager 的空 base directory、动态 handler 分派和 nil source 索引错误。
+/// 验证 manager 的空 base directory、动态 handler 分派和 缺失 source 索引错误。
 #[tokio::test]
 async fn test_source_handler_manager_dispatches_handlers() {
     let empty_error = new_source_handler_manager(
@@ -412,7 +412,7 @@ async fn source_handler_manager_preserves_scoped_trait_object_lifetimes() {
     assert!(source_processed.load(Ordering::SeqCst));
 }
 
-/// 创建与生产 URL 选择逻辑兼容的本地 file source。
+/// 创建使用生产 URL 选择逻辑的本地 file source。
 fn git_test_source(repo: &Path, git_ref: Option<&str>) -> GitRepositorySource {
     GitRepositorySource {
         base: BaseSource {
@@ -548,17 +548,17 @@ struct FakeConfigSource {
 }
 
 impl FakeConfigSource {
-    /// 对应 Go：`fakeConfigSource.IsRepository`，动态 fixture 不是 Git repository。
+    /// 动态 fixture 不是 Git repository。
     fn is_repository(&self) -> bool {
         false
     }
 
-    /// 对应 Go：`fakeConfigSource.GetDirectory`，非仓库 fixture 原样使用 base 目录。
+    /// 非仓库 fixture 原样使用 base 目录。
     fn get_directory(&self, base_dir: &Path) -> PathBuf {
         base_dir.to_path_buf()
     }
 
-    /// 对应 Go：`fakeConfigSource.Validate`，构造完成的 fixture 始终有效。
+    /// 构造完成的 fixture 始终有效。
     fn validate(&self) -> SourcesResult<()> {
         Ok(())
     }

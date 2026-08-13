@@ -1,7 +1,7 @@
 //! 旧版 V0 stdin JSON parser。
 //!
 //! parser 保留环境配置中的未知字段，并在成功后统一补全 API URL scheme。为保持
-//! 当前 Go 工作树的库内行为，缺失 `startup_context` 的普通入口仍触发同文本 panic；
+//! 当前 的库内行为，缺失 `startup_context` 的普通入口仍触发同文本 panic；
 //! CLI 专用入口则把它转换成类型化错误。显式 JSON `null` 仍先构造零值 context，
 //! 再走正常的 API base URL 校验分支。
 
@@ -56,11 +56,11 @@ pub enum V0ParseError {
 
 /// 缺失 `startup_context` 时共享解析流程采用的行为。
 ///
-/// Go parser 本身返回 nil context 后由调用方解引用并 panic。Rust 的库内 parser 保留
+/// parser 本身返回 `None` cancellation 后由调用方解引用并 panic。Rust 的库内 parser 保留
 /// 这一语义，CLI 则返回可诊断的普通错误。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MissingStartupContextBehavior {
-    /// 复刻 parser 被直接调用时发生的 panic，供单元测试和差分 probe 使用。
+    /// 实现parser 被直接调用时发生的 panic，供单元测试和差分 probe 使用。
     PanicLikeGoParser,
     /// 返回专用错误，供 CLI 正常报告无效输入。
     ReturnErrorForCli,
@@ -78,9 +78,9 @@ struct V0EnvironmentConfig {
     disallowed_tools: String,
 }
 
-/// 将环境配置中的显式 JSON `null` 解为 Go string 字段的空字符串零值。
+/// 将环境配置中的显式 JSON `null` 解为 string 字段的空字符串零值。
 ///
-/// Go `encoding/json` 对 string 字段收到 `null` 时不报错且保留零值；Serde 默认拒绝
+/// V0 协议把 string 字段的 `null` 视为空字符串；Serde 默认拒绝
 /// 该输入。这里仅放宽 V0 environment 的四个固定字符串，其他类型错误仍按原顺序返回。
 fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
@@ -111,7 +111,7 @@ impl V0Parser {
 
     /// 执行 V0 共享解析流程，并按调用入口决定日志及缺字段行为。
     ///
-    /// `missing_startup_context` 只改变 Go nil 解引用的承载方式，不能改变它之前的
+    /// `missing_startup_context` 只改变 `None` 解引用的承载方式，不能改变它之前的
     /// JSON 解码和日志，也不能让它之后的 environment/auth 阶段继续执行。
     fn parse_internal(
         &self,
@@ -170,7 +170,7 @@ impl V0Parser {
         value: Option<&Value>,
         missing_behavior: MissingStartupContextBehavior,
     ) -> Result<StartupContext, V0ParseError> {
-        // Go 的 parseStartupContext 对 missing RawMessage 返回 nil、nil，调用方随后立即
+        // parseStartupContext 对 missing RawMessage 返回 `None`、`None`，调用方随后立即
         // 解引用并产生固定 runtime panic。显式 null 则会构造零值 context，不能与
         // missing 合并。
         let Some(value) = value else {
@@ -259,7 +259,7 @@ impl V0Parser {
     }
 }
 
-/// 将单调时钟耗时转换为 Go `Duration.Milliseconds()` 的截断毫秒值。
+/// 将单调时钟耗时转换为截断的 `i64` 毫秒数。
 fn duration_milliseconds(started: Instant) -> i64 {
     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
 }

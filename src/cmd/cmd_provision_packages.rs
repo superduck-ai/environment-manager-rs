@@ -1,6 +1,6 @@
 //! 一次性 package provisioning CLI、信号取消与最终 JSON 输出。
 //!
-//! 对应 Go `cmd/cmd_provision_packages.go`。Clap 只解析 `--protocol` 和 `--stdin`；
+//! Clap 只解析 `--protocol` 和 `--stdin`；
 //! 命令本身严格要求 `v1` 且读取 stdin，随后调用 `internal/packages`。stdout 恰好写一个
 //! 权威 JSON 对象，stderr 只返回有界诊断，绝不包含 manifest、spec 或 manager 输出。
 
@@ -29,7 +29,7 @@ use super::{
 pub struct ProvisionPackagesArgs {
     /// stdin 协议版本；当前唯一合法运行值是 `v1`。
     pub protocol: String,
-    /// 是否显式要求读取 stdin；Go 命令要求该 flag 为真。
+    /// 是否显式要求读取 stdin；命令要求该 flag 为真。
     pub stdin: bool,
 }
 
@@ -79,16 +79,13 @@ pub(crate) fn from_matches(matches: &ArgMatches) -> Result<ProvisionPackagesArgs
     })
 }
 
-/// 对应 Go `AddProvisionPackagesCommand` 的生产运行路径。
-///
-/// Go `interruptReaderOnCancellation` 被折叠到本函数创建并传递的取消 context，以及
-/// `Provisioner::run` 的解码分支中，不再保留一次性 reader 适配器。
+/// 生产运行路径。
 ///
 /// 函数为 SIGINT/SIGTERM 建立取消 token，并在完成后停止信号任务。manifest 解码在
 /// 应用层直接等待同一 token，避免为一次性 stdin 读取维护额外 reader 适配器。
 /// 所有输出都由 `run_with_provisioner` 集中生成，避免信号分支多写 JSON。
 pub async fn run_provision_packages(arguments: &ProvisionPackagesArgs) -> Result<(), RuntimeError> {
-    // Go 只在两个协议 flag 都合法后注册 SIGINT/SIGTERM。先处理错误调用，既保持该
+    // 只在两个协议 flag 都合法后注册 SIGINT/SIGTERM。先处理错误调用，既保持该
     // 初始化顺序，也避免极窄信号窗口把本应稳定的 invalid_manifest 结果改成取消。
     if arguments.protocol != "v1" || !arguments.stdin {
         let started = Instant::now();
@@ -119,9 +116,7 @@ pub async fn run_provision_packages(arguments: &ProvisionPackagesArgs) -> Result
 
 /// 使用注入 provisioner、reader 和 writer 执行命令协议，供生产与测试共享。
 ///
-/// 对应 Go 测试辅助函数 `executeProvisionPackagesCommand` 和
-/// `executeProvisionPackagesCommandWithReader`；Rust 的异步 I/O 抽象无需分别维护
-/// `io.Reader` 与可关闭 reader 两条入口，因此安全地合并为一个实现。
+/// Rust 的异步 I/O 抽象统一处理普通 reader 与可关闭 reader，无需维护两条入口。
 async fn run_with_provisioner(
     arguments: &ProvisionPackagesArgs,
     context: &ProvisionContext,
@@ -163,7 +158,7 @@ async fn wait_for_interrupt_or_terminate() {
     }
 }
 
-/// 对应 Go `invalidInvocationResult`，为缺 flag 或未知协议产生 validate 失败。
+/// 为缺 flag 或未知协议产生 validate 失败。
 fn invalid_invocation_result(started: Instant) -> ProvisionResult {
     let mut result = ProvisionResult::failed();
     result.category = Some(Category::InvalidManifest);
@@ -172,7 +167,7 @@ fn invalid_invocation_result(started: Instant) -> ProvisionResult {
     result
 }
 
-/// 对应 Go `emitProvisionResult`，写出唯一 JSON 行并映射稳定进程退出码。
+/// 写出唯一 JSON 行并映射稳定进程退出码。
 fn emit_provision_result(
     output: &mut dyn Write,
     result: ProvisionResult,
@@ -206,7 +201,7 @@ fn exit_error(exit_code: i32, diagnostic: String) -> RuntimeError {
     RuntimeError::with_exit_code(diagnostic, exit_code)
 }
 
-/// 对应 Go `resultDiagnostic`，只展示结果元数据，不展示 category 或用户输入。
+/// 只展示结果元数据，不展示 category 或用户输入。
 fn result_diagnostic(result: &ProvisionResult) -> String {
     format!(
         "package provisioning status={} manager={} stage={} package_count={} duration_ms={} exit_code={}",
@@ -222,7 +217,7 @@ fn result_diagnostic(result: &ProvisionResult) -> String {
     )
 }
 
-/// 对应 Go `optionalInt`，把省略的整数渲染为固定 `unknown`。
+/// 把省略的整数渲染为固定 `unknown`。
 fn optional_integer<T>(value: Option<T>) -> String
 where
     T: Display,

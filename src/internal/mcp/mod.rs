@@ -1,8 +1,8 @@
 //! 本地 Model Context Protocol 服务器与注册表。
 //!
-//! 该模块机械对应 Go `internal/mcp` 包：[`BaseServer`] 在 loopback 随机端口上
-//! 暴露 `/mcp`，[`MCPServerRegistration`] 把业务服务器接入 Claude CLI。迁移首先
-//! 实现稳定的 JSON-RPC/MCP wire 兼容层；业务代码不直接依赖第三方 MCP 框架，
+//! [`BaseServer`] 在 loopback 随机端口上暴露 `/mcp`，
+//! [`MCPServerRegistration`] 把业务服务器接入 Claude CLI。业务代码只依赖稳定的
+//! JSON-RPC/MCP wire 层，不直接依赖第三方 MCP 框架，
 //! 官方 `rmcp` SDK 被限制在适配层内，不会改变 codesign/supabase API。
 
 mod registry;

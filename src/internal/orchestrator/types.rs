@@ -1,8 +1,7 @@
 //! Orchestrator 的共享类型声明。
 //!
-//! 恢复出的 Go 文件把协议 DTO、轮询 trait 和 orchestrator 配置集中在一起；Rust
-//! 版本保留同一文件边界，并用 `Arc<dyn Trait>` 表达可共享接口、用
-//! `CancellationToken` 表达 `context.Context` 的取消能力。
+//! 本模块集中协议 DTO、轮询 trait 和 orchestrator 配置，并用 `Arc<dyn Trait>` 表达
+//! 可共享接口、用 `CancellationToken` 表达取消能力。
 
 use std::{sync::Arc, time::Duration};
 
@@ -12,13 +11,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::internal::process::{CommandFailure, CommandOutput};
 
-/// 与 Go `json.RawMessage` 对应的原始 JSON 字节。
+/// 后端 work envelope 的原始 JSON 字节。
 pub type RawMessage = Vec<u8>;
 
 /// orchestrator 子系统的稳定文本错误。
 ///
 /// 网络、进程和 JSON 库的具体错误类型不会泄漏进公共 trait；完整原因仍保留在
-/// `Display` 文本中，便于命令行入口按 Go 版本的文案向上包装。
+/// `Display` 文本中，便于命令行入口按 的文案向上包装。
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct OrchestratorError {
@@ -26,7 +25,7 @@ pub struct OrchestratorError {
 }
 
 impl OrchestratorError {
-    /// 由兼容文案构造错误。
+    /// 由稳定文案构造错误。
     pub fn message(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -40,7 +39,7 @@ pub type OrchestratorResult<T> = Result<T, OrchestratorError>;
 /// Hook 子进程的共享执行结果；非零退出仍是带 `ExitStatus` 的完成结果。
 pub type CommandOutcome = Result<CommandOutput, CommandFailure>;
 
-/// 尚未迁移的 sandbox 包与 Hook 之间的目录内适配请求。
+/// 跨模块的 sandbox 包与 Hook 之间的目录内适配请求。
 ///
 /// adapter 必须在 `execute` 返回前完成临时 sandbox 的 cleanup；这样未来接入真实
 /// `internal::sandbox` 时，Hook 的“初始化 → 包装 → 执行 → cleanup”时序不会改变。
@@ -62,7 +61,7 @@ pub struct SandboxRequest {
     pub timeout: Option<Duration>,
 }
 
-/// Hook 对尚在迁移的 sandbox runtime 的显式适配接口。
+/// Hook 与 sandbox runtime 之间的显式适配接口。
 ///
 /// 启用 sandbox 却没有提供 adapter 会返回错误，而不会静默退化为宿主机执行。
 #[async_trait]
@@ -88,12 +87,12 @@ pub struct Hook {
     pub sandbox_config_path: String,
     /// sandbox 工作目录。
     pub working_dir: String,
-    /// 迁移期 sandbox 适配器。
+    /// 可选 sandbox 适配器。
     pub sandbox_adapter: Option<Arc<dyn SandboxAdapter>>,
 }
 
 impl Default for Hook {
-    /// 返回 Go 零值语义的 Hook；空命令是 no-op。
+    /// 返回默认 Hook；空命令是 no-op。
     fn default() -> Self {
         Self {
             name: String::new(),
@@ -169,7 +168,7 @@ pub struct StdoutSessionOutput;
 /// orchestrator 状态机配置。
 #[derive(Clone)]
 pub struct OrchestratorConfig {
-    /// 必填 poller；保留 `Option` 以复刻 Go 构造函数的 nil 校验。
+    /// 必填 poller；保留 `Option` 以便构造函数校验缺失值。
     pub poller: Option<Arc<dyn PollerInterface>>,
     /// loop timeout 到达时执行；错误只记录，不终止状态机。
     pub timeout_hook: Option<Arc<Hook>>,
@@ -188,7 +187,7 @@ pub struct OrchestratorConfig {
 }
 
 impl Default for OrchestratorConfig {
-    /// 返回 Go 零值配置；构造函数负责校验 poller 并填充超时。
+    /// 返回默认配置；构造函数负责校验 poller 并填充超时。
     fn default() -> Self {
         Self {
             poller: None,

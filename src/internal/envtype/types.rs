@@ -1,8 +1,8 @@
 //! 环境类型注册、生命周期和 lease provider 的公共类型。
 //!
-//! 对应 Go：`internal/envtype/envtype.go` 中的 `EnvironmentType`、`Factory`、
-//! `Registration` 和 `EnvTypes` 声明，以及 manager 对 BYOC lease provider 的接口断言。
-//! Rust 使用 async trait 表达初始化与 lease 生命周期。
+//! `EnvironmentType`、`Factory`、`Registration` 和 `EnvTypes` 描述环境注册及生命周期，
+//! manager 通过显式接口访问 BYOC lease provider。异步初始化和 lease 生命周期使用
+//! async trait 表达。
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -43,7 +43,7 @@ pub trait EnvironmentType: Send + Sync {
 
     /// 动态暴露当前环境可选的 lease 能力。
     ///
-    /// Go 可以直接对 interface 执行 `env.(LeaseManagerProvider)`；Rust 的
+    /// 可以直接对 interface 执行 `env.(LeaseManagerProvider)`；Rust 的
     /// `dyn EnvironmentType` 不会因为具体类型还实现了另一个 trait 而自动支持横向
     /// 转换，因此在基础 trait 上提供显式查询入口。普通环境沿用默认 `None`，BYOC
     /// 返回自身的 provider，manager 无需依赖具体环境类型或启动层手工 adapter。
@@ -52,7 +52,6 @@ pub trait EnvironmentType: Send + Sync {
     }
 }
 
-/// 对应 Go：`internal/envtype/envtype.go` 中的 `Factory`。
 ///
 /// 环境工厂接收后端返回的原始 JSON 配置。
 ///

@@ -1,4 +1,4 @@
-//! 对应 Go `internal/mcp/registry_test.go` 的注册表、工厂与 Claude CLI 测试。
+//! 注册表、工厂与 Claude CLI 测试。
 
 use std::{
     os::unix::fs::PermissionsExt as _,
@@ -28,7 +28,7 @@ use super::{
 
 static REGISTRY_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-/// 对应 Go `fakeRegistryServer`；记录工厂传入的工具和注册谓词调用。
+/// 记录工厂传入的工具和注册谓词调用。
 struct FakeRegistryServer {
     name: String,
     tools: Vec<ToolConfig>,
@@ -40,17 +40,15 @@ struct FakeRegistryServer {
 
 #[async_trait::async_trait]
 impl MCPServer for FakeRegistryServer {
-    /// 对应 Go `fakeRegistryServer.GetName`。
     fn get_name(&self) -> String {
         self.name.clone()
     }
 
-    /// 对应 Go `fakeRegistryServer.GetTools`。
     fn get_tools(self: Arc<Self>) -> Vec<ToolConfig> {
         self.tools.clone()
     }
 
-    /// 对应 Go `fakeRegistryServer.Start`，并保存实际启动工具名供断言。
+    /// 并保存实际启动工具名供断言。
     async fn start(&self, tools: Vec<ToolConfig>) -> McpResult<ServerConfig> {
         *self
             .started_with
@@ -66,10 +64,9 @@ impl MCPServer for FakeRegistryServer {
         })
     }
 
-    /// 对应 Go `fakeRegistryServer.Stop`；测试 server 没有后台资源。
+    /// 测试 server 没有后台资源。
     async fn stop(&self) {}
 
-    /// 对应 Go `fakeRegistryServer.ShouldRegisterWithClaude`。
     fn should_register_with_claude(&self) -> bool {
         self.should_register_called.store(true, Ordering::SeqCst);
         self.register_with_claude
@@ -88,7 +85,6 @@ impl Drop for RegistryReset {
     }
 }
 
-/// 对应 Go `resetRegistryForTest`。
 fn reset_registry_for_test() -> RegistryReset {
     let guard = REGISTRY_TEST_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -125,7 +121,7 @@ impl Drop for FakeClaudeInstallation {
     }
 }
 
-/// 对应 Go `installFakeClaude`，创建会记录 argv 的 Linux shell 脚本。
+/// 创建会记录 argv 的 Linux shell 脚本。
 fn install_fake_claude(script: &str) -> FakeClaudeInstallation {
     let directory = tempfile::tempdir().expect("创建 fake Claude 临时目录");
     let log_path = directory.path().join("commands.log");

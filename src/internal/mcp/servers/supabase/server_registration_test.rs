@@ -1,4 +1,4 @@
-//! 对应 Go `internal/mcp/servers/supabase/server_registration_test.go` 的完整行为测试。
+//! 完整行为测试。
 
 use std::{
     collections::HashMap,
@@ -65,7 +65,7 @@ impl Drop for SupabaseDisabledEnvironment {
     }
 }
 
-/// 对应 Go `newSupabaseAuthContext`，生成真实嵌套 Supabase auth token。
+/// 生成真实嵌套 Supabase auth token。
 fn new_supabase_auth_context(
     session_id: &str,
     pat: &str,
@@ -98,7 +98,7 @@ fn new_supabase_auth_context(
     )
 }
 
-/// 对应 Go `mcpResultContains`，搜索实际 MCP 文本内容。
+/// 搜索实际 MCP 文本内容。
 fn mcp_result_contains(result: &CallToolResult, want: &str) -> bool {
     result
         .content
@@ -106,7 +106,7 @@ fn mcp_result_contains(result: &CallToolResult, want: &str) -> bool {
         .any(|content| content.text.contains(want))
 }
 
-/// 对应 Go `toolNames`，提取当前工具顺序供兼容断言。
+/// 提取当前工具顺序供 wire 顺序断言。
 fn tool_names(tools: &[crate::internal::mcp::ToolConfig]) -> Vec<&str> {
     tools.iter().map(|tool| tool.tool.name.as_str()).collect()
 }
@@ -604,7 +604,7 @@ fn test_permanent_provisioning_err_body() {
     );
 }
 
-/// 在专用子进程把 umask 设为 `000`，验证 Supabase 输出目录仍请求 Go 的 `0755`。
+/// 在专用子进程把 umask 设为 `000`，验证 Supabase 输出目录仍请求 `0755`。
 ///
 /// 子进程方案避免在多线程 test harness 中短暂改变全局 umask，从而不会干扰同时
 /// 创建 fixture 的其他测试。

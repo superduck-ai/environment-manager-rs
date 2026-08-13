@@ -1,4 +1,4 @@
-//! `internal/podmonitor/lease_manager_test.go` 对应的 Rust 行为测试。
+//! 租约心跳、超时和停止流程的行为测试。
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -83,7 +83,7 @@ fn successful_heartbeat(last_heartbeat: &str, lease_updated_at: DateTime<Utc>) -
     })
 }
 
-/// 验证默认健康路径和环境阈值解析与 Go 一致。
+/// 验证默认健康路径和环境阈值解析与 一致。
 #[test]
 fn test_default_health_path_and_stuck_threshold() {
     assert!(get_default_health_file_path().ends_with(Path::new(".agent-health/envmgr-healthy")));
@@ -216,7 +216,7 @@ async fn test_heartbeat_lease_not_extended_stopping_stops_and_cancels() {
     );
 }
 
-/// 验证初始 heartbeat 错误会被包装，且未成功 start 的 stop 保留 Go 阻塞语义。
+/// 验证初始 heartbeat 错误会被包装，且未成功 start 的 stop 会保持等待。
 #[tokio::test]
 async fn test_start_initial_heartbeat_failure_and_stop_after_start() {
     let server = MockServer::start().await;
@@ -369,7 +369,7 @@ async fn test_call_stop_api_forced_and_stop_error_classification() {
 /// 验证预先取消仍会进入 stop operation，再由请求层产生不可重试取消错误。
 ///
 /// 这条用例防止通用 retry 恢复“调用 operation 前直接返回 Cancelled”的旧分支；
-/// 取消必须由 `call_stop_api` 闭包观察，才能经过 classifier 和兼容日志流程。
+/// 取消必须由 `call_stop_api` 闭包观察，才能经过 classifier 和统一日志流程。
 #[tokio::test]
 async fn test_call_stop_api_observes_pre_cancel_inside_operation() {
     let manager = test_manager(
@@ -425,7 +425,7 @@ async fn test_call_stop_api_reports_non_retriable_status_once() {
 
 /// 服务端发出非 2xx headers 后，即使响应体永久停住，取消也必须及时结束请求。
 ///
-/// Go 的 `io.ReadAll(resp.Body)` 由 request context 中断且忽略读取错误；本测试使用原始
+/// 完整读取响应体 由 request context 中断且忽略读取错误；本测试使用原始
 /// HTTP server 故意声明更长正文但不结束连接，防止 Reqwest 自行把 EOF 当作完成。
 /// 取消与客户端交付 headers 存在真实竞态，因此允许请求层取消或 HTTP 400 两种结果，
 /// 但两者都必须在一秒内返回；下一个测试再确定性固定已经进入 body 阶段的 partial。
@@ -647,7 +647,7 @@ async fn lease_expiry_safety_window_triggers_shutdown() {
     manager.stop_and_wait().await;
 }
 
-/// 验证空健康路径无操作，嵌套路径会写出可解析的 RFC3339Nano。
+/// 验证空健康路径无操作，嵌套路径会写出可解析的 RFC 3339 纳秒时间戳。
 #[tokio::test]
 async fn test_update_health_file() {
     let manager = test_manager(

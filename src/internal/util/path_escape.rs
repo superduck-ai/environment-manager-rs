@@ -1,15 +1,14 @@
-//! Go `net/url.PathEscape` 的共享兼容实现。
+//! path-segment 百分号编码的共享实现。
 //!
-//! Go 工作树在 API、Git proxy、Supabase MCP 和 session lockfile 中都用
-//! `url.PathEscape` 编码单个动态 path segment。本模块集中保存同一套逐字节规则，
+//! 在 API、Git proxy、Supabase MCP 和 session lockfile 中都用
+//! 单个动态 path segment 使用统一的逐字节编码规则，
 //! 避免各调用方分别使用 query/form encoder 后，在 `: @ & = + $ ; ,` 等保留字符上
 //! 产生不同的外部 URL 或文件名。
 
-/// 逐 UTF-8 字节复刻 Go 标准库 `net/url.PathEscape`。
+/// 逐 UTF-8 字节编码一个 URL path segment。
 ///
-/// 对应 Go：所有生产态 `url.PathEscape` 调用，包括 `internal/api`、
-/// `internal/gitproxy/handler.go`、`internal/mcp/servers/supabase/server.go` 和
-/// `internal/util/lockfile.go`。Go 的 path-segment 模式保留字母、数字、`-._~`
+/// API、Git proxy、Supabase MCP 和 session lockfile 共用该函数。path-segment 模式
+/// 保留字母、数字、`-._~`
 /// 以及 `: @ & = + $`，并转义 `/ ; , ?`、百分号、空格和全部非 ASCII 字节。
 ///
 /// # 参数
@@ -17,14 +16,14 @@
 ///   不要求其满足 ID 格式，也不会先做 Unicode 归一化。
 ///
 /// # 返回
-/// 返回只包含 ASCII 的兼容编码。需要转义的每个 UTF-8 字节都写成大写 `%XX`；
+/// 返回只包含 ASCII 的 path-segment 编码。需要转义的每个 UTF-8 字节都写成大写 `%XX`；
 /// 该过程不会失败，也不会修改 `.` 或 `..` 的文本内容。
 ///
 /// # 副作用
 /// 无文件、网络或环境变量副作用；唯一分配是返回字符串。
 ///
-/// # 兼容性
-/// 这里只复刻 `PathEscape` 本身，不负责完整 URL parser 对 `.`/`..` path segment
+/// # 协议约束
+/// 这里只实现`PathEscape` 本身，不负责完整 URL parser 对 `.`/`..` path segment
 /// 的归一化；上游 `url` 会按 WHATWG 清理后端明确禁止的完整 `.`/`..` ID。
 #[must_use]
 pub(crate) fn go_path_escape(value: &str) -> String {
@@ -52,9 +51,9 @@ pub(crate) fn go_path_escape(value: &str) -> String {
 mod tests {
     use super::go_path_escape;
 
-    /// 表驱动覆盖 Go path-segment 模式的保留字符、百分号二次编码和 UTF-8 字节。
+    /// 表驱动覆盖 path-segment 模式的保留字符、百分号二次编码和 UTF-8 字节。
     #[test]
-    fn matches_go_net_url_path_escape_table() {
+    fn path_escape_encodes_reserved_and_utf8_bytes() {
         let cases = [
             (".", "."),
             ("..", ".."),

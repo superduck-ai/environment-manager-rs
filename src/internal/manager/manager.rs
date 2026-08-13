@@ -1,7 +1,6 @@
 //! Environment manager 的主启动、并行初始化、执行与清理状态机。
 //!
-//! 本文件机械对应 Go `internal/manager/manager.go`。Goroutine/WaitGroup/errgroup 分别
-//! 迁移为 Tokio task、join handle 和共享 `CancellationToken`；所有外部命令取消仅终止
+//! 并发初始化使用 Tokio task、join handle 和共享 `CancellationToken`；所有外部命令取消仅终止
 //! direct child，绝不创建或清理进程组。
 
 use std::{
@@ -48,7 +47,7 @@ const OFFICIAL_PLUGIN_MARKETPLACE: &str =
 
 /// 构造完整 manager，并安装默认 tunnel factory。
 ///
-/// 参数顺序机械对应 Go `NewManagerWithExecutorAndClaudeConfig`；可选配置使用 owned clone，
+/// 参数顺序可选配置使用 owned clone，
 /// event poster 和跨任务依赖使用 `Arc`。BYOC lease 从动态 environment 自动发现；
 /// 测试仍可在构造后显式覆盖 lease/o11y adapter。
 #[allow(clippy::too_many_arguments)]
@@ -85,7 +84,7 @@ pub fn new_manager_with_executor_and_claude_config(
 }
 
 impl Manager {
-    /// 替换或注销默认 tunnel factory；`None` 对应 Go 未注册 factory 的状态。
+    /// 替换或注销默认 tunnel factory；`None` 表示未注册 factory。
     pub fn set_tunnel_client_factory(&mut self, factory: Option<CreateTunnelClientFunc>) {
         self.create_tunnel_client_func = factory;
     }
@@ -119,12 +118,12 @@ impl Manager {
     ///
     /// 顺序严格保持：环境配置与类型创建、三路并行初始化、非致命 MCP/plugin 处理、
     /// lease、executor、setup-only 或 executor+tunnel 并发，以及逆序清理。
-    /// Go 的 `registerMCPServersAsync` 已合并为本函数创建并等待的 MCP Tokio task；
+    /// `registerMCPServersAsync` 已合并为本函数创建并等待的 MCP Tokio task；
     /// `initializeEnvironmentAsync` 则由同一并行阶段直接执行配置应用和 environment
-    /// future。两条路径都返回拥有所有权的结果，不再通过 WaitGroup 后写裸指针。
+    /// future。两条路径都返回拥有所有权的结果，不再通过 join handle 后写裸指针。
     pub async fn run(&mut self, cancellation: &CancellationToken) -> Result<(), ManagerError> {
         let started = Instant::now();
-        // Go 恢复结构保留该字段但 Run 不消费；显式读取避免把协议字段误判为死代码。
+        // 恢复结构保留该字段但 Run 不消费；显式读取避免把协议字段误判为死代码。
         let _ = self.process_start_time;
         let session_id = self
             .session_config
@@ -199,7 +198,7 @@ impl Manager {
                 .disallowed_tools
                 .clone_from(&environment_response.disallowed_tools);
         }
-        // 非 nil Go pointer 在 MCP goroutine 启动前已被原地更新；Rust clone 回字段复刻可见性。
+        // 非 `None` 在 MCP 后台任务 启动前已被原地更新；Rust clone 回字段保留可见性。
         if manager_had_claude_config {
             self.claude_config = Some(claude_config.clone());
         }
@@ -757,7 +756,7 @@ impl Manager {
             Err(_) if execution_was_cancelled => Ok(()),
             Err(error) => {
                 tracing::error!("error" = ?(error.to_string()), "{}", "Environment manager execution failed");
-                // Go 的 `fmt.Errorf("execution failed: %w", err)` 只拼接字节；如果
+                // 错误 source chain 只拼接字节；如果
                 // Claude/npm 捕获输出含非法 UTF-8，提前调用 Display 会改变最终
                 // stderr。日志上方仍使用逐坏字节替换视图，返回链则必须保留原字节。
                 Err(ManagerError::prefixed(
@@ -770,9 +769,9 @@ impl Manager {
 
     /// 在 detached 五秒 context 内顺序停止 MCP servers 并销毁 executor。
     ///
-    /// Go 的 `context.WithTimeout` 只会让 `executor.Destroy` 观察到 deadline，
+    /// `context.WithTimeout` 只会让 `executor.Destroy` 观察到 deadline，
     /// 不会在五秒后强制截断无 context 参数的 `server.Stop`。因此这里用独立
-    /// timer 只取消 operation token，仍等待顺序清理返回，也不添加 Go 中不存在的
+    /// timer 只取消 operation token，仍等待顺序清理返回，也不添加 中不存在的
     /// timeout warning。
     async fn cleanup_mcp_and_executor(
         &self,
@@ -782,8 +781,7 @@ impl Manager {
         let cleanup_cancellation = CancellationToken::new();
         let deadline_cancellation = cleanup_cancellation.clone();
         // deadline 在创建 cleanup context 的这一刻开始，不能推迟到 timer task
-        // 第一次获得调度，否则前面某个 server.Stop 占用 runtime 时会延长 Go
-        // `context.WithTimeout` 规定的五秒总预算。
+        // 第一次获得调度，否则前面某个 server stop 占用 runtime 时会延长五秒总预算。
         let cleanup_deadline = tokio::time::Instant::now() + CLEANUP_TIMEOUT;
         let deadline_task = tokio::spawn(async move {
             tokio::time::sleep_until(cleanup_deadline).await;
@@ -796,8 +794,8 @@ impl Manager {
         if let Err(error) = executor.destroy(&cleanup_cancellation).await {
             tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to destroy Claude executor");
         }
-        // 清理在 deadline 前完成时，Go 的 cancel defer 会立即通知所有派生
-        // context 并释放 timer；先 cancel 再 abort 复刻这个顺序，也避免一个
+        // 清理在 deadline 前完成时，cancel 会立即通知所有派生 token；先 cancel 再
+        // abort 保留这个顺序，也避免一个
         // 无用任务继续存活五秒。
         cleanup_cancellation.cancel();
         deadline_task.abort();
@@ -819,9 +817,9 @@ pub fn is_tunnel_enabled(factory: Option<&CreateTunnelClientFunc>) -> bool {
 
 /// 等待 SIGINT、SIGTERM 或父取消，并记录统一的 graceful-shutdown 消息。
 ///
-/// Linux 上 Go `signal.Notify` 没有可恢复的错误返回；Tokio 的注册接口虽然返回
-/// `Result`，但若该平台不变量被破坏，应直接暴露为内部 panic，而不是产生 Go
-/// 中不存在的 warning 后改成只等待 cancellation。
+/// Linux signal handler 注册被视为不可恢复的启动条件。Tokio 的接口虽然返回
+/// `Result`，但若该平台不变量被破坏，应直接暴露为内部 panic，而不是记录 warning
+/// 后改成只等待 cancellation。
 pub async fn wait_for_shutdown_signal(cancellation: &CancellationToken) {
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .expect("Linux SIGINT handler registration must succeed");
@@ -864,7 +862,7 @@ pub async fn run_init_only(
         {
             tracing::error!("repo_dir" = ?(repository_directory.display().to_string()), "error" = ?(error.to_string()), "{}", "claude --init-only failed");
             // run_init 的捕获输出属于错误字节的一部分；日志使用上方
-            // 的逐坏字节替换视图，返回路径则复刻 `%w` 的原始字节拼接。
+            // 的逐坏字节替换视图，返回路径则实现`source chain` 的原始字节拼接。
             return Err(ManagerError::prefixed(
                 b"failed to run init script: ",
                 error.as_bytes(),
@@ -882,7 +880,7 @@ pub async fn run_init_only(
     Ok(())
 }
 
-/// 停止可选 lease；无 runtime 时保持 Go nil-check 的空操作。
+/// 停止可选 lease；无 runtime 时保持 `None` 检查 的空操作。
 async fn stop_lease(lease_runtime: Option<&ManagerLeaseRuntime>) {
     if let Some(runtime) = lease_runtime {
         runtime.handle.stop().await;

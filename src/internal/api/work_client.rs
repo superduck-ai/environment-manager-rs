@@ -1,6 +1,6 @@
-//! 对应 Go `internal/api/work_client.go` 的 work ACK 客户端。
+//! work ACK 客户端。
 //!
-//! ACK 只接受 HTTP 200 或 204；认证、beta 和版本 header 的名称与 Go 完全一致。
+//! ACK 只接受 HTTP 200 或 204；认证、beta 和版本 header 的名称与 完全一致。
 
 use reqwest::header::HeaderValue;
 use reqwest::{Method, StatusCode};
@@ -27,7 +27,7 @@ impl WorkClient {
         }
     }
 
-    /// 对应 Go `AcknowledgeWork`，确认 worker 已取得指定任务。
+    /// 确认 worker 已取得指定任务。
     ///
     /// # 副作用
     /// 向 `/v1/environments/{environment}/work/{work}/ack` 发送可重试 POST。

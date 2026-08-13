@@ -1,4 +1,4 @@
-//! 对应 Go `internal/sandbox/sandbox_test.go` 的聚合兼容测试。
+//! Sandbox 聚合行为测试。
 //!
 //! 测试覆盖 JSON/权限/清理、域名校验、自动与自定义配置的所有权、命令包装及
 //! `current` 安装短路；所有路径副作用都限制在 Linux ARM64 测试机临时目录。
@@ -32,7 +32,6 @@ fn valid_sandbox_config() -> SrtConfig {
     }
 }
 
-/// 对应 Go：`sandbox_test.go` 中的 `TestWriteLoadValidateAndCleanupConfigFile`。
 ///
 /// 验证配置往返、0600 权限、显式删除以及空路径清理的幂等语义。
 #[test]
@@ -50,7 +49,6 @@ fn test_write_load_validate_and_cleanup_config_file() {
     cleanup_config_file(Path::new("")).unwrap();
 }
 
-/// 对应 Go：`sandbox_test.go` 中的 `TestValidateConfigAndDomainMatches`。
 ///
 /// 覆盖精确域名、双向 `*.` 通配、无关域名以及缺失必需域名的错误分支。
 #[test]
@@ -76,7 +74,6 @@ fn test_validate_config_and_domain_matches() {
     ));
 }
 
-/// 对应 Go：`sandbox_test.go` 中的 `TestLoadAndValidateConfigReportsReadParseAndValidationErrors`。
 ///
 /// 分别构造缺失文件、损坏 JSON 和缺失必需域名，确保三类错误不会被错误合并。
 #[test]
@@ -104,7 +101,6 @@ fn test_load_and_validate_config_reports_read_parse_and_validation_errors() {
     ));
 }
 
-/// 对应 Go：`sandbox_test.go` 中的 `TestNewSandboxRuntimeWithGeneratedConfigWrapAndCleanup`。
 ///
 /// 自动配置必须加入工作目录、包装 SRT 参数，并在显式 cleanup 后删除 owned 文件。
 #[test]
@@ -129,7 +125,6 @@ fn test_new_sandbox_runtime_with_generated_config_wrap_and_cleanup() {
     assert!(!config_path.exists());
 }
 
-/// 对应 Go：`sandbox_test.go` 中的 `TestNewSandboxRuntimeWithCustomConfigDoesNotCleanupFile`。
 ///
 /// 调用方提供的 settings 文件只被引用，即使显式 cleanup 或 Drop 也必须保留。
 #[test]
@@ -148,7 +143,6 @@ fn test_new_sandbox_runtime_with_custom_config_does_not_cleanup_file() {
     assert!(path.exists());
 }
 
-/// 对应 Go：`sandbox_test.go` 中的 `TestNewSandboxRuntimeRejectsInvalidCustomConfig`。
 ///
 /// 自定义配置在创建任何 runtime 副作用前完成读取和安全验证。
 #[test]
@@ -166,7 +160,6 @@ fn test_new_sandbox_runtime_rejects_invalid_custom_config() {
     );
 }
 
-/// 对应 Go：`sandbox_test.go` 中的 `TestInstallSandboxRuntimeSkipsCurrentVersion`。
 ///
 /// `current` 是明确的禁用安装值，不得查询或启动 npm，因而预取消 token 也应成功。
 #[tokio::test]
@@ -179,7 +172,7 @@ async fn test_install_sandbox_runtime_skips_current_version() {
     assert_eq!(default_config().network.allowed_domains.len(), 3);
 }
 
-/// 对应 Go `writeSandboxConfig`，以生产 JSON 形状写入自定义 SRT fixture。
+/// 以生产 JSON 形状写入自定义 SRT fixture。
 fn write_sandbox_config(path: &Path, config: &SrtConfig) {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
@@ -187,7 +180,7 @@ fn write_sandbox_config(path: &Path, config: &SrtConfig) {
     std::fs::write(path, serde_json::to_vec(config).unwrap()).unwrap();
 }
 
-/// 对应 Go `contains`，按精确字符串判断 allow/deny 列表成员。
+/// 按精确字符串判断 allow/deny 列表成员。
 fn contains(values: &[String], target: &str) -> bool {
     values.iter().any(|value| value == target)
 }

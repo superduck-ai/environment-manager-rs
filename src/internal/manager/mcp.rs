@@ -1,7 +1,6 @@
 //! Manager 启动阶段的 MCP registration 选择、server 构造和非致命降级。
 //!
-//! 本文件机械对应 Go `internal/manager/mcp.go`。Registrations 按全局注册顺序串行
-//! 启动，单个 server 失败只记录诊断并继续；返回值仍保留全部 registrations，供
+//! Registrations 按全局注册顺序串行启动，单个 server 失败只记录诊断并继续；返回值仍保留全部 registrations，供
 //! Claude executor 生成工具策略和附加 system prompt。
 
 use std::{collections::BTreeMap, sync::Arc, time::Instant};
@@ -19,7 +18,7 @@ use super::types::{Manager, ManagerError, McpRegistrationBatch, working_director
 impl Manager {
     /// 选择当前会话启用的 registrations，并依次创建、启动和注册 MCP servers。
     ///
-    /// 任一 factory 失败都与 Go 一样是非致命错误：记录
+    /// 任一 factory 失败都是非致命错误：记录
     /// `mcp_server_setup_failed_nonfatal` 后继续下一项，最终 batch 本身仍成功返回。
     pub(super) async fn register_mcp_servers(
         &self,
@@ -65,7 +64,7 @@ impl Manager {
         }
     }
 
-    /// 调用单个 registration factory，并保留 Go 的阶段日志和错误包装文本。
+    /// 调用单个 registration factory，并保留 阶段日志和错误包装文本。
     pub(super) async fn setup_mcp_server_with_registration(
         &self,
         cancellation: &CancellationToken,

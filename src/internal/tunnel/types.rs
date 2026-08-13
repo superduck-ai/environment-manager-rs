@@ -22,7 +22,7 @@ pub struct TunnelError {
 }
 
 impl TunnelError {
-    /// 从完整兼容文本构造 Tunnel 错误。
+    /// 从已经包含完整上下文的文本构造 Tunnel 错误。
     #[must_use]
     pub fn message(message: impl Into<String>) -> Self {
         Self {
@@ -47,16 +47,16 @@ pub type WsSenderError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// 本地 WebSocket 响应发送接口。
 #[async_trait]
 pub trait WsResponseSender: Send + Sync {
-    /// 对应 Go：`WSResponseSender.SendOpened`，报告握手成功和选中的子协议。
+    /// 报告握手成功和选中的子协议。
     async fn send_opened(&self, response: super::WsTunnelOpened) -> Result<(), WsSenderError>;
 
-    /// 对应 Go：`WSResponseSender.SendMessage`，把本地 WebSocket 消息发回 Tunnel。
+    /// 把本地 WebSocket 消息发回 Tunnel。
     async fn send_message(&self, message: super::WsTunnelMessage) -> Result<(), WsSenderError>;
 
-    /// 对应 Go：`WSResponseSender.SendClose`，把本地关闭帧发回 Tunnel。
+    /// 把本地关闭帧发回 Tunnel。
     async fn send_close(&self, message: super::WsTunnelClose) -> Result<(), WsSenderError>;
 
-    /// 对应 Go：`WSResponseSender.SendError`，报告握手或读写错误。
+    /// 报告握手或读写错误。
     async fn send_error(&self, response: super::WsTunnelError) -> Result<(), WsSenderError>;
 }
 
@@ -87,7 +87,7 @@ pub struct WsHandler {
     pub(crate) tunnels: Arc<tokio::sync::RwLock<BTreeMap<String, Arc<WsTunnel>>>>,
 }
 
-/// 对应 Go `ClientOption`：只在 `new_client` 返回共享对象前修改配置。
+/// 只在 `new_client` 返回共享对象前修改配置。
 pub type ClientOption = Box<dyn Fn(&mut Client) + Send + Sync + 'static>;
 
 /// 后端 Tunnel 长连接客户端。
@@ -98,7 +98,7 @@ pub struct Client {
     pub(crate) ws_url: String,
     pub(crate) auth_token: SecretString,
     pub(crate) action_registry: Option<Arc<Registry>>,
-    /// 所有响应和 ping 共用一个异步写锁，复刻 Gorilla WebSocket 单写者要求。
+    /// 所有响应和 ping 共用一个异步写锁，保留 WebSocket 单写者要求。
     pub(crate) writer: tokio::sync::Mutex<Option<LocalWebSocketSink>>,
     /// Connect 安装、Run 独占取走的读半部；同一连接不能并发运行两个 read loop。
     pub(crate) reader: tokio::sync::Mutex<Option<LocalWebSocketStream>>,

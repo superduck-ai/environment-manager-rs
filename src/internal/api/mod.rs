@@ -1,6 +1,6 @@
-//! 对应 Go `internal/api` 包的 HTTP 客户端、会话事件和后端适配器。
+//! HTTP 客户端、会话事件和后端适配器。
 //!
-//! 模块保持 Go 文件边界，但使用异步 Reqwest 和 `CancellationToken` 表达 context 取消。
+//! 模块保持 边界，但使用异步 Reqwest 和 `CancellationToken` 表达 context 取消。
 //! 所有 wire DTO 都显式声明 serde 名称，避免 Rust 字段命名影响现有后端协议。
 
 mod ccr_backend;

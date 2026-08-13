@@ -36,10 +36,10 @@ impl CcLogCollector {
         std::mem::take(&mut *buffer)
     }
 
-    /// 对应 Go：`ccLogCollector.Stop`，停止 tailer 并等待 collector 完全退出。
+    /// 停止 tailer 并等待 collector 完全退出。
     ///
     /// `Tailer::stop` 先关闭生产端，随后等待 consumer 消费完已经送达 channel 的行。
-    /// 正常关闭没有返回值；若后台任务 panic，则恢复 unwind 以复刻 Go goroutine panic
+    /// 正常关闭没有返回值；若后台任务 panic，则恢复 unwind 以实现后台任务 panic
     /// 的致命语义，而不是记录 Rust 独有 warning 后继续运行。
     pub(super) async fn stop(&self) {
         self.tail.stop().await;
@@ -52,7 +52,7 @@ impl CcLogCollector {
             && let Err(error) = task.await
             && error.is_panic()
         {
-            // Go collector goroutine 的 panic 会终止整个进程。Tokio 默认只把 panic
+            // collector 后台任务的 panic 会终止整个进程。Tokio 默认只把 panic
             // 封装进 JoinError，因此必须在唯一 join 点恢复 unwind，不能改写成一条
             // Rust 独有 warning 后继续运行。
             std::panic::resume_unwind(error.into_panic());
@@ -71,10 +71,10 @@ impl CcLogCollector {
         })
     }
 
-    /// 对应 Go：`ccLogCollector.collect`，消费 tailer 行并写入有界内存队列。
+    /// 消费 tailer 行并写入有界内存队列。
     ///
     /// 空行和 tailer 错误行静默跳过；JSON 解析失败时按 `error`、`line` 顺序写 WARN。
-    /// 有效对象会移除可解析的 RFC3339Nano `timestamp`、覆盖 `source=cc`，最后在 mutex
+    /// 有效对象会移除可解析的 RFC 3339 纳秒 `timestamp`、覆盖 `source=cc`，最后在 mutex
     /// 内追加。日志直接发送到进程级 tracing subscriber。
     async fn collect(mut lines: mpsc::Receiver<TailLine>, buffer: Arc<Mutex<Vec<DiagLogEntry>>>) {
         while let Some(line) = lines.recv().await {
@@ -107,7 +107,7 @@ impl CcLogCollector {
     }
 }
 
-/// 对应 Go：`newCCLogCollector`，创建从文件当前末尾开始读取的 Claude Code collector。
+/// 创建从文件当前末尾开始读取的 Claude Code collector。
 ///
 /// # 参数
 /// - `cancellation`：父会话取消 token，负责结束 tailer。

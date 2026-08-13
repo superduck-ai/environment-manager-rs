@@ -1,7 +1,6 @@
 //! Tunnel header 转换与辅助函数。
 //!
-//! 对应 Go `internal/tunnel/helpers.go` 的 header 部分。强类型 Rust API 不再需要
-//! `interface{}` 到 Proto 的反射转换；未知 ProtoJSON 字段的兼容解码放在 client。
+//! 这里处理 header 与 ProtoJSON 字节布局；未知 ProtoJSON 字段的宽容解码放在 client。
 
 use std::io;
 
@@ -10,16 +9,16 @@ use serde::Serialize;
 
 use super::{Header, TunnelError};
 
-/// Go `protojson` 紧凑格式的 Serde JSON formatter。
+/// Tunnel 协议紧凑格式的 Serde JSON formatter。
 ///
-/// `protojson.MarshalOptions{}` 不在冒号后加空格，但会在 object
+/// 协议格式不在冒号后加空格，但会在 object
 /// 和 array 的每个逗号后写一个 ASCII 空格。`serde_json`默认
 /// 紧凑 formatter 不写这个空格，因此需要在 token 边界定制，不能
 /// 对最终字符串做替换（字符串值自身可以包含逗号）。
 struct GoProtoJsonFormatter;
 
 impl serde_json::ser::Formatter for GoProtoJsonFormatter {
-    /// 在非首个 array 元素前写入 Go ProtoJSON 的逗号和单空格。
+    /// 在非首个 array 元素前写入 ProtoJSON 的逗号和单空格。
     fn begin_array_value<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
     where
         W: ?Sized + io::Write,
@@ -31,7 +30,7 @@ impl serde_json::ser::Formatter for GoProtoJsonFormatter {
         }
     }
 
-    /// 在非首个 object 键前写入 Go ProtoJSON 的逗号和单空格。
+    /// 在非首个 object 键前写入 ProtoJSON 的逗号和单空格。
     fn begin_object_key<W>(&mut self, writer: &mut W, first: bool) -> io::Result<()>
     where
         W: ?Sized + io::Write,
@@ -44,7 +43,7 @@ impl serde_json::ser::Formatter for GoProtoJsonFormatter {
     }
 }
 
-/// 按 Go `protojson.MarshalOptions{UseProtoNames:false}.Marshal` 的稳定字节布局编码。
+/// 按稳定字节布局编码。
 ///
 /// # 参数
 /// - `value`：已由 `pbjson` 生成 `Serialize` 实现的 Tunnel Proto 消息。
@@ -53,8 +52,8 @@ impl serde_json::ser::Formatter for GoProtoJsonFormatter {
 /// 成功时返回 lowerCamel ProtoJSON 字节；生成的 Serde 实现拒绝
 /// 某个字段时原样返回序列化错误。
 ///
-/// # 兼容性
-/// 保留 Go ProtoJSON 在逗号后的单空格、pbjson 字段顺序、Base64 bytes
+/// # 协议字节
+/// 保留 ProtoJSON 在逗号后的单空格、pbjson 字段顺序、Base64 bytes
 /// 和默认值省略规则；该空格是 WebSocket text frame 中可观察的协议字节。
 pub fn marshal_protojson<T>(value: &T) -> Result<Vec<u8>, serde_json::Error>
 where
@@ -66,11 +65,10 @@ where
     Ok(output)
 }
 
-/// 对应 Go：`applyTunnelHeaders`。
 ///
 /// 按输入顺序追加非空 header，保留同名多值。无效 header name/value 会返回请求
 /// 构造错误，而不会把未经验证的字节交给本地 HTTP/WS 客户端。`Host`
-/// 特例忽略：Go 把它写入 `Request.Header` 后，Transport 仍只使用
+/// 特例忽略：把它写入 `Request.Header` 后，Transport 仍只使用
 /// `Request.Host`/目标 URL 生成 Host；Rust 若直接透传则可被后端请求覆盖
 /// loopback 目标 authority，因此必须在这一共享边界丢弃。
 pub fn apply_tunnel_headers(
@@ -93,13 +91,13 @@ pub fn apply_tunnel_headers(
     Ok(())
 }
 
-/// 对应 Go WebSocket `DialContext` 对 `Host` 的特殊处理。
+/// 应用 WebSocket 握手 header，并特殊处理 `Host`。
 ///
 /// 普通 header 仍按输入顺序 append；第一个 `Host` 覆盖
 /// `into_client_request` 从 loopback URL 生成的握手 Host，后续 `Host`
-/// 忽略。这与 Go 把 `http.Header["Host"]` 的第一值写入
-/// `Request.Host` 一致，不能复用 HTTP Transport 必须忽略 Host 的分支。
-/// Gorilla 自己生成的握手保留头若被调用方重复传入，会在联网前返回
+/// 忽略。第一值写入握手 request-target 的 authority，不能复用 HTTP transport 忽略
+/// `Host` header 的分支。
+/// WebSocket 自己生成的握手保留头若被调用方重复传入，会在联网前返回
 /// `websocket: duplicate header not allowed`；仅 `Sec-Websocket-Protocol`
 /// 在 dialer 未配置子协议时允许由 header 提供。
 pub fn apply_websocket_tunnel_headers(
@@ -135,11 +133,10 @@ pub fn apply_websocket_tunnel_headers(
     Ok(())
 }
 
-/// 返回 Gorilla 禁止由 `requestHeader` 重复提供的握手头规范名称。
+/// 返回 WebSocket 禁止由 `requestHeader` 重复提供的握手头规范名称。
 ///
-/// `HeaderName` 内部统一为小写，本函数显式返回 Go
-/// `textproto.CanonicalMIMEHeaderKey` 产生的可观测错误文本。协议头只有在
-/// dialer 已通过 `Subprotocols` 配置时才冲突；否则 Gorilla 允许它作为
+/// `HeaderName` 内部统一为小写，本函数显式返回 canonical HTTP header casing 产生的可观测错误文本。协议头只有在
+/// dialer 已通过 `Subprotocols` 配置时才冲突；否则 WebSocket 允许它作为
 /// request header，并保留全部值。
 fn websocket_duplicate_header_name(
     name: &HeaderName,
@@ -156,10 +153,8 @@ fn websocket_duplicate_header_name(
     }
 }
 
-/// 对应 Go：`flattenHTTPHeaders`。
 ///
-/// 名称按字典序排列，每个名称的多个值保持原顺序，并转为 Go
-/// `textproto.CanonicalMIMEHeaderKey` 风格，以稳定差分输出。
+/// 名称按字典序排列，每个名称的多个值保持原顺序，并转为 canonical HTTP header casing 风格，以稳定差分输出。
 #[must_use]
 pub fn flatten_http_headers(source: &HeaderMap) -> Vec<Header> {
     let mut names = source

@@ -1,4 +1,4 @@
-//! `metrics.go` 的业务 helper 与派生指标回归测试。
+//! 指标业务 helper 与派生值回归测试。
 
 use std::sync::{Arc, Mutex};
 
@@ -92,7 +92,7 @@ pub(super) fn context_with_recording_service() -> (O11yContext, Arc<RecordingO11
     )
 }
 
-/// 对应 Go：`copyTags`，为异步/延迟断言复制调用时刻的标签快照。
+/// 为异步/延迟断言复制调用时刻的标签快照。
 fn copy_tags(tags: Option<&MetricTags>) -> MetricTags {
     tags.cloned().unwrap_or_default()
 }
@@ -127,7 +127,7 @@ fn test_increment_end_metrics() {
     assert!(!increments[1].tags.contains_key("error"));
 }
 
-/// 验证启动 helper 使用兼容字段名 `session_mode`。
+/// 验证启动 helper 使用稳定字段名 `session_mode`。
 #[test]
 fn test_increment_env_manager_start() {
     let (context, service) = context_with_recording_service();
@@ -145,7 +145,7 @@ fn test_increment_env_manager_start() {
     );
 }
 
-/// 验证从 DWARF 恢复的代表性指标名称与单位。
+/// 验证代表性指标名称与单位。
 #[test]
 fn test_metric_definitions() {
     assert_eq!(GIT_CHECKOUT_METRIC.name, "git.checkout");

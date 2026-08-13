@@ -1,4 +1,4 @@
-//! 对应 Go `internal/util/git_test.go` 的 Git 引用兼容测试。
+//! Git 引用行为测试。
 //!
 //! 测试使用临时真实仓库验证 `git update-ref` 的成功路径和错误包装；仅在权威
 //! Linux ARM64 测试机执行，避免依赖编辑主机上的 Git 行为。
@@ -10,7 +10,6 @@ use tokio_util::sync::CancellationToken;
 
 use super::update_remote_tracking_branch;
 
-/// 对应 Go：`git_test.go` 中的 `runGitCommand`。
 ///
 /// 在指定测试仓库中执行同步 Git 命令，并返回去除首尾空白的标准输出。命令失败
 /// 会立即终止当前测试，同时保留 Git stderr 便于定位 fixture 初始化问题。
@@ -28,7 +27,6 @@ fn run_git_command(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-/// 对应 Go：`git_test.go` 中的 `TestUpdateRemoteTrackingBranch`。
 ///
 /// 创建最小仓库后更新 remote-tracking ref，并逐字比较它与 `HEAD` 的对象 ID。
 #[tokio::test]
@@ -60,9 +58,8 @@ async fn test_update_remote_tracking_branch() {
     );
 }
 
-/// 对应 Go：`git_test.go` 中的 `TestUpdateRemoteTrackingBranchWrapsGitError`。
 ///
-/// 使用不存在的 revision 触发 Git 失败，并验证错误文本包含 Go 版本相同的目标
+/// 使用不存在的 revision 触发 Git 失败，并验证错误文本包含 相同的目标
 /// remote-tracking 引用，确保上层日志仍能直接定位失败分支。
 #[tokio::test]
 async fn test_update_remote_tracking_branch_wraps_git_error() {

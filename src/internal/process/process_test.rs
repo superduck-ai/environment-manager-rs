@@ -1,4 +1,4 @@
-//! `internal/process/process_test.go` 对应的 Rust 行为测试。
+//! 子进程启动、取消和输出捕获的行为测试。
 
 use std::collections::HashMap;
 use std::io;
@@ -31,13 +31,13 @@ fn write_executable_script(temp: &TempDir, body: &str) -> PathBuf {
     path
 }
 
-/// 对应 Go：`recordedStreams`，线程安全保存 stdout/stderr 字节。
+/// 线程安全保存 stdout/stderr 字节。
 #[derive(Clone)]
 struct RecordedStreams {
     data: RecordedData,
 }
 
-/// 对应 Go：`newRecordedStreams`，创建两个流均为空的记录器。
+/// 创建两个流均为空的记录器。
 fn new_recorded_streams() -> RecordedStreams {
     RecordedStreams {
         data: Arc::new(Mutex::new(HashMap::new())),
@@ -45,7 +45,7 @@ fn new_recorded_streams() -> RecordedStreams {
 }
 
 impl RecordedStreams {
-    /// 对应 Go：`recordedStreams.streamer`，返回共享同一缓冲区的输出回调。
+    /// 返回共享同一缓冲区的输出回调。
     fn streamer(&self) -> OutputStreamer {
         let output = Arc::clone(&self.data);
         output_streamer(move |stream, bytes| {
@@ -59,7 +59,7 @@ impl RecordedStreams {
         })
     }
 
-    /// 对应 Go：`recordedStreams.output`，将指定流的当前快照转换为 UTF-8 文本。
+    /// 将指定流的当前快照转换为 UTF-8 文本。
     fn output(&self, stream: StreamType) -> String {
         String::from_utf8(
             self.data
@@ -213,8 +213,8 @@ async fn test_stream_pipe_stops_when_streamer_errors() {
 #[tokio::test]
 async fn cancellation_kills_process() {
     let temp = TempDir::new().unwrap();
-    // 使用 shell 自身的 busy loop，避免产生孙进程。若使用 `sleep 60`，严格兼容
-    // Go 的“只杀直接 child”会让 sleep 继续持有 pipe，测试也应观察到长期阻塞。
+    // 使用 shell 自身的 busy loop，避免产生孙进程。若使用 `sleep 60`，
+    // “只杀直接 child”会让 sleep 继续持有 pipe，测试也应观察到长期阻塞。
     let script = write_executable_script(&temp, "#!/bin/sh\nwhile :; do :; done\n");
     let streams = new_recorded_streams();
     let cancellation = CancellationToken::new();
@@ -355,7 +355,7 @@ async fn cancellation_waits_for_descendant_that_holds_pipes() {
 
 /// 从 Linux `/proc/PID/status` 读取单字母进程状态；进程不存在时返回 `None`。
 ///
-/// 本迁移只支持 Linux ARM64，因此直接使用 `/proc` 比引入跨平台抽象更准确；该
+/// 测试目标仅支持 Linux ARM64，因此直接使用 `/proc` 比引入跨平台抽象更准确；该
 /// helper 仅用于验证 wait/reap 的可观察顺序。
 fn linux_process_state(pid: i32) -> Option<String> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
@@ -373,7 +373,7 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// 验证 tempfile pattern 按 Go `CreateTemp` 在最后一个星号处分割。
+/// 验证 tempfile pattern 按 临时文件创建 在最后一个星号处分割。
 #[test]
 fn splits_temp_pattern() {
     assert_eq!(split_pattern("prefix-*.sh"), ("prefix-", ".sh"));

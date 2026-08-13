@@ -1,4 +1,4 @@
-//! `o11y_service.go` 的上下文安装、fallback 与 deferred error 回归测试。
+//! O11y 上下文安装、fallback 与 deferred error 回归测试。
 
 use std::sync::{Arc, Mutex};
 

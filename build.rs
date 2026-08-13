@@ -1,7 +1,7 @@
 //! Tunnel Proto 的构建期代码生成入口。
 //!
-//! 对应 Go 工作区 `gen/proto/anthropic/sessions/tunnel/v1alpha/tunnel.proto` 的
-//! `protoc` 流程。生成的 Prost 消息和 pbjson 实现只写入 Cargo `OUT_DIR`，源码树中
+//! 根据工作区 `gen/proto/anthropic/sessions/tunnel/v1alpha/tunnel.proto` 运行
+//! `protoc`。生成的 Prost 消息和 pbjson 实现只写入 Cargo `OUT_DIR`，源码树中
 //! 只保留协议原文件与薄封装，避免手工修改生成代码。
 
 use std::error::Error;

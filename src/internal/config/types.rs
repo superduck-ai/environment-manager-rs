@@ -1,7 +1,7 @@
 //! 配置子系统的数据声明。
 //!
-//! Session 配置与源码类型。与旧 interface 不同，源码类型
-//! 使用封闭 enum 表达，因此未知 source 会在反序列化阶段被明确拒绝。
+//! Session 配置与源码类型。源码类型使用封闭 enum 表达，因此未知 source 会在
+//! 反序列化阶段被明确拒绝。
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -11,10 +11,10 @@ use serde_json::Value;
 
 use crate::internal::auth::AuthConfig;
 
-/// 把 JSON `null` 还原为 Go 值类型字段的零值。
+/// 把 JSON `null` 还原为字段类型的零值。
 ///
-/// `encoding/json` 遇到 string、bool、int、slice、map 或 struct 的 `null` 时不会
-/// 报类型错误，而是保留对应零值。Serde 的 `#[serde(default)]` 只处理字段缺失，
+/// 配置协议允许 string、bool、int、slice、map 或 struct 字段为 `null`，并将其视为
+/// 对应零值。Serde 的 `#[serde(default)]` 只处理字段缺失，
 /// 因此所有可显式为 null 的配置字段都通过此入口统一补齐另一半语义。
 fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
@@ -24,11 +24,11 @@ where
     Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
-/// 解析 Go 的值类型 slice，并把整个 null 或 null 元素映射为零值。
+/// 解析值类型 slice，并把整个 null 或 null 元素映射为零值。
 ///
-/// Go 对 `[]string`、`[]OutcomeField` 等切片中的 null 元素也会追加一个元素零值；
+/// 对 `[]string`、`[]OutcomeField` 等切片中的 null 元素也会追加一个元素零值；
 /// 使用 `Vec<T>` 的 Serde 默认实现则会在该元素处失败。Source 列表刻意不使用本
-/// helper，因为 Go 先保留 RawMessage，再把 null source 判为未知类型。
+/// helper，因为 source 列表会把 null source 判为未知类型。
 fn deserialize_null_default_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -38,10 +38,10 @@ where
     Ok(values.into_iter().map(Option::unwrap_or_default).collect())
 }
 
-/// 解析 Go 的 `map[string]T`，并把 null map/value 映射为零值。
+/// 解析 `map[string]T`，并把 null map/value 映射为零值。
 ///
-/// `encoding/json` 会为 map 中的 primitive null 写入空字符串等零值；这与整个
-/// map 为 null 时的 nil map 在当前 owned DTO 中都安全归并为空集合/默认元素。
+/// JSON 会为 map 中的 primitive null 写入空字符串等零值；这与整个
+/// map 为 null 时的 未初始化 map 在当前 owned DTO 中都安全归并为空集合/默认元素。
 fn deserialize_null_default_map_values<'de, D, T>(
     deserializer: D,
 ) -> Result<HashMap<String, T>, D::Error>
@@ -263,7 +263,7 @@ pub struct McpServerConfigTool {
 pub struct PermissionPolicy(pub String);
 
 impl PermissionPolicy {
-    /// 判断策略是否为空，用于实现与 Go `omitempty` 一致的序列化。
+    /// 判断策略是否为空，用于实现与 JSON 空值省略 一致的序列化。
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -445,17 +445,17 @@ struct RawStartupContext {
 }
 
 impl<'de> Deserialize<'de> for StartupContext {
-    /// 执行 Go `UnmarshalJSON` 的完整结构化解析。
+    /// 执行 startup context 的完整结构化解析。
     ///
-    /// Go 的 `decodeMcpConfigMap`、`remainingFields` 与 `containsString` 是为了在手写
-    /// JSON 解码时保留 MCP 未知字段；Rust 在同一次反序列化中由 `McpConfig` 和
+    /// `McpConfig` 和 `McpServerConfig` 在同一次反序列化中保留 MCP 未知字段，
+    /// 并由
     /// `McpServerConfig` 的 `#[serde(flatten)]` 完成该工作。source 则由封闭 enum
     /// 逐项判别，未知类型仍会立即返回带类型名的解析错误。
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        // Go 允许把顶层 JSON null 解进已分配的 raw struct，并继续使用全部零值。
+        // 允许把顶层 JSON null 解进已分配的 raw struct，并继续使用全部零值。
         // `Option` 只在 wire 边界承接这一特殊输入，公开 StartupContext 不引入
         // “整个上下文可空”的额外状态。
         let raw = Option::<RawStartupContext>::deserialize(deserializer)?.unwrap_or_default();

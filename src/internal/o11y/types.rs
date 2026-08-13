@@ -1,6 +1,6 @@
 //! 可观测性配置、服务 trait、上下文和静态指标定义。
 //!
-//! Go 版本依赖指针零值和 `context.WithValue`。Rust 版本用 `Option` 表达可缺省参数，
+//! 依赖指针零值和 `context.WithValue`。Rust 版本用 `Option` 表达可缺省参数，
 //! 用 `Arc<dyn O11yService>` 支持跨任务共享，并以 `Cow<'static, str>` 同时容纳静态
 //! 指标和 `record_duration` 动态派生的指标名。
 
@@ -131,7 +131,7 @@ pub trait O11yService: Send + Sync {
     );
 }
 
-/// 显式替代 Go `context.WithValue` 的可克隆 O11y 上下文。
+/// 可克隆的 O11y 上下文。
 #[derive(Clone)]
 pub struct O11yContext {
     pub(crate) cancellation: CancellationToken,
@@ -182,7 +182,7 @@ pub(crate) struct O11yMetricsProvider {
     pub(crate) meter: Mutex<Option<Meter>>,
 }
 
-/// exporter 的强类型联合；避免 Go `interface{}` 初始化路径中的错误 downcast。
+/// exporter 的强类型联合，避免初始化路径中的错误 downcast。
 pub(crate) enum MetricsExporter {
     /// OTLP/HTTP protobuf exporter。
     Otlp(opentelemetry_otlp::MetricExporter),

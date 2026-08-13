@@ -1,7 +1,7 @@
 //! Git proxy 的数据类型、异步接口与稳定错误边界。
 //!
 //! Git proxy 配置与仓库认证类型：配置和认证字段保持同名的
-//! snake_case 映射，`context.Context` 映射为 `CancellationToken`，同步接口则改为
+//! snake_case 映射，取消上下文 映射为 `CancellationToken`，同步接口则改为
 //! 可在线程间共享的异步 trait。认证 token 的 `Debug` 实现始终脱敏，避免诊断日志
 //! 偶然暴露仓库凭据。
 
@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 /// Git proxy 子系统的稳定文本错误。
 ///
-/// Go 调用方依赖 `%w` 逐层拼接后的英文文案；Rust 因而在错误产生处完成兼容包装，
-/// 不把 Axum、Reqwest 或 Tokio 的具体错误类型泄漏到公共接口。
+/// 调用方依赖错误链逐层拼接后的英文文案；错误在产生处完成文本包装，不把 Axum、
+/// Reqwest 或 Tokio 的具体错误类型泄漏到公共接口。
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct GitProxyError {
@@ -21,7 +21,7 @@ pub struct GitProxyError {
 }
 
 impl GitProxyError {
-    /// 使用已经完成 Go 兼容包装的文本构造错误。
+    /// 使用已经包含完整上下文的文本构造错误。
     #[must_use]
     pub fn message(message: impl Into<String>) -> Self {
         Self {
@@ -59,7 +59,7 @@ impl fmt::Debug for RepoAuth {
 /// 本地 Git proxy 的完整配置。
 #[derive(Clone, Default)]
 pub struct Config {
-    /// Session ingress 的基础 URL；仅去掉末尾 `/` 后追加恢复出的路径。
+    /// Session ingress 的基础 URL；仅去掉末尾 `/` 后追加请求路径。
     pub session_ingress_url: String,
     /// 当前 session ID。
     pub session_id: String,
@@ -85,7 +85,7 @@ impl fmt::Debug for Config {
     }
 }
 
-/// Go `Server` 的 Tokio 异步对应接口。
+/// 异步 proxy server 接口。
 #[async_trait]
 pub trait Server: Send + Sync {
     /// 在 `127.0.0.1` 启动 HTTP proxy；重复启动返回 `server already started`。
@@ -101,7 +101,7 @@ pub trait Server: Send + Sync {
     fn base_url(&self) -> String;
 }
 
-/// Go `Manager` 的 Tokio 异步对应接口。
+/// 异步 proxy manager 接口。
 #[async_trait]
 pub trait Manager: Send + Sync {
     /// 幂等启动 proxy，并返回不含用户名和仓库路径的 base URL。

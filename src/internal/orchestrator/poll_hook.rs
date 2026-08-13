@@ -16,7 +16,7 @@ use super::{
 use crate::internal::process::CaptureMode;
 use crate::internal::util::{duration_nanoseconds, format_go_duration};
 
-/// 对应 Go `NewPollHook`，创建命令型 poller。
+/// 创建命令型 poller。
 ///
 /// 零超时默认 30 秒；固定参数随后可通过公开 `args` 字段设置。
 pub fn new_poll_hook(
@@ -44,7 +44,7 @@ pub fn new_poll_hook(
 }
 
 impl PollHook {
-    /// 对应 Go `(*PollHook).Poll`，执行一次命令并解释 stdout。
+    /// 执行一次命令并解释 stdout。
     ///
     /// 空白输出或精确 JSON `null` 表示空队列；其他输出必须是合法 JSON，但不在这一层
     /// 限制具体 schema，以保持外部 poll hook 的协议扩展能力。
@@ -117,7 +117,7 @@ impl PollHook {
         Ok(Some(output.as_bytes().to_vec()))
     }
 
-    /// 对应 Go `(*PollHook).SleepWithJitter`，空队列后随机等待 1–3 秒。
+    /// 空队列后随机等待 1–3 秒。
     ///
     /// `biased` 让已经取消的 token 优先于恰好同时到期的 timer，避免关闭过程多做一轮
     /// poll。随机数在 await 前生成并丢弃，future 因而保持 `Send`。

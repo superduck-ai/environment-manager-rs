@@ -1,8 +1,7 @@
 //! Antspace tar.gz 打包和 control plane 上传。
 //!
 //! 项目根目录及其子目录都会写入 tar header，symlink 被跳过，文件总量受与 Vercel
-//! 相同的 100 MiB 上限约束。上传使用完整内存 multipart body，匹配 Go 实现的内存与
-//! 请求时序。
+//! 相同的 100 MiB 上限约束。上传使用完整内存 multipart body，并在单次请求中发送。
 
 use std::io::Cursor;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
@@ -21,13 +20,12 @@ use crate::internal::tunnel::actions::{ActionError, ProgressUpdate};
 use super::types::{AntspaceClient, AntspaceDeployResult, AntspaceResponse, OptionalProgress};
 use super::vercel::MAX_DEPLOYMENT_BYTES;
 
-/// Antspace 整次 HTTP 请求的固定超时，对应 Go 的十五分钟 `http.Client.Timeout`。
+/// Antspace 整次 HTTP 请求的固定十五分钟超时。
 const ANTSPACE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
-/// 对应 Go：`NewAntspaceClient`。
 ///
 /// URL 原样保存，不删除末尾斜杠；部署时固定再拼 `"/deploy"`，因此配置自带斜杠时
-/// 仍会产生 Go 一样的双斜杠路径。
+/// 仍会产生双斜杠路径。
 #[must_use]
 pub fn new_antspace_client(
     control_plane_url: impl Into<String>,
@@ -44,7 +42,6 @@ pub fn new_antspace_client(
     }
 }
 
-/// 对应 Go：`CreateTarball`。
 ///
 /// 使用名称排序的深度优先遍历，先保留根目录 `.` 和每个目录 header，再写普通或其他
 /// 非目录、非 symlink 项的数据。文件读取完成后才检查累计上限；任何遍历/读取/写入
@@ -99,7 +96,7 @@ pub fn create_tarball(
         }
         let mut header = Header::new_ustar();
         header.set_metadata(&metadata);
-        // tar-rs 默认写入 `st_mode`（含 S_IFREG/S_IFDIR）；Go FileInfoHeader 只保留权限
+        // tar-rs 默认写入 `st_mode`（含 S_IFREG/S_IFDIR）；FileInfoHeader 只保留权限
         // 与 setuid/setgid/sticky 位，文件类型由 typeflag 单独表达。
         header.set_mode(metadata.mode() & 0o7777);
 
@@ -153,7 +150,6 @@ pub fn create_tarball(
 }
 
 impl AntspaceClient {
-    /// 对应 Go：`(*AntspaceClient).Deploy`。
     ///
     /// multipart 字段顺序为 `app` 后 `dist`，文件名固定为 `dist.tar.gz`，并设置 bearer
     /// token。成功的 control plane 响应由 `read_deploy_response` 统一解析和上报 100%。
@@ -178,7 +174,6 @@ impl AntspaceClient {
             .await
     }
 
-    /// 对应 Go：`(*AntspaceClient).readDeployResponse`。
     ///
     /// 只接受 200；非 200 原样包含响应体。成功体的 JSON 解析错误同时附上原 body，
     /// API 的 `error` 字段优先转为业务错误。最终进度发送失败仅记录 warning，不改变已
@@ -200,7 +195,7 @@ impl AntspaceClient {
         };
         let status = response.status();
         if status != StatusCode::OK {
-            // Go 在非 200 分支忽略 `io.ReadAll` 错误；取消或读取失败不能覆盖已经取得的
+            // 在非 200 分支忽略响应体读取错误；取消或读取失败不能覆盖已经取得的
             // HTTP status，因此没有可用 body 时仍返回 status 错误。
             let body = tokio::select! {
                 biased;
@@ -248,7 +243,7 @@ impl AntspaceClient {
                 })
                 .await
         {
-            // 此事件必须在 Go 对应分支直接调用 facade；若经动态 wrapper 转发，
+            // 此事件必须在失败分支直接调用 facade；若经动态 wrapper 转发，
             // `#[track_caller]` 会把 source 错记为 wrapper，而不是进度失败分支。
             tracing::warn!("error" = ?(error.to_string()), "{}", "antspace_progress_send_error");
         }
@@ -260,10 +255,10 @@ impl AntspaceClient {
     }
 }
 
-/// 在内存中构造与 Go `mime/multipart.Writer` 相同顺序的完整请求体。
+/// 在内存中构造顺序的完整请求体。
 ///
 /// boundary 使用 30 个随机字节的 60 位小写十六进制；`app` field 后接 `dist` file，
-/// 每段采用 CRLF，并以 `--boundary--\r\n` 收尾。提前完成整个 body 保留 Go 在发 HTTP
+/// 每段采用 CRLF，并以 `--boundary--\r\n` 收尾。提前完成整个 body 保留 在发 HTTP
 /// 请求前已经承担全部 multipart 内存开销和序列化工作的时序。
 fn build_multipart_body(app_name: &str, tarball: &[u8]) -> (Vec<u8>, String) {
     let random_bytes = rand::random::<[u8; 30]>();

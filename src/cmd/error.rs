@@ -151,9 +151,9 @@ impl RuntimeError {
         }
     }
 
-    /// 给原始下层错误添加兼容 Go `%w` 的静态字节前缀。
+    /// 给原始下层错误添加静态字节前缀，保留既有的 source chain 文本形状。
     ///
-    /// 返回值不经过 UTF-8 解码；用于 `environment manager failed: %w` 这类可能包裹
+    /// 返回值不经过 UTF-8 解码；用于 `environment manager failed: source chain` 这类可能包裹
     /// 非 UTF-8 Claude 错误的路径。
     #[must_use]
     pub(crate) fn prefixed(prefix: &[u8], error: &[u8]) -> Self {
@@ -196,7 +196,7 @@ impl From<String> for RuntimeError {
 }
 
 impl Display for RuntimeError {
-    /// 为日志、断言和诊断输出提供 Go 风格的逐坏字节替换视图。
+    /// 为日志、断言和诊断输出提供 风格的逐坏字节替换视图。
     ///
     /// 原始 stderr 输出不得使用本方法；它会用替换字符显示非 UTF-8 字节。
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
@@ -216,7 +216,7 @@ pub fn render_runtime_error(error: &RuntimeError) -> (Vec<u8>, i32) {
     (rendered, error.exit_code())
 }
 
-/// 将任意错误字节转换成 Go `encoding/json` 采用的逐坏字节替换文本。
+/// 将任意错误字节转换成逐坏字节替换的 UTF-8 文本。
 fn go_utf8_error_view(value: &[u8]) -> String {
     let mut output = String::new();
     let mut remaining = value;

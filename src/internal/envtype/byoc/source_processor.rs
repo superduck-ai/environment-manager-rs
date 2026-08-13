@@ -1,8 +1,5 @@
 //! BYOC 到生产 `sources` 子系统的默认适配器。
 //!
-//! 对应 Go：`internal/envtype/byoc/byoc.go` 中 `Initialize` 与
-//! `handleBranchCheckout` 创建 `SourceHandlerManager` 的两处路径。
-//!
 //! BYOC 保留 [`SourceProcessor`] trait 以便单元测试替换外部 Git 副作用；生产构造
 //! 则通过本适配器直接创建 `SourceHandlerManager`，不要求上层 manager 再手工注入。
 
@@ -26,7 +23,7 @@ pub(super) struct ProductionSourceProcessor;
 
 #[async_trait]
 impl SourceProcessor for ProductionSourceProcessor {
-    /// 创建与 Go branch checkout 路径参数相同的 manager，然后串行处理 sources。
+    /// 创建与 branch checkout 路径参数相同的 manager，然后串行处理 sources。
     async fn process_sources(
         &self,
         cancellation: &CancellationToken,
@@ -40,13 +37,13 @@ impl SourceProcessor for ProductionSourceProcessor {
             .process_sources(cancellation, &request.sources)
             .await
             .map_err(|error| SourceProcessorError::ProcessSources(Box::new(error) as BoxError));
-        // manager 的类型携带 recorder 借用；显式 drop 记录 Go 局部 manager 的结束点，
+        // manager 的类型携带 recorder 借用；显式 drop 记录 局部 manager 的结束点，
         // 编译器也会禁止 manager 被返回、spawn 或保存到更长生命周期中。
         drop(manager);
         result
     }
 
-    /// 创建 fresh/no-validation manager，并执行 Go 中独立的 Git proxy 后处理阶段。
+    /// 创建 fresh/no-validation manager，并执行 中独立的 Git proxy 后处理阶段。
     async fn setup_git_proxy_after_sources_processed(
         &self,
         cancellation: &CancellationToken,
@@ -60,14 +57,14 @@ impl SourceProcessor for ProductionSourceProcessor {
             .setup_git_proxy_after_sources_processed(cancellation, &request.sources)
             .await
             .map_err(|error| SourceProcessorError::SetupGitProxy(Box::new(error) as BoxError));
-        // proxy manager 只属于本次 Go 对应的局部 manager 构造；manager 的生命周期
+        // proxy manager 只属于本次局部 manager 构造；manager 的生命周期
         // 参数保证其中的 handler 不得带走 recorder 借用。
         drop(manager);
         result
     }
 }
 
-/// 把迁移期 BYOC 请求无损映射为 sources 的生产 manager 参数。
+/// 把 BYOC 请求无损映射为 sources 的生产 manager 参数。
 ///
 /// `'recorder` 由当前 `SourceProcessor` 方法收到的 recorder 引用推导。返回 manager
 /// 显式携带该生命周期，因此只能在同一个 processor future 内使用。
