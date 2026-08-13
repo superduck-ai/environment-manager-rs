@@ -2,22 +2,18 @@
 //!
 //! Vercel 流程保持 Go 的构建、收集、首次创建、缺失文件上传、再次创建和轮询顺序；
 //! Antspace 流程保持先打包完整项目再 multipart 上传的顺序。外部命令继承父进程环境，
-//! stdout/stderr 共用同一 pipe 以复刻 `CombinedOutput`，取消时只终止直接子进程。
+//! stdout/stderr 共用同一 pipe 保留交错顺序，取消时只终止直接子进程。
 
-use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-use nix::unistd::pipe;
 use serde::Serialize;
-use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
+use crate::internal::process::{CaptureMode, CommandFailure, CommandOutput, run_command};
 use crate::internal::tunnel::actions::{
     Action, ActionError, ActionRequest, ActionResult, ProgressReporter, ProgressUpdate,
 };
@@ -47,12 +43,6 @@ struct AntspaceActionResponse {
     files: usize,
     deployer: &'static str,
     error: &'static str,
-}
-
-/// 一次外部命令失败及失败前已经捕获的 combined output。
-pub(super) struct CommandFailure {
-    pub(super) error: String,
-    pub(super) output: Vec<u8>,
 }
 
 /// 对应 Go：`NewDeployAction`。
@@ -140,19 +130,23 @@ impl Action for DeployAction {
             tracing::warn!("error" = ?(error.to_string()), "{}", "deploy_progress_failed");
         }
         let build_started = Instant::now();
-        if let Err(mut failure) =
-            run_npm_build(&cancellation, Path::new(&parameters.project_dir)).await
-        {
-            if failure.output.len() > BUILD_ERROR_OUTPUT_LIMIT {
-                failure.output = failure
-                    .output
-                    .split_off(failure.output.len() - BUILD_ERROR_OUTPUT_LIMIT);
+        let failure = match run_npm_build(&cancellation, Path::new(&parameters.project_dir)).await {
+            Ok(output) if output.status.success() => None,
+            Ok(output) => Some((output.status.to_string(), output.output.expect_combined())),
+            Err(error) => {
+                let message = error.to_string();
+                Some((message, error.output.expect_combined()))
             }
-            tracing::error!("duration_ms" = ?(build_started.elapsed().as_millis() as u64), "error" = ?(failure.error.clone()), "{}", "deploy_build_failed");
+        };
+        if let Some((error, mut output)) = failure {
+            if output.len() > BUILD_ERROR_OUTPUT_LIMIT {
+                output = output.split_off(output.len() - BUILD_ERROR_OUTPUT_LIMIT);
+            }
+            tracing::error!("duration_ms" = ?(build_started.elapsed().as_millis() as u64), error, "deploy_build_failed");
             return Err(format!(
                 "build failed: {}\n{}",
-                failure.error,
-                String::from_utf8_lossy(&failure.output)
+                error,
+                String::from_utf8_lossy(&output)
             )
             .into());
         }
@@ -388,48 +382,20 @@ async fn send_progress(
 /// 完整父进程环境并以项目目录为 cwd；取消只杀 direct child，随后像 Go `Output` 一样
 /// 等待 child 和 stdout pipe 清理完成。
 pub(super) async fn get_commit_sha(cancellation: &CancellationToken, directory: &Path) -> String {
-    if cancellation.is_cancelled() {
-        return String::new();
-    }
     let mut command = Command::new("git");
-    command
-        .args(["rev-parse", "HEAD"])
-        .current_dir(directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => return String::new(),
-    };
-    let Some(mut stdout) = child.stdout.take() else {
-        return String::new();
-    };
-    let reader = tokio::spawn(async move {
-        let mut output = Vec::new();
-        stdout.read_to_end(&mut output).await.map(|_| output)
-    });
-    let status = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => {
-            // 与 npm 路径一致：不创建 process group，只终止 direct git child。
-            let _direct_child_kill = child.start_kill();
-            child.wait().await
-        }
-        result = child.wait() => result,
-    };
-    let output = match reader.await {
-        Ok(Ok(output)) => output,
-        Ok(Err(_)) | Err(_) => return String::new(),
-    };
-    if !status.is_ok_and(|status| status.success()) {
-        return String::new();
-    }
-    String::from_utf8_lossy(&output).trim().to_owned()
+    command.args(["rev-parse", "HEAD"]).current_dir(directory);
+    run_command(command, cancellation, None, None, CaptureMode::Separate)
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            let (stdout, _) = output.output.expect_separate();
+            String::from_utf8_lossy(&stdout).trim().to_owned()
+        })
+        .unwrap_or_default()
 }
 
-/// 执行 `npm run build` 并复刻 Go `CombinedOutput`。
+/// 执行 `npm run build` 并捕获 stdout/stderr 的真实交错顺序。
 ///
 /// stdout 与 stderr 指向同一个匿名 pipe，因此内核写入顺序被保留；父进程继承环境，
 /// stdin 指向 null。取消时明确调用 `start_kill` 终止**直接 child**，不创建 process
@@ -437,7 +403,7 @@ pub(super) async fn get_commit_sha(cancellation: &CancellationToken, directory: 
 async fn run_npm_build(
     cancellation: &CancellationToken,
     directory: &Path,
-) -> Result<Vec<u8>, CommandFailure> {
+) -> Result<CommandOutput, CommandFailure> {
     run_build_program(cancellation, directory, Path::new("npm")).await
 }
 
@@ -449,104 +415,8 @@ pub(super) async fn run_build_program(
     cancellation: &CancellationToken,
     directory: &Path,
     program: &Path,
-) -> Result<Vec<u8>, CommandFailure> {
-    if cancellation.is_cancelled() {
-        return Err(CommandFailure {
-            error: "context canceled".to_owned(),
-            output: Vec::new(),
-        });
-    }
-
-    let (read_end, write_end) = pipe().map_err(|error| CommandFailure {
-        error: error.to_string(),
-        output: Vec::new(),
-    })?;
-    for descriptor in [&read_end, &write_end] {
-        fcntl(descriptor, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|error| {
-            CommandFailure {
-                error: error.to_string(),
-                output: Vec::new(),
-            }
-        })?;
-    }
-    let stderr_end = write_end.try_clone().map_err(|error| CommandFailure {
-        error: error.to_string(),
-        output: Vec::new(),
-    })?;
+) -> Result<CommandOutput, CommandFailure> {
     let mut command = Command::new(program);
-    command
-        .args(["run", "build"])
-        .current_dir(directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(write_end))
-        .stderr(Stdio::from(stderr_end))
-        .kill_on_drop(true);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return Err(CommandFailure {
-                error: error.to_string(),
-                output: Vec::new(),
-            });
-        }
-    };
-    // `Command` 不再需要；立即 drop 确保父进程没有保留 shared pipe 的写端。
-    drop(command);
-
-    let mut pipe_reader = tokio::fs::File::from_std(std::fs::File::from(read_end));
-    let reader = tokio::spawn(async move {
-        let mut output = Vec::new();
-        pipe_reader.read_to_end(&mut output).await.map(|_| output)
-    });
-    let status_result = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => {
-            // 只向 direct child 发信号；这是有意保持 Go CommandContext 的语义。
-            let _direct_child_kill = child.start_kill();
-            child.wait().await
-        }
-        result = child.wait() => result,
-    };
-    let output_result = reader.await;
-    let output = match output_result {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            return Err(CommandFailure {
-                error: error.to_string(),
-                output: Vec::new(),
-            });
-        }
-        Err(error) => {
-            return Err(CommandFailure {
-                error: error.to_string(),
-                output: Vec::new(),
-            });
-        }
-    };
-    let status = status_result.map_err(|error| CommandFailure {
-        error: error.to_string(),
-        output: output.clone(),
-    })?;
-    if status.success() {
-        Ok(output)
-    } else {
-        Err(CommandFailure {
-            error: format_exit_status(status),
-            output,
-        })
-    }
-}
-
-/// 把 Unix `ExitStatus` 格式化为 Go `exec.ExitError` 的常见文本。
-fn format_exit_status(status: ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit status: {code}");
-    }
-    match status.signal() {
-        Some(libc::SIGKILL) => "signal: killed".to_owned(),
-        Some(libc::SIGTERM) => "signal: terminated".to_owned(),
-        Some(libc::SIGINT) => "signal: interrupt".to_owned(),
-        Some(signal) => format!("signal: {signal}"),
-        None => status.to_string(),
-    }
+    command.args(["run", "build"]).current_dir(directory);
+    run_command(command, cancellation, None, None, CaptureMode::Combined).await
 }

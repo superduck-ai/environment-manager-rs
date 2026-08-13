@@ -47,7 +47,7 @@ use crate::internal::{
     auth::AuthContext,
     config::{ClaudeConfig, Source, StartupContext},
     logger::LogWriter,
-    process::{go_spawn_error, resolve_go_command},
+    process::terminate_and_reap,
     session::ActivityRecorder,
     util::{Tailer, version},
 };
@@ -58,7 +58,6 @@ use super::{
     session_urls::build_session_urls,
     types::{
         ClaudeCodeExecutor, ClaudeError, ClaudeObservability, Executor, McpServerRegistration,
-        format_exit_status,
     },
 };
 
@@ -131,8 +130,10 @@ impl Drop for TokenSourceFd {
 
 /// 一次 Claude child wait 与 stream 汇合的结果。
 struct ExecutionRun {
-    /// Go error string 的原始字节；显式 executable 路径可能不是 UTF-8。
+    /// 执行错误的原始字节；显式 executable 路径可能不是 UTF-8。
     error: Option<Vec<u8>>,
+    /// 此次运行是否由结构化取消信号终止。
+    cancelled: bool,
     exit_code: i32,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -511,22 +512,15 @@ impl ClaudeCodeExecutor {
             environment.extend(proxy.environment().iter().cloned());
         }
 
-        // Go `exec.CommandContext` 在构造 Cmd 时立即执行 LookPath，但把错误保存到
-        // `Cmd.Err`，直到后续 `Run` 才返回。这里同样先解析并继续完成日志/tailer
-        // 准备，避免 missing executable 改变已有文件副作用的先后顺序。
-        let (resolved_program, command_lookup_error) =
-            match resolve_go_command(OsStr::new(&self.claude_path)) {
-                Ok(path) => (path, None),
-                Err(error) => (OsString::from(&self.claude_path), Some(error.into_bytes())),
-            };
-        let mut command = Command::new(&resolved_program);
+        let mut command = Command::new(&self.claude_path);
         command
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_clear()
-            .envs(environment);
+            .envs(environment)
+            .kill_on_drop(true);
         // `os.Getwd` 失败时 Go 保持 `Cmd.Dir == ""`，让 exec 继承当前目录；给 Tokio
         // 传空 Path 会变成一次失败的 chdir，所以 None 分支必须完全不调用 current_dir。
         if let Some(directory) = working_dir.as_deref() {
@@ -561,8 +555,6 @@ impl ClaudeCodeExecutor {
             .run_child(
                 cancellation,
                 command,
-                resolved_program,
-                command_lookup_error,
                 local_testing_mode,
                 Arc::clone(&log_file),
                 agent_proxy.as_mut(),
@@ -583,9 +575,7 @@ impl ClaudeCodeExecutor {
             );
         }
 
-        let result = self
-            .finish_execution(cancellation, &log_file, run, duration_ms)
-            .await;
+        let result = self.finish_execution(&log_file, run, duration_ms).await;
 
         // 日志与 token read FD 的清理只告警，不覆盖 child 的主返回结果。
         close_claude_log(log_file).await;
@@ -816,23 +806,14 @@ impl ClaudeCodeExecutor {
         &self,
         cancellation: &CancellationToken,
         mut command: Command,
-        resolved_program: OsString,
-        command_lookup_error: Option<Vec<u8>>,
         local_testing_mode: bool,
         log_file: Arc<Mutex<File>>,
         agent_proxy: Option<&mut super::agent_proxy::AgentProxyHandle>,
     ) -> ExecutionRun {
-        if let Some(error) = command_lookup_error {
-            return ExecutionRun {
-                error: Some(error),
-                exit_code: -1,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            };
-        }
         if cancellation.is_cancelled() {
             return ExecutionRun {
-                error: Some(b"context canceled".to_vec()),
+                error: Some(b"command was cancelled".to_vec()),
+                cancelled: true,
                 exit_code: -1,
                 stdout: Vec::new(),
                 stderr: Vec::new(),
@@ -842,7 +823,8 @@ impl ClaudeCodeExecutor {
             Ok(child) => child,
             Err(error) => {
                 return ExecutionRun {
-                    error: Some(go_spawn_error(&resolved_program, &error).into_bytes()),
+                    error: Some(error.to_string().into_bytes()),
+                    cancelled: false,
                     exit_code: -1,
                     stdout: Vec::new(),
                     stderr: Vec::new(),
@@ -879,18 +861,16 @@ impl ClaudeCodeExecutor {
         let proxy_failure = super::agent_proxy::wait_for_agent_proxy_failure(agent_proxy);
         tokio::pin!(proxy_failure);
         let mut forced_error = None;
+        let mut cancelled = false;
         let status = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
-                // 有意只 kill direct child；孙进程持有 pipe 时 reader 可能继续等待，
-                // 这正是 Go CommandContext 的兼容行为，不能擅自切换 process group。
-                let _direct_child_kill = child.start_kill();
-                child.wait().await
+                cancelled = true;
+                terminate_and_reap(&mut child).await
             }
             error = &mut proxy_failure => {
                 forced_error = Some(error.into_bytes());
-                let _direct_child_kill = child.start_kill();
-                child.wait().await
+                terminate_and_reap(&mut child).await
             }
             result = child.wait() => result,
         };
@@ -915,6 +895,7 @@ impl ClaudeCodeExecutor {
         if let Some(error) = forced_error {
             return ExecutionRun {
                 error: Some(error),
+                cancelled,
                 exit_code: process_exit_code,
                 stdout,
                 stderr,
@@ -923,18 +904,21 @@ impl ClaudeCodeExecutor {
         match status {
             Ok(status) if status.success() && stream_error.is_none() => ExecutionRun {
                 error: None,
+                cancelled,
                 exit_code: process_exit_code,
                 stdout,
                 stderr,
             },
             Ok(status) => ExecutionRun {
-                error: stream_error.or_else(|| Some(format_exit_status(status).into_bytes())),
+                error: stream_error.or_else(|| Some(status.to_string().into_bytes())),
+                cancelled,
                 exit_code: process_exit_code,
                 stdout,
                 stderr,
             },
             Err(error) => ExecutionRun {
                 error: Some(error.to_string().into_bytes()),
+                cancelled,
                 exit_code: process_exit_code,
                 stdout,
                 stderr,
@@ -945,35 +929,31 @@ impl ClaudeCodeExecutor {
     /// 写完成标记、记录活动/失败结果，并生成最终兼容错误。
     async fn finish_execution(
         &self,
-        cancellation: &CancellationToken,
         log_file: &Arc<Mutex<File>>,
         run: ExecutionRun,
         duration_ms: i64,
     ) -> Result<(), ClaudeError> {
-        if let Some(error) = run.error.as_deref() {
-            if cancellation.is_cancelled() {
-                append_log(log_file, format!(
-                        "\n[{}] Command stopped gracefully after {duration_ms}ms (context cancelled)\n",
-                        timestamp()
-                    )
-                    .as_bytes())
-                .await;
-                tracing::info!(
-                    duration_ms,
-                    "Claude Code stopped due to context cancellation"
-                );
-                if self.cfg.as_ref().is_some_and(|cfg| cfg.print_code_logs) {
-                    // 三个终止分支保留独立调用点，便于区分各自的 sync 失败。
-                    if let Err(error) = log_file.lock().await.sync_all().await {
-                        tracing::warn!(error = %error, "Failed to sync log file before printing");
-                    }
-                    self.print_code_logs().await;
+        if run.cancelled {
+            append_log(
+                log_file,
+                format!(
+                    "\n[{}] Command stopped gracefully after {duration_ms}ms (cancelled)\n",
+                    timestamp()
+                )
+                .as_bytes(),
+            )
+            .await;
+            tracing::info!(duration_ms, "Claude Code execution was cancelled");
+            if self.cfg.as_ref().is_some_and(|cfg| cfg.print_code_logs) {
+                if let Err(error) = log_file.lock().await.sync_all().await {
+                    tracing::warn!(error = %error, "Failed to sync log file before printing");
                 }
-                return Err(ClaudeError::message(
-                    "claude code stopped: context canceled",
-                ));
+                self.print_code_logs().await;
             }
+            return Err(ClaudeError::message("claude code execution was cancelled"));
+        }
 
+        if let Some(error) = run.error.as_deref() {
             // 日志文件和 JSON 属性必须是合法 UTF-8；只在这些观测旁路生成替换
             // 视图，最终返回的 ClaudeError 仍拼接原始 PathError 字节。
             let error_view = go_json_valid_utf8(error);

@@ -1,9 +1,8 @@
 //! `internal/process/process_test.go` 对应的 Rust 行为测试。
 
 use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::unix::{ffi::OsStringExt as _, fs::PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,60 +22,6 @@ use super::script::split_pattern;
 use super::{ProcessError, ProcessExitError, ScriptError, execute, execute_script};
 
 type RecordedData = Arc<Mutex<HashMap<StreamType, Vec<u8>>>>;
-
-/// 在 PATH/GODEBUG/cwd 兼容测试结束时恢复进程全局状态。
-struct ProcessEnvironmentRestore {
-    path: Option<OsString>,
-    godebug: Option<OsString>,
-    cwd: PathBuf,
-}
-
-impl Drop for ProcessEnvironmentRestore {
-    /// 在仍持有 crate 级进程状态锁时恢复环境和工作目录。
-    fn drop(&mut self) {
-        // SAFETY: 所有调用点都持有 `PROCESS_STATE_TEST_LOCK`，且 child 已 wait 完成；
-        // 因而没有并发 Rust 线程在环境写入期间调用 libc getenv/setenv。
-        unsafe {
-            if let Some(path) = self.path.take() {
-                std::env::set_var("PATH", path);
-            } else {
-                std::env::remove_var("PATH");
-            }
-            if let Some(godebug) = self.godebug.take() {
-                std::env::set_var("GODEBUG", godebug);
-            } else {
-                std::env::remove_var("GODEBUG");
-            }
-        }
-        std::env::set_current_dir(&self.cwd).expect("必须恢复测试前工作目录");
-    }
-}
-
-/// 原子地替换 PATH、GODEBUG 和 cwd，并返回作用域恢复 guard。
-///
-/// 调用方必须在 guard 整个生命周期内持有 `PROCESS_STATE_TEST_LOCK`。
-fn replace_process_environment(
-    path: &OsStr,
-    godebug: Option<&OsStr>,
-    cwd: &Path,
-) -> ProcessEnvironmentRestore {
-    let restore = ProcessEnvironmentRestore {
-        path: std::env::var_os("PATH"),
-        godebug: std::env::var_os("GODEBUG"),
-        cwd: std::env::current_dir().expect("测试进程必须有工作目录"),
-    };
-    std::env::set_current_dir(cwd).expect("必须切换到隔离测试目录");
-    // SAFETY: 调用方持有 crate 级进程状态锁；设置后必须等所有受影响 child 退出。
-    unsafe {
-        std::env::set_var("PATH", path);
-        if let Some(godebug) = godebug {
-            std::env::set_var("GODEBUG", godebug);
-        } else {
-            std::env::remove_var("GODEBUG");
-        }
-    }
-    restore
-}
 
 /// 写入权限为 0700 的 POSIX shell 测试脚本。
 fn write_executable_script(temp: &TempDir, body: &str) -> PathBuf {
@@ -171,10 +116,10 @@ async fn test_execute_validation_errors() {
     ));
 }
 
-/// 验证预取消与 Go `CommandContext.Start` 一样在触碰 `execve` 前失败。
+/// 验证预取消在触碰 `execve` 前失败。
 ///
 /// fixture 故意没有 executable bit；若实现仍尝试 spawn，会得到 PermissionDenied
-/// 启动错误而不是稳定的 context-canceled 错误，从而可靠暴露子进程副作用。
+/// 启动错误而不是稳定的取消错误，从而可靠暴露子进程副作用。
 #[tokio::test]
 async fn pre_cancelled_execute_never_attempts_spawn() {
     let temp = TempDir::new().unwrap();
@@ -187,198 +132,36 @@ async fn pre_cancelled_execute_never_attempts_spawn() {
         .await
         .unwrap_err();
     assert!(matches!(error, ProcessError::Cancelled));
-    assert_eq!(
-        error.to_string(),
-        "failed to start command: context canceled"
-    );
+    assert_eq!(error.to_string(), "command was cancelled before it started");
 }
 
-/// 验证 PATH 搜索失败与显式 slash 启动失败使用 Go 的两种不同错误前缀。
+/// 验证启动失败保留 Rust 原生 I/O 错误类型。
 #[tokio::test]
-async fn look_path_and_slash_permission_errors_match_go() {
-    // 父测试进程只启动隔离子进程，不在自身读写全局环境。
-    if !crate::internal::enter_isolated_process_test(concat!(
-        module_path!(),
-        "::look_path_and_slash_permission_errors_match_go"
-    )) {
-        return;
-    }
-    let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
+async fn spawn_errors_preserve_native_io_kind() {
     let temp = TempDir::new().unwrap();
     let non_executable = temp.path().join("blocked-tool");
     std::fs::write(&non_executable, "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let _restore = replace_process_environment(temp.path().as_os_str(), None, temp.path());
-
-    let lookup_error = execute(
-        &CancellationToken::new(),
-        Path::new("blocked-tool"),
-        new_recorded_streams().streamer(),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(
-        lookup_error.to_string(),
-        "failed to start command: exec: \"blocked-tool\": executable file not found in $PATH"
-    );
-
-    let slash_error = execute(
+    let error = execute(
         &CancellationToken::new(),
         &non_executable,
         new_recorded_streams().streamer(),
     )
     .await
     .unwrap_err();
-    assert_eq!(
-        slash_error.to_string(),
-        format!(
-            "failed to start command: fork/exec {}: permission denied",
-            non_executable.display()
-        )
-    );
-}
-
-/// 验证显式 slash 路径中的非法 UTF-8 在 ENOENT/EACCES 启动错误里逐字节保留。
-///
-/// `Display` 只能返回替换后的合法 UTF-8；真正 CLI 兼容边界必须读取
-/// `ProcessError::to_bytes`。这两个断言对应固定 Go 1.25.7 ARM64 probe 的
-/// `*fs.PathError` 原始 `Error()` 字节。
-#[tokio::test]
-async fn slash_spawn_errors_preserve_non_utf8_path_bytes() {
-    let temp = TempDir::new().unwrap();
-    let missing = temp
-        .path()
-        .join(OsString::from_vec(b"missing-\xff".to_vec()));
-    let missing_error = execute(
-        &CancellationToken::new(),
-        &missing,
-        new_recorded_streams().streamer(),
-    )
-    .await
-    .unwrap_err();
-    let mut expected = b"failed to start command: fork/exec ".to_vec();
-    expected.extend_from_slice(missing.as_os_str().as_encoded_bytes());
-    expected.extend_from_slice(b": no such file or directory");
-    assert_eq!(missing_error.to_bytes(), expected);
-
-    let denied = temp
-        .path()
-        .join(OsString::from_vec(b"denied-\xfe".to_vec()));
-    std::fs::write(&denied, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let denied_error = execute(
-        &CancellationToken::new(),
-        &denied,
-        new_recorded_streams().streamer(),
-    )
-    .await
-    .unwrap_err();
-    let mut expected = b"failed to start command: fork/exec ".to_vec();
-    expected.extend_from_slice(denied.as_os_str().as_encoded_bytes());
-    expected.extend_from_slice(b": permission denied");
-    assert_eq!(denied_error.to_bytes(), expected);
-}
-
-/// 验证相对 PATH 默认触发 ErrDot，而最后一个 `execerrdot=0` 明确允许执行。
-#[tokio::test]
-async fn look_path_honors_errdot_and_godebug_override() {
-    // 父测试进程只启动隔离子进程，不在自身读写全局环境。
-    if !crate::internal::enter_isolated_process_test(concat!(
-        module_path!(),
-        "::look_path_honors_errdot_and_godebug_override"
-    )) {
-        return;
+    match error {
+        ProcessError::Start { source, .. } => {
+            assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+        }
+        other => panic!("expected a native spawn error, got {other}"),
     }
-    let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
-    let temp = TempDir::new().unwrap();
-    let relative_directory = temp.path().join("relative-bin");
-    std::fs::create_dir(&relative_directory).unwrap();
-    let tool = relative_directory.join("relative-tool");
-    std::fs::write(&tool, "#!/bin/sh\nprintf errdot-ok\n").unwrap();
-    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let _restore = replace_process_environment(
-        OsStr::new("relative-bin"),
-        Some(OsStr::new("execerrdot=0,execerrdot=1")),
-        temp.path(),
-    );
-
-    let error = execute(
-        &CancellationToken::new(),
-        Path::new("relative-tool"),
-        new_recorded_streams().streamer(),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "failed to start command: exec: \"relative-tool\": cannot run executable found relative to current directory"
-    );
-
-    // SAFETY: 仍持有 crate 级锁，且上一条 execute 已完成；最后一个同名设置应覆盖前者。
-    unsafe { std::env::set_var("GODEBUG", "execerrdot=1,execerrdot=0") };
-    let streams = new_recorded_streams();
-    let result = execute(
-        &CancellationToken::new(),
-        Path::new("relative-tool"),
-        streams.streamer(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(result.exit_code, 0);
-    assert_eq!(streams.output(StreamType::Stdout), "errdot-ok");
-}
-
-/// 验证 PATH 目录可包含任意 Unix 字节且不会被 UTF-8 转换破坏。
-#[tokio::test]
-async fn look_path_preserves_non_utf8_directory_bytes() {
-    // 父测试进程只启动隔离子进程，不在自身读写全局环境。
-    if !crate::internal::enter_isolated_process_test(concat!(
-        module_path!(),
-        "::look_path_preserves_non_utf8_directory_bytes"
-    )) {
-        return;
-    }
-    let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
-    let temp = TempDir::new().unwrap();
-    let directory = temp
-        .path()
-        .join(OsString::from_vec(b"non-utf8-\xff-bin".to_vec()));
-    std::fs::create_dir(&directory).unwrap();
-    let tool = directory.join("byte-path-tool");
-    std::fs::write(&tool, "#!/bin/sh\nprintf non-utf8-ok\n").unwrap();
-    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let _restore = replace_process_environment(directory.as_os_str(), None, temp.path());
-
-    let streams = new_recorded_streams();
-    let result = execute(
-        &CancellationToken::new(),
-        Path::new("byte-path-tool"),
-        streams.streamer(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(result.exit_code, 0);
-    assert_eq!(streams.output(StreamType::Stdout), "non-utf8-ok");
-
-    let missing_name = PathBuf::from(OsString::from_vec(b"missing-\xff-tool".to_vec()));
-    let error = execute(
-        &CancellationToken::new(),
-        &missing_name,
-        new_recorded_streams().streamer(),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "failed to start command: exec: \"missing-\\xff-tool\": executable file not found in $PATH"
-    );
 }
 
 /// 验证脚本执行输出自身路径，并且函数返回前临时文件已删除。
 #[tokio::test]
 async fn test_execute_script_writes_runs_and_cleans_temp_script() {
-    // fixture 内的 shell 通过 PATH 查找 stat；与临时替换 PATH 的 LookPath 测试
-    // 共享全局锁，避免默认并行执行时产生与被测逻辑无关的启动失败。
+    // fixture 内的 shell 通过 PATH 查找 stat，因此持有进程状态锁，避免其他测试
+    // 修改全局环境时产生与被测逻辑无关的启动失败。
     let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
     let output = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&output);
@@ -457,8 +240,7 @@ async fn cancellation_kills_process() {
 /// 证明没有转发软信号、也没有杀整个 process group。
 #[tokio::test]
 async fn cancellation_kills_only_direct_child_with_sigkill() {
-    // 同模块的 LookPath 测试会暂时替换进程级 PATH；本 fixture 需要 sleep/mv，
-    // 因此也持有同一锁，避免并行测试令 shell 在写 PID marker 前失败。
+    // fixture 需要 sleep/mv，因此持有进程状态锁，避免并行测试修改 PATH。
     let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
     let temp = TempDir::new().unwrap();
     let pid_file = temp.path().join("grandchild.pid");
@@ -503,13 +285,10 @@ async fn cancellation_kills_only_direct_child_with_sigkill() {
     let _cleanup_result = kill(Pid::from_raw(grandchild_pid), Signal::SIGKILL);
 }
 
-/// 验证 direct child 被取消后，只要孙进程仍持有 stdout/stderr，Execute 就等待 EOF。
-///
-/// 这覆盖 Go `StdoutPipe`/`StderrPipe` 的关键副作用：取消不清理进程组，reader 也不
-/// 能提前丢弃已经打开的 pipe。测试显式杀掉孙进程后才允许执行任务完成。
+/// 验证取消后先回收 direct child，再等待孙进程关闭 stdout/stderr。
 #[tokio::test]
 async fn cancellation_waits_for_descendant_that_holds_pipes() {
-    // 保护 shell 使用的 sleep/mv 不受并行 LookPath 测试的全局 PATH 修改影响。
+    // 保护 shell 使用的 sleep/mv 不受并行测试修改全局 PATH 的影响。
     let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
     let temp = TempDir::new().unwrap();
     let direct_pid_file = temp.path().join("direct.pid");
@@ -548,18 +327,17 @@ async fn cancellation_waits_for_descendant_that_holds_pipes() {
             .is_err(),
         "孙进程持有 pipe 时 Execute 不应提前返回"
     );
-    let mut direct_state = None;
+    let mut direct_state = linux_process_state(direct_pid);
     for _ in 0..100 {
-        direct_state = linux_process_state(direct_pid);
-        if direct_state.as_deref() == Some("Z") {
+        if direct_state.is_none() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+        direct_state = linux_process_state(direct_pid);
     }
-    assert_eq!(
-        direct_state.as_deref(),
-        Some("Z"),
-        "Go Execute 在 pipe reader 完成前不调用 Wait，因此 direct child 应暂为 zombie"
+    assert!(
+        direct_state.is_none(),
+        "等待孙进程 pipe EOF 时 direct child 应已经被回收"
     );
     assert_eq!(kill(Pid::from_raw(descendant_pid), Signal::SIGKILL), Ok(()));
     let result = tokio::time::timeout(Duration::from_secs(5), execution)
@@ -571,14 +349,14 @@ async fn cancellation_waits_for_descendant_that_holds_pipes() {
     assert_eq!(result.error, Some(ProcessExitError::ExitCode(-1)));
     assert!(
         linux_process_state(direct_pid).is_none(),
-        "reader EOF 后 Wait 必须回收 direct child"
+        "reader EOF 后 direct child 仍应保持已回收状态"
     );
 }
 
 /// 从 Linux `/proc/PID/status` 读取单字母进程状态；进程不存在时返回 `None`。
 ///
 /// 本迁移只支持 Linux ARM64，因此直接使用 `/proc` 比引入跨平台抽象更准确；该
-/// helper 仅用于验证 Go 的 wait/reap 可观察顺序。
+/// helper 仅用于验证 wait/reap 的可观察顺序。
 fn linux_process_state(pid: i32) -> Option<String> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     status

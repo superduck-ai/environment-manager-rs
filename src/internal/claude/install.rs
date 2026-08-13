@@ -8,14 +8,12 @@ use std::{collections::BTreeMap, ffi::OsString, time::Duration};
 
 use crate::internal::{
     api::{LogCategory, LogLevel},
+    process::{CommandFailure, CommandOutput},
     session::ActivityRecorder,
 };
 use tokio_util::sync::CancellationToken;
 
-use super::types::{
-    CapturedCommandError, ClaudeError, ClaudeObservability, run_combined_command,
-    run_stdout_command,
-};
+use super::types::{ClaudeError, ClaudeObservability, run_combined_command, run_stdout_command};
 
 const CLAUDE_PACKAGE: &str = "@anthropic-ai/claude-code";
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -82,9 +80,15 @@ pub(super) async fn get_installed_version(
     )
     .await
     {
-        Ok(output) => output,
+        Ok(output) => {
+            let (stdout, _) = output.output.expect_separate();
+            stdout
+        }
         // Go 忽略 `Cmd.Output` 的 error 但仍扫描非零退出前产生的 stdout。
-        Err(error) => error.output,
+        Err(error) => {
+            let (stdout, _) = error.output.expect_separate();
+            stdout
+        }
     };
     find_version(&String::from_utf8_lossy(&output))
         .map(str::to_owned)
@@ -107,12 +111,15 @@ async fn install_via_npm(
         OsString::from("-g"),
         OsString::from(&install_target),
     ];
-    match run_combined_command(cancellation, "npm".as_ref(), &args, None, None).await {
+    match successful_combined(
+        "npm install failed",
+        run_combined_command(cancellation, "npm".as_ref(), &args, None, None).await,
+    ) {
         Ok(output) => {
             tracing::debug!("output" = ?(String::from_utf8_lossy(&output)), "{}", "npm install completed");
             Ok(())
         }
-        Err(error) => Err(command_error("npm install failed", error)),
+        Err(error) => Err(error),
     }
 }
 
@@ -124,12 +131,15 @@ async fn upgrade_via_cli(
 ) -> Result<(), ClaudeError> {
     tracing::info!("version" = ?(version), "{}", "Upgrading Claude Code via CLI");
     let args = [OsString::from("install"), OsString::from(version)];
-    match run_combined_command(cancellation, claude_path.as_ref(), &args, None, None).await {
+    match successful_combined(
+        "claude install failed",
+        run_combined_command(cancellation, claude_path.as_ref(), &args, None, None).await,
+    ) {
         Ok(output) => {
             tracing::debug!("output" = ?(String::from_utf8_lossy(&output)), "{}", "claude install completed");
             Ok(())
         }
-        Err(error) => Err(command_error("claude install failed", error)),
+        Err(error) => Err(error),
     }
 }
 
@@ -303,22 +313,47 @@ fn handle_install_error(
         BTreeMap::from([("error".to_owned(), serde_json::json!(error.to_string()))]),
     );
     let mut message = format!("claude code installation failed during {operation}: ").into_bytes();
-    // 安装命令的 CombinedOutput 可能不是 UTF-8；外层 `%w` 只追加前缀，不应把
+    // 安装命令的捕获输出可能不是 UTF-8；外层只追加前缀，不应把
     // 已由 command_error 保存的原始字节提前替换为 U+FFFD。
     message.extend_from_slice(error.as_bytes());
     Err(ClaudeError::message_bytes(message))
 }
 
-/// 把捕获命令错误包装为 Go `CombinedOutput` 使用的 `error, output` 文案。
-fn command_error(context: &str, error: CapturedCommandError) -> ClaudeError {
+/// 把完成状态与生命周期错误收敛为安装步骤的成功输出或 Claude 错误。
+fn successful_combined(
+    context: &str,
+    result: Result<CommandOutput, CommandFailure>,
+) -> Result<Vec<u8>, ClaudeError> {
+    match result {
+        Ok(output) if output.status.success() => Ok(output.output.expect_combined()),
+        Ok(output) => {
+            let error = output.status.to_string();
+            Err(command_error(
+                context,
+                error.as_bytes(),
+                &output.output.expect_combined(),
+            ))
+        }
+        Err(error) => {
+            let message = error.to_string();
+            Err(command_error(
+                context,
+                message.as_bytes(),
+                &error.output.expect_combined(),
+            ))
+        }
+    }
+}
+
+/// 把命令错误和原始输出包装为 `error, output` 文案。
+fn command_error(context: &str, error: &[u8], output: &[u8]) -> ClaudeError {
     let mut message = context.as_bytes().to_vec();
     message.extend_from_slice(b": ");
-    // 启动路径本身可能含非法 UTF-8；Go `%w` 会把底层 PathError 字节原样拼入，
-    // 因此不能通过 `format!`/Display 追加这部分。
-    message.extend_from_slice(&error.error);
+    // 命令错误和输出都以字节保存，避免在 CLI 边界之前替换非法 UTF-8。
+    message.extend_from_slice(error);
     message.extend_from_slice(b", output: ");
-    // Go 的 string 可以承载任意字节；这里直接拼接 CombinedOutput，直到 CLI 最外层
+    // 这里直接拼接捕获输出，直到 CLI 最外层
     // 才决定原样写 stderr 或为 JSON 日志生成 UTF-8 替换视图。
-    message.extend_from_slice(&error.output);
+    message.extend_from_slice(output);
     ClaudeError::message_bytes(message)
 }

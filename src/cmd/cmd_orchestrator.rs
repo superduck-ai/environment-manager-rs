@@ -24,6 +24,7 @@ use crate::internal::orchestrator::{
     log_sandbox_cleanup_failed, new_orchestrator, new_poll_hook, new_poller_with_worker_id,
     new_whoami_client,
 };
+use crate::internal::process::CaptureMode;
 use crate::internal::sandbox::{install_sandbox_runtime, new_sandbox_runtime_with_config};
 use crate::internal::util::acquire_container_lock;
 
@@ -287,12 +288,13 @@ impl SandboxAdapter for SandboxRuntimeAdapter {
                 .map_err(|error| OrchestratorError::message(error.to_string()))?;
         let (command, arguments) = runtime.wrap_command(&request.command, &request.args);
         log_command_wrapped_with_sandbox(&command, &arguments);
-        let outcome = crate::internal::orchestrator::run_command_combined_capture(
+        let outcome = crate::internal::orchestrator::run_command_capture(
             &request.cancellation,
             &command,
             &arguments,
             Some(&request.stdin_data),
             request.timeout,
+            CaptureMode::Combined,
         )
         .await;
         if let Err(error) = runtime.cleanup() {

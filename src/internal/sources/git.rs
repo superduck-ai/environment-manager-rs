@@ -1,28 +1,20 @@
 //! Git source 的外部命令实现。
 //!
-//! 本文件机械对应 Go `git.go`。所有仓库操作继续启动系统 `git`，不会通过 `git2`
-//! 改写协议、凭据或 ref 行为。子进程取消严格模拟 `exec.CommandContext`：只向当前
-//! 直接子进程发送 kill，随后 wait 回收；不会建立或终止额外进程组。
+//! 所有仓库操作启动系统 `git`，不会通过 `git2` 改写协议、凭据或 ref 行为。
+//! 子进程统一走 Tokio 执行层；取消只终止并回收直接 child，不遍历 process group。
 
 use std::{
     collections::HashMap,
-    fmt,
     fs::OpenOptions,
     io::{self, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    process::{ExitStatus, Stdio},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
-use nix::{fcntl::OFlag, unistd::pipe2};
-use tokio::{
-    io::AsyncReadExt,
-    process::{Child, Command},
-    task::JoinHandle,
-};
+use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -33,6 +25,7 @@ use crate::internal::{
     api::LogCategory,
     auth::{AuthContext, Permission, SourceAuthProvider, new_github_source_auth_provider},
     config::{GitInfo, GitRepositorySource},
+    process::{CaptureMode, CommandFailure, CommandOutput, run_command},
     session::ActivityRecorder,
     util::{Stopper, update_remote_tracking_branch},
 };
@@ -245,7 +238,6 @@ impl GitHandler<'_> {
                 validation_guard.stop().await;
             }
             if let Err(error) = validation_result {
-                let _error_type = classify_git_error(Some(&error));
                 return Err(SourcesError::message(format!(
                     "repository access validation failed: {error}"
                 )));
@@ -271,7 +263,6 @@ impl GitHandler<'_> {
             let duration_ms = elapsed_milliseconds(process_started);
             tracing::error!("repo" = ?(&git_source.git_info.repo), "repo_path" = ?(repo_path.to_string_lossy()), "duration_ms" = ?(duration_ms), "error" = ?(error), "{}", "Failed to clone repository");
             if process_mode != "resume" {
-                let _error_type = classify_git_error(Some(error));
                 return Err(SourcesError::message(format!(
                     "failed to clone repository: {error}"
                 )));
@@ -429,7 +420,6 @@ impl GitHandler<'_> {
         }
 
         let last_error = last_error.unwrap_or_default();
-        let _error_type = classify_git_error(Some(&last_error));
         tracing::error!("attempts" = ?(MAX_ATTEMPTS), "error" = ?(&last_error), "{}", "Git fetch failed after all retries");
         Err(SourcesError::message(format!(
             "git fetch failed after {MAX_ATTEMPTS} attempts: {last_error}"
@@ -546,22 +536,38 @@ impl GitHandler<'_> {
         let command = sanitized_args.join(" ");
         tracing::info!("command" = ?(format!("git {command}")), "dir" = ?(dir.map_or_else(String::new, |path| path.to_string_lossy().into_owned())), "{}", "Executing git command");
 
-        // Go 的 `CombinedOutput` 让两个输出流共享一个 pipe；错误日志和返回错误都能
-        // 观察真实交错顺序，因此这里不能再分别读取 stdout/stderr 后拼接。
-        let outcome =
-            run_combined_external_command(cancellation, "git", &git_args, dir, environment).await;
+        // 两个输出流共享一个 pipe，错误日志和返回错误都能观察真实交错顺序。
+        let outcome = run_external_command(
+            cancellation,
+            "git",
+            &git_args,
+            dir,
+            environment,
+            CaptureMode::Combined,
+        )
+        .await;
         let duration_ms = elapsed_milliseconds(command_started);
-        if let Some(error) = outcome.error.as_ref() {
-            let mut output = String::from_utf8_lossy(&outcome.combined_output()).into_owned();
+        let (output, error) = match outcome {
+            Ok(outcome) => {
+                let error = (!outcome.status.success()).then(|| outcome.status.to_string());
+                (outcome.output.expect_combined(), error)
+            }
+            Err(outcome) => {
+                let error = outcome.to_string();
+                (outcome.output.expect_combined(), Some(error))
+            }
+        };
+        if let Some(error) = error {
+            let mut output = String::from_utf8_lossy(&output).into_owned();
             if let Some(provider) = auth_provider {
                 output = provider.sanitize_output(&output, git_url, authenticated_url);
             }
-            tracing::error!("command" = ?(&sanitized_args), "error" = ?(error), "output" = ?(&output), "duration_ms" = ?(duration_ms), "{}", "Git command failed");
+            tracing::error!("command" = ?(&sanitized_args), error, output, duration_ms, "Git command failed");
             return Err(SourcesError::message(format!(
                 "git {command} failed: {error}\nOutput: {output}"
             )));
         }
-        tracing::info!("command" = ?(format!("git {command}")), "duration_ms" = ?(duration_ms), "output_size" = ?(outcome.combined_output().len()), "{}", "Git command succeeded");
+        tracing::info!(command = %format!("git {command}"), duration_ms, output_size = output.len(), "Git command succeeded");
         Ok(())
     }
 
@@ -728,10 +734,16 @@ impl GitHandler<'_> {
                     "--verify".to_owned(),
                     ref_name.to_owned(),
                 ];
-                if run_external_command(cancellation, "git", &local_ref_args, None, &[])
-                    .await
-                    .error
-                    .is_none()
+                if run_external_command(
+                    cancellation,
+                    "git",
+                    &local_ref_args,
+                    None,
+                    &[],
+                    CaptureMode::Separate,
+                )
+                .await
+                .is_ok_and(|output| output.status.success())
                 {
                     tracing::info!("ref" = ?(ref_name), "{}", "Ref already exists locally in prefetched repo, skipping fetch");
                     let checkout_args = vec![
@@ -979,15 +991,32 @@ impl GitHandler<'_> {
             self.post_clone_hook_path.clone(),
             repo_path.display().to_string(),
         ];
-        let outcome = run_combined_external_command(cancellation, "bash", &args, None, &[]).await;
-        let output = outcome.combined_output();
+        let outcome = run_external_command(
+            cancellation,
+            "bash",
+            &args,
+            None,
+            &[],
+            CaptureMode::Combined,
+        )
+        .await;
+        let (output, error) = match outcome {
+            Ok(outcome) => {
+                let error = (!outcome.status.success()).then(|| outcome.status.to_string());
+                (outcome.output.expect_combined(), error)
+            }
+            Err(outcome) => {
+                let error = outcome.to_string();
+                (outcome.output.expect_combined(), Some(error))
+            }
+        };
         if let Err(error) =
             write_file_0644(Path::new("/tmp/post-clone-hook.out"), output.clone()).await
         {
             tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to write post-clone hook output to file");
         }
-        if let Some(error) = outcome.error.as_ref() {
-            tracing::warn!("error" = ?(error), "output" = ?(String::from_utf8_lossy(&output)), "repo_path" = ?(repo_path.to_string_lossy()), "hook_path" = ?(&self.post_clone_hook_path), "{}", "Post-clone hook failed, continuing anyway");
+        if let Some(error) = error {
+            tracing::warn!(error, output = %String::from_utf8_lossy(&output), repo_path = %repo_path.display(), hook_path = %self.post_clone_hook_path, "Post-clone hook failed, continuing anyway");
         } else {
             tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "hook_path" = ?(&self.post_clone_hook_path), "{}", "Post-clone hook completed successfully");
         }
@@ -1009,14 +1038,30 @@ impl GitHandler<'_> {
             authenticated_url.to_owned(),
             "HEAD".to_owned(),
         ];
-        let outcome = run_external_command(cancellation, "git", &args, Some(repo_path), &[]).await;
-        let trimmed_output = String::from_utf8_lossy(&outcome.stdout).trim().to_owned();
-        if outcome.error.is_none() && trimmed_output.is_empty() {
-            tracing::info!("repo_path" = ?(repo_path.to_string_lossy()), "{}", "Repository confirmed empty - no commits");
-            return true;
-        }
-        if let Some(error) = outcome.error.as_ref() {
-            tracing::debug!("repo_path" = ?(repo_path.to_string_lossy()), "error" = ?(error), "output" = ?(&trimmed_output), "{}", "Failed to check if repository is empty");
+        let outcome = run_external_command(
+            cancellation,
+            "git",
+            &args,
+            Some(repo_path),
+            &[],
+            CaptureMode::Separate,
+        )
+        .await;
+        match outcome {
+            Ok(outcome) => {
+                let (stdout, _) = outcome.output.expect_separate();
+                let trimmed_output = String::from_utf8_lossy(&stdout).trim().to_owned();
+                if outcome.status.success() && trimmed_output.is_empty() {
+                    tracing::info!(repo_path = %repo_path.display(), "Repository confirmed empty - no commits");
+                    return true;
+                }
+                if !outcome.status.success() {
+                    tracing::debug!(repo_path = %repo_path.display(), error = %outcome.status, output = %trimmed_output, "Failed to check if repository is empty");
+                }
+            }
+            Err(error) => {
+                tracing::debug!(repo_path = %repo_path.display(), error = %error, "Failed to check if repository is empty");
+            }
         }
         false
     }
@@ -1073,8 +1118,19 @@ impl GitHandler<'_> {
             authenticated_url.to_owned(),
             branch.to_owned(),
         ];
-        let outcome = run_external_command(cancellation, "git", &args, Some(repo_path), &[]).await;
-        outcome.error.is_none() && !outcome.stdout.is_empty()
+        run_external_command(
+            cancellation,
+            "git",
+            &args,
+            Some(repo_path),
+            &[],
+            CaptureMode::Separate,
+        )
+        .await
+        .is_ok_and(|outcome| {
+            let (stdout, _) = outcome.output.expect_separate();
+            outcome.status.success() && !stdout.is_empty()
+        })
     }
 
     /// 若目标 branch 已存在于 remote 则 fetch/checkout，否则从当前 HEAD 新建。
@@ -1228,7 +1284,7 @@ impl GitHandler<'_> {
     ///
     /// # 副作用
     /// 创建 Git 子进程、修改本地 branch/ref，并按 Go 的消息、级别和属性顺序记录
-    /// 创建前、失败或成功事件。失败 `output` 保留 `CombinedOutput` 尾随换行。
+    /// 创建前、失败或成功事件。失败 `output` 保留捕获输出的尾随换行。
     async fn create_local_branch(
         &self,
         cancellation: &CancellationToken,
@@ -1247,19 +1303,31 @@ impl GitHandler<'_> {
             "-b".to_owned(),
             target_branch.to_owned(),
         ];
-        let checkout = run_combined_external_command(
+        let checkout = run_external_command(
             cancellation,
             "git",
             &checkout_args,
             Some(repo_path),
             &[],
+            CaptureMode::Combined,
         )
         .await;
-        if let Some(error) = checkout.error.as_ref() {
+        let failure = match checkout {
+            Ok(checkout) if checkout.status.success() => None,
+            Ok(checkout) => Some((
+                checkout.status.to_string(),
+                checkout.output.expect_combined(),
+            )),
+            Err(checkout) => {
+                let error = checkout.to_string();
+                Some((error, checkout.output.expect_combined()))
+            }
+        };
+        if let Some((error, output)) = failure {
             tracing::error!(
                 target_branch,
-                error = %error,
-                output = %String::from_utf8_lossy(&checkout.combined_output()),
+                error,
+                output = %String::from_utf8_lossy(&output),
                 "Failed to create new branch"
             );
             return Err(SourcesError::message(format!(
@@ -1298,11 +1366,20 @@ impl GitHandler<'_> {
         tracing::info!("repo" = ?(&git_source.git_info.repo), "target_branch" = ?(target_branch), "process_mode" = ?(self.process_mode.as_str()), "{}", "Processing branch from outcomes");
 
         let current_args = vec!["branch".to_owned(), "--show-current".to_owned()];
-        let current =
-            run_external_command(cancellation, "git", &current_args, Some(repo_path), &[]).await;
-        if current.error.is_none()
-            && String::from_utf8_lossy(&current.stdout).trim() == target_branch
-        {
+        let current = run_external_command(
+            cancellation,
+            "git",
+            &current_args,
+            Some(repo_path),
+            &[],
+            CaptureMode::Separate,
+        )
+        .await;
+        let already_on_target = current.is_ok_and(|current| {
+            let (stdout, _) = current.output.expect_separate();
+            current.status.success() && String::from_utf8_lossy(&stdout).trim() == target_branch
+        });
+        if already_on_target {
             tracing::info!("target_branch" = ?(target_branch), "{}", "Already on target branch, skipping checkout");
             return Ok(());
         }
@@ -1375,10 +1452,25 @@ impl GitHandler<'_> {
             "origin".to_owned(),
             custom_url.clone(),
         ];
-        let outcome =
-            run_combined_external_command(cancellation, "git", &args, Some(&repo_path), &[]).await;
-        if let Some(error) = outcome.error.as_ref() {
-            tracing::error!("repo" = ?(&git_source.git_info.repo), "repo_path" = ?(repo_path.to_string_lossy()), "error" = ?(error), "output" = ?(String::from_utf8_lossy(&outcome.combined_output())), "{}", "Failed to update remote URL");
+        let outcome = run_external_command(
+            cancellation,
+            "git",
+            &args,
+            Some(&repo_path),
+            &[],
+            CaptureMode::Combined,
+        )
+        .await;
+        let failure = match outcome {
+            Ok(outcome) if outcome.status.success() => None,
+            Ok(outcome) => Some((outcome.status.to_string(), outcome.output.expect_combined())),
+            Err(outcome) => {
+                let error = outcome.to_string();
+                Some((error, outcome.output.expect_combined()))
+            }
+        };
+        if let Some((error, output)) = failure {
+            tracing::error!(repo = %git_source.git_info.repo, repo_path = %repo_path.display(), error, output = %String::from_utf8_lossy(&output), "Failed to update remote URL");
             return Err(SourcesError::message(format!(
                 "failed to update remote URL for {}: {error}",
                 git_source.git_info.repo
@@ -1520,11 +1612,25 @@ impl GitHandler<'_> {
             "origin".to_owned(),
             proxy_url.clone(),
         ];
-        let outcome =
-            run_combined_external_command(cancellation, "git", &args, Some(repo_path), &[]).await;
-        if let Some(error) = outcome.error.as_ref() {
-            let output_bytes = outcome.combined_output();
-            let output = String::from_utf8_lossy(&output_bytes);
+        let outcome = run_external_command(
+            cancellation,
+            "git",
+            &args,
+            Some(repo_path),
+            &[],
+            CaptureMode::Combined,
+        )
+        .await;
+        let failure = match outcome {
+            Ok(outcome) if outcome.status.success() => None,
+            Ok(outcome) => Some((outcome.status.to_string(), outcome.output.expect_combined())),
+            Err(outcome) => {
+                let error = outcome.to_string();
+                Some((error, outcome.output.expect_combined()))
+            }
+        };
+        if let Some((error, output)) = failure {
+            let output = String::from_utf8_lossy(&output);
             return Err(SourcesError::message(format!(
                 "failed to update git remote to use proxy: {error}, output: {output}"
             )));
@@ -1605,79 +1711,6 @@ pub(crate) fn pack_size(repo_path: &Path) -> SourcesResult<i64> {
     Ok(total)
 }
 
-/// 对应 Go `classifyGitError`，按固定优先级把错误文本归入低基数类别。
-#[must_use]
-pub(crate) fn classify_git_error(error: Option<&dyn fmt::Display>) -> &'static str {
-    let Some(error) = error else {
-        return "none";
-    };
-    let error_text = error.to_string().to_lowercase();
-    if [
-        "context deadline exceeded",
-        "context canceled",
-        "timed out",
-        "timeout",
-    ]
-    .iter()
-    .any(|needle| error_text.contains(needle))
-    {
-        return "timeout";
-    }
-    if [
-        "authentication failed",
-        "could not read username",
-        "could not read password",
-        "invalid credentials",
-        "bad credentials",
-        "permission denied",
-        "access denied",
-        " 401",
-        " 403",
-    ]
-    .iter()
-    .any(|needle| error_text.contains(needle))
-    {
-        return "auth";
-    }
-    if [
-        "rate limit",
-        "secondary rate limit",
-        "too many requests",
-        " 429",
-    ]
-    .iter()
-    .any(|needle| error_text.contains(needle))
-    {
-        return "rate_limit";
-    }
-    if ["repository not found", "not found", " 404"]
-        .iter()
-        .any(|needle| error_text.contains(needle))
-    {
-        return "not_found";
-    }
-    if ["no space left", "disk full", "disk quota exceeded"]
-        .iter()
-        .any(|needle| error_text.contains(needle))
-    {
-        return "disk";
-    }
-    if [
-        "connection refused",
-        "connection reset",
-        "no route to host",
-        "could not resolve host",
-        "name or service not known",
-        "network is unreachable",
-    ]
-    .iter()
-    .any(|needle| error_text.contains(needle))
-    {
-        return "network";
-    }
-    "unknown"
-}
-
 /// 保存长任务 stopper，在正常返回时等待、future 被丢弃时至少同步请求停止。
 pub(super) struct ActivityStopGuard {
     stopper: Option<Arc<dyn Stopper>>,
@@ -1709,157 +1742,19 @@ impl Drop for ActivityStopGuard {
     }
 }
 
-/// 一次外部命令的两个输出流与 Go 风格错误文本。
-#[derive(Debug, Default)]
-struct ExternalCommandOutcome {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    error: Option<String>,
-}
-
-impl ExternalCommandOutcome {
-    /// 按稳定的 stdout、stderr 顺序合并捕获输出。
-    ///
-    /// 单个流内顺序与子进程完全一致；Tokio 分离 pipe 后无法保证两个流之间的
-    /// 字节级交错，错误文本仍保留 Go `CombinedOutput` 的全部内容。
-    fn combined_output(&self) -> Vec<u8> {
-        let mut output = Vec::with_capacity(self.stdout.len() + self.stderr.len());
-        output.extend_from_slice(&self.stdout);
-        output.extend_from_slice(&self.stderr);
-        output
-    }
-}
-
-/// 使用 Go `exec.Cmd.CombinedOutput` 的共享 pipe 执行外部命令。
-///
-/// 该 helper 只用于必须逐字保留 stdout/stderr 交错顺序的分支；其他调用者仍可使用
-/// [`run_external_command`] 分别消费两个流。两个写端来自同一条 `O_CLOEXEC` pipe，
-/// 因此不会在 Rust 端重排输出，也不会丢弃尾随换行。
-///
-/// # 参数
-/// - `cancellation`：上层 context 的取消信号；只终止并回收 direct child。
-/// - `program`：直接执行的程序名，不经 shell。
-/// - `args`：原样传给子进程的 argv。
-/// - `dir`：可选 current directory。
-/// - `environment`：覆盖或新增的环境变量，不清空继承环境。
-///
-/// # 返回
-/// 返回与普通 runner 相同的 [`ExternalCommandOutcome`]；合并字节存放在 `stdout`，
-/// `stderr` 留空，因此现有 `combined_output()` 会原样返回共享 pipe 内容。
-///
-/// # 副作用
-/// 创建一条 pipe、一个 reader task 和一个直接子进程；取消时不处理子进程组。
-async fn run_combined_external_command(
-    cancellation: &CancellationToken,
-    program: &str,
-    args: &[String],
-    dir: Option<&Path>,
-    environment: &[(String, String)],
-) -> ExternalCommandOutcome {
-    if cancellation.is_cancelled() {
-        return ExternalCommandOutcome {
-            error: Some("context canceled".to_owned()),
-            ..ExternalCommandOutcome::default()
-        };
-    }
-
-    // CLOEXEC 必须在 pipe 创建时原子设置；若随后才 fcntl，并发 spawn 可能继承
-    // 写端，造成 direct child 已退出但 reader 永远等不到 EOF。
-    let (read_end, write_end) = match pipe2(OFlag::O_CLOEXEC) {
-        Ok(pipe) => pipe,
-        Err(error) => {
-            return ExternalCommandOutcome {
-                error: Some(error.to_string()),
-                ..ExternalCommandOutcome::default()
-            };
-        }
-    };
-    let stderr_end = match write_end.try_clone() {
-        Ok(descriptor) => descriptor,
-        Err(error) => {
-            return ExternalCommandOutcome {
-                error: Some(error.to_string()),
-                ..ExternalCommandOutcome::default()
-            };
-        }
-    };
-
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdout(Stdio::from(write_end))
-        .stderr(Stdio::from(stderr_end))
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-    if let Some(dir) = dir {
-        command.current_dir(dir);
-    }
-    for (name, value) in environment {
-        command.env(name, value);
-    }
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return ExternalCommandOutcome {
-                error: Some(error.to_string()),
-                ..ExternalCommandOutcome::default()
-            };
-        }
-    };
-    // 释放父进程侧 command 状态，确保共享 pipe 只剩 child 写端。
-    drop(command);
-    let reader = tokio::fs::File::from_std(std::fs::File::from(read_end));
-    let output_task = Some(read_pipe(reader));
-
-    enum Completion {
-        Wait(io::Result<ExitStatus>),
-        Cancelled,
-    }
-    let completion = tokio::select! {
-        status = child.wait() => Completion::Wait(status),
-        _ = cancellation.cancelled() => Completion::Cancelled,
-    };
-    let mut error = match completion {
-        Completion::Wait(Ok(status)) if status.success() => None,
-        Completion::Wait(Ok(status)) => Some(exit_status_error(status)),
-        Completion::Wait(Err(error)) => Some(error.to_string()),
-        Completion::Cancelled => terminate_direct_child(&mut child).await,
-    };
-    let output = join_pipe(output_task, &mut error).await;
-    ExternalCommandOutcome {
-        stdout: output,
-        stderr: Vec::new(),
-        error,
-    }
-}
-
 /// 启动外部命令、并发排空 stdout/stderr，并响应上层取消。
 ///
-/// 取消分支只调用当前 [`Child`] 的 `start_kill`，绝不设置 process group，也不遍历
-/// 后代。随后必须 wait 回收直接子进程，再等待 pipe 到 EOF，这与 Go
-/// `exec.CommandContext(...).CombinedOutput()` 的生命周期边界一致。
+/// 共享执行器只终止并回收直接子进程，不设置 process group，也不遍历后代。
 async fn run_external_command(
     cancellation: &CancellationToken,
     program: &str,
     args: &[String],
     dir: Option<&Path>,
     environment: &[(String, String)],
-) -> ExternalCommandOutcome {
-    if cancellation.is_cancelled() {
-        return ExternalCommandOutcome {
-            error: Some("context canceled".to_owned()),
-            ..ExternalCommandOutcome::default()
-        };
-    }
-
+    capture: CaptureMode,
+) -> Result<CommandOutput, CommandFailure> {
     let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
+    command.args(args);
     if let Some(dir) = dir {
         command.current_dir(dir);
     }
@@ -1867,118 +1762,7 @@ async fn run_external_command(
         command.env(name, value);
     }
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            return ExternalCommandOutcome {
-                error: Some(error.to_string()),
-                ..ExternalCommandOutcome::default()
-            };
-        }
-    };
-    let stdout_task = child.stdout.take().map(read_pipe);
-    let stderr_task = child.stderr.take().map(read_pipe);
-
-    enum Completion {
-        Wait(io::Result<ExitStatus>),
-        Cancelled,
-    }
-    let completion = tokio::select! {
-        status = child.wait() => Completion::Wait(status),
-        _ = cancellation.cancelled() => Completion::Cancelled,
-    };
-    let mut error = match completion {
-        Completion::Wait(Ok(status)) if status.success() => None,
-        Completion::Wait(Ok(status)) => Some(exit_status_error(status)),
-        Completion::Wait(Err(error)) => Some(error.to_string()),
-        Completion::Cancelled => terminate_direct_child(&mut child).await,
-    };
-
-    let stdout = join_pipe(stdout_task, &mut error).await;
-    let stderr = join_pipe(stderr_task, &mut error).await;
-    ExternalCommandOutcome {
-        stdout,
-        stderr,
-        error,
-    }
-}
-
-/// 在后台持续读取单个 pipe，避免 stdout 或 stderr 填满后阻塞子进程。
-fn read_pipe<R>(mut pipe: R) -> JoinHandle<io::Result<Vec<u8>>>
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        pipe.read_to_end(&mut bytes).await?;
-        Ok(bytes)
-    })
-}
-
-/// 等待 pipe reader，并只在没有更重要的进程错误时记录读取错误。
-async fn join_pipe(
-    task: Option<JoinHandle<io::Result<Vec<u8>>>>,
-    primary_error: &mut Option<String>,
-) -> Vec<u8> {
-    let Some(task) = task else {
-        return Vec::new();
-    };
-    match task.await {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(error)) => {
-            primary_error.get_or_insert_with(|| error.to_string());
-            Vec::new()
-        }
-        Err(error) => {
-            primary_error.get_or_insert_with(|| format!("output task failed: {error}"));
-            Vec::new()
-        }
-    }
-}
-
-/// 取消时只杀死直接 child 并 wait；返回最终 Go 风格进程错误。
-async fn terminate_direct_child(child: &mut Child) -> Option<String> {
-    match child.try_wait() {
-        Ok(Some(status)) if status.success() => return None,
-        Ok(Some(status)) => return Some(exit_status_error(status)),
-        Ok(None) => {}
-        Err(error) => return Some(error.to_string()),
-    }
-
-    let kill_error = child.start_kill().err();
-    match child.wait().await {
-        Ok(status) if status.success() => kill_error.map(|error| error.to_string()),
-        Ok(status) => Some(exit_status_error(status)),
-        Err(wait_error) => Some(
-            kill_error
-                .map(|error| error.to_string())
-                .unwrap_or_else(|| wait_error.to_string()),
-        ),
-    }
-}
-
-/// 把 Unix exit status 格式化为 Go `exec.ExitError.Error()` 风格。
-fn exit_status_error(status: ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit status {code}");
-    }
-    use std::os::unix::process::ExitStatusExt;
-    let signal = status.signal().unwrap_or_default();
-    let name = match signal {
-        libc::SIGHUP => "hangup",
-        libc::SIGINT => "interrupt",
-        libc::SIGQUIT => "quit",
-        libc::SIGILL => "illegal instruction",
-        libc::SIGABRT => "aborted",
-        libc::SIGFPE => "floating point exception",
-        libc::SIGKILL => "killed",
-        libc::SIGSEGV => "segmentation fault",
-        libc::SIGPIPE => "broken pipe",
-        libc::SIGALRM => "alarm clock",
-        libc::SIGTERM => "terminated",
-        _ => return format!("signal: {signal}"),
-    };
-    format!("signal: {name}")
+    run_command(command, cancellation, None, None, capture).await
 }
 
 /// 用 0755 创建目录树，并保留 Go `MkdirAll` 的 umask 行为。

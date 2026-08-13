@@ -14,7 +14,6 @@ mod whoami;
 
 pub(crate) use hooks::{
     log_command_wrapped_with_sandbox, log_sandbox_cleanup_failed, run_command_capture,
-    run_command_combined_capture,
 };
 pub use orchestrator::new_orchestrator;
 pub use poll_hook::new_poll_hook;

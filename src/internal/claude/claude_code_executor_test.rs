@@ -499,7 +499,7 @@ async fn cancellation_does_not_kill_process_group() {
         .unwrap()
         .unwrap()
         .unwrap_err();
-    assert_eq!(error.to_string(), "claude code stopped: context canceled");
+    assert_eq!(error.to_string(), "claude code execution was cancelled");
     assert_eq!(kill(Pid::from_raw(pid), None::<Signal>), Ok(()));
     let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
 }
@@ -507,7 +507,7 @@ async fn cancellation_does_not_kill_process_group() {
 /// 验证 Claude direct child 被取消后，继承 stdio 的孙进程会延迟 Execute 返回。
 ///
 /// Go `Cmd.Run` 会等待 stdout/stderr copy goroutine；只有显式结束孙进程、让两个
-/// pipe 到达 EOF 后，Rust 才能返回 context canceled，不能擅自关闭 reader。
+/// pipe 到达 EOF 后，Rust 才能返回取消错误，不能擅自关闭 reader。
 #[tokio::test]
 async fn claude_cancellation_waits_for_descendant_pipe_eof() {
     // pipe-holder fixture 同样依赖 PATH 中的 sleep/mv，必须保护到孙进程清理完成。
@@ -553,7 +553,7 @@ async fn claude_cancellation_waits_for_descendant_pipe_eof() {
         .unwrap()
         .unwrap()
         .unwrap_err();
-    assert_eq!(error.to_string(), "claude code stopped: context canceled");
+    assert_eq!(error.to_string(), "claude code execution was cancelled");
 }
 
 /// 验证 init-only 环境过滤仅删除精确的 `CCR_PLUGINS_JSON` 键。

@@ -7,9 +7,7 @@
 use std::fs::OpenOptions;
 use std::io::Read as _;
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +15,9 @@ use async_trait::async_trait;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-use crate::internal::tunnel::actions::{
-    Action, ActionError, ActionRequest, ActionResult, ProgressReporter,
+use crate::internal::{
+    process::{CaptureMode, run_command},
+    tunnel::actions::{Action, ActionError, ActionRequest, ActionResult, ProgressReporter},
 };
 
 use super::types::{FileEntry, SnapshotAction, SnapshotResponse};
@@ -273,51 +272,21 @@ impl SnapshotAction {
 
     /// 运行一个只捕获 stdout 的可取消 Git 子进程。
     ///
-    /// `kill_on_drop` 确保 Registry 超时导致 future 被丢弃时直接子进程被终止；不创建
-    /// 或终止进程组，保持 Go 当前只处理直接子进程的语义。
+    /// 共享执行器负责取消、回收和输出排空；这里不创建或终止进程组。
     async fn git_output(
         &self,
         cancellation: &CancellationToken,
         arguments: &[&str],
     ) -> Result<Vec<u8>, String> {
         let mut command = Command::new("git");
-        command
-            .args(arguments)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let child = command.spawn().map_err(|error| error.to_string())?;
-        tokio::select! {
-            // 丢弃 `wait_with_output` future 会触发 `kill_on_drop`，只终止直接子进程；
-            // 返回文本匹配 Go `exec.CommandContext` 被取消后常见的 `ExitError`。
-            () = cancellation.cancelled() => Err("signal: killed".to_owned()),
-            output = child.wait_with_output() => {
-                let output = output.map_err(|error| error.to_string())?;
-                if output.status.success() {
-                    Ok(output.stdout)
-                } else {
-                    Err(git_exit_error(&output.status))
-                }
+        command.args(arguments);
+        match run_command(command, cancellation, None, None, CaptureMode::Separate).await {
+            Ok(output) if output.status.success() => {
+                let (stdout, _) = output.output.expect_separate();
+                Ok(stdout)
             }
+            Ok(output) => Err(output.status.to_string()),
+            Err(error) => Err(error.to_string()),
         }
-    }
-}
-
-/// 把 Unix 子进程终态格式化为 Go `os/exec.ExitError.Error()` 的常见文本。
-///
-/// 普通非零退出使用 `exit status N`；信号终止保留常见 Unix signal 名称。该文本只
-/// 进入诊断日志，不改变 snapshot 的容错返回值。
-fn git_exit_error(status: &ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit status {code}");
-    }
-    match status.signal() {
-        Some(libc::SIGKILL) => "signal: killed".to_owned(),
-        Some(libc::SIGTERM) => "signal: terminated".to_owned(),
-        Some(libc::SIGINT) => "signal: interrupt".to_owned(),
-        Some(libc::SIGPIPE) => "signal: broken pipe".to_owned(),
-        Some(signal) => format!("signal {signal}"),
-        None => "exit status unknown".to_owned(),
     }
 }

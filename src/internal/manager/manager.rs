@@ -8,19 +8,14 @@ use std::{
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     fs,
-    os::unix::{fs::symlink, process::ExitStatusExt as _},
+    os::unix::fs::symlink,
     path::{Path, PathBuf},
-    process::{ExitStatus, Stdio},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
-use nix::{
-    fcntl::{FcntlArg, FdFlag, fcntl},
-    unistd::pipe,
-};
 use serde_json::{Value, json};
-use tokio::{io::AsyncReadExt as _, process::Command};
+use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::internal::{
@@ -30,14 +25,15 @@ use crate::internal::{
     config::{self, ClaudeConfig, Session, SessionMode},
     envtype::EnvironmentType,
     mcp::MCPServer,
+    process::{CaptureMode, CommandFailure, CommandOutput, run_command},
     session::{ActivityRecorder, EventPoster, NoopActivityRecorder, new_activity_recorder},
 };
 
 use super::{
     tunnel_register::default_create_tunnel_client_func,
     types::{
-        ClaudeExecutorFactory, CommandFailure, CreateTunnelClientFunc, EnvironmentLeaseAdapter,
-        Manager, ManagerApiClient, ManagerError, ManagerLeaseRequest, ManagerLeaseRuntime,
+        ClaudeExecutorFactory, CreateTunnelClientFunc, EnvironmentLeaseAdapter, Manager,
+        ManagerApiClient, ManagerError, ManagerLeaseRequest, ManagerLeaseRuntime,
         ManagerObservability, McpRegistrationBatch,
     },
 };
@@ -441,7 +437,7 @@ impl Manager {
                 stop_lease(lease_runtime.as_ref()).await;
                 // Factory trait 为了可替换性返回 BoxError；生产 factory 实际会装入
                 // ClaudeError。先 downcast 可避免在 Box→String 边界损坏未来可能携带
-                // CombinedOutput 的原始字节，其他 UTF-8 错误仍走普通 Display。
+                // 子进程捕获输出的原始字节，其他 UTF-8 错误仍走普通 Display。
                 let error = match error.downcast::<claude::ClaudeError>() {
                     Ok(error) => ManagerError::prefixed(
                         b"failed to create Claude executor: ",
@@ -592,10 +588,18 @@ impl Manager {
                 OsString::from(key),
                 value,
             ];
-            if let Err(error) =
-                run_combined_command(cancellation, OsStr::new("git"), &arguments).await
+            let failure = match run_combined_command(cancellation, OsStr::new("git"), &arguments)
+                .await
             {
-                tracing::warn!("key" = ?(key), "error" = ?(error.error), "output" = ?(String::from_utf8_lossy(&error.output)), "{}", "Failed to set git signing key config");
+                Ok(output) if output.status.success() => None,
+                Ok(output) => Some((output.status.to_string(), output.output.expect_combined())),
+                Err(error) => {
+                    let message = error.to_string();
+                    Some((message, error.output.expect_combined()))
+                }
+            };
+            if let Some((error, output)) = failure {
+                tracing::warn!(key, error, output = ?String::from_utf8_lossy(&output), "Failed to set git signing key config");
             }
         }
 
@@ -644,16 +648,20 @@ impl Manager {
             OsString::from("add"),
             OsString::from(OFFICIAL_PLUGIN_MARKETPLACE),
         ];
-        run_combined_command(cancellation, OsStr::new(&claude_path), &arguments)
-            .await
-            .map(|_| ())
-            .map_err(|error| {
-                ManagerError::message(format!(
-                    "failed to add official plugin marketplace: {}, output: {}",
-                    error.error,
-                    String::from_utf8_lossy(&error.output)
-                ))
-            })
+        let failure =
+            match run_combined_command(cancellation, OsStr::new(&claude_path), &arguments).await {
+                Ok(output) if output.status.success() => return Ok(()),
+                Ok(output) => (output.status.to_string(), output.output.expect_combined()),
+                Err(error) => {
+                    let message = error.to_string();
+                    (message, error.output.expect_combined())
+                }
+            };
+        Err(ManagerError::message(format!(
+            "failed to add official plugin marketplace: {}, output: {}",
+            failure.0,
+            String::from_utf8_lossy(&failure.1)
+        )))
     }
 
     /// 创建可选 tunnel，令它与 Claude executor 并发运行，并解释取消为正常退出。
@@ -703,11 +711,14 @@ impl Manager {
         let cancel_after_execute = run_cancellation.clone();
         let execute_future = async move {
             let result = executor.execute(&execute_token).await;
+            let was_cancelled = execute_token.is_cancelled();
             cancel_after_execute.cancel();
-            result
+            (result, was_cancelled)
         };
 
-        let execution_result = if let Some(client) = tunnel_client.as_ref() {
+        let (execution_result, execution_was_cancelled) = if let Some(client) =
+            tunnel_client.as_ref()
+        {
             let tunnel_run_client = Arc::clone(client);
             let tunnel_token = run_cancellation.clone();
             let tunnel_session_id = session_id.to_owned();
@@ -743,11 +754,11 @@ impl Manager {
                 Ok(())
             }
             Err(_) if executor_cancellation.is_cancelled() => Ok(()),
-            Err(error) if is_cancellation_error(&error.to_string()) => Ok(()),
+            Err(_) if execution_was_cancelled => Ok(()),
             Err(error) => {
                 tracing::error!("error" = ?(error.to_string()), "{}", "Environment manager execution failed");
                 // Go 的 `fmt.Errorf("execution failed: %w", err)` 只拼接字节；如果
-                // Claude/npm CombinedOutput 含非法 UTF-8，提前调用 Display 会改变最终
+                // Claude/npm 捕获输出含非法 UTF-8，提前调用 Display 会改变最终
                 // stderr。日志上方仍使用逐坏字节替换视图，返回链则必须保留原字节。
                 Err(ManagerError::prefixed(
                     b"execution failed: ",
@@ -852,7 +863,7 @@ pub async fn run_init_only(
             claude::run_init(cancellation, Some(claude_config), &repository_directory).await
         {
             tracing::error!("repo_dir" = ?(repository_directory.display().to_string()), "error" = ?(error.to_string()), "{}", "claude --init-only failed");
-            // run_init 的 CombinedOutput 属于 Go error string 的一部分；日志使用上方
+            // run_init 的捕获输出属于错误字节的一部分；日志使用上方
             // 的逐坏字节替换视图，返回路径则复刻 `%w` 的原始字节拼接。
             return Err(ManagerError::prefixed(
                 b"failed to run init script: ",
@@ -883,98 +894,10 @@ async fn run_combined_command(
     cancellation: &CancellationToken,
     program: &OsStr,
     arguments: &[OsString],
-) -> Result<Vec<u8>, CommandFailure> {
-    if cancellation.is_cancelled() {
-        return Err(CommandFailure {
-            error: "context canceled".to_owned(),
-            output: Vec::new(),
-        });
-    }
-
-    let (read_end, write_end) = pipe().map_err(|error| CommandFailure {
-        error: error.to_string(),
-        output: Vec::new(),
-    })?;
-    for descriptor in [&read_end, &write_end] {
-        fcntl(descriptor, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(|error| {
-            CommandFailure {
-                error: error.to_string(),
-                output: Vec::new(),
-            }
-        })?;
-    }
-    let stderr_end = write_end.try_clone().map_err(|error| CommandFailure {
-        error: error.to_string(),
-        output: Vec::new(),
-    })?;
-
+) -> Result<CommandOutput, CommandFailure> {
     let mut command = Command::new(program);
-    command
-        .args(arguments)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(write_end))
-        .stderr(Stdio::from(stderr_end))
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|error| CommandFailure {
-        error: error.to_string(),
-        output: Vec::new(),
-    })?;
-    drop(command);
-
-    let mut reader = tokio::fs::File::from_std(fs::File::from(read_end));
-    let reader_task = tokio::spawn(async move {
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output).await.map(|_| output)
-    });
-    let status = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            Err("context canceled".to_owned())
-        }
-        result = child.wait() => result.map_err(|error| error.to_string()),
-    };
-    let output = reader_task
-        .await
-        .map_err(|error| CommandFailure {
-            error: error.to_string(),
-            output: Vec::new(),
-        })?
-        .map_err(|error| CommandFailure {
-            error: error.to_string(),
-            output: Vec::new(),
-        })?;
-    let status = status.map_err(|error| CommandFailure {
-        error,
-        output: output.clone(),
-    })?;
-    if status.success() {
-        Ok(output)
-    } else {
-        Err(CommandFailure {
-            error: exit_status_error(status),
-            output,
-        })
-    }
-}
-
-/// 将 Unix exit status 格式化为 Go `exec.ExitError` 风格文本。
-fn exit_status_error(status: ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit status {code}");
-    }
-    match status.signal() {
-        Some(libc::SIGKILL) => "signal: killed".to_owned(),
-        Some(libc::SIGTERM) => "signal: terminated".to_owned(),
-        Some(signal) => format!("signal: {signal}"),
-        None => "process exited unsuccessfully".to_owned(),
-    }
-}
-
-/// 判断 Claude 错误文本是否保持了 Go `context.Canceled` 的可识别语义。
-fn is_cancellation_error(error: &str) -> bool {
-    error.contains("context canceled") || error.contains("operation canceled")
+    command.args(arguments);
+    run_command(command, cancellation, None, None, CaptureMode::Combined).await
 }
 
 /// 把成对字段收集为诊断事件使用的稳定排序属性。

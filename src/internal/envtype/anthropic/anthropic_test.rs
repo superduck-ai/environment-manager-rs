@@ -38,7 +38,7 @@ use crate::internal::{
 
 use super::{
     AnthropicEnvironmentType, Config, Language,
-    anthropic::{InitActivityStopGuard, copy_dir, extract_exit_code},
+    anthropic::{InitActivityStopGuard, copy_dir},
     decode_config,
     types::HookConfig,
 };
@@ -531,6 +531,7 @@ async fn test_run_init_script_failure() {
             .contains("init script failed (exit code 7)")
     );
     assert!(error.output.contains("before failure"));
+    assert_eq!(error.exit_code, Some(7));
 }
 
 /// 验证空脚本无法执行时返回 execute 包装且不虚构输出。
@@ -543,6 +544,7 @@ async fn test_run_init_script_execute_error() {
         .unwrap_err();
     assert!(empty.to_string().contains("failed to execute init script"));
     assert!(empty.output.is_empty());
+    assert_eq!(empty.exit_code, None);
 }
 
 /// 验证环形输出缓冲只保留最后 4096 字节，并留下最终 `tail` 标记。
@@ -600,19 +602,6 @@ async fn cancellation_kills_only_direct_script_child() {
         .unwrap();
     assert_eq!(kill(Pid::from_raw(pid), None::<Signal>), Ok(()));
     let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-}
-
-/// 验证 exit status 前缀解析以及不匹配时的默认值。
-#[test]
-fn test_extract_exit_code() {
-    assert_eq!(
-        extract_exit_code(&std::io::Error::other("exit status 42")),
-        42
-    );
-    assert_eq!(
-        extract_exit_code(&std::io::Error::other("command failed")),
-        1
-    );
 }
 
 /// 验证空语言列表直接成功，不启动任何安装子进程。

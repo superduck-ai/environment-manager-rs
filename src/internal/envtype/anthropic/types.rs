@@ -269,13 +269,15 @@ impl Error for AnthropicError {
     }
 }
 
-/// 初始化脚本失败，同时携带 Go 双返回值中的已捕获输出。
+/// 初始化脚本失败，同时携带已捕获输出和可用的退出码。
 #[derive(Debug)]
 pub struct RunScriptError {
     /// stdout/stderr 合并流最后最多 4096 字节的有损 UTF-8 表示。
     pub output: String,
     /// 启动错误或非零退出错误。
     pub error: AnthropicError,
+    /// 子进程正常退出时的退出码；启动失败时为空。
+    pub exit_code: Option<i32>,
 }
 
 impl fmt::Display for RunScriptError {

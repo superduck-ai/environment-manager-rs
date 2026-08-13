@@ -7,21 +7,19 @@
 use std::{
     ffi::{OsStr, OsString},
     path::Path,
-    process::{ExitStatus, Stdio},
     sync::Arc,
     time::Duration,
 };
 
 use async_trait::async_trait;
-use nix::{fcntl::OFlag, unistd::pipe2};
-use tokio::{io::AsyncReadExt, process::Command};
+use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::internal::{
     auth::AuthContext,
     config::{ClaudeConfig, StartupContext},
     envtype::LeaseManagerHandle,
-    process::{go_spawn_error, resolve_go_command},
+    process::{CaptureMode, CommandFailure, CommandOutput, run_command},
     session::ActivityRecorder,
 };
 
@@ -45,7 +43,7 @@ impl ClaudeError {
         }
     }
 
-    /// 从可能包含非 UTF-8 `CombinedOutput` 的完整错误字节构造错误。
+    /// 从可能包含非 UTF-8 子进程输出的完整错误字节构造错误。
     ///
     /// Go error string 本身是任意字节序列；保存为 `Vec<u8>` 可让最外层 CLI 使用
     /// `Write::write_all` 原样输出。普通 Rust `Display` 只能提供有损的人类可读视图。
@@ -177,147 +175,33 @@ impl std::fmt::Debug for ClaudeCodeExecutor {
     }
 }
 
-/// `CombinedOutput`/`Output` 的失败信息与已读取字节。
-#[derive(Debug)]
-pub(super) struct CapturedCommandError {
-    /// Go `exec.Cmd` 风格的底层错误原始字节。
-    pub(super) error: Vec<u8>,
-    /// 失败前已经读取的目标输出。
-    pub(super) output: Vec<u8>,
-    /// 普通退出码；启动/等待失败或 signal 终止为 -1。
-    pub(super) exit_code: i32,
-}
-
-/// 使用同一匿名 pipe 捕获 stdout/stderr，保持 Go `CombinedOutput` 的内核写入顺序。
-///
-/// 环境为 `Some` 时先清空继承环境再设置给定键值；工作目录为空时保持父进程目录。
-/// 取消只调用 `Child::start_kill`，不会创建或杀死 process group。
+/// 捕获 stdout/stderr，保留内核写入顺序。
 pub(super) async fn run_combined_command(
     cancellation: &CancellationToken,
     program: &OsStr,
     args: &[OsString],
     working_dir: Option<&Path>,
     environment: Option<&[(OsString, OsString)]>,
-) -> Result<Vec<u8>, CapturedCommandError> {
-    let resolved_program = resolve_go_command(program).map_err(|error| CapturedCommandError {
-        error: error.into_bytes(),
-        output: Vec::new(),
-        exit_code: -1,
-    })?;
-    if cancellation.is_cancelled() {
-        return Err(CapturedCommandError {
-            error: b"context canceled".to_vec(),
-            output: Vec::new(),
-            exit_code: -1,
-        });
-    }
-
-    // Go CombinedOutput 使用的 os.Pipe 在 Linux 上原子设置 CLOEXEC；若先创建裸
-    // pipe 再逐个 fcntl，并发 spawn 可能短暂继承捕获管道并延迟 EOF。
-    let (read_end, write_end) = pipe2(OFlag::O_CLOEXEC).map_err(|error| CapturedCommandError {
-        error: error.to_string().into_bytes(),
-        output: Vec::new(),
-        exit_code: -1,
-    })?;
-    let stderr_end = write_end
-        .try_clone()
-        .map_err(|error| CapturedCommandError {
-            error: error.to_string().into_bytes(),
-            output: Vec::new(),
-            exit_code: -1,
-        })?;
-
-    let mut command = Command::new(&resolved_program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(write_end))
-        .stderr(Stdio::from(stderr_end));
+) -> Result<CommandOutput, CommandFailure> {
+    let mut command = Command::new(program);
+    command.args(args);
     apply_command_context(&mut command, working_dir, environment);
-    let mut child = command.spawn().map_err(|error| CapturedCommandError {
-        error: go_spawn_error(&resolved_program, &error).into_bytes(),
-        output: Vec::new(),
-        exit_code: -1,
-    })?;
-    drop(command);
-
-    let mut reader = tokio::fs::File::from_std(std::fs::File::from(read_end));
-    let reader_task = tokio::spawn(async move {
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output).await.map(|_| output)
-    });
-    let status = wait_for_direct_child(cancellation, None, &mut child).await;
-    let output = join_captured_reader(reader_task)
-        .await
-        .map_err(|error| CapturedCommandError {
-            error,
-            output: Vec::new(),
-            exit_code: -1,
-        })?;
-    classify_status(status, output)
+    run_command(command, cancellation, None, None, CaptureMode::Combined).await
 }
 
-/// 只返回 stdout，同时后台排空 stderr，复刻 Go `Cmd.Output` 的输出选择。
+/// 只返回 stdout，同时后台排空 stderr。
 ///
 /// 可选 timeout 和上层取消都会只终止 direct child；调用者仍会得到退出状态错误，
-/// 因而版本探测可以像 Go 一样忽略全部失败并返回空字符串。
+/// 因而版本探测可以忽略全部失败并返回空字符串。
 pub(super) async fn run_stdout_command(
     cancellation: &CancellationToken,
     program: &OsStr,
     args: &[OsString],
     timeout: Option<Duration>,
-) -> Result<Vec<u8>, CapturedCommandError> {
-    let resolved_program = resolve_go_command(program).map_err(|error| CapturedCommandError {
-        error: error.into_bytes(),
-        output: Vec::new(),
-        exit_code: -1,
-    })?;
-    if cancellation.is_cancelled() {
-        return Err(CapturedCommandError {
-            error: b"context canceled".to_vec(),
-            output: Vec::new(),
-            exit_code: -1,
-        });
-    }
-
-    let mut command = Command::new(&resolved_program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| CapturedCommandError {
-        error: go_spawn_error(&resolved_program, &error).into_bytes(),
-        output: Vec::new(),
-        exit_code: -1,
-    })?;
-    let mut stdout = child.stdout.take().expect("stdout configured as piped");
-    let mut stderr = child.stderr.take().expect("stderr configured as piped");
-    let stdout_task = tokio::spawn(async move {
-        let mut output = Vec::new();
-        stdout.read_to_end(&mut output).await.map(|_| output)
-    });
-    // Go 的 Output 会排空 stderr 以免管道填满，但返回值不包含这些字节。
-    let stderr_task = tokio::spawn(async move {
-        let mut discarded = Vec::new();
-        stderr.read_to_end(&mut discarded).await
-    });
-    let status = wait_for_direct_child(cancellation, timeout, &mut child).await;
-    let output = join_captured_reader(stdout_task)
-        .await
-        .map_err(|error| CapturedCommandError {
-            error,
-            output: Vec::new(),
-            exit_code: -1,
-        })?;
-    if let Err(error) = stderr_task.await {
-        return Err(CapturedCommandError {
-            error: error.to_string().into_bytes(),
-            output,
-            exit_code: -1,
-        });
-    }
-    classify_status(status, output)
+) -> Result<CommandOutput, CommandFailure> {
+    let mut command = Command::new(program);
+    command.args(args);
+    run_command(command, cancellation, timeout, None, CaptureMode::Separate).await
 }
 
 /// 把 cwd 与完整环境表应用到 Tokio command。
@@ -333,126 +217,4 @@ fn apply_command_context(
         command.env_clear();
         command.envs(environment.iter().cloned());
     }
-}
-
-/// 等待 child 完成；取消或 timeout 只向该 child PID 发送强制终止。
-async fn wait_for_direct_child(
-    cancellation: &CancellationToken,
-    timeout: Option<Duration>,
-    child: &mut tokio::process::Child,
-) -> std::io::Result<ExitStatus> {
-    if let Some(timeout) = timeout {
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => {
-                let _direct_child_kill = child.start_kill();
-                child.wait().await
-            }
-            () = tokio::time::sleep(timeout) => {
-                let _direct_child_kill = child.start_kill();
-                child.wait().await
-            }
-            result = child.wait() => result,
-        }
-    } else {
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => {
-                let _direct_child_kill = child.start_kill();
-                child.wait().await
-            }
-            result = child.wait() => result,
-        }
-    }
-}
-
-/// 汇合捕获任务，并把 Tokio join/read 错误压成 Go 风格单层文本。
-async fn join_captured_reader(
-    task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
-) -> Result<Vec<u8>, Vec<u8>> {
-    task.await
-        .map_err(|error| error.to_string().into_bytes())?
-        .map_err(|error| error.to_string().into_bytes())
-}
-
-/// 把 wait 状态分类为成功字节或包含输出的兼容错误。
-fn classify_status(
-    status: std::io::Result<ExitStatus>,
-    output: Vec<u8>,
-) -> Result<Vec<u8>, CapturedCommandError> {
-    match status {
-        Ok(status) if status.success() => Ok(output),
-        Ok(status) => Err(CapturedCommandError {
-            error: format_exit_status(status).into_bytes(),
-            output,
-            exit_code: status.code().unwrap_or(-1),
-        }),
-        Err(error) => Err(CapturedCommandError {
-            error: error.to_string().into_bytes(),
-            output,
-            exit_code: -1,
-        }),
-    }
-}
-
-/// 生成 Go `exec.ExitError.Error()` 常见的 `exit status N` 或 `signal: name` 文本。
-pub(super) fn format_exit_status(status: ExitStatus) -> String {
-    if let Some(code) = status.code() {
-        return format!("exit status {code}");
-    }
-
-    use std::os::unix::process::ExitStatusExt as _;
-    let signal = status.signal().unwrap_or_default();
-    let mut message = format!("signal: {}", go_signal_name(signal));
-    if status.core_dumped() {
-        message.push_str(" (core dumped)");
-    }
-    message
-}
-
-/// 返回 Go Linux `syscall.Signal.String()` 使用的信号名称。
-fn go_signal_name(signal: i32) -> String {
-    let name = match signal {
-        libc::SIGHUP => "hangup",
-        libc::SIGINT => "interrupt",
-        libc::SIGQUIT => "quit",
-        libc::SIGILL => "illegal instruction",
-        libc::SIGTRAP => "trace/breakpoint trap",
-        libc::SIGABRT => "aborted",
-        libc::SIGBUS => "bus error",
-        libc::SIGFPE => "floating point exception",
-        libc::SIGKILL => "killed",
-        libc::SIGUSR1 => "user defined signal 1",
-        libc::SIGSEGV => "segmentation fault",
-        libc::SIGUSR2 => "user defined signal 2",
-        libc::SIGPIPE => "broken pipe",
-        libc::SIGALRM => "alarm clock",
-        libc::SIGTERM => "terminated",
-        // MIPS 和 SPARC 的 Linux signal ABI 没有 SIGSTKFLT；其他架构按 libc
-        // 定义保留 Go 对 "stack fault" 的命名。
-        #[cfg(not(any(
-            target_arch = "mips",
-            target_arch = "mips64",
-            target_arch = "sparc",
-            target_arch = "sparc64"
-        )))]
-        libc::SIGSTKFLT => "stack fault",
-        libc::SIGCHLD => "child exited",
-        libc::SIGCONT => "continued",
-        libc::SIGSTOP => "stopped (signal)",
-        libc::SIGTSTP => "stopped",
-        libc::SIGTTIN => "stopped (tty input)",
-        libc::SIGTTOU => "stopped (tty output)",
-        libc::SIGURG => "urgent I/O condition",
-        libc::SIGXCPU => "CPU time limit exceeded",
-        libc::SIGXFSZ => "file size limit exceeded",
-        libc::SIGVTALRM => "virtual timer expired",
-        libc::SIGPROF => "profiling timer expired",
-        libc::SIGWINCH => "window changed",
-        libc::SIGIO => "I/O possible",
-        libc::SIGPWR => "power failure",
-        libc::SIGSYS => "bad system call",
-        _ => return format!("signal {signal}"),
-    };
-    name.to_owned()
 }

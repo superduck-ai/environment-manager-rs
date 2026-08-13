@@ -16,7 +16,7 @@ use tempfile::TempDir;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use super::git::{ActivityStopGuard, classify_git_error, pack_size};
+use super::git::{ActivityStopGuard, pack_size};
 use super::*;
 use crate::internal::{
     api::{LogCategory, LogLevel, SessionError},
@@ -296,9 +296,9 @@ async fn test_git_handler_branch_helpers() {
     );
 }
 
-/// 验证 pack size 只统计 `.pack`，并覆盖全部低基数 Git 错误类别。
+/// 验证 pack size 只统计 `.pack` 文件。
 #[test]
-fn test_pack_size_and_classify_git_error() {
+fn test_pack_size() {
     let repo_path = TempDir::new().expect("temp dir should be created");
     let pack_dir = repo_path.path().join(".git/objects/pack");
     std::fs::create_dir_all(&pack_dir).expect("pack directory should be created");
@@ -309,19 +309,6 @@ fn test_pack_size_and_classify_git_error() {
         pack_size(repo_path.path()).expect("pack size should work"),
         7
     );
-
-    for (message, expected) in [
-        ("context deadline exceeded", "timeout"),
-        ("authentication failed", "auth"),
-        ("secondary rate limit", "rate_limit"),
-        ("repository not found", "not_found"),
-        ("no space left on device", "disk"),
-        ("could not resolve host github", "network"),
-        ("something surprising happened", "unknown"),
-    ] {
-        assert_eq!(classify_git_error(Some(&message)), expected);
-    }
-    assert_eq!(classify_git_error(None), "none");
 }
 
 /// 验证 manager 的空 base directory、动态 handler 分派和 nil source 索引错误。

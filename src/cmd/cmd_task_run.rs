@@ -781,7 +781,7 @@ async fn ensure_claude_code_available_for_task_run(
     Ok(duration)
 }
 
-/// 为 Claude 安装失败添加 task-run 阶段前缀并保留任意 CombinedOutput 字节。
+/// 为 Claude 安装失败添加 task-run 阶段前缀并保留任意子进程输出字节。
 ///
 /// 对应 Go `fmt.Errorf("failed to ensure Claude Code is available: %w", err)`；调用方
 /// 必须把返回值继续交给原始字节 renderer，日志若需要文本可使用其 `Display` 视图。
@@ -1087,8 +1087,8 @@ impl TaskRunManager for Manager {
 /// 对应 Go `runTaskRunManager`，监听 SIGINT/SIGTERM 并给 manager 最多十秒清理。
 ///
 /// manager 自然完成时直接返回结果；收到信号时只取消它的 token。
-/// `context canceled` 等价于 Go `errors.Is(err, context.Canceled)`，按正常结束
-/// 记录指标，其他错误添加 `environment manager failed` 前缀。
+/// 只有结构化取消令牌触发才按正常结束记录指标；错误文本不会参与取消分类，
+/// 其他错误添加 `environment manager failed` 前缀。
 pub(super) async fn run_task_run_manager(
     cancellation: &CancellationToken,
     manager: &mut dyn TaskRunManager,
@@ -1126,7 +1126,7 @@ pub(super) async fn run_task_run_manager(
     };
 
     if let Err(error) = run_result
-        && !is_task_run_cancellation_error(&error)
+        && !manager_cancellation.is_cancelled()
     {
         tracing::error!("error" = ?(error.to_string()), "total_duration_ms" = ?(duration_milliseconds(process_started)), "{}", "Environment manager execution failed");
         if let Some(metrics) = &observability.metrics {
@@ -1173,17 +1173,6 @@ async fn wait_for_task_run_manager_shutdown(
             ))
         }
     }
-}
-
-/// 判断 manager 错误的文本视图是否代表 Go `context.Canceled`。
-fn is_task_run_cancellation_error(error: &ManagerError) -> bool {
-    // 取消分类只影响控制流，可使用日志用的有损视图；真正向上传播的失败仍保留在
-    // ManagerError 原始字节中，不会因为本次检查而被替换。
-    let error = error.to_string();
-    error.contains("context canceled")
-        || error.contains("context cancelled")
-        || error.contains("operation canceled")
-        || error.contains("operation cancelled")
 }
 
 /// 对应 Go `logTaskRunStart`，只记录不含 secret 的 session 摘要。
