@@ -1,4 +1,4 @@
-//! `internal/api/client_test.go` 对应的 Rust 行为测试。
+//! API HTTP 客户端的 Rust 行为测试。
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -66,36 +66,7 @@ async fn spawn_raw_api_response(response: Vec<u8>) -> (String, oneshot::Receiver
     (format!("http://{address}"), request_receiver)
 }
 
-/// 验证测试 transport 的 Close 故障标记能穿过统一重试层。
-///
-/// 三个上层 API 会在各自 Go `defer` 对应位置读取该标记并记录 warning/error；这里
-/// 只验证共享 transport 不会在返回响应前丢弃标记，具体消息和级别由日志映射门禁检查。
-#[tokio::test]
-async fn response_close_error_fault_survives_retry_transport() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&server)
-        .await;
-    let mut client = HttpClient::new(&server.uri(), None).unwrap();
-    client.inject_response_close_error_for_test("synthetic close failure");
-    let request = client
-        .http_client
-        .get(server.uri())
-        .build()
-        .expect("构造故障注入请求");
-    let response = client
-        .retryable_http_do(&CancellationToken::new(), &request, None)
-        .await
-        .expect("故障只在 Close 阶段出现，HTTP 请求本身应成功");
-    assert_eq!(
-        super::client::go_response_close_error(&response).as_deref(),
-        Some("synthetic close failure")
-    );
-}
-
-/// 生成一个完整 gzip member，供 Go Transport 自动解压测试使用。
+/// 生成一个完整 gzip member，供 Reqwest 原生解压测试使用。
 fn gzip_bytes(body: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(body).unwrap();
@@ -466,9 +437,9 @@ async fn ccr_register_worker_epoch_accepts_go_null_and_missing_zero_values() {
     }
 }
 
-/// 精确覆盖 Go JSON HTML 转义、默认 transport headers 与自动 gzip 解压。
+/// 覆盖 wire JSON 编码和 Reqwest 原生 gzip 解压。
 #[tokio::test]
-async fn json_transport_headers_and_gzip_match_go() {
+async fn json_body_uses_native_gzip_decoding() {
     let compressed = gzip_bytes(br#"{"ok":true}"#);
     let mut raw_response = format!(
         "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -501,7 +472,7 @@ async fn json_transport_headers_and_gzip_match_go() {
             "gzip JSON",
         )
         .await
-        .expect("零 timeout 应采用五分钟默认值，gzip JSON 应自动解压");
+        .expect("零 timeout 应采用默认值，gzip JSON 应自动解压");
     assert_eq!(response, json!({"ok": true}));
 
     let request = request.await.unwrap();
@@ -513,79 +484,8 @@ async fn json_transport_headers_and_gzip_match_go() {
             + 4,
     );
     let headers = String::from_utf8_lossy(headers).to_ascii_lowercase();
-    assert!(headers.contains("user-agent: go-http-client/1.1\r\n"));
     assert!(headers.contains("accept-encoding: gzip\r\n"));
     assert_eq!(body, br#"{"a":"\u003c\u2028\u0026\u003e","z":"last"}"#);
-}
-
-/// 调用方显式 Accept-Encoding 时 Go Transport 不覆盖 header，也不自动解压。
-#[tokio::test]
-async fn explicit_accept_encoding_disables_transport_gzip() {
-    let compressed = gzip_bytes(br#"{"ok":true}"#);
-    let mut raw_response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        compressed.len()
-    )
-    .into_bytes();
-    raw_response.extend_from_slice(&compressed);
-    let (base_url, request) = spawn_raw_api_response(raw_response).await;
-    let client = HttpClient::with_options(
-        &base_url,
-        ClientOptions {
-            retry_config: Some(RetryConfig {
-                max_retries: 0,
-                initial_backoff: Duration::ZERO,
-                max_backoff: Duration::ZERO,
-                backoff_factor: 1.0,
-            }),
-            default_headers: BTreeMap::from([
-                ("Accept-Encoding".to_owned(), "identity".to_owned()),
-                (
-                    "User-Agent".to_owned(),
-                    "custom-environment-manager".to_owned(),
-                ),
-            ]),
-            ..ClientOptions::default()
-        },
-    )
-    .unwrap();
-    let error = client
-        .post_json_with_response::<_, Value>(
-            &CancellationToken::new(),
-            &format!("{base_url}/explicit"),
-            &json!({}),
-            "token",
-            "explicit encoding",
-        )
-        .await
-        .expect_err("显式 identity 时压缩字节必须原样进入 JSON parser");
-    assert!(
-        error
-            .to_string()
-            .starts_with("failed to parse explicit encoding response:")
-    );
-    let request = String::from_utf8_lossy(&request.await.unwrap()).to_ascii_lowercase();
-    assert!(request.contains("accept-encoding: identity\r\n"));
-    assert!(!request.contains("accept-encoding: gzip\r\n"));
-    assert!(request.contains("user-agent: custom-environment-manager\r\n"));
-    assert!(!request.contains("user-agent: go-http-client/1.1\r\n"));
-}
-
-/// Go 允许显式空 User-Agent 完全禁止默认 header，不能发送一个空值 header。
-#[test]
-fn explicit_empty_user_agent_suppresses_transport_default() {
-    let client = HttpClient::new("https://api.example.test", None).unwrap();
-    let mut request = client
-        .http_client
-        .get("https://api.example.test/path")
-        .header("User-Agent", "")
-        .build()
-        .unwrap();
-    assert!(request.headers().contains_key("User-Agent"));
-
-    prepare_go_transport_request(&mut request);
-
-    assert!(!request.headers().contains_key("User-Agent"));
 }
 
 /// Go 忽略通用 POST 的 ReadAll error，但错误文案保留截断前的 partial body。
@@ -725,9 +625,9 @@ fn session_ingress_otlp_endpoints_keep_raw_base_url() {
     );
 }
 
-/// 已取消请求和 connection-refused 都必须走稳定的 Go retry 包装顺序。
+/// 已取消请求和 connection-refused 都必须走统一的 retry 包装顺序。
 #[tokio::test]
-async fn retry_errors_use_go_context_and_transport_mapping() {
+async fn retry_reports_cancellation_and_transport_errors() {
     let client = HttpClient::new(
         "http://127.0.0.1:9",
         Some(RetryConfig {
@@ -751,7 +651,7 @@ async fn retry_errors_use_go_context_and_transport_mapping() {
         .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "request failed after 0 retries: request failed: Get \"http://127.0.0.1:9/\": context canceled"
+        "request failed after 0 retries: request canceled"
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -763,12 +663,9 @@ async fn retry_errors_use_go_context_and_transport_mapping() {
         .retryable_http_do(&CancellationToken::new(), &request, None)
         .await
         .unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "request failed after 0 retries: request failed: Get \"{endpoint}\": dial tcp {address}: connect: connection refused"
-        )
-    );
+    let error = error.to_string();
+    assert!(error.starts_with("request failed after 0 retries: request failed: "));
+    assert!(error.contains("error sending request"));
 }
 
 #[tokio::test]

@@ -1,7 +1,6 @@
-//! `internal/tunnel/handler.go` 对应的本地 HTTP 转发测试。
+//! 本地 HTTP tunnel 转发测试。
 
 use std::convert::Infallible;
-use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -9,8 +8,6 @@ use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, Response, StatusCode};
 use axum::routing::any;
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -338,7 +335,7 @@ async fn test_cancel_request_cancels_active_http_forward() {
 
     let errors = sender.errors.lock().unwrap();
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].error_message.contains("request failed"));
+    assert_eq!(errors[0].error_message, "request canceled");
     server.abort();
 }
 
@@ -394,7 +391,7 @@ async fn test_streams_one_byte_flush_without_waiting_for_eof() {
 }
 
 #[tokio::test]
-async fn test_preserves_partial_body_before_unexpected_eof() {
+async fn test_preserves_partial_body_before_read_error() {
     let (sender, result, _) = run_raw_http_exchange(
         HttpTunnelRequest {
             request_id: "req-partial-error".to_owned(),
@@ -414,10 +411,12 @@ async fn test_preserves_partial_body_before_unexpected_eof() {
             .iter()
             .all(|chunk| !chunk.is_final),
     );
-    assert_eq!(result.unwrap_err().to_string(), "unexpected EOF");
-    assert_eq!(
-        sender.errors.lock().unwrap()[0].error_message,
-        "failed to read response body: unexpected EOF",
+    let error = result.unwrap_err().to_string();
+    assert!(!error.is_empty());
+    assert!(
+        sender.errors.lock().unwrap()[0]
+            .error_message
+            .starts_with("failed to read response body: "),
     );
 }
 
@@ -452,7 +451,7 @@ async fn test_preserves_custom_and_empty_reason_phrases() {
 }
 
 #[tokio::test]
-async fn test_normalizes_chunked_response_headers_like_go_transport() {
+async fn test_removes_consumed_http_framing_headers() {
     let (sender, result, _) = run_raw_http_exchange(
         HttpTunnelRequest {
             request_id: "req-chunked-headers".to_owned(),
@@ -477,7 +476,7 @@ async fn test_normalizes_chunked_response_headers_like_go_transport() {
 }
 
 #[tokio::test]
-async fn test_applies_go_request_special_headers_and_default_user_agent() {
+async fn test_rebuilds_transport_headers_and_preserves_user_agent() {
     let (sender, result, request_head) = run_raw_http_exchange(
         HttpTunnelRequest {
             request_id: "req-special-headers".to_owned(),
@@ -522,14 +521,14 @@ async fn test_applies_go_request_special_headers_and_default_user_agent() {
         .to_ascii_lowercase();
     assert!(head.contains("content-length: 3\r\n"));
     assert!(head.contains("user-agent: first-agent\r\n"));
-    assert!(!head.contains("second-agent"));
+    assert!(head.contains("user-agent: second-agent\r\n"));
     assert!(!head.contains("transfer-encoding:"));
     assert!(!head.contains("trailer:"));
     assert!(!head.contains("attacker.example"));
 }
 
 #[tokio::test]
-async fn test_go_url_request_target_preserves_query_and_escapes_backslash() {
+async fn test_request_target_preserves_query_and_escapes_backslash() {
     let (_, result, request_head) = run_raw_http_exchange(
         HttpTunnelRequest {
             request_id: "req-url".to_owned(),
@@ -545,7 +544,7 @@ async fn test_go_url_request_target_preserves_query_and_escapes_backslash() {
 }
 
 #[tokio::test]
-async fn test_invalid_method_url_and_header_keep_go_error_categories() {
+async fn test_rejects_invalid_method_path_and_header() {
     let handler = new_handler().unwrap();
     let sender = Arc::new(RecordingSender::default());
     let method_error = handler
@@ -562,13 +561,16 @@ async fn test_invalid_method_url_and_header_keep_go_error_categories() {
         )
         .await
         .unwrap_err();
-    assert_eq!(
-        method_error.to_string(),
-        "net/http: invalid method \"BAD METHOD\""
-    );
-    assert_eq!(
-        sender.errors.lock().unwrap().pop().unwrap().error_message,
-        "failed to create request: net/http: invalid method \"BAD METHOD\"",
+    assert!(method_error.to_string().contains("invalid HTTP method"));
+    assert!(
+        sender
+            .errors
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .error_message
+            .starts_with("failed to create request: "),
     );
 
     let url_error = handler
@@ -584,10 +586,7 @@ async fn test_invalid_method_url_and_header_keep_go_error_categories() {
         )
         .await
         .unwrap_err();
-    assert_eq!(
-        url_error.to_string(),
-        "parse \"http://localhost:3000/bad%zz\": invalid URL escape \"%zz\"",
-    );
+    assert!(url_error.to_string().contains("invalid percent escape"));
 
     handler
         .handle_request(
@@ -606,9 +605,15 @@ async fn test_invalid_method_url_and_header_keep_go_error_categories() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        sender.errors.lock().unwrap().last().unwrap().error_message,
-        "request failed: Get \"http://localhost:3000/\": net/http: invalid header field name \"Bad Header\"",
+    assert!(
+        sender
+            .errors
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .error_message
+            .starts_with("request failed: invalid header name"),
     );
 
     let control_error = handler
@@ -624,111 +629,39 @@ async fn test_invalid_method_url_and_header_keep_go_error_categories() {
         )
         .await
         .unwrap_err();
-    assert_eq!(
-        control_error.to_string(),
-        "parse \"http://localhost:3000/?line=one\\ntwo\": net/url: invalid control character in URL",
-    );
+    assert!(control_error.to_string().contains("control character"));
 }
 
 #[tokio::test]
-async fn test_auto_gzip_and_explicit_accept_encoding_match_go_transport() {
-    let plain = b"transparent gzip body";
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(plain).unwrap();
-    let compressed = encoder.finish().unwrap();
-    let mut response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
-        compressed.len(),
-    )
-    .into_bytes();
-    response.extend_from_slice(&compressed);
-
-    let (automatic, result, automatic_head) = run_raw_http_exchange(
+async fn test_preserves_content_encoding_without_negotiating_compression() {
+    let (sender, result, request_head) = run_raw_http_exchange(
         HttpTunnelRequest {
-            request_id: "req-auto-gzip".to_owned(),
+            request_id: "req-encoded".to_owned(),
             path: "/".to_owned(),
             ..Default::default()
         },
-        response.clone(),
+        b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 7\r\n\r\nencoded".to_vec(),
     )
     .await;
     result.unwrap();
     assert!(
-        String::from_utf8(automatic_head)
+        !String::from_utf8(request_head)
             .unwrap()
             .to_ascii_lowercase()
-            .contains("accept-encoding: gzip\r\n"),
+            .contains("accept-encoding:"),
     );
-    assert_eq!(recorded_body(&automatic), plain);
-    // 后面仍会 await 第二次交换，不能让标准 MutexGuard 跨过挂起点；复制 protobuf
-    // header 也让两个独立请求的断言生命周期互不耦合。
-    let automatic_headers = automatic.headers.lock().unwrap()[0].headers.clone();
+    assert_eq!(recorded_body(&sender), b"encoded");
+    let headers = &sender.headers.lock().unwrap()[0].headers;
     assert!(
-        automatic_headers
-            .iter()
-            .all(|header| { header.name != "Content-Encoding" && header.name != "Content-Length" })
-    );
-
-    let (explicit, result, explicit_head) = run_raw_http_exchange(
-        HttpTunnelRequest {
-            request_id: "req-explicit-gzip".to_owned(),
-            path: "/".to_owned(),
-            headers: vec![Header {
-                name: "Accept-Encoding".to_owned(),
-                value: "identity".to_owned(),
-            }],
-            ..Default::default()
-        },
-        response,
-    )
-    .await;
-    result.unwrap();
-    assert!(
-        String::from_utf8(explicit_head)
-            .unwrap()
-            .to_ascii_lowercase()
-            .contains("accept-encoding: identity\r\n"),
-    );
-    assert_eq!(recorded_body(&explicit), compressed);
-    let explicit_headers = &explicit.headers.lock().unwrap()[0].headers;
-    assert!(
-        explicit_headers
+        headers
             .iter()
             .any(|header| header.name == "Content-Encoding" && header.value == "gzip"),
     );
-}
-
-#[tokio::test]
-async fn test_head_and_range_disable_auto_gzip() {
-    for (method, headers) in [
-        ("HEAD", Vec::new()),
-        (
-            "GET",
-            vec![Header {
-                name: "Range".to_owned(),
-                value: "bytes=0-1".to_owned(),
-            }],
-        ),
-    ] {
-        let (_, result, request_head) = run_raw_http_exchange(
-            HttpTunnelRequest {
-                request_id: format!("req-{method}-no-gzip"),
-                method: method.to_owned(),
-                path: "/".to_owned(),
-                headers,
-                ..Default::default()
-            },
-            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
-        )
-        .await;
-        result.unwrap();
-        assert!(
-            !String::from_utf8(request_head)
-                .unwrap()
-                .to_ascii_lowercase()
-                .contains("accept-encoding:"),
-        );
-    }
+    assert!(
+        headers
+            .iter()
+            .any(|header| header.name == "Content-Length" && header.value == "7"),
+    );
 }
 
 #[tokio::test]
@@ -798,7 +731,7 @@ async fn test_aborted_future_drops_active_request_registration() {
 }
 
 #[tokio::test]
-async fn test_response_header_timeout_uses_go_error_text() {
+async fn test_response_header_timeout_reports_protocol_error() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = i32::from(listener.local_addr().unwrap().port());
     let server = tokio::spawn(async move {
@@ -829,9 +762,7 @@ async fn test_response_header_timeout_uses_go_error_text() {
     .unwrap();
     assert_eq!(
         sender.errors.lock().unwrap()[0].error_message,
-        format!(
-            "request failed: Get \"http://localhost:{port}/wait\": net/http: timeout awaiting response headers"
-        ),
+        "request failed: response header timeout",
     );
     server.abort();
 }

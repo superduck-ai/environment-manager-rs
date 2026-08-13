@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::internal::util::go_path_escape;
 
-use super::client::{go_response_close_error, read_go_response_body};
+use super::client::read_response_body;
 use super::{ApiError, HttpClient, SessionContext, SessionContextResponse};
 
 /// `/v2/sessions` 查询客户端。
@@ -66,23 +66,16 @@ impl SessionsClient {
                 ApiError::message(format!("failed to fetch session context: {error}"))
             })?;
         let status = response.status();
-        // Go 在函数退出时通过 defer 关闭 body。先保存自定义 transport 注入的 Close
-        // 结果，再计算完整业务返回值，最后记录 warning，才能保持 defer 的时序。
-        let close_error = go_response_close_error(&response);
-        let body = read_go_response_body(response, cancellation)
+        let body = read_response_body(response, cancellation)
             .await
             .map_err(|error| {
                 ApiError::message(format!("failed to read session context response: {error}"))
             });
 
-        let result = match body {
+        match body {
             Ok(body) => self.parse_session_context_response(status, &body, session_id),
             Err(error) => Err(error),
-        };
-        if let Some(error) = close_error {
-            tracing::warn!("error" = ?(error), "endpoint" = ?(endpoint), "{}", "Failed to close response body");
         }
-        result
     }
 
     /// 解释 `GetSessionContext` 已读取的响应 body，并保持 Go 状态码错误文本。

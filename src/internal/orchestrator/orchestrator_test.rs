@@ -300,16 +300,6 @@ async fn test_whoami_client_get_identity() {
             .to_ascii_lowercase()
             .contains("authorization: bearer auth-token")
     );
-    assert!(
-        request
-            .to_ascii_lowercase()
-            .contains("user-agent: go-http-client/1.1\r\n")
-    );
-    assert!(
-        request
-            .to_ascii_lowercase()
-            .contains("accept-encoding: gzip\r\n")
-    );
 }
 
 /// 验证 Whoami 构造器保留 Go 的原始尾随斜杠，因此请求路径可见双斜杠。
@@ -499,7 +489,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-/// 生成测试响应使用的 gzip member，覆盖 Whoami 的 Go Transport 自动解压路径。
+/// 生成测试响应使用的 gzip member，覆盖 Reqwest 原生解压路径。
 fn gzip_orchestrator_bytes(body: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(body).unwrap();

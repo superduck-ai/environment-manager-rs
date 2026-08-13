@@ -9,11 +9,6 @@ use rand::Rng;
 use reqwest::{Request, Response, StatusCode};
 use tokio_util::sync::CancellationToken;
 
-#[cfg(test)]
-use super::client::GoResponseCloseError;
-use super::client::{
-    GoRequestErrorContext, mark_go_transport_response, prepare_go_transport_request,
-};
 use super::{ApiError, HttpClient};
 
 /// HTTP 重试参数，对应 Go `RetryConfig`。
@@ -94,11 +89,9 @@ impl HttpClient {
 
         let mut last_error = String::new();
         for attempt in 0..=config.max_retries {
-            let mut attempt_request = request.try_clone().ok_or_else(|| {
+            let attempt_request = request.try_clone().ok_or_else(|| {
                 ApiError::message("failed to read request body: request body is not replayable")
             })?;
-            let error_context = GoRequestErrorContext::from_request(&attempt_request);
-            let auto_gzip = prepare_go_transport_request(&mut attempt_request);
             tracing::debug!("attempt" = ?(attempt), "max_retries" = ?(config.max_retries), "method" = ?(attempt_request.method().as_str()), "url" = ?(attempt_request.url().as_str()), "{}", "Executing HTTP request");
 
             let result = tokio::select! {
@@ -108,14 +101,7 @@ impl HttpClient {
             };
 
             match result {
-                Ok(mut response) if !is_retryable_status_code(response.status()) => {
-                    mark_go_transport_response(&mut response, auto_gzip);
-                    #[cfg(test)]
-                    if let Some(error) = &self.response_close_error_for_test {
-                        response
-                            .extensions_mut()
-                            .insert(GoResponseCloseError::new(error.clone()));
-                    }
+                Ok(response) if !is_retryable_status_code(response.status()) => {
                     return Ok(response);
                 }
                 Ok(response) => {
@@ -125,10 +111,10 @@ impl HttpClient {
                     drop(response);
                 }
                 Err(Some(error)) => {
-                    last_error = format!("request failed: {}", error_context.request_error(&error));
+                    last_error = format!("request failed: {}", error.without_url());
                 }
                 Err(None) => {
-                    last_error = format!("request failed: {}", error_context.canceled());
+                    last_error = "request canceled".to_owned();
                 }
             }
 

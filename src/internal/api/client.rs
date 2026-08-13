@@ -1,19 +1,12 @@
-//! 对应 Go `internal/api/client.go` 的共享 JSON HTTP 客户端。
+//! 共享 JSON HTTP 客户端。
 //!
-//! Reqwest client 在构造后复用连接池；默认超时、认证头、runner 版本头和错误文本保持
-//! Go 行为。敏感 token 只写入请求头，不进入 tracing 字段。
+//! Reqwest client 在构造后复用连接池；敏感 token 只写入请求头，不进入 tracing 字段。
 
 use std::collections::BTreeMap;
-use std::fmt;
-use std::io::{self, Read as _};
 use std::time::Duration;
 
-use flate2::read::MultiGzDecoder;
 use futures_util::StreamExt as _;
-use reqwest::header::{
-    ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, HeaderMap, HeaderName,
-    HeaderValue, RANGE, USER_AGENT,
-};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Request, Response};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -23,88 +16,6 @@ use tokio_util::sync::CancellationToken;
 use crate::internal::util::{claude_code_version, version};
 
 use super::RetryConfig;
-
-/// Go `net/http.Transport` 在调用方没有显式提供 UA 时写入的默认值。
-///
-/// Reqwest 默认不承诺同一 UA；显式固定该值既保持后端观测兼容，也避免把 Rust
-/// HTTP 库及版本暴露到服务端日志中。调用方请求上的 `User-Agent` 仍会覆盖它。
-pub(crate) const GO_DEFAULT_USER_AGENT: &str = "Go-http-client/1.1";
-
-/// 标记本次响应的请求由兼容层自动协商了 gzip。
-///
-/// Go 只会自动解压由 Transport 自己添加 `Accept-Encoding: gzip` 的请求；调用方
-/// 显式设置同名 header 时，即使值也是 gzip，也必须把响应原样交给调用方。
-#[derive(Clone, Copy, Debug)]
-struct AutoGzipResponse;
-
-/// 自定义 HTTP transport 注入的 Go `Response.Body.Close` 失败。
-///
-/// Reqwest 的标准响应 body 通过 Drop 释放连接，Drop 不返回错误；Go 的标准
-/// `net/http.Transport` 在本项目这些读取/提前关闭路径上也通常返回 `nil`。不过 Go
-/// API 允许测试或嵌入方提供自定义 `RoundTripper` 与会失败的 `io.ReadCloser`，三个
-/// 调用点会把该失败写入 tracing。扩展标记为这一可观察边界保留等价注入通道，
-/// 同时避免把 body 的读取错误错误地伪装成 Close 错误。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GoResponseCloseError {
-    message: String,
-}
-
-impl GoResponseCloseError {
-    /// 创建一个供自定义 transport 或故障注入测试附加到响应上的 Close 错误。
-    ///
-    /// # 参数
-    /// - `message`：对应 Go `error.Error()` 的原始文本；不得包含 Rust error wrapper。
-    ///
-    /// # 返回
-    /// 返回可插入 `reqwest::Response::extensions_mut()` 的不可变错误标记。
-    #[cfg(test)]
-    pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-
-    /// 返回用于 `error` tracing 字段的错误文本。
-    pub(crate) fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-/// 读取自定义 transport 附加的 Go response body Close 错误。
-///
-/// # 参数
-/// - `response`：尚未被 body reader 消费的 Reqwest 响应引用。
-///
-/// # 返回
-/// 标记存在时复制其错误文本；标准 Reqwest transport 返回 `None`。
-///
-/// # 兼容性
-/// 调用方必须在消费 `Response` 前调用本函数，并在业务返回值已经计算完成后记录，
-/// 从而复刻 Go `defer` 的执行顺序。
-pub(crate) fn go_response_close_error(response: &Response) -> Option<String> {
-    response
-        .extensions()
-        .get::<GoResponseCloseError>()
-        .map(|error| error.message().to_owned())
-}
-
-/// 响应 body 读取失败的稳定兼容错误。
-///
-/// 该类型刻意不保存 Reqwest 的 `Display` 文本，避免依赖升级改变 CLI 错误，也避免
-/// 底层错误意外带出带凭据 URL。`message` 使用 Go 常见的 body 读取错误词汇。
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct GoHttpBodyError {
-    message: &'static str,
-}
-
-impl fmt::Display for GoHttpBodyError {
-    /// 输出稳定的 Go 风格 body 错误文本。
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.message)
-    }
-}
-
-impl std::error::Error for GoHttpBodyError {}
 
 /// API 层统一错误；`EndpointNotImplemented` 保留 Go sentinel 的可判定语义。
 #[derive(Debug, thiserror::Error)]
@@ -175,9 +86,6 @@ pub struct HttpClient {
     pub(crate) retry_config: RetryConfig,
     /// 已验证的默认 header。
     default_headers: HeaderMap,
-    /// 单元测试专用的 Go `Body.Close` 故障；生产构建不包含该状态。
-    #[cfg(test)]
-    pub(crate) response_close_error_for_test: Option<String>,
 }
 
 impl HttpClient {
@@ -236,8 +144,6 @@ impl HttpClient {
             http_client,
             retry_config: options.retry_config.unwrap_or_default(),
             default_headers,
-            #[cfg(test)]
-            response_close_error_for_test: None,
         })
     }
 
@@ -266,22 +172,7 @@ impl HttpClient {
             http_client,
             retry_config: retry_config.unwrap_or_default(),
             default_headers: HeaderMap::new(),
-            #[cfg(test)]
-            response_close_error_for_test: None,
         }
-    }
-
-    /// 为下一步单元测试请求注入 Go `Response.Body.Close` 错误。
-    ///
-    /// # 参数
-    /// - `message`：自定义 `io.ReadCloser.Close` 返回的 Go error 文本。
-    ///
-    /// # 副作用
-    /// 后续所有由此测试 client 返回的非重试响应都会带同一扩展标记；本入口不会编译
-    /// 到生产二进制，防止后端响应控制本地日志故障注入。
-    #[cfg(test)]
-    pub(crate) fn inject_response_close_error_for_test(&mut self, message: impl Into<String>) {
-        self.response_close_error_for_test = Some(message.into());
     }
 
     /// 返回规范化后的 base URL，供 endpoint 适配器拼接路径。
@@ -405,10 +296,8 @@ impl HttpClient {
                 ApiError::message(format!("failed to post {operation_name}: {error}"))
             })?;
         let status = response.status();
-        // Go 的通用 POST 路径故意忽略 io.ReadAll 错误，但会保留错误前已经读到的
-        // 字节。兼容 helper 因此不能使用 `Response::bytes().unwrap_or_default()`；后者
-        // 会在截断响应上把可见的 partial body 一并丢掉。
-        let response_body = read_go_response_body_ignoring_errors(response, cancellation).await;
+        // 错误响应仍应保留传输中断前已经收到的 body，便于显示服务端诊断。
+        let response_body = read_response_body_ignoring_errors(response, cancellation).await;
         if status == reqwest::StatusCode::OK {
             return Ok(response_body);
         }
@@ -442,286 +331,66 @@ pub(crate) fn add_version_headers(headers: &mut HeaderMap) -> Result<(), ApiErro
     Ok(())
 }
 
-/// 在发送前复刻 Go `net/http.Transport` 的自动 gzip 协商规则。
+/// 严格读取响应 body，并在取消或传输失败时返回错误。
 ///
-/// 只有非 HEAD、没有非空 `Range` 且没有非空 `Accept-Encoding` 的请求才由 Transport
-/// 自动添加 gzip。返回值必须随最终响应保存；只有返回 `true` 时 Go 才会自动解压。
-pub(crate) fn prepare_go_transport_request(request: &mut Request) -> bool {
-    // Go 在序列化 Request 时才补默认 UA，因此即使底层 client 来自 BYOC 等外部
-    // 构造路径也具有同一行为。显式空值表示“完全不发送 UA”；Reqwest 若直接保留
-    // 空 HeaderValue 会写出空 header，必须先删除才能等价于 Go。
-    match request.headers().get(USER_AGENT) {
-        None => {
-            request
-                .headers_mut()
-                .insert(USER_AGENT, HeaderValue::from_static(GO_DEFAULT_USER_AGENT));
-        }
-        Some(value) if value.as_bytes().is_empty() => {
-            request.headers_mut().remove(USER_AGENT);
-        }
-        Some(_) => {}
-    }
-
-    let header_is_empty = |name: &reqwest::header::HeaderName| {
-        request
-            .headers()
-            .get(name)
-            .is_none_or(|value| value.as_bytes().is_empty())
-    };
-    let auto_gzip = request.method() != Method::HEAD
-        && header_is_empty(&ACCEPT_ENCODING)
-        && header_is_empty(&RANGE);
-    if auto_gzip {
-        // Go 的 extraHeaders 会让传输层实际只写出 gzip；这里直接替换显式空值，
-        // 避免 HeaderMap 留下一个空 header 和一个 gzip header 的多值差异。
-        request
-            .headers_mut()
-            .insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
-    }
-    auto_gzip
-}
-
-/// 把请求阶段的自动 gzip 决策附加到响应，供 body reader 决定是否解压。
-pub(crate) fn mark_go_transport_response(response: &mut Response, auto_gzip: bool) {
-    if auto_gzip {
-        response.extensions_mut().insert(AutoGzipResponse);
-    }
-}
-
-/// 严格读取响应 body，并复刻 Go Transport 的自动 gzip 解压。
-///
-/// SessionContext 与 Whoami 的 Go 路径会检查 `io.ReadAll` 错误，因此该函数在保留
-/// partial bytes 的同时返回稳定错误。取消、client timeout、截断和 gzip 损坏均不会
-/// 暴露 Reqwest/flate2 的版本相关文本。
-pub(crate) async fn read_go_response_body(
+/// Reqwest 负责其原生支持的 content decoding；该 helper 只保留取消处理和 partial
+/// body 收集，避免在多个 API 调用点重复流读取循环。
+pub(crate) async fn read_response_body(
     response: Response,
     cancellation: &CancellationToken,
-) -> Result<Vec<u8>, GoHttpBodyError> {
-    let outcome = read_go_response_body_outcome(response, cancellation).await;
+) -> Result<Vec<u8>, ApiError> {
+    let outcome = read_response_body_outcome(response, cancellation).await;
     match outcome.error {
         Some(error) => Err(error),
         None => Ok(outcome.body),
     }
 }
 
-/// 读取响应 body，但像 Go 的通用 POST/ACK 分支一样忽略读取错误并保留 partial bytes。
-pub(crate) async fn read_go_response_body_ignoring_errors(
+/// 读取响应 body，忽略读取错误但保留传输中断前已经到达的字节。
+pub(crate) async fn read_response_body_ignoring_errors(
     response: Response,
     cancellation: &CancellationToken,
 ) -> Vec<u8> {
-    read_go_response_body_outcome(response, cancellation)
+    read_response_body_outcome(response, cancellation)
         .await
         .body
 }
 
 /// body reader 的内部结果；错误路径仍携带已经读取或解压出的字节。
-struct GoHttpBodyOutcome {
+struct ResponseBodyOutcome {
     body: Vec<u8>,
-    error: Option<GoHttpBodyError>,
+    error: Option<ApiError>,
 }
 
-/// 收集传输流、处理取消并按 Go 的“仅自动协商才解 gzip”规则生成最终 body。
-async fn read_go_response_body_outcome(
+/// 收集 Reqwest 响应流并处理取消。
+async fn read_response_body_outcome(
     response: Response,
     cancellation: &CancellationToken,
-) -> GoHttpBodyOutcome {
-    let should_decompress = response.extensions().get::<AutoGzipResponse>().is_some()
-        && response
-            .headers()
-            .get(CONTENT_ENCODING)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.eq_ignore_ascii_case("gzip"));
+) -> ResponseBodyOutcome {
     let mut stream = response.bytes_stream();
-    let mut encoded = Vec::new();
-    let mut transport_error = None;
+    let mut body = Vec::new();
+    let mut error = None;
 
     loop {
         let next = tokio::select! {
             biased;
             _ = cancellation.cancelled() => {
-                transport_error = Some(GoHttpBodyError { message: "context canceled" });
+                error = Some(ApiError::message("response body read canceled"));
                 break;
             }
             next = stream.next() => next,
         };
         match next {
-            Some(Ok(chunk)) => encoded.extend_from_slice(&chunk),
-            Some(Err(error)) => {
-                transport_error = Some(classify_body_transport_error(&error));
+            Some(Ok(chunk)) => body.extend_from_slice(&chunk),
+            Some(Err(source)) => {
+                error = Some(ApiError::message(source.without_url().to_string()));
                 break;
             }
             None => break,
         }
     }
 
-    if !should_decompress {
-        return GoHttpBodyOutcome {
-            body: encoded,
-            error: transport_error,
-        };
-    }
-
-    // Go 的 lazy gzipReader 把完全空的底层 body 首次返回的 io.EOF 交给
-    // io.ReadAll；ReadAll 将该 EOF 视为正常结束。因此只有“零字节”在带 gzip
-    // header 时仍成功，任意非空截断 header 才是 unexpected EOF。
-    if encoded.is_empty() && transport_error.is_none() {
-        return GoHttpBodyOutcome {
-            body: Vec::new(),
-            error: None,
-        };
-    }
-
-    let mut decoded = Vec::new();
-    let gzip_result = MultiGzDecoder::new(encoded.as_slice()).read_to_end(&mut decoded);
-    match gzip_result {
-        Ok(_) => GoHttpBodyOutcome {
-            body: decoded,
-            // 完整 gzip member 自带结束边界；Go gzip reader 到达该边界后也不会再
-            // 为多报的 HTTP Content-Length 强制读取，因此成功解压优先于传输尾错。
-            error: None,
-        },
-        Err(error) => GoHttpBodyOutcome {
-            body: decoded,
-            error: Some(classify_gzip_error(&error)),
-        },
-    }
-}
-
-/// 把 Reqwest body 错误归并为 Go 调用方稳定可见的分类。
-fn classify_body_transport_error(error: &reqwest::Error) -> GoHttpBodyError {
-    if error.is_timeout() {
-        return GoHttpBodyError {
-            message: "context deadline exceeded (Client.Timeout or context cancellation while reading body)",
-        };
-    }
-    if find_io_error_kind(error) == Some(io::ErrorKind::UnexpectedEof) {
-        return GoHttpBodyError {
-            message: "unexpected EOF",
-        };
-    }
-    // Hyper 对 Content-Length 截断通常不保留 std::io::UnexpectedEof，但仍会把
-    // body 标为 decode error；Go 对同一 wire 统一返回 unexpected EOF。
-    if error.is_body() || error.is_decode() {
-        return GoHttpBodyError {
-            message: "unexpected EOF",
-        };
-    }
-    GoHttpBodyError {
-        message: "transport body read error",
-    }
-}
-
-/// 把 flate2 错误映射为 Go `compress/gzip` 常用错误文本。
-fn classify_gzip_error(error: &io::Error) -> GoHttpBodyError {
-    let text = error.to_string().to_ascii_lowercase();
-    if error.kind() == io::ErrorKind::UnexpectedEof || text.contains("unexpected end") {
-        return GoHttpBodyError {
-            message: "unexpected EOF",
-        };
-    }
-    if text.contains("checksum") || text.contains("corrupt") {
-        return GoHttpBodyError {
-            message: "gzip: invalid checksum",
-        };
-    }
-    GoHttpBodyError {
-        message: "gzip: invalid header",
-    }
-}
-
-/// 在错误 source chain 中查找底层 `std::io::ErrorKind`。
-///
-/// 某些 connector 会先包一层 `Other`，再把真正的 ConnectionRefused/TimedOut 放在
-/// 更深处；优先返回具体 kind，避免外层无信息 wrapper 把稳定的 Linux 原因吞掉。
-fn find_io_error_kind(error: &(dyn std::error::Error + 'static)) -> Option<io::ErrorKind> {
-    let mut current = Some(error);
-    let mut fallback = None;
-    while let Some(source) = current {
-        if let Some(io_error) = source.downcast_ref::<io::Error>() {
-            let kind = io_error.kind();
-            if kind != io::ErrorKind::Other {
-                return Some(kind);
-            }
-            fallback = Some(kind);
-        }
-        current = source.source();
-    }
-    fallback
-}
-
-/// 保存一次 HTTP attempt 的 Go `url.Error` 格式化上下文。
-///
-/// Request 在交给 Reqwest 后会被 move；预先保存 method、脱敏 URL 和 dial authority
-/// 才能在错误分支稳定复刻 `Post "...": ...`，且不会在日志中泄漏 URL password。
-#[derive(Clone, Debug)]
-pub(crate) struct GoRequestErrorContext {
-    operation: String,
-    redacted_url: String,
-    dial_authority: String,
-}
-
-impl GoRequestErrorContext {
-    /// 从待发送请求提取 Go `url.Error` 所需的非敏感字段。
-    pub(crate) fn from_request(request: &Request) -> Self {
-        let method = request.method().as_str().to_ascii_lowercase();
-        let mut characters = method.chars();
-        let operation = characters.next().map_or_else(String::new, |first| {
-            first.to_uppercase().collect::<String>() + characters.as_str()
-        });
-
-        let mut redacted = request.url().clone();
-        if redacted.password().is_some() {
-            let _ = redacted.set_password(Some("xxxxx"));
-        }
-        let host = redacted.host_str().unwrap_or_default();
-        let host = if host.contains(':') {
-            format!("[{host}]")
-        } else {
-            host.to_owned()
-        };
-        let dial_authority = redacted
-            .port_or_known_default()
-            .map_or(host.clone(), |port| format!("{host}:{port}"));
-        Self {
-            operation,
-            redacted_url: redacted.into(),
-            dial_authority,
-        }
-    }
-
-    /// 生成 context 已取消时 Go `url.Error.Error()` 的文本。
-    pub(crate) fn canceled(&self) -> String {
-        self.with_cause("context canceled")
-    }
-
-    /// 把 Reqwest 错误分类为稳定的 Go transport 文案。
-    pub(crate) fn request_error(&self, error: &reqwest::Error) -> String {
-        let cause = match find_io_error_kind(error) {
-            Some(io::ErrorKind::ConnectionRefused) => format!(
-                "dial tcp {}: connect: connection refused",
-                self.dial_authority
-            ),
-            // Reqwest 把 Dialer connect timeout 和整个 Client deadline 都标为 timeout；
-            // 只有前者的 source chain 含 io::TimedOut，必须先判定才能还原 Go 文本。
-            Some(io::ErrorKind::TimedOut) => {
-                format!("dial tcp {}: i/o timeout", self.dial_authority)
-            }
-            Some(io::ErrorKind::UnexpectedEof) => "EOF".to_owned(),
-            Some(io::ErrorKind::ConnectionReset) => "connection reset by peer".to_owned(),
-            Some(io::ErrorKind::BrokenPipe) => "broken pipe".to_owned(),
-            _ if error.is_timeout() => {
-                "context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
-                    .to_owned()
-            }
-            _ => "transport error".to_owned(),
-        };
-        self.with_cause(&cause)
-    }
-
-    /// 按 Go `%q` URL 形态拼接 operation 和原因。
-    fn with_cause(&self, cause: &str) -> String {
-        format!("{} {:?}: {cause}", self.operation, self.redacted_url)
-    }
+    ResponseBodyOutcome { body, error }
 }
 
 /// 使用 Serde 编码强类型值，并补齐 Go `json.Marshal` 默认 HTML 转义。

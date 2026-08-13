@@ -13,10 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::internal::util::go_path_escape;
 
-use super::client::{
-    add_version_headers, go_response_close_error, marshal_go_json,
-    read_go_response_body_ignoring_errors,
-};
+use super::client::{add_version_headers, marshal_go_json, read_response_body_ignoring_errors};
 use super::{ApiError, DiagLogEntry, HttpClient, SessionEvent};
 
 /// SessionIngress events/diag_logs 客户端。
@@ -89,13 +86,10 @@ impl HttpSessionIngressClient {
                 ApiError::message(format!("failed to post {operation_name}: {error}"))
             })?;
         let status = response.status();
-        let close_error = go_response_close_error(&response);
-        let result = if status == StatusCode::OK {
+        if status == StatusCode::OK {
             Ok(())
         } else {
-            // Go 忽略 ReadAll 错误但保留截断前的字节；共享 helper 同时处理 Transport
-            // 自动协商的 gzip，避免 4xx/501 文案在压缩或 partial body 时变空。
-            let body = read_go_response_body_ignoring_errors(response, cancellation).await;
+            let body = read_response_body_ignoring_errors(response, cancellation).await;
             let body = String::from_utf8_lossy(&body);
             if status == StatusCode::NOT_IMPLEMENTED {
                 Err(ApiError::EndpointNotImplemented(format!(
@@ -108,12 +102,7 @@ impl HttpSessionIngressClient {
                     status.as_u16()
                 )))
             }
-        };
-        // 与 Go defer 一样，Close warning 晚于业务结果计算，且不会替换 501 sentinel。
-        if let Some(error) = close_error {
-            tracing::warn!("error" = ?(error), "endpoint" = ?(endpoint), "{}", "Failed to close response body");
         }
-        result
     }
 
     /// 对应 Go `PostSessionEvent`，用 `events` 数组包裹单个事件。

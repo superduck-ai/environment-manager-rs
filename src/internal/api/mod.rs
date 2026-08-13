@@ -15,11 +15,8 @@ mod types;
 mod work_client;
 
 pub use ccr_backend::CCRBackend;
+pub(crate) use client::read_response_body;
 pub use client::{ApiError, ClientOptions, HttpClient};
-pub(crate) use client::{
-    GoRequestErrorContext, mark_go_transport_response, prepare_go_transport_request,
-    read_go_response_body,
-};
 pub use get_session_context::SessionsClient;
 pub use noop_backend::NoopBackend;
 pub use retry::RetryConfig;

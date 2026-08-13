@@ -8,9 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::internal::util::go_path_escape;
 
-use super::client::{
-    add_version_headers, go_response_close_error, read_go_response_body_ignoring_errors,
-};
+use super::client::{add_version_headers, read_response_body_ignoring_errors};
 use super::{ApiError, HttpClient};
 
 /// 环境 work API 客户端。
@@ -69,11 +67,8 @@ impl WorkClient {
             .await
             .map_err(|error| ApiError::message(format!("ACK request failed: {error}")))?;
         let status = response.status();
-        let close_error = go_response_close_error(&response);
-        let result = if status != StatusCode::OK && status != StatusCode::NO_CONTENT {
-            // Go 忽略 ACK body 的 ReadAll 错误，但错误文本仍包含已经到达的 partial
-            // bytes；共享 reader 还负责仅对 Transport 自动协商的 gzip 解压。
-            let body = read_go_response_body_ignoring_errors(response, cancellation).await;
+        if status != StatusCode::OK && status != StatusCode::NO_CONTENT {
+            let body = read_response_body_ignoring_errors(response, cancellation).await;
             Err(ApiError::message(format!(
                 "ACK request returned status {}: {}",
                 status.as_u16(),
@@ -82,12 +77,6 @@ impl WorkClient {
         } else {
             tracing::debug!("environment_id" = ?(environment_id), "work_id" = ?(work_id), "{}", "Work ACK successful");
             Ok(())
-        };
-        // Go 的 defer 在成功日志或错误值完成之后执行；Close 失败只写日志，不覆盖
-        // ACK 的业务返回值。标准 Reqwest 响应没有该扩展，因此不会生成伪警报。
-        if let Some(error) = close_error {
-            tracing::error!("error" = ?(error), "{}", "Failed to close ACK response body");
         }
-        result
     }
 }

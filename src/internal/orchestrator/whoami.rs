@@ -11,10 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{OrchestratorError, OrchestratorResult, WhoamiClient, WhoamiResponse};
 use crate::{
-    internal::api::{
-        GoRequestErrorContext, mark_go_transport_response, prepare_go_transport_request,
-        read_go_response_body,
-    },
+    internal::api::read_response_body,
     internal::util::{claude_code_version, version},
 };
 
@@ -76,36 +73,30 @@ impl WhoamiClient {
         if let Some(claude_version) = claude_code_version() {
             request = request.header("x-claude-code-version", claude_version);
         }
-        let mut request = request.build().map_err(|error| {
+        let request = request.build().map_err(|error| {
             OrchestratorError::message(format!("failed to create whoami request: {error}"))
         })?;
-        let error_context = GoRequestErrorContext::from_request(&request);
-        let auto_gzip = prepare_go_transport_request(&mut request);
 
         let response = tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(None),
             response = self.http_client.execute(request) => response.map_err(Some),
         };
-        let mut response = match response {
+        let response = match response {
             Ok(response) => response,
             Err(Some(error)) => {
                 return Err(OrchestratorError::message(format!(
                     "whoami request failed: {}",
-                    error_context.request_error(&error)
+                    error.without_url()
                 )));
             }
             Err(None) => {
-                return Err(OrchestratorError::message(format!(
-                    "whoami request failed: {}",
-                    error_context.canceled()
-                )));
+                return Err(OrchestratorError::message("whoami request canceled"));
             }
         };
-        mark_go_transport_response(&mut response, auto_gzip);
 
         let status = response.status();
-        let body = read_go_response_body(response, cancellation)
+        let body = read_response_body(response, cancellation)
             .await
             .map_err(|error| {
                 OrchestratorError::message(format!("failed to read whoami response body: {error}"))
