@@ -161,7 +161,7 @@ impl Server for ServerImpl {
                     biased;
                     _ = &mut *serve_task => {}
                     _ = cancellation.cancelled() => {
-                        return Err(GitProxyError::message("context canceled"));
+                        return Err(GitProxyError::message("operation cancelled"));
                     }
                 }
             } else {

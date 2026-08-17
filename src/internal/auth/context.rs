@@ -6,7 +6,7 @@
 use serde::Deserialize;
 use thiserror::Error;
 
-use super::types::{AuthConfig, AuthContext, deserialize_string_or_null};
+use super::types::{AuthConfig, AuthContext};
 
 /// 认证配置解析失败。
 #[derive(Debug, Error)]
@@ -31,22 +31,16 @@ pub enum AuthError {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct AntspaceCredentials {
-    #[serde(deserialize_with = "deserialize_string_or_null")]
     url: String,
-    #[serde(deserialize_with = "deserialize_string_or_null")]
     auth_token: String,
 }
 
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct SupabaseCredentials {
-    #[serde(deserialize_with = "deserialize_string_or_null")]
     project_ref: String,
-    #[serde(deserialize_with = "deserialize_string_or_null")]
     anon_key: String,
-    #[serde(deserialize_with = "deserialize_string_or_null")]
     db_pass: String,
-    #[serde(deserialize_with = "deserialize_string_or_null")]
     pat: String,
 }
 
@@ -72,13 +66,10 @@ fn parse_auth_context(auth_json: &[u8], session_id: String) -> Result<AuthContex
         return Ok(context);
     }
 
-    // 把顶层 `null` 解为 null 数组，也允许数组元素 `null` 先落成 AuthConfig
-    // 零值；后者随后按既有顺序触发 unknown provider，而不是 JSON 类型错误。
-    let configurations: Option<Vec<Option<AuthConfig>>> =
+    let configurations: Vec<AuthConfig> =
         serde_json::from_slice(auth_json).map_err(AuthError::InvalidConfiguration)?;
 
-    for configuration in configurations.unwrap_or_default() {
-        let configuration = configuration.unwrap_or_default();
+    for configuration in configurations {
         // provider 日志需要在 token 被移动进上下文后继续引用类型名，因此先复制
         // 这个非敏感小字符串，避免让 match 借用扩大到整个分支。
         let auth_type = configuration.auth_type.clone();
@@ -105,10 +96,9 @@ fn parse_auth_context(auth_json: &[u8], session_id: String) -> Result<AuthContex
             }
             "antspace_deploy" => {
                 require_token("antspace_deploy", &configuration.token)?;
-                let credentials: Option<AntspaceCredentials> =
+                let credentials: AntspaceCredentials =
                     serde_json::from_str(&configuration.token)
                         .map_err(AuthError::InvalidAntspaceCredentials)?;
-                let credentials = credentials.unwrap_or_default();
                 context.antspace_control_plane_url = credentials.url;
                 context.antspace_auth_token = credentials.auth_token;
                 tracing::info!(
@@ -119,10 +109,9 @@ fn parse_auth_context(auth_json: &[u8], session_id: String) -> Result<AuthContex
             }
             "supabase" => {
                 require_token("supabase", &configuration.token)?;
-                let credentials: Option<SupabaseCredentials> =
+                let credentials: SupabaseCredentials =
                     serde_json::from_str(&configuration.token)
                         .map_err(AuthError::InvalidSupabaseCredentials)?;
-                let credentials = credentials.unwrap_or_default();
                 context.supabase_project_ref = credentials.project_ref;
                 context.supabase_anon_key = credentials.anon_key;
                 context.supabase_db_pass = credentials.db_pass;

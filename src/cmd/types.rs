@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::internal::{
@@ -55,13 +55,9 @@ pub(super) struct StdinConfigClient {
 #[serde(default)]
 pub(super) struct CodeSignConfig {
     /// loopback HTTP 监听端口。
-    #[serde(deserialize_with = "deserialize_null_as_default")]
     pub(super) port: i64,
     /// `Authorization: Bearer` 使用的临时 token。
-    #[serde(
-        rename = "bearer_token",
-        deserialize_with = "deserialize_null_as_default"
-    )]
+    #[serde(rename = "bearer_token")]
     pub(super) bearer_token: String,
 }
 
@@ -70,10 +66,9 @@ pub(super) struct CodeSignConfig {
 #[serde(default)]
 pub(super) struct McpContent {
     /// 内容类型，当前通常为 `text`。
-    #[serde(rename = "type", deserialize_with = "deserialize_null_as_default")]
+    #[serde(rename = "type")]
     pub(super) r#type: String,
     /// 服务端返回的人类可读正文。
-    #[serde(deserialize_with = "deserialize_null_as_default")]
     pub(super) text: String,
 }
 
@@ -82,10 +77,8 @@ pub(super) struct McpContent {
 #[serde(default)]
 pub(super) struct McpError {
     /// JSON-RPC 错误码。
-    #[serde(deserialize_with = "deserialize_null_as_default")]
     pub(super) code: i64,
     /// 错误消息；code-sign 对外只展示此字段。
-    #[serde(deserialize_with = "deserialize_null_as_default")]
     pub(super) message: String,
 }
 
@@ -110,10 +103,8 @@ pub(super) struct McpRequest {
 #[serde(default)]
 pub(super) struct McpResponse {
     /// JSON-RPC 版本。
-    #[serde(deserialize_with = "deserialize_null_as_default")]
     pub(super) jsonrpc: String,
     /// 对应请求 ID。
-    #[serde(deserialize_with = "deserialize_null_as_default")]
     pub(super) id: String,
     /// 工具结果原始值。
     pub(super) result: Option<Value>,
@@ -135,31 +126,10 @@ pub(super) struct McpToolCallParams {
 #[serde(default)]
 pub(super) struct McpToolResult {
     /// 文本或其他内容块。
-    #[serde(deserialize_with = "deserialize_content_list")]
     pub(super) content: Vec<McpContent>,
     /// MCP 工具级失败标志。
-    #[serde(rename = "isError", deserialize_with = "deserialize_null_as_default")]
+    #[serde(rename = "isError")]
     pub(super) is_error: bool,
-}
-
-/// task context 协议把显式 `null` 标量字段视为零值；serde 默认会报类型
-/// 错误。这个适配器只放宽 `null`，数字到字符串等真正的类型错误仍然会失败。
-fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de> + Default,
-{
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
-}
-
-/// 允许 `content: null`，也允许数组中的 `null` 作为一个零值结构体；两者都在
-/// 签名失败文案中回退到 `unknown error`，不能被 serde 的严格 Vec 解码提前截断。
-fn deserialize_content_list<'de, D>(deserializer: D) -> Result<Vec<McpContent>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let values = Option::<Vec<Option<McpContent>>>::deserialize(deserializer)?.unwrap_or_default();
-    Ok(values.into_iter().map(Option::unwrap_or_default).collect())
 }
 
 /// code-sign HTTP 请求的有界指数退避参数。

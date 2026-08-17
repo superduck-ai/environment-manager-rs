@@ -25,48 +25,25 @@ use crate::internal::util::BoxError;
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ByocConfig {
     /// 必须为 `byoc` 的稳定类型标签。
-    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    #[serde(default)]
     pub environment_type: String,
     /// 环境工作目录；非空时必须是已归一化的绝对路径。
-    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    #[serde(default)]
     pub cwd: String,
     /// 新建或 setup-only session 中执行的一次性脚本。
-    #[serde(default, deserialize_with = "deserialize_nullable_string")]
+    #[serde(default)]
     pub task_setup_script: String,
     /// 追加到 Claude Code 环境的变量；同名键覆盖 BYOC 默认值。
-    #[serde(default, deserialize_with = "deserialize_nullable_environment")]
+    #[serde(default)]
     pub environment: BTreeMap<String, String>,
-}
-
-/// 将 JSON null string 映射为空字符串零值。
-fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
-}
-
-/// 接受 null map，并把 null string value 映射为空字符串。
-fn deserialize_nullable_environment<'de, D>(
-    deserializer: D,
-) -> Result<BTreeMap<String, String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let values = Option::<BTreeMap<String, Option<String>>>::deserialize(deserializer)?;
-    Ok(values
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(key, value)| (key, value.unwrap_or_default()))
-        .collect())
 }
 
 /// BYOC 构造和初始化的类型化错误。
 #[derive(Debug, Error)]
 pub enum ByocError {
     /// JSON 无法解析。
-    #[error("failed to unmarshal byoc config: {0}")]
-    Unmarshal(#[from] serde_json::Error),
+    #[error("failed to deserialize byoc config: {0}")]
+    Deserialize(#[from] serde_json::Error),
     /// `environment_type` 不是 BYOC。
     #[error("invalid environment_type: expected 'byoc', got '{actual}'")]
     InvalidEnvironmentType {

@@ -413,6 +413,7 @@ impl ClaudeCodeExecutor {
         let mut args = vec![
             "--output-format=stream-json".to_owned(),
             "--verbose".to_owned(),
+            "--include-partial-messages".to_owned(),
         ];
         if !local_testing_mode {
             args.extend([

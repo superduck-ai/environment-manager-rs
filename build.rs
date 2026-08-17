@@ -90,6 +90,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let descriptors = fs::read(descriptor_path)?;
     pbjson_build::Builder::new()
         .register_descriptors(&descriptors)?
+        .ignore_unknown_fields()
         .build(&[".anthropic.sessions.tunnel.v1alpha"])?;
     Ok(())
 }

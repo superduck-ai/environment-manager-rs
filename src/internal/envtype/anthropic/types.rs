@@ -3,15 +3,12 @@
 //! 集中保存 JSON DTO、环境生命周期字段及错误包装，供 `anthropic.rs` 的副作用实现
 //! 使用；模块拆分不改变外部 JSON 或调用顺序。
 //!
-//! `Option<Config>` 允许测试构造 `None` 配置；正常工厂始终填充配置。JSON 字段接受
-//! `null` 并落为类型默认值。
+//! `Option<Config>` 允许测试构造 `None` 配置；正常工厂始终填充配置。JSON 使用正式的
+//! snake_case 字段名，缺失字段采用类型默认值。
 
 use std::{collections::BTreeMap, error::Error, fmt, sync::Arc};
 
-use serde::{
-    Deserialize, Deserializer, Serialize,
-    de::{IgnoredAny, MapAccess, Visitor},
-};
+use serde::{Deserialize, Serialize};
 
 use crate::internal::{
     auth::AuthContext,
@@ -20,7 +17,8 @@ use crate::internal::{
 };
 
 /// Anthropic 环境 JSON 配置。
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct Config {
     /// 环境类型标签；只保存而不额外验证。
     pub environment_type: String,
@@ -47,132 +45,13 @@ pub struct Config {
 }
 
 /// 单个语言及其期望版本。
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct Language {
     /// 语言名称；识别值为 python、node/nodejs、go/golang。
     pub name: String,
     /// 原样替换安装脚本 `$1` 占位符的版本文本。
     pub version: String,
-}
-
-impl<'de> Deserialize<'de> for Config {
-    /// 逐键解码以保留 大小写不敏感字段名、重复字段和 null 零值语义。
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_map(ConfigVisitor)
-    }
-}
-
-/// `Config` 的宽容 JSON visitor。
-struct ConfigVisitor;
-
-impl<'de> Visitor<'de> for ConfigVisitor {
-    type Value = Config;
-
-    /// 描述顶层必须为 JSON object。
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an anthropic configuration object")
-    }
-
-    /// 按 wire 顺序应用字段；重复 map 合并，其余非 null 字段后者覆盖前者。
-    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-    where
-        M: MapAccess<'de>,
-    {
-        let mut config = Config::default();
-        while let Some(key) = map.next_key::<String>()? {
-            if key.eq_ignore_ascii_case("environment_type") {
-                if let Some(value) = map.next_value::<Option<String>>()? {
-                    config.environment_type = value;
-                }
-            } else if key.eq_ignore_ascii_case("version") {
-                if let Some(value) = map.next_value::<Option<String>>()? {
-                    config.version = value;
-                }
-            } else if key.eq_ignore_ascii_case("cwd") {
-                if let Some(value) = map.next_value::<Option<String>>()? {
-                    config.cwd = value;
-                }
-            } else if key.eq_ignore_ascii_case("init_script") {
-                if let Some(value) = map.next_value::<Option<String>>()? {
-                    config.init_script = value;
-                }
-            } else if key.eq_ignore_ascii_case("environment") {
-                match map.next_value::<Option<BTreeMap<String, Option<String>>>>()? {
-                    Some(values) => config.environment.extend(
-                        values
-                            .into_iter()
-                            .map(|(key, value)| (key, value.unwrap_or_default())),
-                    ),
-                    None => config.environment.clear(),
-                }
-            } else if key.eq_ignore_ascii_case("languages") {
-                config.languages = map
-                    .next_value::<Option<Vec<Option<Language>>>>()?
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(Option::unwrap_or_default)
-                    .collect();
-            } else if key.eq_ignore_ascii_case("allowed_tools") {
-                if let Some(value) = map.next_value::<Option<String>>()? {
-                    config.allowed_tools = value;
-                }
-            } else if key.eq_ignore_ascii_case("disallowed_tools") {
-                if let Some(value) = map.next_value::<Option<String>>()? {
-                    config.disallowed_tools = value;
-                }
-            } else {
-                map.next_value::<IgnoredAny>()?;
-            }
-        }
-        Ok(config)
-    }
-}
-
-impl<'de> Deserialize<'de> for Language {
-    /// 逐键解码语言字段，接受大小写变体、重复键和 null 字符串。
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_map(LanguageVisitor)
-    }
-}
-
-/// `Language` 的宽容 JSON visitor。
-struct LanguageVisitor;
-
-impl<'de> Visitor<'de> for LanguageVisitor {
-    type Value = Language;
-
-    /// 描述单个语言必须为 JSON object。
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("an anthropic language object")
-    }
-
-    /// 按顺序应用 name/version，null 不覆盖已有字符串。
-    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-    where
-        M: MapAccess<'de>,
-    {
-        let mut language = Language::default();
-        while let Some(key) = map.next_key::<String>()? {
-            if key.eq_ignore_ascii_case("name") {
-                if let Some(value) = map.next_value::<Option<String>>()? {
-                    language.name = value;
-                }
-            } else if key.eq_ignore_ascii_case("version") {
-                if let Some(value) = map.next_value::<Option<String>>()? {
-                    language.version = value;
-                }
-            } else {
-                map.next_value::<IgnoredAny>()?;
-            }
-        }
-        Ok(language)
-    }
 }
 
 /// Anthropic 环境的可变 session 状态。

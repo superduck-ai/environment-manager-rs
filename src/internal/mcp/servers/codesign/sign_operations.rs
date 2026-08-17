@@ -91,7 +91,7 @@ impl CodeSignMCPServer {
 
         let response = tokio::select! {
             _ = cancellation.cancelled() => {
-                Err("context canceled".to_owned())
+                Err("operation cancelled".to_owned())
             }
             result = tokio::time::timeout(Duration::from_secs(30), builder.send()) => {
                 match result {
@@ -113,7 +113,7 @@ impl CodeSignMCPServer {
         let status = response.status();
         let response_body = tokio::select! {
             _ = cancellation.cancelled() => {
-                return Err(McpError::message("failed to read response: context canceled"));
+                return Err(McpError::message("failed to read response: operation cancelled"));
             }
             result = response.bytes() => result.map_err(|error| {
                 McpError::message(format!("failed to read response: {error}"))

@@ -70,7 +70,7 @@ async fn start_tunnel_server() -> (
 /// 验证 ping 写失败遵循取消优先级并保留底层网络错误文本。
 ///
 /// 网络错误文本不带 tungstenite 的 `IO error:` 前缀；如果写失败与取消并发发生，
-/// 则固定返回 `context canceled`。
+/// 则固定返回 `operation cancelled`。
 #[test]
 fn ping_write_failure_prefers_cancellation_then_network_error() {
     let cancellation = CancellationToken::new();
@@ -98,7 +98,7 @@ fn ping_write_failure_prefers_cancellation_then_network_error() {
             ),),
         )
         .to_string(),
-        "context canceled"
+        "operation cancelled"
     );
 }
 

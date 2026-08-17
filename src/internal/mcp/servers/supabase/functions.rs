@@ -90,7 +90,7 @@ impl Client {
             .multipart(form);
         let response = tokio::select! {
             _ = cancellation.cancelled() => {
-                return Err(McpError::message("deploy request failed: context canceled"));
+                return Err(McpError::message("deploy request failed: operation cancelled"));
             }
             result = tokio::time::timeout(std::time::Duration::from_secs(120), request.send()) => {
                 match result {

@@ -98,7 +98,7 @@ impl Poller {
             biased;
             _ = cancellation.cancelled() => {
                 return Err(OrchestratorError::message(
-                    "poll request failed: context canceled",
+                    "poll request failed: operation cancelled",
                 ));
             }
             response = self.http_client.execute(request) => response,
@@ -121,7 +121,7 @@ impl Poller {
             biased;
             _ = cancellation.cancelled() => {
                 return Err(OrchestratorError::message(
-                    "failed to read poll response body: context canceled",
+                    "failed to read poll response body: operation cancelled",
                 ));
             }
             body = response.bytes() => body,
@@ -144,7 +144,7 @@ impl Poller {
         }
 
         let work_response: WorkResponse = serde_json::from_slice(&body).map_err(|error| {
-            OrchestratorError::message(format!("failed to unmarshal work response: {error}"))
+            OrchestratorError::message(format!("failed to deserialize work response: {error}"))
         })?;
         if work_response.r#type != "work" {
             tracing::warn!("poll_duration" = ?(duration_nanoseconds(poll_duration)), "type" = ?(work_response.r#type), "{}", "received unexpected response type");
@@ -172,7 +172,7 @@ impl Poller {
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(OrchestratorError::message(
-                "jitter sleep interrupted: context canceled",
+                "jitter sleep interrupted: operation cancelled",
             )),
             _ = tokio::time::sleep(sleep_duration) => Ok(()),
         }

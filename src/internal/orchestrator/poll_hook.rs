@@ -135,7 +135,7 @@ impl PollHook {
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => Err(OrchestratorError::message(
-                "jitter sleep interrupted: context canceled",
+                "jitter sleep interrupted: operation cancelled",
             )),
             _ = tokio::time::sleep(sleep_duration) => Ok(()),
         }

@@ -1,14 +1,13 @@
 //! 旧版 V0 stdin JSON parser。
 //!
 //! parser 保留环境配置中的未知字段，并在成功后统一补全 API URL scheme。为保持
-//! 当前 的库内行为，缺失 `startup_context` 的普通入口仍触发同文本 panic；
-//! CLI 专用入口则把它转换成类型化错误。显式 JSON `null` 仍先构造零值 context，
-//! 再走正常的 API base URL 校验分支。
+//! 当前的库内行为，缺失 `startup_context` 的普通入口仍触发同文本 panic；
+//! CLI 专用入口则把它转换成类型化错误。
 
 use std::{pin::Pin, time::Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -27,7 +26,7 @@ pub enum V0ParseError {
     #[error("failed to parse startup_context: startup context is required")]
     StartupContextRequired,
     /// startup_context JSON 形状无效。
-    #[error("failed to parse startup_context: failed to unmarshal startup_context: {0}")]
+    #[error("failed to parse startup_context: failed to deserialize startup_context: {0}")]
     InvalidStartupContextJson(#[source] serde_json::Error),
     /// startup_context 未通过领域校验。
     #[error("failed to parse startup_context: invalid startup_context: {0}")]
@@ -36,7 +35,7 @@ pub enum V0ParseError {
     #[error("failed to parse environment: environment configuration is required")]
     EnvironmentRequired,
     /// environment JSON 不是预期对象。
-    #[error("failed to parse environment: failed to unmarshal environment: {0}")]
+    #[error("failed to parse environment: failed to deserialize environment: {0}")]
     InvalidEnvironmentJson(#[source] serde_json::Error),
     /// environment_type 为空。
     #[error(
@@ -56,25 +55,14 @@ pub enum V0ParseError {
 
 #[derive(Default, Deserialize)]
 struct V0EnvironmentConfig {
-    #[serde(default, deserialize_with = "deserialize_string_or_null")]
+    #[serde(default)]
     environment_type: String,
-    #[serde(default, deserialize_with = "deserialize_string_or_null")]
+    #[serde(default)]
     cwd: String,
-    #[serde(default, deserialize_with = "deserialize_string_or_null")]
+    #[serde(default)]
     allowed_tools: String,
-    #[serde(default, deserialize_with = "deserialize_string_or_null")]
+    #[serde(default)]
     disallowed_tools: String,
-}
-
-/// 将环境配置中的显式 JSON `null` 解为 string 字段的空字符串零值。
-///
-/// V0 协议把 string 字段的 `null` 视为空字符串；Serde 默认拒绝
-/// 该输入。这里仅放宽 V0 environment 的四个固定字符串，其他类型错误仍按原顺序返回。
-fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 impl V0Parser {
@@ -148,12 +136,8 @@ impl V0Parser {
     ///
     fn parse_startup_context(&self, value: Option<&Value>) -> Result<StartupContext, V0ParseError> {
         let value = value.ok_or(V0ParseError::StartupContextRequired)?;
-        let mut startup_context = if value.is_null() {
-            StartupContext::default()
-        } else {
-            serde_json::from_value(value.clone())
-                .map_err(V0ParseError::InvalidStartupContextJson)?
-        };
+        let mut startup_context: StartupContext = serde_json::from_value(value.clone())
+            .map_err(V0ParseError::InvalidStartupContextJson)?;
         startup_context
             .validate()
             .map_err(V0ParseError::InvalidStartupContext)?;
@@ -167,11 +151,8 @@ impl V0Parser {
         value: Option<&Value>,
     ) -> Result<EnvironmentConfigResponse, V0ParseError> {
         let value = value.ok_or(V0ParseError::EnvironmentRequired)?;
-        let environment: V0EnvironmentConfig = if value.is_null() {
-            V0EnvironmentConfig::default()
-        } else {
-            serde_json::from_value(value.clone()).map_err(V0ParseError::InvalidEnvironmentJson)?
-        };
+        let environment: V0EnvironmentConfig =
+            serde_json::from_value(value.clone()).map_err(V0ParseError::InvalidEnvironmentJson)?;
         if environment.environment_type.is_empty() {
             return Err(V0ParseError::EnvironmentTypeRequired);
         }

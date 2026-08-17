@@ -451,7 +451,7 @@ async fn test_vercel_wait_for_ready() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(error.contains("context cancelled while waiting for deployment"));
+    assert!(error.contains("deployment wait cancelled"));
     assert!(
         cancelled_server
             .received_requests()

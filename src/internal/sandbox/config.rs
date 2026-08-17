@@ -8,7 +8,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// sandbox-runtime 顶层配置。
@@ -16,10 +16,10 @@ use thiserror::Error;
 #[serde(rename_all = "camelCase", default)]
 pub struct SrtConfig {
     /// 网络访问白名单与黑名单。
-    #[serde(default, deserialize_with = "deserialize_null_default")]
+    #[serde(default)]
     pub network: NetworkConfig,
     /// 文件系统读写约束。
-    #[serde(default, deserialize_with = "deserialize_null_default")]
+    #[serde(default)]
     pub filesystem: FilesystemConfig,
     /// 是否允许较弱的嵌套 sandbox。
     pub enable_weaker_nested_sandbox: bool,
@@ -30,7 +30,7 @@ pub struct SrtConfig {
 #[serde(rename_all = "camelCase", default)]
 pub struct NetworkConfig {
     /// 允许访问的精确域名或 `*.` 通配域名。
-    #[serde(default, deserialize_with = "deserialize_null_default")]
+    #[serde(default)]
     pub allowed_domains: Vec<String>,
     /// 明确拒绝的域名；`None` 保留 null 数组 编码为 JSON null 的区别。
     pub denied_domains: Option<Vec<String>>,
@@ -41,10 +41,10 @@ pub struct NetworkConfig {
 #[serde(rename_all = "camelCase", default)]
 pub struct FilesystemConfig {
     /// 禁止读取的路径。
-    #[serde(default, deserialize_with = "deserialize_null_default")]
+    #[serde(default)]
     pub deny_read: Vec<String>,
     /// 允许写入的路径。
-    #[serde(default, deserialize_with = "deserialize_null_default")]
+    #[serde(default)]
     pub allow_write: Vec<String>,
     /// 明确禁止写入的路径；`None` 保留 null 数组 编码为 JSON null 的区别。
     pub deny_write: Option<Vec<String>>,
@@ -58,30 +58,11 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// 将 JSON `null` 解码为字段类型的默认值，同时仍接受正常值。
-///
-/// sandbox 配置协议允许 struct 或 slice 字段为 `null`：struct 保持
-/// 零值，slice 变为 `None`。Rust 模型不需要区分 `None` 与空 Vec 的读取行为，因此统一
-/// 落为 `Default::default()`；缺字段继续由外层 `#[serde(default)]` 处理。
-///
-/// # 参数
-/// - `deserializer`：当前字段对应的 serde 输入游标。
-///
-/// # 返回
-/// 非 null 值正常反序列化；null 返回类型零值；类型不匹配仍返回 serde 错误。
-fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de> + Default,
-{
-    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
-}
-
 /// 配置编码、文件操作或验证错误。
 #[derive(Debug, Error)]
 pub enum ConfigError {
     /// 无法编码为 JSON。
-    #[error("failed to marshal sandbox config: {0}")]
+    #[error("failed to serialize sandbox config: {0}")]
     Serialize(#[source] serde_json::Error),
     /// 无法创建安全临时文件。
     #[error("failed to create temp config file: {0}")]
@@ -288,11 +269,8 @@ pub fn load_and_validate_config(path: impl AsRef<Path>) -> Result<SrtConfig, Con
         path: path.clone(),
         source,
     })?;
-    // 将顶层 `null` 解码到现有 struct 指针时保持零值且不报 parse error。
-    // 先解码 Option 再取默认值，可把错误正确留到后续 validation 阶段。
-    let config = serde_json::from_slice::<Option<SrtConfig>>(&data)
-        .map(Option::unwrap_or_default)
-        .map_err(|source| ConfigError::Parse {
+    let config =
+        serde_json::from_slice::<SrtConfig>(&data).map_err(|source| ConfigError::Parse {
             path: path.clone(),
             source,
         })?;
@@ -386,30 +364,6 @@ mod tests {
         let encoded = serde_json::to_vec_pretty(&config).unwrap();
         assert_eq!(encoded, expected.as_bytes());
         assert!(!encoded.ends_with(b"\n"));
-    }
-
-    /// 验证 接受的顶层、嵌套 struct 和 slice null 都进入 validation 阶段。
-    #[test]
-    fn null_values_decode_to_defaults_before_validation() {
-        let temp = TempDir::new().unwrap();
-        let cases = [
-            ("top-null.json", "null"),
-            ("struct-null.json", r#"{"network":null,"filesystem":null}"#),
-            (
-                "slice-null.json",
-                r#"{"network":{"allowedDomains":null,"deniedDomains":null},"filesystem":{"denyRead":null,"allowWrite":null,"denyWrite":null}}"#,
-            ),
-        ];
-        for (name, content) in cases {
-            let path = temp.path().join(name);
-            std::fs::write(&path, content).unwrap();
-            let error = load_and_validate_config(path).unwrap_err();
-            assert!(matches!(error, ConfigError::Validation(_)));
-            assert_eq!(
-                error.to_string(),
-                "config validation failed: required domain \"api.anthropic.com\" not found in allowed domains (have: [])"
-            );
-        }
     }
 
     /// 验证缺字段采用默认值，未知顶层或嵌套字段被忽略。

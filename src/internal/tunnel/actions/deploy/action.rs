@@ -268,7 +268,7 @@ impl Action for DeployAction {
             files_cached: files.len() as i64 - files_uploaded,
         };
         let body = serde_json::to_vec(&response)
-            .map_err(|error| format!("failed to marshal deploy response: {error}"))?;
+            .map_err(|error| format!("failed to serialize deploy response: {error}"))?;
         tracing::info!("url" = ?(response.url.clone()), "deploy_id" = ?(response.deploy_id.clone()), "project_name" = ?(project_name), "duration_ms" = ?(started.elapsed().as_millis() as u64), "files_uploaded" = ?(files_uploaded), "files_cached" = ?(response.files_cached), "session_id" = ?(request.session_id), "{}", "deploy_success");
         Ok(ActionResult {
             status_code: 200,
@@ -351,7 +351,7 @@ impl DeployAction {
             deployer: "antspace",
             error: "",
         })
-        .map_err(|error| format!("failed to marshal deploy response: {error}"))?;
+        .map_err(|error| format!("failed to serialize deploy response: {error}"))?;
         Ok(ActionResult {
             status_code: 200,
             body,

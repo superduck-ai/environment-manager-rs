@@ -83,70 +83,6 @@ fn test_decode_work_secret_reports_errors() {
     );
 }
 
-/// 验证顶层 null 与值类型 null 的处理。
-///
-/// 顶层 null 或 null version 都先形成 version=0 的零值 secret，再由版本门禁返回
-/// UnsupportedVersion；不能提前折叠成 Invalid，否则 CLI 的错误分类和文本会变化。
-#[test]
-fn test_work_secret_top_level_and_version_null_reach_version_gate() {
-    for encoded in [
-        URL_SAFE.encode(b"null"),
-        encoded_work_secret(json!({"version": null})),
-    ] {
-        assert_eq!(
-            decode_work_secret(&encoded).unwrap_err().to_string(),
-            "unsupported secret version. Download the latest version of the Claude Environment Runner"
-        );
-    }
-}
-
-/// 验证 V1 secret 的 null slice 元素、map value 与 MCP 文件字段采用默认值。
-///
-/// auth 中的 null 必须保留为一个默认 AuthConfig，供后续认证层按 provider 顺序
-/// 报错；可选 map 仍保持 Some，以免把“已提供但值为空”误当成字段缺失。
-#[test]
-fn test_work_secret_explicit_null_values_use_defaults() {
-    let secret = decode_work_secret(&encoded_work_secret(json!({
-        "version": 1,
-        "session_ingress_token": null,
-        "api_base_url": null,
-        "sources": null,
-        "auth": [null],
-        "claude_code_args": {"model": null},
-        "mcp_config": {"path": null, "content": null, "mode": null},
-        "use_sandbox_gateway_config": null,
-        "environment_variables": {"EMPTY": null},
-        "use_code_sessions": null
-    })))
-    .expect("值类型 null 的 V1 secret 应成功解码");
-
-    assert_eq!(secret.session_ingress_token, "");
-    assert_eq!(secret.api_base_url, "");
-    assert!(secret.sources.is_empty());
-    assert_eq!(secret.auth, [AuthConfig::default()]);
-    assert_eq!(secret.claude_code_args.as_ref().unwrap()["model"], "");
-    assert_eq!(
-        secret.mcp_config.as_ref(),
-        Some(&crate::internal::config::McpConfigFile::default())
-    );
-    assert!(!secret.use_sandbox_gateway_config);
-    assert_eq!(secret.environment_variables.as_ref().unwrap()["EMPTY"], "");
-    assert!(!secret.use_code_sessions);
-
-    let optional_nulls = decode_work_secret(&encoded_work_secret(json!({
-        "version": 1,
-        "auth": null,
-        "claude_code_args": null,
-        "mcp_config": null,
-        "environment_variables": null
-    })))
-    .expect("可选 null 字段应保持未设置状态");
-    assert!(optional_nulls.auth.is_empty());
-    assert!(optional_nulls.claude_code_args.is_none());
-    assert!(optional_nulls.mcp_config.is_none());
-    assert!(optional_nulls.environment_variables.is_none());
-}
-
 ///
 /// 验证 session/healthcheck 两个合法联合体分支，并逐项检查 envelope 校验顺序。
 #[test]
@@ -333,41 +269,6 @@ async fn test_v1_parser_fetches_session_context_and_builds_result() {
     assert_eq!(
         parsed.environment.as_ref().unwrap().config["cwd"],
         "/session/cwd"
-    );
-}
-
-/// 验证 V1 parser 不折叠 原始 JSON 的显式 null 与缺失字段。
-#[tokio::test]
-async fn test_v1_parser_preserves_explicit_null_session_fields() {
-    let observed = Arc::new(Mutex::new(Vec::new()));
-    let provider = FixtureProvider {
-        context: SessionContext {
-            outcomes: Some(Value::Null),
-            mcp_config: Some(Value::Null),
-            ..SessionContext::default()
-        },
-        observed,
-    };
-    let secret = encoded_work_secret(json!({
-        "version": 1,
-        "session_ingress_token": "ingress-token",
-        "api_base_url": "api.example.test"
-    }));
-    let parsed = V1Parser::new("/workspace", provider)
-        .parse(&v1_work_response_json(
-            "work-1",
-            "env-1",
-            "session",
-            "session-1",
-            &secret,
-        ))
-        .await
-        .expect("显式 null 应按字段默认值解析");
-
-    assert!(parsed.outcomes.is_empty());
-    assert!(
-        parsed.startup_context.mcp_config.is_some(),
-        "显式 null mcp_config 应创建可用的默认配置"
     );
 }
 

@@ -26,7 +26,7 @@ impl Client {
         sql: &str,
     ) -> McpResult<()> {
         let body = serde_json::to_string(&json!({"name": name, "query": sql}))
-            .map_err(|error| McpError::message(format!("marshal migration: {error}")))?;
+            .map_err(|error| McpError::message(format!("serialize migration: {error}")))?;
         let path = format!("/projects/{}/database/migrations", self.project_ref);
         self.do_request(cancellation, Method::POST, &path, &body)
             .await
@@ -41,7 +41,7 @@ impl Client {
         sql: &str,
     ) -> McpResult<String> {
         let body = serde_json::to_string(&json!({"query": sql}))
-            .map_err(|error| McpError::message(format!("marshal query: {error}")))?;
+            .map_err(|error| McpError::message(format!("serialize query: {error}")))?;
         let path = format!("/projects/{}/database/query", self.project_ref);
         self.do_request(cancellation, Method::POST, &path, &body)
             .await
@@ -58,8 +58,7 @@ impl Client {
             .do_request(cancellation, Method::GET, &path, "")
             .await
             .map_err(|error| McpError::message(format!("list migrations: {error}")))?;
-        serde_json::from_str::<Option<Vec<MigrationResponse>>>(&body)
-            .map(Option::unwrap_or_default)
+        serde_json::from_str::<Vec<MigrationResponse>>(&body)
             .map_err(|error| McpError::message(format!("parse migrations: {error}")))
     }
 
@@ -96,7 +95,7 @@ impl Client {
 
         let response = tokio::select! {
             _ = cancellation.cancelled() => {
-                return Err(McpError::message("http request: context canceled"));
+                return Err(McpError::message("http request: operation cancelled"));
             }
             result = request.send() => result.map_err(|error| {
                 McpError::message(format!("http request: {error}"))
@@ -137,7 +136,7 @@ pub(crate) async fn read_limited_response(
     let mut body = Vec::new();
     while body.len() < limit {
         let next = tokio::select! {
-            _ = cancellation.cancelled() => return Err(McpError::message("context canceled")),
+            _ = cancellation.cancelled() => return Err(McpError::message("operation cancelled")),
             next = stream.next() => next,
         };
         let Some(chunk) = next else {

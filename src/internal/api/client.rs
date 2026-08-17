@@ -250,7 +250,7 @@ impl HttpClient {
     ) -> Result<Vec<u8>, ApiError> {
         let body = serde_json::to_vec(request_body).map_err(|error| {
             ApiError::message(format!(
-                "failed to marshal {operation_name} request: {error}"
+                "failed to serialize {operation_name} request: {error}"
             ))
         })?;
         self.do_post_json_bytes(cancellation, endpoint, body, auth_token, operation_name)

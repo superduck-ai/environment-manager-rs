@@ -98,7 +98,7 @@ impl WsHandler {
         // 注入 write-poison；任何写失败都会在应用层立即取消并移除整条 tunnel。
         let websocket_config = tunnel_websocket_config();
         let handshake = tokio::select! {
-                   () = cancellation.cancelled() => return Err(TunnelError::message("context canceled")),
+                   () = cancellation.cancelled() => return Err(TunnelError::message("operation cancelled")),
                    handshake = tokio::time::timeout(
                        WEBSOCKET_HANDSHAKE_TIMEOUT,
         // 本地 `localhost` 会按环境代理规则直连。仍经过
@@ -169,7 +169,7 @@ impl WsHandler {
 
     ///
     /// 根据 `is_binary` 选择 text/binary frame，并在单连接写锁内完整发送。未知 ID
-    /// 返回 `tunnel not found`；取消令牌已触发时返回 `context canceled`。
+    /// 返回 `tunnel not found`；取消令牌已触发时返回 `operation cancelled`。
     pub async fn send_message(
         &self,
         cancellation: &CancellationToken,
@@ -192,7 +192,7 @@ impl WsHandler {
         write_timeout: Duration,
     ) -> Result<(), TunnelError> {
         if cancellation.is_cancelled() {
-            return Err(TunnelError::message("context canceled"));
+            return Err(TunnelError::message("operation cancelled"));
         }
         let tunnel = self
             .lookup_tunnel(&message.tunnel_id)
@@ -236,7 +236,7 @@ impl WsHandler {
         message: WsTunnelClose,
     ) -> Result<(), TunnelError> {
         if cancellation.is_cancelled() {
-            return Err(TunnelError::message("context canceled"));
+            return Err(TunnelError::message("operation cancelled"));
         }
         let code = if message.code == 0 {
             1000

@@ -6,7 +6,6 @@
 use std::time::Duration;
 
 use reqwest::header::AUTHORIZATION;
-use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use super::{OrchestratorError, OrchestratorResult, WhoamiClient, WhoamiResponse};
@@ -17,19 +16,6 @@ use crate::{
 
 const ENVIRONMENTS_BETA: &str = "environments-2025-11-01";
 const WHOAMI_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Whoami 的 wire 结构。
-///
-/// string 字段对 missing 与显式 null 都保留空零值；普通 Rust `String` 即使带
-/// `#[serde(default)]` 仍会拒绝 null。先用 Option 接住两种空值，再转换为公开 DTO。
-#[derive(Default, Deserialize)]
-#[serde(default)]
-struct WhoamiWireResponse {
-    #[serde(rename = "type")]
-    response_type: Option<String>,
-    organization_uuid: Option<String>,
-    environment_id: Option<String>,
-}
 
 /// 创建身份发现客户端。
 pub fn new_whoami_client(
@@ -108,18 +94,9 @@ impl WhoamiClient {
             )));
         }
 
-        let response: Option<WhoamiWireResponse> =
-            serde_json::from_slice(&body).map_err(|error| {
-                OrchestratorError::message(format!("failed to unmarshal whoami response: {error}"))
-            })?;
-        // JSON 解码 不报错且保留整份 struct 零值；Option 只在
-        // 本地 wire 边界表达该语义，公开 WhoamiResponse 仍保持稳定的 String 字段。
-        let response = response.unwrap_or_default();
-        let response = WhoamiResponse {
-            r#type: response.response_type.unwrap_or_default(),
-            organization_uuid: response.organization_uuid.unwrap_or_default(),
-            environment_id: response.environment_id.unwrap_or_default(),
-        };
+        let response: WhoamiResponse = serde_json::from_slice(&body).map_err(|error| {
+            OrchestratorError::message(format!("failed to deserialize whoami response: {error}"))
+        })?;
         if response.r#type != "environment_whoami" {
             return Err(OrchestratorError::message(format!(
                 "unexpected whoami response type: {}",

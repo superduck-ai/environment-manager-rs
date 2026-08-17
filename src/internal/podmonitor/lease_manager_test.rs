@@ -359,7 +359,7 @@ async fn test_call_stop_api_forced_and_stop_error_classification() {
         StopApiError::new(500, "server error")
     )));
     assert!(!is_retriable_stop_error(&StopRequestError::Cancelled {
-        message: "context canceled".to_owned(),
+        message: "operation cancelled".to_owned(),
     }));
     assert!(!is_retriable_stop_error(
         &StopRequestError::DeadlineExceeded
@@ -389,7 +389,7 @@ async fn test_call_stop_api_observes_pre_cancel_inside_operation() {
     assert!(matches!(&error, StopRequestError::Cancelled { .. }));
     assert_eq!(
         error.to_string(),
-        "stop API request failed: Post \"https://api.example.test/v1/environments/env-1/work/session-1/stop?organization_uuid=org-1\": context canceled"
+        "stop API request failed: Post \"https://api.example.test/v1/environments/env-1/work/session-1/stop?organization_uuid=org-1\": operation cancelled"
     );
 }
 

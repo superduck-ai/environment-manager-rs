@@ -111,38 +111,6 @@ fn event_timestamps_use_trimmed_rfc3339_nanos() {
     assert_eq!(value["requested_at"], "2026-07-15T01:02:03.12345678Z");
 }
 
-/// 验证 session context 保留 原始 JSON 的 missing/null 差别。
-#[test]
-fn session_context_preserves_missing_null_and_string_zero_values() {
-    let missing: SessionContextResponse =
-        serde_json::from_str("{}").expect("缺失 session_context 使用默认值");
-    assert!(missing.session_context.outcomes.is_none());
-    assert!(missing.session_context.mcp_config.is_none());
-
-    let explicit_null: SessionContextResponse = serde_json::from_value(json!({
-        "session_context": {
-            "cwd": null,
-            "outcomes": null,
-            "custom_system_prompt": null,
-            "append_system_prompt": null,
-            "model": null,
-            "mcp_config": null
-        }
-    }))
-    .expect("值字段和原始 JSON 字段接受显式 null");
-    assert!(explicit_null.session_context.cwd.is_empty());
-    assert_eq!(explicit_null.session_context.outcomes, Some(Value::Null));
-    assert_eq!(explicit_null.session_context.mcp_config, Some(Value::Null));
-
-    let nested_null: SessionContextResponse = serde_json::from_str(r#"{"session_context":null}"#)
-        .expect("显式 null session_context 使用零值");
-    assert_eq!(nested_null, SessionContextResponse::default());
-
-    let top_level: Option<SessionContextResponse> =
-        serde_json::from_str("null").expect("顶层 null 应可映射到 response 零值");
-    assert!(top_level.is_none());
-}
-
 #[tokio::test]
 async fn test_post_json_with_response() {
     let server = MockServer::start().await;
@@ -395,45 +363,38 @@ async fn test_ccr_backend_escapes_session_id_as_path_segment() {
     );
 }
 
-/// 验证 CCR register 的 `worker_epoch,string` 保留 primitive 零值规则。
+/// 验证 CCR register 缺失 worker epoch 时采用字段默认值。
 #[tokio::test]
-async fn ccr_register_worker_epoch_accepts_null_and_missing_defaults() {
-    // JSON 对缺失、null 和 quoted null 都不会覆盖 int64 的初始零值；这些
-    // 响应虽不常见，却会决定 worker 后续事件与 OTLP URL 使用哪个 epoch。
-    for body in [
-        br#"{}"#.as_slice(),
-        br#"{"worker_epoch":null}"#.as_slice(),
-        br#"{"worker_epoch":"null"}"#.as_slice(),
-    ] {
-        let mut response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
+async fn ccr_register_worker_epoch_uses_missing_default() {
+    let body = br#"{}"#;
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    let (base_url, _request) = spawn_raw_api_response(response).await;
+    let backend = CCRBackend::new(
+        HttpClient::new(
+            &base_url,
+            Some(RetryConfig {
+                max_retries: 0,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+                backoff_factor: 1.0,
+            }),
         )
-        .into_bytes();
-        response.extend_from_slice(body);
-        let (base_url, _request) = spawn_raw_api_response(response).await;
-        let backend = CCRBackend::new(
-            HttpClient::new(
-                &base_url,
-                Some(RetryConfig {
-                    max_retries: 0,
-                    initial_backoff: Duration::ZERO,
-                    max_backoff: Duration::ZERO,
-                    backoff_factor: 1.0,
-                }),
-            )
-            .unwrap(),
-            "token",
-            "session",
-        );
-        assert_eq!(
-            backend
-                .register_worker(&CancellationToken::new())
-                .await
-                .expect("missing worker epoch should use zero"),
-            0
-        );
-    }
+        .unwrap(),
+        "token",
+        "session",
+    );
+    assert_eq!(
+        backend
+            .register_worker(&CancellationToken::new())
+            .await
+            .expect("missing worker epoch should use zero"),
+        0
+    );
 }
 
 /// 覆盖 wire JSON 编码和 Reqwest 原生 gzip 解压。

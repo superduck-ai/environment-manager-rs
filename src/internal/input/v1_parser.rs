@@ -5,7 +5,7 @@
 
 use std::{pin::Pin, time::Instant};
 
-use serde_json::{Value, json};
+use serde_json::json;
 use thiserror::Error;
 
 use super::secret::{SecretError, decode_work_secret, parse_v1_work_response};
@@ -26,7 +26,7 @@ pub enum V1ParseError {
     #[error("failed to decode secret: {0}")]
     Secret(#[source] SecretError),
     /// auth 数组无法编码为认证子系统输入。
-    #[error("failed to build auth context: failed to marshal auth configs: {0}")]
+    #[error("failed to build auth context: failed to serialize auth configs: {0}")]
     AuthEncoding(#[source] serde_json::Error),
     /// auth provider 配置无效。
     #[error("failed to build auth context: failed to create auth context: {0}")]
@@ -148,13 +148,12 @@ where
         session_context: &SessionContext,
     ) -> Result<StartupContext, V1ParseError> {
         let outcomes = match session_context.outcomes.as_ref() {
-            None | Some(Value::Null) => Vec::new(),
+            None => Vec::new(),
             Some(value) => serde_json::from_value::<Vec<OutcomeField>>(value.clone())
                 .map_err(V1ParseError::Outcomes)?,
         };
         let mcp_config = match session_context.mcp_config.as_ref() {
             None => None,
-            Some(Value::Null) => Some(McpConfig::default()),
             Some(value) => Some(
                 serde_json::from_value::<McpConfig>(value.clone())
                     .map_err(V1ParseError::McpConfig)?,
@@ -221,15 +220,11 @@ where
         let Some(value) = session_context.outcomes.as_ref() else {
             return Outcomes::new();
         };
-        let fields = if value.is_null() {
-            Vec::new()
-        } else {
-            match serde_json::from_value::<Vec<OutcomeField>>(value.clone()) {
-                Ok(fields) => fields,
-                Err(error) => {
-                    tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to parse outcomes for git push info");
-                    return Outcomes::new();
-                }
+        let fields = match serde_json::from_value::<Vec<OutcomeField>>(value.clone()) {
+            Ok(fields) => fields,
+            Err(error) => {
+                tracing::warn!("error" = ?(error.to_string()), "{}", "Failed to parse outcomes for git push info");
+                return Outcomes::new();
             }
         };
 

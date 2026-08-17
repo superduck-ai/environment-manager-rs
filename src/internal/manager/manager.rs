@@ -724,7 +724,7 @@ impl Manager {
             let tunnel_future = async move {
                 match tunnel_run_client.connect_and_run(&tunnel_token).await {
                     Err(error) if tunnel_token.is_cancelled() => {
-                        tracing::info!("session_id" = ?(&tunnel_session_id), "error" = ?(error.to_string()), "{}", "Tunnel client stopped after context cancellation")
+                        tracing::info!("session_id" = ?(&tunnel_session_id), "error" = ?(error.to_string()), "{}", "Tunnel client stopped after cancellation")
                     }
                     Err(error) => {
                         tracing::error!("session_id" = ?(&tunnel_session_id), "error" = ?(error.to_string()), "{}", "Tunnel client failed")
@@ -749,7 +749,7 @@ impl Manager {
                 Ok(())
             }
             Err(error) if using_lease_context && executor_cancellation.is_cancelled() => {
-                tracing::info!("error" = ?(error.to_string()), "{}", "Claude Code execution stopped after lease manager context cancellation");
+                tracing::info!("error" = ?(error.to_string()), "{}", "Claude Code execution stopped after lease manager cancellation");
                 Ok(())
             }
             Err(_) if executor_cancellation.is_cancelled() => Ok(()),
@@ -767,11 +767,11 @@ impl Manager {
         }
     }
 
-    /// 在 detached 五秒 context 内顺序停止 MCP servers 并销毁 executor。
+    /// 在独立的五秒取消窗口内顺序停止 MCP servers 并销毁 executor。
     ///
-    /// `context.WithTimeout` 只会让 `executor.Destroy` 观察到 deadline，
-    /// 不会在五秒后强制截断无 context 参数的 `server.Stop`。因此这里用独立
-    /// timer 只取消 operation token，仍等待顺序清理返回，也不添加 中不存在的
+    /// 超时只会让 executor 的销毁过程观察到取消信号，不会在五秒后强制截断
+    /// 不接受取消令牌的 server 停止过程。因此这里用独立 timer 取消 operation
+    /// token，仍等待顺序清理返回，也不添加当前清理流程中不存在的
     /// timeout warning。
     async fn cleanup_mcp_and_executor(
         &self,
@@ -829,7 +829,7 @@ pub async fn wait_for_shutdown_signal(cancellation: &CancellationToken) {
     let signal = tokio::select! {
         _ = interrupt.recv() => "interrupt",
         _ = terminate.recv() => "terminated",
-        () = cancellation.cancelled() => "context canceled",
+        () = cancellation.cancelled() => "operation cancelled",
     };
     tracing::info!("signal" = ?(signal), "{}", "Received signal, shutting down gracefully");
 }

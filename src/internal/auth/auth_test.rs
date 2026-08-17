@@ -77,34 +77,20 @@ fn test_new_auth_context_with_session_id_handles_empty_auth() {
     assert!(!context.has_supabase());
 }
 
-/// 覆盖认证 JSON 的零值边界：顶层 null、嵌套 null 和缺失凭据字段。
+/// 验证嵌套凭据的缺失字段采用默认值。
 #[test]
-fn auth_null_and_missing_nested_fields_use_defaults() {
-    let top_level_null = new_auth_context_with_session_id(b"null", "session-null")
-        .expect("顶层 null 等同空认证列表");
-    assert_eq!(top_level_null.get_session_id(), "session-null");
-    assert!(top_level_null.get_session_ingress_token().is_empty());
-
+fn auth_missing_nested_fields_use_defaults() {
     let missing_fields = br#"[
         {"type":"antspace_deploy","token":"{}"},
-        {"type":"supabase","token":"{\"project_ref\":null}"}
+        {"type":"supabase","token":"{}"}
     ]"#;
     let context = new_auth_context_with_session_id(missing_fields, "session")
-        .expect("缺失或 null 的凭据字符串使用空默认值");
+        .expect("缺失的凭据字符串使用空默认值");
     assert!(context.get_antspace_control_plane_url().is_empty());
     assert!(context.get_antspace_auth_token().is_empty());
     assert!(context.get_supabase_project_ref().is_empty());
     assert!(context.get_supabase_anon_key().is_empty());
     assert!(!context.has_supabase());
-
-    let nested_null = br#"[{"type":"antspace_deploy","token":"null"}]"#;
-    let context = new_auth_context_with_session_id(nested_null, "session")
-        .expect("token 字符串中的 JSON null 解为嵌套凭据零值");
-    assert!(context.get_antspace_control_plane_url().is_empty());
-
-    let null_element = new_auth_context_with_session_id(b"[null]", "session")
-        .expect_err("null 配置元素应按空 provider 报错");
-    assert_eq!(null_element.to_string(), "unknown auth provider type: ");
 }
 
 ///

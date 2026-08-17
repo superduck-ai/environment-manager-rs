@@ -1,13 +1,13 @@
 //! API 协议类型。
 //!
-//! 这里保留后端 JSON 字段和零值语义，并用 `Option` 明确表示字段是否省略。动态事件
+//! 这里保留后端 JSON 字段，并用 `Option` 明确表示字段是否省略。动态事件
 //! 内容使用 `serde_json::Value`，以免枚举封闭后丢弃后端新增字段。
 
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Utc};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -43,22 +43,22 @@ pub struct GetEnvironmentConfigResponse {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct SessionContext {
     /// 后端要求的工作目录。
-    #[serde(default, deserialize_with = "deserialize_string_or_null")]
+    #[serde(default)]
     pub cwd: String,
-    /// 原始 outcomes 配置；`None` 表示字段缺失，`Some(Null)` 表示显式 JSON null。
-    #[serde(default, deserialize_with = "deserialize_present_json_value")]
+    /// 原始 outcomes 配置；`None` 表示字段缺失。
+    #[serde(default)]
     pub outcomes: Option<Value>,
     /// 替换系统提示词。
-    #[serde(default, deserialize_with = "deserialize_string_or_null")]
+    #[serde(default)]
     pub custom_system_prompt: String,
     /// 追加系统提示词。
-    #[serde(default, deserialize_with = "deserialize_string_or_null")]
+    #[serde(default)]
     pub append_system_prompt: String,
     /// 指定模型名。
-    #[serde(default, deserialize_with = "deserialize_string_or_null")]
+    #[serde(default)]
     pub model: String,
-    /// 原始 MCP 配置；保留未知字段以及 missing/null 的 JSON 差别。
-    #[serde(default, deserialize_with = "deserialize_present_json_value")]
+    /// 原始 MCP 配置；保留未知字段。
+    #[serde(default)]
     pub mcp_config: Option<Value>,
 }
 
@@ -66,33 +66,8 @@ pub struct SessionContext {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct SessionContextResponse {
     /// 实际会话上下文。
-    #[serde(default, deserialize_with = "deserialize_default_on_null")]
+    #[serde(default)]
     pub session_context: SessionContext,
-}
-
-/// 反序列化 string 字段，并把显式 JSON null 映射为空字符串零值。
-fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
-}
-
-/// 保留 JSON 字段的存在性，避免普通 `Option<Value>` 折叠显式 null。
-fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Value::deserialize(deserializer).map(Some)
-}
-
-/// 把显式 null 的嵌套 struct 还原为结构体零值。
-fn deserialize_default_on_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de> + Default,
-{
-    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// 会话事件中的文本内容块。

@@ -35,7 +35,7 @@ use super::{
     },
 };
 
-/// 创建全部 null 或缺失字段的默认值的 Claude config。
+/// 创建字段均为空的 Claude config。
 fn empty_config() -> ClaudeConfig {
     ClaudeConfig {
         command: String::new(),
@@ -431,7 +431,8 @@ async fn test_execute_runs_claude_command_with_expected_args_and_env() {
     let canonical = fs::canonicalize(temp.path()).unwrap();
     for expected in [
         format!("PWD={}", canonical.display()),
-        "ARGS=--output-format=stream-json --verbose --model claude-test".to_owned(),
+        "ARGS=--output-format=stream-json --verbose --include-partial-messages --model claude-test"
+            .to_owned(),
         "SESSION=session-123".to_owned(),
         "REMOTE_SESSION=session-123".to_owned(),
         "BASE_URL=https://api.example.test".to_owned(),

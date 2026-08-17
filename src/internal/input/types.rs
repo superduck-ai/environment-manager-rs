@@ -8,7 +8,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::internal::auth::{AuthConfig, AuthContext};
@@ -71,8 +71,8 @@ pub struct SessionContext {
     /// session 指定的工作目录。
     #[serde(default)]
     pub cwd: String,
-    /// 原始 outcomes JSON；空值表示没有 outcomes。
-    #[serde(default, deserialize_with = "deserialize_present_json_value")]
+    /// 原始 outcomes JSON；字段缺失表示没有 outcomes。
+    #[serde(default)]
     pub outcomes: Option<Value>,
     /// 替换默认 system prompt 的文本。
     #[serde(default)]
@@ -84,16 +84,8 @@ pub struct SessionContext {
     #[serde(default)]
     pub model: String,
     /// 原始 inline MCP 配置。
-    #[serde(default, deserialize_with = "deserialize_present_json_value")]
+    #[serde(default)]
     pub mcp_config: Option<Value>,
-}
-
-/// 保留 session context 中 原始 JSON 的 missing/null 差别。
-fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Value::deserialize(deserializer).map(Some)
 }
 
 /// 仓库名到分支列表的映射。
@@ -305,7 +297,8 @@ impl V1WorkResponse {
 }
 
 /// 解码后的 V1 work secret。
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct WorkSecret {
     /// secret schema 版本；当前只接受 1。
     pub version: i64,

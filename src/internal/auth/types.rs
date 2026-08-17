@@ -3,33 +3,18 @@
 //! 认证 provider 与上下文类型。敏感字段不会通过 `Debug`
 //! 输出，避免错误链或诊断日志意外泄漏令牌。
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// 一条来自 stdin 或 work secret 的认证配置。
 #[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AuthConfig {
     /// 认证提供方的稳定 wire 名称。
-    #[serde(
-        rename = "type",
-        default,
-        deserialize_with = "deserialize_string_or_null"
-    )]
+    #[serde(rename = "type", default)]
     pub auth_type: String,
     /// 提供方令牌；部分提供方把一段 JSON 凭据编码在此字符串中。
-    #[serde(default, deserialize_with = "deserialize_string_or_null")]
+    #[serde(default)]
     pub token: String,
-}
-
-/// 把缺失或 JSON `null` 字符串字段还原为空字符串零值。
-///
-/// 认证 wire 接受 string 字段为 null，而 Serde 的 `String` 默认拒绝 null。认证配置
-/// 和嵌套部署凭据共享该 helper，以保持错误分支顺序。
-pub(crate) fn deserialize_string_or_null<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 impl fmt::Debug for AuthConfig {

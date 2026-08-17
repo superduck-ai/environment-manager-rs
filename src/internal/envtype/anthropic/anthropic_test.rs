@@ -253,14 +253,14 @@ fn test_decode_config() {
     assert_eq!(config.disallowed_tools, "WebFetch");
 }
 
-/// 验证无效 JSON、缺失 CWD 与 null 零值语义。
+/// 验证无效 JSON、字段类型和正式字段名约束。
 #[test]
 fn test_decode_config_errors() {
     assert!(
         decode_config(b"{")
             .unwrap_err()
             .to_string()
-            .starts_with("failed to unmarshal anthropic config:")
+            .starts_with("failed to deserialize anthropic config:")
     );
     assert_eq!(
         decode_config(br#"{"environment_type":"anthropic"}"#)
@@ -269,31 +269,28 @@ fn test_decode_config_errors() {
         "anthropic config missing required cwd"
     );
     let config = decode_config(
-        br#"{"environment_type":null,"cwd":"/tmp/x","environment":{"A":null},"languages":null}"#,
-    )
-    .unwrap();
-    assert_eq!(config.environment_type, "");
-    assert_eq!(config.environment["A"], "");
-    assert!(config.languages.is_empty());
-    assert_eq!(
-        decode_config(b"null").unwrap_err().to_string(),
-        "anthropic config missing required cwd"
-    );
-
-    let config = decode_config(
         br#"{
-            "CWD":"/first",
-            "cwd":null,
-            "environment":{"A":"one"},
-            "ENVIRONMENT":{"B":"two"},
-            "languages":[null,{"NAME":"node","name":null,"VERSION":"22"}]
+            "CWD":"/ignored",
+            "cwd":"/formal",
+            "unknown":true
         }"#,
     )
     .unwrap();
-    assert_eq!(config.cwd, "/first");
-    assert_eq!(config.environment.len(), 2);
-    assert_eq!(config.languages[0], Language::default());
-    assert_eq!(config.languages[1].name, "node");
+    assert_eq!(config.cwd, "/formal");
+
+    for data in [
+        b"null".as_slice(),
+        br#"{"environment_type":null,"cwd":"/tmp/x"}"#.as_slice(),
+        br#"{"cwd":"/one","cwd":"/two"}"#.as_slice(),
+        br#"{"cwd":"/tmp/x","languages":[null]}"#.as_slice(),
+    ] {
+        assert!(
+            decode_config(data)
+                .unwrap_err()
+                .to_string()
+                .starts_with("failed to deserialize anthropic config:")
+        );
+    }
 }
 
 /// 验证构造器与三个生命周期 setter 保存调用方提供的值。

@@ -128,13 +128,11 @@ impl HttpClient {
             // select 中观察取消。因此只有“仍有下一次重试”时错误才是 retry
             // cancelled；最后一次 attempt 必须落入统一的 exhausted 包装。
             if cancellation.is_cancelled() {
-                return Err(ApiError::message(
-                    "retry cancelled by context: context canceled",
-                ));
+                return Err(ApiError::message("retry cancelled"));
             }
             tokio::select! {
                 _ = cancellation.cancelled() => {
-                    return Err(ApiError::message("retry cancelled by context: context canceled"));
+                    return Err(ApiError::message("retry cancelled"));
                 }
                 _ = tokio::time::sleep(backoff) => {}
             }

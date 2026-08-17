@@ -374,7 +374,7 @@ impl GitHandler<'_> {
                     biased;
                     _ = cancellation.cancelled() => {
                         return Err(SourcesError::message(
-                            "context cancelled during retry backoff: context canceled",
+                            "retry backoff cancelled",
                         ));
                     }
                     _ = tokio::time::sleep(delay) => {}
@@ -450,7 +450,7 @@ impl GitHandler<'_> {
                     biased;
                     _ = cancellation.cancelled() => {
                         return Err(SourcesError::message(
-                            "context cancelled during validation retry backoff: context canceled",
+                            "validation retry backoff cancelled",
                         ));
                     }
                     _ = tokio::time::sleep(delay) => {}

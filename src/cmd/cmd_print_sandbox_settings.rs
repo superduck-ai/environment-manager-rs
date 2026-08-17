@@ -65,8 +65,8 @@ pub(crate) fn from_matches(_matches: &ArgMatches) -> Result<PrintSandboxSettings
 pub fn run_print_sandbox_settings(writer: &mut dyn Write) -> Result<(), String> {
     let configuration = crate::internal::sandbox::default_config();
     serde_json::to_writer_pretty(&mut *writer, &configuration)
-        .map_err(|error| format!("failed to marshal sandbox settings: {error}"))?;
+        .map_err(|error| format!("failed to serialize sandbox settings: {error}"))?;
     writer
         .write_all(b"\n")
-        .map_err(|error| format!("failed to marshal sandbox settings: {error}"))
+        .map_err(|error| format!("failed to serialize sandbox settings: {error}"))
 }

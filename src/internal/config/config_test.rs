@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::*;
 
@@ -190,125 +190,6 @@ fn test_startup_context_reports_validation_errors() {
             .to_string()
             .contains("startup context is required")
     );
-}
-
-/// 验证 `RawStartupContext` 将显式 null 解码为字段默认值。
-///
-/// V0 stdin 来自旧客户端，历史 payload 可能把所有值类型字段写成 null。会继续
-/// 构造一个全零值 startup context，领域校验随后才报告缺失 API URL；Rust 不能在
-/// Serde 类型检查阶段提前失败，否则错误阶段和对外文本都会发生变化。
-#[test]
-fn test_startup_context_explicit_null_fields_use_defaults() {
-    let startup: StartupContext = serde_json::from_value(json!({
-        "sources": null,
-        "api_base_url": null,
-        "outcomes": null,
-        "custom_system_prompt": null,
-        "append_system_prompt": null,
-        "model": null,
-        "mcp_config": null,
-        "allowed_tools": null,
-        "disallowed_tools": null,
-        "enabled_tools": null,
-        "claude_code_args": null,
-        "mcp_config_file": null,
-        "use_sandbox_gateway_config": null,
-        "entrypoint": null,
-        "environment_variables": null,
-        "environment_sub_type": null,
-        "use_code_sessions": null
-    }))
-    .expect("V0 startup 的显式 null 值类型字段应采用默认值");
-    assert_eq!(startup, StartupContext::default());
-
-    let top_level_null: StartupContext =
-        serde_json::from_value(Value::Null).expect("顶层 null 应解成零值 startup context");
-    assert_eq!(top_level_null, StartupContext::default());
-}
-
-/// 验证嵌套配置 DTO 的 null、null 元素和 null map value 都映射为默认值。
-///
-/// 这些字段会同时出现在 V0 stdin、V1 session context 与 secret 中。测试刻意保留
-/// Option 字段的 None 语义，并只把值类型转换为空字符串、false、0 或默认结构。
-#[test]
-fn test_nested_config_explicit_null_values_use_defaults() {
-    let git_info: GitInfo = serde_json::from_value(json!({
-        "type": null,
-        "repo": null,
-        "ref": null,
-        "url": null,
-        "host": null,
-        "auth": null,
-        "allow_unrestricted_git_push": null
-    }))
-    .expect("GitInfo 的值类型 null 应解析");
-    assert_eq!(git_info, GitInfo::default());
-
-    let repository: GitRepositorySource = serde_json::from_value(json!({
-        "type": "git_repository",
-        "git_info": null
-    }))
-    .expect("null git_info 应变为默认结构");
-    assert_eq!(repository.git_info, GitInfo::default());
-
-    let server: McpServerConfig = serde_json::from_value(json!({
-        "type": null,
-        "url": null,
-        "command": null,
-        "args": [null],
-        "headers": {"X-Empty": null},
-        "tools": [null, {
-            "name": null,
-            "enabled": null,
-            "permission_policy": null
-        }]
-    }))
-    .expect("MCP server 的显式 null 应采用字段默认值");
-    assert_eq!(server.server_type, "");
-    assert_eq!(server.url, "");
-    assert_eq!(server.command, "");
-    assert_eq!(server.args, [""]);
-    assert_eq!(server.headers["X-Empty"], "");
-    assert_eq!(
-        server.tools,
-        vec![
-            McpServerConfigTool::default(),
-            McpServerConfigTool::default()
-        ]
-    );
-
-    let mcp: McpConfig =
-        serde_json::from_value(json!({"mcpServers": null})).expect("null mcpServers 应变为空 map");
-    assert!(mcp.mcp_servers.is_empty());
-
-    let file: McpConfigFile = serde_json::from_value(json!({
-        "path": null,
-        "content": null,
-        "mode": null
-    }))
-    .expect("MCP 文件值类型 null 应解析");
-    assert_eq!(file, McpConfigFile::default());
-
-    let outcome: OutcomeField = serde_json::from_value(json!({
-        "type": null,
-        "git_info": {
-            "type": null,
-            "repo": null,
-            "branches": [null]
-        }
-    }))
-    .expect("outcome 的显式 null 应采用字段默认值");
-    assert_eq!(outcome.outcome_type, "");
-    assert_eq!(outcome.git_info.git_type, "");
-    assert_eq!(outcome.git_info.repo, "");
-    assert_eq!(outcome.git_info.branches, [""]);
-
-    let null_git_info: OutcomeField = serde_json::from_value(json!({
-        "type": "git_repository",
-        "git_info": null
-    }))
-    .expect("null outcome git_info 应变为默认结构");
-    assert_eq!(null_git_info.git_info, GitOutcomeInfo::default());
 }
 
 /// 验证四种模式及空字符串默认值。

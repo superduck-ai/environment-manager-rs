@@ -57,7 +57,7 @@ impl HttpSessionIngressClient {
     ) -> Result<(), ApiError> {
         let body = serde_json::to_vec(request_body).map_err(|error| {
             ApiError::message(format!(
-                "failed to marshal {operation_name} request: {error}"
+                "failed to serialize {operation_name} request: {error}"
             ))
         })?;
         let mut request = self

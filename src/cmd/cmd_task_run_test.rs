@@ -504,7 +504,7 @@ async fn test_run_task_run_manager_does_not_parse_cancellation_text() {
         return;
     }
     let mut manager = FakeTaskRunManager {
-        result: Some(Err(ManagerError::message("context canceled"))),
+        result: Some(Err(ManagerError::message("operation cancelled"))),
     };
     let error = run_task_run_manager(
         &CancellationToken::new(),
@@ -517,7 +517,7 @@ async fn test_run_task_run_manager_does_not_parse_cancellation_text() {
     .expect_err("an uncancelled error must propagate");
     assert_eq!(
         error.as_bytes(),
-        b"environment manager failed: context canceled"
+        b"environment manager failed: operation cancelled"
     );
 }
 

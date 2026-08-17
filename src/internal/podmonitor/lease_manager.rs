@@ -326,14 +326,14 @@ impl LeaseManager {
                                if self.inner.cancellation.is_cancelled() {
             // 周期 heartbeat 分支；
             // 取消时仍保留该分支自身的业务日志。
-                                   tracing::info!(session_id = %self.inner.session_id, error = "context canceled", "heartbeat_loop_stopped");
+                                   tracing::info!(session_id = %self.inner.session_id, error = "operation cancelled", "heartbeat_loop_stopped");
                                    return;
                                }
                            }
                            _ = self.inner.cancellation.cancelled() => {
-            // context.Done 分支
+            // 显式取消分支。
             // Claude Code 无进展超时分支。不得与上方 heartbeat 分支合并，原因同上。
-                               tracing::info!("session_id" = ?(self.inner.session_id), "error" = ?("context canceled"), "{}", "heartbeat_loop_stopped");
+                               tracing::info!("session_id" = ?(self.inner.session_id), "error" = ?("operation cancelled"), "{}", "heartbeat_loop_stopped");
                                return;
                            }
                        }
@@ -675,7 +675,7 @@ impl LeaseManager {
         force: bool,
     ) -> Result<(), StopRequestError> {
         let body = serde_json::to_vec(&StopRequest { force }).map_err(|error| {
-            StopRequestError::Request(format!("failed to marshal stop request body: {error}"))
+            StopRequestError::Request(format!("failed to serialize stop request body: {error}"))
         })?;
         let endpoint = self.endpoint("stop", None).map_err(|error| {
             StopRequestError::Request(format!("failed to create stop request: {error}"))
@@ -690,7 +690,7 @@ impl LeaseManager {
                 let cancellation = cancellation.clone();
                 async move {
                     let cancellation_message = format!(
-                        "stop API request failed: Post \"{}\": context canceled",
+                        "stop API request failed: Post \"{}\": operation cancelled",
                         endpoint.as_str()
                     );
                     let request = client

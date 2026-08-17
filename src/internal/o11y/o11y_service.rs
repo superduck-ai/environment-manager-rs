@@ -55,7 +55,7 @@ pub fn get_o11y_service(context: Option<&O11yContext>) -> Arc<dyn O11yService> {
 pub(crate) fn new_resource(cancellation: &CancellationToken) -> Result<Resource, O11yError> {
     if cancellation.is_cancelled() {
         return Err(O11yError::message(
-            "failed to create otel resource: context canceled",
+            "failed to create otel resource: operation cancelled",
         ));
     }
     Ok(Resource::builder().build())

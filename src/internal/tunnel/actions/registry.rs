@@ -180,7 +180,7 @@ impl Registry {
         let outcome = tokio::select! {
             () = cancellation.cancelled() => {
                 action_cancellation.cancel();
-                ActionOutcome::Error("context canceled".to_owned())
+                ActionOutcome::Error("operation cancelled".to_owned())
             }
             timed = tokio::time::timeout(timeout, future) => {
                 match timed {
@@ -230,7 +230,7 @@ impl Registry {
             }
         };
         let mut encoded = serde_json::to_vec(&payload).unwrap_or_else(|error| {
-            format!(r#"{{"error":"failed to marshal action result: {error}","type":"error"}}"#)
+            format!(r#"{{"error":"failed to serialize action result: {error}","type":"error"}}"#)
                 .into_bytes()
         });
         encoded.push(b'\n');
@@ -398,7 +398,7 @@ impl ProgressReporter for TunnelProgressReporter {
         payload.insert("step", Value::String(update.step));
         payload.insert("type", Value::String("progress".to_owned()));
         let mut data = serde_json::to_vec(&payload)
-            .map_err(|error| format!("failed to marshal progress: {error}"))?;
+            .map_err(|error| format!("failed to serialize progress: {error}"))?;
         data.push(b'\n');
         self.sender
             .send_chunk(HttpTunnelResponseChunk {

@@ -36,9 +36,6 @@ pub struct CCRBackend {
 }
 
 /// CCR register 响应的 wire 结构。
-///
-/// 对缺失、JSON `null` 以及字符串 `"null"` 都保留 `int64` 零值；单纯使用
-/// Rust `String` 会把这些可接受输入误判成协议错误，因此在边界处直接恢复整数。
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct RegisterResponse {
@@ -48,19 +45,13 @@ struct RegisterResponse {
 
 /// 反序列化由 JSON 字符串承载的 `int64` 字段。
 ///
-/// 只接受字符串承载的十进制整数；缺失值由结构体默认值处理，显式 `null` 与
-/// `"null"` 按 primitive 零值规则返回 0。前导 `+` 必须拒绝，因为 JSON 不把它视为合法的 quoted number。
+/// 只接受字符串承载的十进制整数；缺失值由结构体默认值处理。前导 `+` 必须拒绝，
+/// 因为 quoted integer 协议不接受它。
 fn deserialize_string_encoded_i64<'de, D>(deserializer: D) -> Result<i64, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let encoded = Option::<String>::deserialize(deserializer)?;
-    let Some(encoded) = encoded else {
-        return Ok(0);
-    };
-    if encoded == "null" {
-        return Ok(0);
-    }
+    let encoded = String::deserialize(deserializer)?;
     if encoded.starts_with('+') {
         return Err(de::Error::custom(
             "invalid use of ,string struct tag for signed integer",

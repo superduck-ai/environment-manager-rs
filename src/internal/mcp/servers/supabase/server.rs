@@ -150,7 +150,7 @@ impl SupabaseMCPServer {
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", "ccr-byoc-2025-07-29");
         let response = tokio::select! {
-            _ = cancellation.cancelled() => return Err(McpError::message("http request: context canceled")),
+            _ = cancellation.cancelled() => return Err(McpError::message("http request: operation cancelled")),
             result = request.send() => result.map_err(|error| McpError::message(format!("http request: {error}")))?,
         };
         let status = response.status();
@@ -169,7 +169,7 @@ impl SupabaseMCPServer {
             }
             reqwest::StatusCode::OK => {
                 let bytes = tokio::select! {
-                    _ = cancellation.cancelled() => return Err(McpError::message("decode response: context canceled")),
+                    _ = cancellation.cancelled() => return Err(McpError::message("decode response: operation cancelled")),
                     result = response.bytes() => result.map_err(|error| McpError::message(format!("decode response: {error}")))?,
                 };
                 let credentials: SupabaseCredentials = serde_json::from_slice(&bytes)
@@ -583,7 +583,7 @@ impl SupabaseMCPServer {
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", "ccr-byoc-2025-07-29");
         let response = tokio::select! {
-            _ = cancellation.cancelled() => return Err(McpError::message("http request: context canceled")),
+            _ = cancellation.cancelled() => return Err(McpError::message("http request: operation cancelled")),
             result = request.send() => result.map_err(|error| McpError::message(format!("http request: {error}")))?,
         };
         let status = response.status();

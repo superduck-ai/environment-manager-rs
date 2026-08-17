@@ -184,9 +184,7 @@ impl VercelClient {
         let deadline = started.checked_add(timeout).unwrap_or(started);
         while Instant::now() < deadline {
             if cancellation.is_cancelled() {
-                return Err(
-                    "context cancelled while waiting for deployment: context canceled".into(),
-                );
+                return Err("deployment wait cancelled".into());
             }
 
             let mut url = format!("{}/v13/deployments/{deployment_id}", self.base_url);
@@ -343,8 +341,8 @@ fn push_project_character(output: &mut String, character: char) {
 
 /// 对单次 HTTP 请求施加 action 取消令牌。
 ///
-/// 丢弃 reqwest future 会关闭本次请求；错误文本使用 取消上下文 的稳定
-/// `context canceled`，由各 API 方法再加各自的外层操作说明。
+/// 丢弃 reqwest future 会关闭本次请求；取消时返回稳定的
+/// `operation cancelled`，由各 API 方法再加各自的外层操作说明。
 async fn execute_request(
     client: &reqwest::Client,
     request: reqwest::Request,
@@ -352,7 +350,7 @@ async fn execute_request(
 ) -> Result<reqwest::Response, String> {
     tokio::select! {
         biased;
-        () = cancellation.cancelled() => Err("context canceled".to_owned()),
+        () = cancellation.cancelled() => Err("operation cancelled".to_owned()),
         result = client.execute(request) => result.map_err(|error| error.to_string()),
     }
 }
@@ -364,7 +362,7 @@ async fn read_response(
 ) -> Result<Vec<u8>, String> {
     tokio::select! {
         biased;
-        () = cancellation.cancelled() => Err("context canceled".to_owned()),
+        () = cancellation.cancelled() => Err("operation cancelled".to_owned()),
         result = response.bytes() => result
             .map(|bytes| bytes.to_vec())
             .map_err(|error| error.to_string()),
@@ -376,7 +374,7 @@ async fn wait_for_deployment_poll(cancellation: &CancellationToken) -> Result<()
     tokio::select! {
         () = tokio::time::sleep(DEPLOYMENT_POLL_INTERVAL) => Ok(()),
         () = cancellation.cancelled() => {
-            Err("context cancelled during poll: context canceled".into())
+            Err("deployment poll cancelled".into())
         }
     }
 }

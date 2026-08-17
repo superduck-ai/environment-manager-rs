@@ -1,7 +1,7 @@
 //! 可观测性配置、服务 trait、上下文和静态指标定义。
 //!
-//! 依赖指针零值和 `context.WithValue`。Rust 版本用 `Option` 表达可缺省参数，
-//! 用 `Arc<dyn O11yService>` 支持跨任务共享，并以 `Cow<'static, str>` 同时容纳静态
+//! 配置用 `Option` 表达可缺省参数，用 `Arc<dyn O11yService>` 支持跨任务共享，
+//! 并以 `Cow<'static, str>` 同时容纳静态
 //! 指标和 `record_duration` 动态派生的指标名。
 
 use std::{

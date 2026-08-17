@@ -28,7 +28,7 @@ pub struct CodeSignArgs {
 }
 
 impl CodeSignArgs {
-    /// 按旧 `runCodeSign`/`handleSSHSign` 规则识别支持的操作。
+    /// 根据参数序列识别受支持的签名操作。
     ///
     /// 当前只支持参数序列中出现 `-Y sign` 的 SSH 签名。该方法不访问文件系统，
     /// 相对路径的绝对化、配置读取与 MCP 调用留给执行层完成。
@@ -109,7 +109,7 @@ fn remove_ssh_sign_marker(args: &[OsString]) -> (bool, Vec<OsString>) {
     (found, filtered)
 }
 
-/// 保留旧 `handleSSHSign` 的宽松 flag 扫描，提取首个非 flag 文件。
+/// 以宽松的 flag 扫描方式提取首个非 flag 文件。
 fn parse_ssh_sign_args(args: &[OsString]) -> Result<SshSignArgs, String> {
     let mut file_path = None;
     let mut key_file = None;
@@ -251,16 +251,8 @@ pub(super) async fn handle_ssh_sign(arguments: &SshSignArgs) -> Result<(), Strin
     let result_raw = call_mcp_server(&config, &request)
         .await
         .map_err(|error| format!("failed to call MCP server: {error}"))?;
-    let tool_result_value: Value = serde_json::from_slice(&result_raw)
+    let tool_result: McpToolResult = serde_json::from_slice(&result_raw)
         .map_err(|error| format!("failed to parse tool result: {error}"))?;
-    // JSON 把顶层 null 解到结构体时保留零值；serde 对 null→struct 默认
-    // 报错。签名服务若已经落盘但返回 result:null，旧 wrapper 会继续检查 `.sig`。
-    let tool_result: McpToolResult = if tool_result_value.is_null() {
-        McpToolResult::default()
-    } else {
-        serde_json::from_value(tool_result_value)
-            .map_err(|error| format!("failed to parse tool result: {error}"))?
-    };
     if tool_result.is_error {
         let message = tool_result
             .content
@@ -360,8 +352,8 @@ pub(super) fn get_git_object_format(working_dir: &std::path::Path) -> &'static s
 
 ///
 /// 发送一次带 JSON content type 和 Bearer token 的 POST，请求成功必须同时满足 HTTP
-/// 200、合法 JSON-RPC response、没有 error 且存在 result。显式 `result: null` 被视为
-/// 存在并原样返回，区别于字段缺失。
+/// 200、合法 JSON-RPC response、没有 error 且存在 result。JSON-RPC 允许
+/// `result: null`，因此该值仍区别于字段缺失并原样返回。
 pub(super) async fn do_single_attempt(
     client: &reqwest::Client,
     url: &str,
@@ -394,17 +386,11 @@ pub(super) async fn do_single_attempt(
 
     let value: Value = serde_json::from_slice(&response_body)
         .map_err(|error| format!("failed to parse response: {error}"))?;
-    let object = match &value {
-        Value::Object(object) => Some(object),
-        Value::Null => None,
-        _ => return Err("failed to parse response: expected a JSON object".to_owned()),
-    };
-    let response: McpResponse = if value.is_null() {
-        McpResponse::default()
-    } else {
-        serde_json::from_value(value.clone())
-            .map_err(|error| format!("failed to parse response: {error}"))?
-    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "failed to parse response: expected a JSON object".to_owned())?;
+    let response: McpResponse = serde_json::from_value(value.clone())
+        .map_err(|error| format!("failed to parse response: {error}"))?;
     // jsonrpc、id 和 typed result 不参与 控制流，但读取后保留类型作为协议审计点。
     let _protocol_fields = (&response.jsonrpc, &response.id, &response.result);
     if let Some(error) = response.error {
@@ -412,7 +398,7 @@ pub(super) async fn do_single_attempt(
         return Err(format!("MCP error: {}", error.message));
     }
     let result = object
-        .and_then(|object| object.get("result"))
+        .get("result")
         .ok_or_else(|| "no result in MCP response".to_owned())?;
     serde_json::to_vec(result).map_err(|error| format!("failed to parse response: {error}"))
 }
@@ -460,7 +446,7 @@ pub(super) async fn call_mcp_server(
     request: &McpRequest,
 ) -> Result<Vec<u8>, String> {
     let request_data = serde_json::to_vec(request)
-        .map_err(|error| format!("failed to marshal request: {error}"))?;
+        .map_err(|error| format!("failed to serialize request: {error}"))?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()

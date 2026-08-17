@@ -342,7 +342,7 @@ async fn test_whoami_client_reports_status_parse_and_type_errors() {
     assert!(
         error
             .to_string()
-            .contains("failed to unmarshal whoami response")
+            .contains("failed to deserialize whoami response")
     );
 
     let (base_url, _request) = spawn_http_response(200, &[], br#"{"type":"other"}"#).await;
@@ -356,21 +356,6 @@ async fn test_whoami_client_reports_status_parse_and_type_errors() {
             .to_string()
             .contains("unexpected whoami response type")
     );
-
-    // 会把顶层 null 以及 string 字段的显式 null 都解码为结构体零值；两种输入
-    // 都应进入 response type 校验，而不是提前暴露 serde 的类型错误。
-    for body in [
-        b"null".as_slice(),
-        br#"{"type":null,"organization_uuid":null,"environment_id":null}"#.as_slice(),
-    ] {
-        let (base_url, _request) = spawn_http_response(200, &[], body).await;
-        let client = new_whoami_client(base_url, "token");
-        let error = client
-            .get_identity(&CancellationToken::new())
-            .await
-            .unwrap_err();
-        assert_eq!(error.to_string(), "unexpected whoami response type: ");
-    }
 }
 
 /// 验证状态机把 work 原文写到输出，并按 start/end 顺序发 observer 事件。

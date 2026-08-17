@@ -117,7 +117,7 @@ impl Orchestrator {
                         biased;
                         _ = cancellation.cancelled() => {
                             return Err(OrchestratorError::message(
-                                "orchestrator stopped during backoff: context canceled",
+                                "orchestrator stopped during backoff: operation cancelled",
                             ));
                         }
                         _ = tokio::time::sleep(backoff) => continue,
@@ -176,12 +176,9 @@ impl Orchestrator {
         let mut loop_start_time = Instant::now();
         loop {
             if cancellation.is_cancelled() {
-                tracing::info!(
-                    "{}",
-                    "orchestrator shutting down due to context cancellation"
-                );
+                tracing::info!("{}", "orchestrator shutting down after cancellation");
                 return Err(OrchestratorError::message(
-                    "orchestrator stopped: context canceled",
+                    "orchestrator stopped: operation cancelled",
                 ));
             }
 

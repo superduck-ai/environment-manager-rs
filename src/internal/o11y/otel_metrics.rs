@@ -69,7 +69,7 @@ pub(crate) fn make_otlp_exporter(
 ) -> Result<MetricsExporter, O11yError> {
     if cancellation.is_cancelled() {
         return Err(O11yError::message(
-            "failed to create OTLP metrics exporter: context canceled",
+            "failed to create OTLP metrics exporter: operation cancelled",
         ));
     }
 
@@ -110,13 +110,13 @@ impl O11yMetricsProvider {
         let shutdown = tokio::task::spawn_blocking(move || provider.shutdown());
         if cancellation.is_cancelled() {
             return Err(O11yError::message(
-                "failed to shutdown otel metrics: context canceled",
+                "failed to shutdown otel metrics: operation cancelled",
             ));
         }
 
         tokio::select! {
             _ = cancellation.cancelled() => Err(O11yError::message(
-                "failed to shutdown otel metrics: context canceled",
+                "failed to shutdown otel metrics: operation cancelled",
             )),
             result = shutdown => match result {
                 Ok(Ok(())) => Ok(()),

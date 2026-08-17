@@ -15,7 +15,6 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use http::header::{AUTHORIZATION, HeaderValue};
 use rand::Rng as _;
 use secrecy::{ExposeSecret as _, SecretString};
-use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -105,7 +104,7 @@ pub(super) fn ping_write_failure(
     failure: PingWriteFailure,
 ) -> TunnelError {
     if cancellation.is_cancelled() {
-        return TunnelError::message("context canceled");
+        return TunnelError::message("operation cancelled");
     }
 
     match failure {
@@ -194,7 +193,7 @@ impl Client {
         }
 
         let connected = tokio::select! {
-            () = cancellation.cancelled() => return Err(TunnelError::message("context canceled")),
+            () = cancellation.cancelled() => return Err(TunnelError::message("operation cancelled")),
             result = tokio::time::timeout(CONNECT_TIMEOUT, connect_websocket(request)) => result,
         };
         let (socket, _response) = match connected {
@@ -225,7 +224,7 @@ impl Client {
 
     ///
     /// 独占 Connect 安装的 reader，同时运行请求读取与 ping loop；任一失败都会取消
-    /// 另一侧并关闭 writer。调用方取消返回 `context canceled`，供外层决定是否重试。
+    /// 另一侧并关闭 writer。调用方取消返回 `operation cancelled`，供外层决定是否重试。
     pub async fn run(
         self: &Arc<Self>,
         cancellation: &CancellationToken,
@@ -245,7 +244,7 @@ impl Client {
         tokio::pin!(read, ping);
 
         let result = tokio::select! {
-            () = cancellation.cancelled() => Err(TunnelError::message("context canceled")),
+            () = cancellation.cancelled() => Err(TunnelError::message("operation cancelled")),
             result = &mut read => result,
             result = &mut ping => result,
         };
@@ -267,7 +266,7 @@ impl Client {
             let result = self.run(cancellation).await;
             self.close_connection().await;
             if cancellation.is_cancelled() {
-                return Err(TunnelError::message("context canceled"));
+                return Err(TunnelError::message("operation cancelled"));
             }
             if let Err(error) = result {
                 tracing::warn!("error" = ?(error.to_string()), "{}", "tunnel_run_failed");
@@ -275,7 +274,7 @@ impl Client {
 
             let wait = add_jitter(delay);
             tokio::select! {
-                () = cancellation.cancelled() => return Err(TunnelError::message("context canceled")),
+                () = cancellation.cancelled() => return Err(TunnelError::message("operation cancelled")),
                 () = tokio::time::sleep(wait) => {}
             }
             delay = std::cmp::min(delay.saturating_mul(2), MAX_RETRY_DELAY);
@@ -314,7 +313,7 @@ impl Client {
                     let wait = add_jitter(delay);
                     tracing::warn!("error" = ?(error.to_string()), "retry_in" = ?(format_duration(wait)), "{}", "tunnel_connect_failed");
                     tokio::select! {
-                        () = cancellation.cancelled() => return Err(TunnelError::message("context canceled")),
+                        () = cancellation.cancelled() => return Err(TunnelError::message("operation cancelled")),
                         () = tokio::time::sleep(wait) => {}
                     }
                     delay = std::cmp::min(delay.saturating_mul(2), MAX_RETRY_DELAY);
@@ -367,7 +366,7 @@ impl Client {
         interval.tick().await;
         loop {
             tokio::select! {
-                () = cancellation.cancelled() => return Err(TunnelError::message("context canceled")),
+                () = cancellation.cancelled() => return Err(TunnelError::message("operation cancelled")),
                 _ = interval.tick() => {}
             }
             let last_pong = *self
@@ -593,9 +592,9 @@ impl Client {
     /// 序列化 lowerCamel ProtoJSON 并写入主 Tunnel text frame。
     async fn send_response(&self, response: TunnelResponse) -> Result<(), TunnelError> {
         let data = encode_protojson(&response)
-            .map_err(|error| TunnelError::message(format!("marshal response: {error}")))?;
+            .map_err(|error| TunnelError::message(format!("serialize response: {error}")))?;
         let text = String::from_utf8(data)
-            .map_err(|error| TunnelError::message(format!("marshal response: {error}")))?;
+            .map_err(|error| TunnelError::message(format!("serialize response: {error}")))?;
         let mut writer = self.writer.lock().await;
         let writer = writer
             .as_mut()
@@ -862,7 +861,7 @@ where
     };
 
     tokio::select! {
-        () = cancellation.cancelled() => Err(TunnelError::message("context canceled")),
+        () = cancellation.cancelled() => Err(TunnelError::message("operation cancelled")),
         result = tokio::time::timeout(read_timeout, read_until_data) => {
             result.unwrap_or_else(|_| Err(TunnelError::message("read tunnel request: i/o timeout")))
         }
@@ -1593,127 +1592,7 @@ pub fn add_jitter(base: Duration) -> Duration {
 }
 
 /// 解码允许未知字段的 Tunnel ProtoJSON。
-///
-/// Tunnel wire 协议为向前兼容而忽略未知字段；这里先只删除消息 schema 以外的 key，
-/// 再交给生成的强类型反序列化器处理字段别名、Base64、数值范围和 oneof 冲突。
 fn decode_tunnel_request(data: &[u8]) -> Result<TunnelRequest, TunnelError> {
-    let mut value: Value = serde_json::from_slice(data)
-        .map_err(|error| TunnelError::message(format!("decode tunnel request: {error}")))?;
-    discard_unknown_tunnel_fields(&mut value);
-    serde_json::from_value(value)
+    serde_json::from_slice(data)
         .map_err(|error| TunnelError::message(format!("decode tunnel request: {error}")))
-}
-
-/// 按 TunnelRequest 及其嵌套消息 schema 原地删除未知 JSON 字段。
-fn discard_unknown_tunnel_fields(value: &mut Value) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    retain_fields(
-        object,
-        &[
-            "sessionId",
-            "session_id",
-            "httpRequest",
-            "http_request",
-            "httpCancel",
-            "http_cancel",
-            "wsOpen",
-            "ws_open",
-            "wsMessage",
-            "ws_message",
-            "wsClose",
-            "ws_close",
-        ],
-    );
-    for key in ["httpRequest", "http_request"] {
-        if let Some(message) = object.get_mut(key) {
-            sanitize_http_request(message);
-        }
-    }
-    for key in ["httpCancel", "http_cancel"] {
-        if let Some(message) = object.get_mut(key)
-            && let Some(message) = message.as_object_mut()
-        {
-            retain_fields(message, &["requestId", "request_id"]);
-        }
-    }
-    for key in ["wsOpen", "ws_open"] {
-        if let Some(message) = object.get_mut(key) {
-            sanitize_ws_open(message);
-        }
-    }
-    for key in ["wsMessage", "ws_message"] {
-        if let Some(message) = object.get_mut(key)
-            && let Some(message) = message.as_object_mut()
-        {
-            retain_fields(
-                message,
-                &["tunnelId", "tunnel_id", "data", "isBinary", "is_binary"],
-            );
-        }
-    }
-    for key in ["wsClose", "ws_close"] {
-        if let Some(message) = object.get_mut(key)
-            && let Some(message) = message.as_object_mut()
-        {
-            retain_fields(message, &["tunnelId", "tunnel_id", "code", "reason"]);
-        }
-    }
-}
-
-/// 删除 HTTP request 及 header 消息中的未知字段。
-fn sanitize_http_request(value: &mut Value) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    retain_fields(
-        object,
-        &[
-            "requestId",
-            "request_id",
-            "port",
-            "method",
-            "path",
-            "headers",
-            "body",
-        ],
-    );
-    sanitize_headers(object.get_mut("headers"));
-}
-
-/// 删除 WebSocket open 及 header 消息中的未知字段。
-fn sanitize_ws_open(value: &mut Value) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    retain_fields(
-        object,
-        &[
-            "tunnelId",
-            "tunnel_id",
-            "port",
-            "path",
-            "headers",
-            "protocols",
-        ],
-    );
-    sanitize_headers(object.get_mut("headers"));
-}
-
-/// 删除 repeated Header 数组元素中的未知字段。
-fn sanitize_headers(value: Option<&mut Value>) {
-    let Some(headers) = value.and_then(Value::as_array_mut) else {
-        return;
-    };
-    for header in headers {
-        if let Some(header) = header.as_object_mut() {
-            retain_fields(header, &["name", "value"]);
-        }
-    }
-}
-
-/// 仅保留允许的 JSON object key，丢弃协议允许忽略的未知字段。
-fn retain_fields(object: &mut serde_json::Map<String, Value>, allowed: &[&str]) {
-    object.retain(|key, _| allowed.contains(&key.as_str()));
 }

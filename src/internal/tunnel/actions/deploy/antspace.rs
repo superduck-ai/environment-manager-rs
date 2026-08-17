@@ -194,7 +194,7 @@ impl AntspaceClient {
         let response = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
-                return Err("deploy request failed: context canceled".into());
+                return Err("deploy request failed: operation cancelled".into());
             }
             result = self.http_client.execute(request) => {
                 result.map_err(|error| format!("deploy request failed: {error}"))?
@@ -221,7 +221,7 @@ impl AntspaceClient {
         let body = tokio::select! {
             biased;
             () = cancellation.cancelled() => {
-                return Err("failed to read deploy response: context canceled".into());
+                return Err("failed to read deploy response: operation cancelled".into());
             }
             result = response.bytes() => {
                 result

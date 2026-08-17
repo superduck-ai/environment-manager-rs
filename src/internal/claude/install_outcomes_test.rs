@@ -92,7 +92,7 @@ impl Stopper for NoopTestStopper {
     async fn stop(&self) {}
 }
 
-/// 创建全部 null 或缺失字段的默认值的 Claude config。
+/// 创建字段均为空的 Claude config。
 fn empty_config() -> ClaudeConfig {
     ClaudeConfig {
         command: String::new(),

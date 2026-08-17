@@ -70,7 +70,7 @@ fn test_new_validates_config_and_setters() {
 #[test]
 fn new_rejects_invalid_config() {
     let error = new(b"{bad json").expect_err("bad JSON must fail");
-    assert!(error.to_string().contains("failed to unmarshal"));
+    assert!(error.to_string().contains("failed to deserialize"));
 
     let wrong_type = serde_json::to_vec(&serde_json::json!({
         "environment_type": "anthropic"
@@ -111,32 +111,6 @@ fn new_rejects_invalid_config() {
             .to_string()
             .contains("too large")
     );
-}
-
-/// 验证 null string 和 map 被映射为配置零值。
-#[test]
-fn accepts_null_and_missing_defaults() {
-    let environment = new(br#"{
-            "environment_type":"byoc",
-            "cwd":null,
-            "task_setup_script":null,
-            "environment":{"EMPTY":null}
-        }"#)
-    .expect("null values should map to configuration defaults");
-    assert_eq!(environment.get_cwd(), "");
-    assert_eq!(environment.config.task_setup_script, "");
-    assert_eq!(
-        environment
-            .config
-            .environment
-            .get("EMPTY")
-            .map(String::as_str),
-        Some("")
-    );
-
-    let environment = new(br#"{"environment_type":"byoc","environment":null}"#)
-        .expect("null environment map should become empty");
-    assert!(environment.config.environment.is_empty());
 }
 
 /// 验证只提取单 branch Git outcome，且重复 repo 以后者为准。

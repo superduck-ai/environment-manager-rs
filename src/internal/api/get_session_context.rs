@@ -95,15 +95,12 @@ impl SessionsClient {
     ) -> Result<SessionContext, ApiError> {
         match status {
             StatusCode::OK => {
-                let response: Option<SessionContextResponse> = serde_json::from_slice(body)
-                    .map_err(|error| {
+                let response: SessionContextResponse =
+                    serde_json::from_slice(body).map_err(|error| {
                         ApiError::message(format!(
                             "failed to parse session context response: {error}"
                         ))
                     })?;
-                // 把顶层 JSON null 解进预先分配的 response struct 后保留零值；
-                // serde 对 struct 的默认行为会报错，因此这里显式映射为默认结构。
-                let response = response.unwrap_or_default();
                 tracing::debug!("session_id" = ?(session_id), "cwd" = ?(&response.session_context.cwd), "has_outcomes" = ?(response.session_context.outcomes.is_some()), "has_mcp_config" = ?(response.session_context.mcp_config.is_some()), "{}", "Successfully fetched session context");
                 Ok(response.session_context)
             }

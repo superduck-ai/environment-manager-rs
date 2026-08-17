@@ -512,7 +512,10 @@ async fn test_server_stop_cancellation_preserves_state_for_later_cleanup() {
     let canceled = CancellationToken::new();
     canceled.cancel();
     let error = manager.stop(&canceled).await.unwrap_err();
-    assert_eq!(error.to_string(), "failed to stop server: context canceled");
+    assert_eq!(
+        error.to_string(),
+        "failed to stop server: operation cancelled"
+    );
     assert!(manager.is_running());
 
     release.cancel();

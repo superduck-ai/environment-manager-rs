@@ -160,7 +160,7 @@ impl DiagService {
                            _ = cancellation.cancelled() => {
                                tracing::warn!("{}", "Shutdown timed out waiting for diag log flusher to stop");
                                errors.push(DiagError::message(
-                                   "shutdown timed out waiting for final flush: context canceled"
+                                   "shutdown timed out waiting for final flush: operation cancelled"
                                ));
                            }
                        }
@@ -231,7 +231,7 @@ impl DiagService {
         let mut line = match serde_json::to_vec(&file_entry) {
             Ok(line) => line,
             Err(error) => {
-                tracing::error!(%error, "Failed to marshal diag log entry");
+                tracing::error!(%error, "Failed to serialize diag log entry");
                 return;
             }
         };

@@ -237,7 +237,7 @@ impl TunnelClient for FakeTunnelClient {
     ) -> Result<(), ManagerError> {
         self.connect_called.store(true, Ordering::SeqCst);
         cancellation.cancelled().await;
-        Err(ManagerError::message("context canceled"))
+        Err(ManagerError::message("operation cancelled"))
     }
 
     /// 标记 manager 调用了 Close。
@@ -643,14 +643,14 @@ async fn test_run_does_not_parse_cancellation_text() {
         fake_environment(None),
         SessionMode::New,
         true,
-        Some("context canceled"),
+        Some("operation cancelled"),
     );
 
     let error = manager
         .run(&CancellationToken::new())
         .await
         .expect_err("uncancelled executor error must propagate");
-    assert_eq!(error.to_string(), "execution failed: context canceled");
+    assert_eq!(error.to_string(), "execution failed: operation cancelled");
 
     assert!(executor.execute_called.load(Ordering::SeqCst));
     assert!(executor.destroy_called.load(Ordering::SeqCst));
