@@ -577,7 +577,7 @@ impl Manager {
         let git_configurations = [
             ("gpg.format", OsString::from("ssh")),
             ("gpg.ssh.program", OsString::from(CODE_SIGN_PATH)),
-            ("commit.gpgsign", OsString::from("true")),
+            ("commit.gpgsign", OsString::from("false")),
             ("user.signingkey", signing_key.into_os_string()),
         ];
         for (key, value) in git_configurations {
