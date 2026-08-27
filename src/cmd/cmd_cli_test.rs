@@ -7,25 +7,22 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{body_partial_json, header, method, path, query_param};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::code_sign::{
-    calculate_backoff, do_attempts_with_retry, do_single_attempt, read_code_sign_config,
-    scan_positive_integer,
-};
 use super::setup::{
     check_npm_available, install_sandbox_runtime, load_service_key, run_api_healthcheck,
 };
-use super::types::RetryConfig;
 use super::*;
+use crate::internal::codesign::{
+    CONTEXT_ENV as CODESIGN_CONTEXT_ENV, CodeSignContext, CodeSignSource,
+};
 
 /// 根命令应注册全部公开命令，并从普通帮助中隐藏 code-sign。
 #[test]
@@ -815,193 +812,13 @@ fn code_sign_parses_ssh_arguments() {
     );
 }
 
-/// code-sign 指数退避的边界测试；抖动只能增加基础值，不能超过 30%。
-#[test]
-fn calculate_backoff_uses_capped_positive_jitter() {
-    let config = RetryConfig {
-        max_retries: 2,
-        initial_backoff: Duration::from_millis(100),
-        max_backoff: Duration::from_millis(200),
-        backoff_factor: 2.0,
-    };
-    assert_eq!(calculate_backoff(0, config), Duration::from_millis(100));
-    for _ in 0..32 {
-        let first = calculate_backoff(1, config);
-        assert!(first >= Duration::from_millis(100));
-        assert!(first < Duration::from_millis(130));
-        let capped = calculate_backoff(10, config);
-        assert!(capped >= Duration::from_millis(200));
-        assert!(capped < Duration::from_millis(260));
-    }
-}
-
-/// code-sign 配置优先读取成对环境变量，端口允许整数后的非数字后缀。
-#[test]
-fn code_sign_config_reads_environment() {
+/// 端到端验证 code-sign 直接使用 ingress token 请求后台并写出 `.sig`。
+#[tokio::test(flavor = "current_thread")]
+async fn ssh_sign_calls_backend_and_writes_signature() {
     // 父测试进程只启动隔离子进程，不在自身读写全局环境。
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::code_sign_config_reads_environment"
-    )) {
-        return;
-    }
-    // code-sign 配置是进程全局环境，使用 crate 级锁覆盖设置、读取和恢复全过程。
-    let _process_state = crate::internal::PROCESS_STATE_TEST_LOCK.blocking_lock();
-    let mut environment = ScopedEnvironment::new();
-    environment.set("CODESIGN_MCP_PORT", OsStr::new("12345trailing"));
-    environment.set("CODESIGN_MCP_TOKEN", OsStr::new("temporary-token"));
-    let config = read_code_sign_config().expect("valid env config must win");
-    assert_eq!(config.port, 12_345);
-    assert_eq!(config.bearer_token, "temporary-token");
-    assert_eq!(scan_positive_integer("  +9199 rest"), Some(9199));
-    assert_eq!(scan_positive_integer("0"), None);
-    assert_eq!(scan_positive_integer("-1"), None);
-    assert_eq!(scan_positive_integer("not-a-port"), None);
-}
-
-/// 单次 MCP HTTP 调用必须验证 header、状态码、JSON-RPC error 和 result 存在性。
-#[tokio::test(flavor = "current_thread")]
-async fn single_sign_attempt_validates_json_rpc() {
-    let server = MockServer::start().await;
-    for (endpoint, body) in [
-        (
-            "/result",
-            r#"{"jsonrpc":"2.0","id":"request-1","result":{"content":null,"isError":null}}"#,
-        ),
-        ("/explicit-null", r#"{"result":null}"#),
-    ] {
-        Mock::given(method("POST"))
-            .and(path(endpoint))
-            .and(header("Content-Type", "application/json"))
-            .and(header("Authorization", "Bearer bearer-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/json"))
-            .expect(1)
-            .mount(&server)
-            .await;
-    }
-    Mock::given(method("POST"))
-        .and(path("/rpc-error"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "error": {"code": -1, "message": "denied"}
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/response-null"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw("null", "application/json"))
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/status"))
-        .respond_with(ResponseTemplate::new(503).set_body_string("busy"))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let client = reqwest::Client::new();
-    let result = do_single_attempt(
-        &client,
-        &format!("{}/result", server.uri()),
-        b"{}",
-        "bearer-token",
-    )
-    .await
-    .expect("result object must pass");
-    assert_eq!(
-        serde_json::from_slice::<Value>(&result).unwrap(),
-        json!({"content": null, "isError": null})
-    );
-
-    let explicit_null = do_single_attempt(
-        &client,
-        &format!("{}/explicit-null", server.uri()),
-        b"{}",
-        "bearer-token",
-    )
-    .await
-    .expect("explicit result:null is present");
-    assert_eq!(explicit_null, b"null");
-
-    let error = do_single_attempt(
-        &client,
-        &format!("{}/rpc-error", server.uri()),
-        b"{}",
-        "bearer-token",
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error, "MCP error: denied");
-    let error = do_single_attempt(
-        &client,
-        &format!("{}/response-null", server.uri()),
-        b"{}",
-        "bearer-token",
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error, "failed to parse response: expected a JSON object");
-    let error = do_single_attempt(
-        &client,
-        &format!("{}/status", server.uri()),
-        b"{}",
-        "bearer-token",
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error, "MCP server returned status 503: busy");
-    server.verify().await;
-}
-
-/// 重试必须总共尝试 `max_retries + 1` 次，并在第三次成功后返回 result。
-#[tokio::test(flavor = "current_thread")]
-async fn signing_attempts_retry_transient_failures() {
-    let server = MockServer::start().await;
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let observed = attempts.clone();
-    Mock::given(method("POST"))
-        .and(path("/mcp"))
-        .respond_with(move |_request: &Request| {
-            if observed.fetch_add(1, Ordering::SeqCst) < 2 {
-                ResponseTemplate::new(503).set_body_string("not ready")
-            } else {
-                ResponseTemplate::new(200).set_body_json(json!({"result": {"ok": true}}))
-            }
-        })
-        .expect(3)
-        .mount(&server)
-        .await;
-    let client = reqwest::Client::new();
-    let result = do_attempts_with_retry(
-        &client,
-        &format!("{}/mcp", server.uri()),
-        b"{}",
-        "token",
-        RetryConfig {
-            max_retries: 2,
-            initial_backoff: Duration::from_millis(1),
-            max_backoff: Duration::from_millis(1),
-            backoff_factor: 1.0,
-        },
-    )
-    .await
-    .expect("third attempt must succeed");
-    assert_eq!(
-        serde_json::from_slice::<Value>(&result).unwrap(),
-        json!({"ok": true})
-    );
-    assert_eq!(attempts.load(Ordering::SeqCst), 3);
-    server.verify().await;
-}
-
-/// 端到端验证 code-sign 请求协议、tool error 和 `.sig` 文件副作用。
-#[tokio::test(flavor = "current_thread")]
-async fn ssh_sign_calls_server_and_checks_signature() {
-    // 父测试进程只启动隔离子进程，不在自身读写全局环境。
-    if !crate::internal::enter_isolated_process_test(concat!(
-        module_path!(),
-        "::ssh_sign_calls_server_and_checks_signature"
+        "::ssh_sign_calls_backend_and_writes_signature"
     )) {
         return;
     }
@@ -1009,49 +826,62 @@ async fn ssh_sign_calls_server_and_checks_signature() {
     // 测试使用同一把 crate 级锁，保持默认 sha1 分支的真实成因。
     let _process_state = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
     let server = MockServer::start().await;
-    let mut environment = ScopedEnvironment::new();
-    environment.set(
-        "CODESIGN_MCP_PORT",
-        OsStr::new(&server.address().port().to_string()),
-    );
-    environment.set("CODESIGN_MCP_TOKEN", OsStr::new("signing-token"));
-
     let directory = TempDir::new().unwrap();
+    let token_path = directory.path().join("session-token");
+    fs::write(&token_path, "signing-token").unwrap();
+    let source = json!({
+        "type": "git_repository",
+        "git_info": {"type": "github", "repo": "anthropic/demo", "ref": "main"}
+    });
+    let context = CodeSignContext {
+        session_id: "session-123".to_owned(),
+        signing_server_url: server.uri(),
+        use_code_sessions: false,
+        sources: vec![CodeSignSource {
+            directory: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            source: source.clone(),
+        }],
+    };
+    let serialized_context = serde_json::to_string(&context).unwrap();
+    let mut environment = ScopedEnvironment::new();
+    environment.set(CODESIGN_CONTEXT_ENV, OsStr::new(&serialized_context));
+    environment.set("CLAUDE_SESSION_INGRESS_TOKEN_FILE", token_path.as_os_str());
+
     let payload = directory.path().join("payload");
     fs::write(&payload, b"payload").unwrap();
     let signature = PathBuf::from(format!("{}.sig", payload.display()));
-    fs::write(&signature, b"signature").unwrap();
     let expected_request = json!({
-        "jsonrpc": "2.0",
-        "method": "tools/call",
-        "params": {
-            "name": "sign_file",
-            "arguments": {"file_path": payload.to_string_lossy()}
-        }
+        "contents": "payload",
+        "source": source,
+        "git_object_format": "sha1"
     });
     mount_code_sign_response(
         &server,
         &expected_request,
-        json!({"result": {"content": [], "isError": false}}),
+        200,
+        json!({"signature": "signed"}),
     )
     .await;
     let arguments = code_sign_arguments(&payload);
     run_code_sign(&arguments)
         .await
-        .expect("successful tool call plus signature file must pass");
+        .expect("direct signing request must succeed");
+    assert_eq!(fs::read_to_string(&signature).unwrap(), "signed");
+    assert_eq!(
+        fs::metadata(&signature).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     server.verify().await;
 
     server.reset().await;
-    mount_code_sign_response(
-        &server,
-        &expected_request,
-        json!({"result": {"content": [], "isError": true}}),
-    )
-    .await;
+    mount_code_sign_response(&server, &expected_request, 503, json!("busy")).await;
     let error = run_code_sign(&arguments)
         .await
-        .expect_err("tool-level failure must win over existing signature");
-    assert_eq!(error, "signing failed: unknown error");
+        .expect_err("remote status must fail signing");
+    assert!(error.starts_with("signing server returned status 503:"));
     server.verify().await;
 }
 
@@ -1185,14 +1015,20 @@ fn code_sign_arguments(payload: &std::path::Path) -> CodeSignArgs {
     }
 }
 
-/// 挂载一个带严格认证与核心请求体匹配的 code-sign MCP 响应。
-async fn mount_code_sign_response(server: &MockServer, request: &Value, response: Value) {
+/// 挂载一个带严格认证与核心请求体匹配的远端签名响应。
+async fn mount_code_sign_response(
+    server: &MockServer,
+    request: &Value,
+    status: u16,
+    response: Value,
+) {
     Mock::given(method("POST"))
-        .and(path("/mcp"))
+        .and(path("/v1/session_ingress/sources/sign-commit/session-123"))
         .and(header("Authorization", "Bearer signing-token"))
         .and(header("Content-Type", "application/json"))
+        .and(header("anthropic-version", "2023-06-01"))
         .and(body_partial_json(request))
-        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .respond_with(ResponseTemplate::new(status).set_body_json(response))
         .expect(1)
         .mount(server)
         .await;

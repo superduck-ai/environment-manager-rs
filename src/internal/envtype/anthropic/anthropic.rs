@@ -842,12 +842,12 @@ impl AnthropicEnvironmentType {
     ) -> Result<(), AnthropicError> {
         const COMMANDS: &[&[&str]] = &[
             &["git", "init"],
-            &["git", "config", "user.email", "claude@anthropic.com"],
-            &["git", "config", "user.name", "Claude"],
+            &["git", "config", "user.email", "oma@superduck.ai"],
+            &["git", "config", "user.name", "oma"],
             &["git", "config", "gc.auto", "0"],
-            &["git", "config", "commit.gpgsign", "false"],
+            &["git", "config", "commit.gpgsign", "true"],
             &["git", "add", "."],
-            &["git", "commit", "-m", "Initial project from Baku template"],
+            &["git", "commit", "--no-gpg-sign", "-m", "Initial project"],
         ];
         for command in COMMANDS {
             let (output, result) =
