@@ -1,7 +1,7 @@
 //! Git proxy 的数据类型、异步接口与稳定错误边界。
 //!
 //! Git proxy 配置与仓库认证类型：配置和认证字段保持同名的
-//! snake_case 映射，取消上下文 映射为 `CancellationToken`，同步接口则改为
+//! snake_case 映射，取消状态由 `CancellationToken` 表达，同步接口则改为
 //! 可在线程间共享的异步 trait。认证 token 的 `Debug` 实现始终脱敏，避免诊断日志
 //! 偶然暴露仓库凭据。
 

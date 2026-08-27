@@ -1,18 +1,18 @@
 //! 异步租约实现。
 //!
 //! 协议层保持原有 heartbeat CAS、stop body、状态码分类和健康文件格式；并发层则用
-//! 单调时钟计算本地卡死阈值，用绝对 UTC 时间计算服务端租约，用 `Notify` 代替可重置
-//! timer。三个循环全部登记到 `TaskTracker`，因此退出顺序可被明确等待和测试。
+//! 服务端 heartbeat 时间与 TTL 计算绝对租约期限，用 `Notify` 代替可重置 timer。
+//! 两个循环全部登记到 `TaskTracker`，因此退出顺序可被明确等待和测试。
 
 use std::error::Error;
 use std::ffi::OsString;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use futures_util::{FutureExt, StreamExt};
 use reqwest::header::CONTENT_TYPE;
 use tokio::io::AsyncWriteExt;
@@ -24,10 +24,9 @@ use crate::internal::api::HttpClient;
 use crate::internal::util::{RetryConfig, RetryError, Stopper, retry_operation};
 
 use super::types::{
-    DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD, DEFAULT_SHUTDOWN_GRACE_PERIOD, HealthFileError,
-    HeartbeatError, HeartbeatResponse, LeaseInfo, LeaseManager, LeaseManagerError,
-    LeaseManagerInner, LeaseState, Lifecycle, NO_SERVER_HEARTBEAT, SHUTDOWN_GRACE_PERIOD_BUFFER,
-    StopApiError, StopRequest, StopRequestError,
+    DEFAULT_SHUTDOWN_GRACE_PERIOD, HealthFileError, HeartbeatError, HeartbeatResponse, LeaseInfo,
+    LeaseManager, LeaseManagerError, LeaseManagerInner, LeaseState, Lifecycle, NO_SERVER_HEARTBEAT,
+    SHUTDOWN_GRACE_PERIOD_BUFFER, StopApiError, StopRequest, StopRequestError,
 };
 
 /// 从 `HOME` 生成默认健康文件路径；缺少 `HOME` 时回退到 `/tmp`。
@@ -38,28 +37,6 @@ use super::types::{
 pub fn get_default_health_file_path() -> PathBuf {
     let home = std::env::var_os("HOME").unwrap_or_else(|| OsString::from("/tmp"));
     PathBuf::from(home).join(".agent-health/envmgr-healthy")
-}
-
-/// 读取 `CLAUDE_CODE_STUCK_THRESHOLD_SECONDS`，非法值回退到十分钟。
-pub(super) fn get_claude_code_stuck_threshold() -> Duration {
-    let value = std::env::var("CLAUDE_CODE_STUCK_THRESHOLD_SECONDS").ok();
-    claude_code_stuck_threshold_from(value.as_deref())
-}
-
-/// 解析卡死阈值，供构造函数和无需修改进程环境的并发测试共用。
-pub(super) fn claude_code_stuck_threshold_from(value: Option<&str>) -> Duration {
-    let Some(value) = value.filter(|value| !value.is_empty()) else {
-        return DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD;
-    };
-    if let Ok(seconds) = value.parse::<u64>()
-        && seconds > 0
-    {
-        return Duration::from_secs(seconds);
-    }
-
-    // 该环境变量在 LeaseManager 构造前解析，事件直接写入进程 tracing subscriber。
-    tracing::warn!("value" = ?(value), "default_seconds" = ?(DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD.as_secs()), "{}", "invalid_claude_code_stuck_threshold");
-    DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD
 }
 
 /// 按 marker 规则判断 heartbeat 错误是否永久不可恢复。
@@ -112,13 +89,13 @@ pub fn is_precondition_failed_error(error: Option<&(dyn Error + 'static)>) -> bo
 #[must_use]
 pub fn is_retriable_stop_error(error: &StopRequestError) -> bool {
     match error {
-        StopRequestError::Cancelled { .. } | StopRequestError::DeadlineExceeded => false,
+        StopRequestError::Cancelled | StopRequestError::DeadlineExceeded => false,
         StopRequestError::Api(error) => error.status_code >= 500,
         StopRequestError::Request(_) => true,
     }
 }
 
-/// 创建 LeaseManager，并从环境读取 Claude Code 卡死阈值。
+/// 创建 LeaseManager。
 ///
 /// `api_client` 复用 `internal::api::HttpClient` 的 base URL、超时与 Reqwest 连接池；
 /// heartbeat/stop 的特殊状态码语义仍由本模块解释，不经过通用 JSON 200-only helper。
@@ -134,32 +111,6 @@ pub fn new_lease_manager(
     safety_window: Duration,
     health_file_path: impl Into<PathBuf>,
 ) -> LeaseManager {
-    new_lease_manager_with_stuck_threshold(
-        parent_cancellation,
-        session_id,
-        environment_id,
-        organization_uuid,
-        api_client,
-        interval,
-        safety_window,
-        health_file_path,
-        get_claude_code_stuck_threshold(),
-    )
-}
-
-/// 以显式卡死阈值构造 manager，避免测试修改进程级环境变量。
-#[allow(clippy::too_many_arguments)]
-pub(super) fn new_lease_manager_with_stuck_threshold(
-    parent_cancellation: CancellationToken,
-    session_id: impl Into<String>,
-    environment_id: impl Into<String>,
-    organization_uuid: impl Into<String>,
-    api_client: HttpClient,
-    interval: Duration,
-    safety_window: Duration,
-    health_file_path: impl Into<PathBuf>,
-    claude_code_stuck_threshold: Duration,
-) -> LeaseManager {
     LeaseManager {
         inner: Arc::new(LeaseManagerInner {
             session_id: session_id.into(),
@@ -169,13 +120,11 @@ pub(super) fn new_lease_manager_with_stuck_threshold(
             organization_uuid: organization_uuid.into(),
             api_client,
             health_file_path: health_file_path.into(),
-            claude_code_stuck_threshold,
             state: std::sync::RwLock::new(LeaseState::default()),
             cancellation: parent_cancellation.child_token(),
             tasks: tokio_util::task::TaskTracker::new(),
             heartbeat_loop_exited: CancellationToken::new(),
             expiry_changed: tokio::sync::Notify::new(),
-            activity_changed: tokio::sync::Notify::new(),
         }),
     }
 }
@@ -236,7 +185,7 @@ impl LeaseManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// 发送初始 heartbeat，然后原子登记 heartbeat、expiry、stuck 三个任务。
+    /// 发送初始 heartbeat，然后原子登记 heartbeat、expiry 两个任务。
     ///
     /// 初始请求期间生命周期保持 `Starting`。显式停止会先把它改为 `Stopping`，所以
     /// `TaskTracker::close()` 与这里的 spawn 不会发生“wait 已返回后又新增任务”的竞态。
@@ -278,7 +227,7 @@ impl LeaseManager {
         Ok(())
     }
 
-    /// 将三个后台循环登记到同一个 TaskTracker。
+    /// 将两个后台循环登记到同一个 TaskTracker。
     fn spawn_background_tasks(&self) {
         let heartbeat = self.clone();
         drop(
@@ -292,13 +241,6 @@ impl LeaseManager {
             self.inner
                 .tasks
                 .spawn(async move { expiry.lease_expiry_loop().await }),
-        );
-
-        let stuck = self.clone();
-        drop(
-            self.inner
-                .tasks
-                .spawn(async move { stuck.claude_code_stuck_loop().await }),
         );
     }
 
@@ -332,7 +274,7 @@ impl LeaseManager {
                            }
                            _ = self.inner.cancellation.cancelled() => {
             // 显式取消分支。
-            // Claude Code 无进展超时分支。不得与上方 heartbeat 分支合并，原因同上。
+            // 显式取消单独记录循环退出原因。
                                tracing::info!("session_id" = ?(self.inner.session_id), "error" = ?("operation cancelled"), "{}", "heartbeat_loop_stopped");
                                return;
                            }
@@ -358,7 +300,7 @@ impl LeaseManager {
                 continue;
             }
 
-            // 即便 send_heartbeat 已因 lease_not_extended 调用 stop 并取消 context， // 仍会继续读取 terminal state、再次调用 stop，然后才返回；不能在此提前退出。
+            // 租约未延长时仍需读取终态并完成停止流程，不能在此提前退出。
             let state = self.read_state().instance_state.clone();
             if is_stopping_state(&state) {
                 tracing::info!("session_id" = ?(self.inner.session_id), "state" = ?(state), "{}", "session_entered_terminal_state");
@@ -405,6 +347,11 @@ impl LeaseManager {
 
         let heartbeat: HeartbeatResponse = serde_json::from_slice(&body)
             .map_err(|error| HeartbeatError::Decode(error.to_string()))?;
+        if heartbeat.response_type != "work_heartbeat" {
+            return Err(HeartbeatError::Decode(
+                "heartbeat response type must be work_heartbeat".into(),
+            ));
+        }
         if !heartbeat.lease_extended {
             tracing::warn!("session_id" = ?(self.inner.session_id), "state" = ?(heartbeat.state), "{}", "heartbeat_lease_not_extended");
             self.write_state().instance_state = heartbeat.state.clone();
@@ -419,15 +366,19 @@ impl LeaseManager {
             return Ok(());
         }
 
-        let lease_updated_at = heartbeat.lease_updated_at;
-        let lease_expires_at = lease_updated_at
+        let heartbeat_at = DateTime::parse_from_rfc3339(&heartbeat.last_heartbeat)
+            .map_err(|error| HeartbeatError::Decode(format!("invalid last_heartbeat: {error}")))?
+            .with_timezone(&Utc);
+        let lease_ttl = u64::try_from(heartbeat.ttl_seconds)
+            .ok()
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+            .ok_or_else(|| HeartbeatError::Decode("ttl_seconds must be positive".into()))?;
+        let lease_expires_at = heartbeat_at
             .checked_add_signed(ChronoDuration::seconds(heartbeat.ttl_seconds))
             .ok_or_else(|| {
                 HeartbeatError::Decode("lease expiry is outside datetime range".into())
             })?;
-        let lease_ttl = u64::try_from(heartbeat.ttl_seconds)
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::ZERO);
         {
             let mut state = self.write_state();
             state.last_heartbeat = Some(now);
@@ -435,27 +386,14 @@ impl LeaseManager {
             state.lease_expires_at = Some(lease_expires_at);
             state.instance_state = heartbeat.state.clone();
             state.server_last_heartbeat = Some(heartbeat.last_heartbeat.clone());
-            if state.last_claude_code_activity != Some(lease_updated_at) {
-                // 两种时钟必须在同一个临界区内同步推进：墙钟用于记录日志值，
-                // 单调时钟用于 deadline，避免 NTP 调整让卡死检测提前或延后。
-                state.last_updated_at = Some(Utc::now());
-                state.last_updated_instant = Some(Instant::now());
-            }
-            state.last_claude_code_activity = Some(lease_updated_at);
         }
 
         self.schedule_lease_expiry_check();
-        self.schedule_claude_code_stuck_check();
         tracing::info!("session_id" = ?(self.inner.session_id), "state" = ?(heartbeat.state), "ttl_seconds" = ?(heartbeat.ttl_seconds), "lease_extended" = ?(true), "{}", "heartbeat_success");
         if let Err(error) = self.update_health_file().await {
             tracing::warn!("session_id" = ?(self.inner.session_id), "path" = ?(self.inner.health_file_path), "error" = ?(error.to_string()), "{}", "failed_to_update_health_file");
         }
         Ok(())
-    }
-
-    /// 通知卡死检测任务重新计算 deadline；不额外创建 timer task。
-    fn schedule_claude_code_stuck_check(&self) {
-        self.inner.activity_changed.notify_one();
     }
 
     /// 返回距离绝对租约过期时间的剩余时长；未知或已过期时为零。
@@ -519,66 +457,10 @@ impl LeaseManager {
         }
     }
 
-    /// 计算 stuck loop 下一次等待；尚无活动或阈值为零时返回 `None`。
-    fn claude_code_stuck_delay(&self) -> Option<Duration> {
-        let state = self.read_state();
-        if self.inner.claude_code_stuck_threshold.is_zero() {
-            return None;
-        }
-        state.last_updated_instant.map(|last_updated_at| {
-            self.inner
-                .claude_code_stuck_threshold
-                .saturating_sub(last_updated_at.elapsed())
-        })
-    }
-
-    /// 长驻 Claude Code 卡死循环；只有服务端活动时间戳不再推进达到阈值才终止。
-    async fn claude_code_stuck_loop(&self) {
-        loop {
-            let delay = self.claude_code_stuck_delay();
-            match delay {
-                None => {
-                    tokio::select! {
-                        _ = self.inner.cancellation.cancelled() => return,
-                        _ = self.inner.activity_changed.notified() => continue,
-                    }
-                }
-                Some(delay) => {
-                    tokio::select! {
-                        _ = self.inner.cancellation.cancelled() => return,
-                        _ = self.inner.activity_changed.notified() => continue,
-                        _ = tokio::time::sleep(delay) => {}
-                    }
-                }
-            }
-
-            if self
-                .claude_code_stuck_delay()
-                .is_some_and(|remaining| !remaining.is_zero())
-            {
-                continue;
-            }
-            let (last_updated_at, last_activity) = {
-                let state = self.read_state();
-                (state.last_updated_at, state.last_claude_code_activity)
-            };
-            if last_updated_at.is_none() {
-                continue;
-            }
-            tracing::error!("session_id" = ?(self.inner.session_id), "last_updated_at" = ?(last_updated_at), "last_claude_code_activity" = ?(last_activity), "threshold_seconds" = ?(self.inner.claude_code_stuck_threshold.as_secs()), "{}", "claude_code_stuck_detected");
-            let cancellation = self.inner.cancellation.clone();
-            if let Err(error) = self.call_stop_api(&cancellation, false).await {
-                tracing::error!("session_id" = ?(self.inner.session_id), "error" = ?(error.to_string()), "{}", "failed_to_stop_stuck_session");
-            }
-            self.set_grace_period_and_cancel();
-            return;
-        }
-    }
-
     /// 只在第一个 fatal 路径中计算宽限期，然后取消并关闭 tracker。
     ///
     /// 所有权/退出顺序为：持写锁写入 `Stopping` 和 grace → 释放锁 → 取消 token →
-    /// `TaskTracker::close()`。当前任务随后返回，其他两个任务在 select 中观察取消；
+    /// `TaskTracker::close()`。当前任务随后返回，另一个任务在 select 中观察取消；
     /// heartbeat loop 退出时再触发独立的 loop-exited token；`stop_and_wait` 先等该 token，
     /// 再等 tracker 计数归零。
     pub(super) fn set_grace_period_and_cancel(&self) {
@@ -604,7 +486,6 @@ impl LeaseManager {
         self.inner.cancellation.cancel();
         self.inner.tasks.close();
         self.inner.expiry_changed.notify_waiters();
-        self.inner.activity_changed.notify_waiters();
     }
 
     /// 返回 fatal 退出路径计算出的宽限期；尚未 fatal 时为零。
@@ -689,24 +570,16 @@ impl LeaseManager {
                 let body = body.clone();
                 let cancellation = cancellation.clone();
                 async move {
-                    let cancellation_message = format!(
-                        "stop API request failed: Post \"{}\": operation cancelled",
-                        endpoint.as_str()
-                    );
                     let request = client
                         .post(endpoint)
                         .header(CONTENT_TYPE, "application/json")
                         .body(body)
                         .send();
                     let response = tokio::select! {
-                    // 每轮都会创建带 context 的请求。即使 token 在不可取消的
-                    // backoff 中触发，本轮 operation 仍被调用，再由请求层返回取消
-                    // sentinel，进入统一 classifier 与 error_not_retryable 日志路径。
+                    // 每轮请求都观察取消令牌；若在退避期间取消，下一轮会立即停止。
                                            biased;
                                            _ = cancellation.cancelled() => {
-                                               return Err(StopRequestError::Cancelled {
-                                                   message: cancellation_message,
-                                               });
+                                               return Err(StopRequestError::Cancelled);
                                            }
                                            response = request => response.map_err(|error| {
                                                if error.is_timeout() {
@@ -722,11 +595,8 @@ impl LeaseManager {
                     if status.is_success() {
                         return Ok(());
                     }
-                    // response body 仍绑定创建请求时的 context：收到非 2xx
-                    // headers 后若发生取消，响应体读取会立即返回“已读部分 + error”，
-                    // 调用方忽略 error 并继续按 HTTP status 分类。Reqwest 的 Response
-                    // 不认识本项目 CancellationToken，因此逐 chunk select，取消时保留
-                    // 已经收到的正文并停止等待，避免卡到五分钟 client timeout。
+                    // 收到非 2xx headers 后仍逐块读取正文，同时观察项目取消令牌；
+                    // 取消时保留已收到的正文，避免等待客户端的长超时。
                     let response_body =
                         read_stop_response_body(response.bytes_stream(), &cancellation).await;
                     let response_text = String::from_utf8_lossy(&response_body);
@@ -820,7 +690,6 @@ impl LeaseManager {
         self.inner.cancellation.cancel();
         self.inner.tasks.close();
         self.inner.expiry_changed.notify_waiters();
-        self.inner.activity_changed.notify_waiters();
     }
 
     /// 取消后等待 heartbeat loop 关闭信号和全部受追踪任务退出。

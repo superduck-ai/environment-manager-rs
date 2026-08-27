@@ -175,7 +175,7 @@ impl SessionActivityRecorder {
 
         if let Err(error) = invoker.start() {
             // Start 在重复启动时 panic；新建实例正常不会失败。Rust 的
-            // NoRuntime 同样属于编程错误，不能降级成 中不存在的日志和 noop。
+            // NoRuntime 同样属于编程错误，不能降级成普通日志和无操作。
             panic!("{error}");
         }
 

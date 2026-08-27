@@ -36,7 +36,7 @@ use super::{
 pub const ERR_PROVISIONING_FAILED: &str = "supabase provisioning failed";
 const CONTROL_RESPONSE_LIMIT: usize = 1024;
 
-/// 使用 `0755` 创建目录树，对齐 递归建目录。
+/// 使用 `0755` 创建目录树。
 ///
 /// 显式 mode 很重要：Rust `create_dir_all` 默认请求 `0777`，在宽松 umask 下会让
 /// migrations 或生成类型的父目录额外可写。这里仍让内核应用当前 umask，且不会

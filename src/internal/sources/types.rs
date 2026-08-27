@@ -1,7 +1,7 @@
 //! `internal/sources` 的共享类型与跨子系统适配边界。
 //!
-//! 依赖 interface、可空 interface 和具体 `gitproxy.Manager`。Rust
-//! 版本分别使用 trait object、[`SourceSlot`] 与显式 proxy factory 表达这些语义；
+//! 共享边界分别使用 trait object、[`SourceSlot`] 与显式 proxy factory 表达必选、
+//! 可选和具体代理依赖；
 //! 生产 Git handler 默认接入真实 proxy，测试仍可覆盖或禁用 factory。
 
 use std::{
@@ -232,7 +232,7 @@ pub struct GitProxyConfig {
     pub token_backend: String,
 }
 
-/// 跨模块的 `gitproxy.Manager` 的显式异步适配接口。
+/// 跨模块的 Git proxy 显式异步适配接口。
 #[async_trait]
 pub trait GitProxyManager: Send + Sync {
     /// 启动本地 proxy 并返回 base URL；重复启动语义由实现保持。

@@ -433,8 +433,7 @@ async fn test_install_or_update_claude_code_upgrades_via_cli_and_falls_back_on_f
 
 /// 验证安装错误在有旧版本时降级为 warning，无旧版本时返回致命错误。
 ///
-/// 两个分支都通过公共安装状态机触发私有 `handleInstallError`，并断言返回值与
-/// activity 级别，从而保留 调用方实际可观察的契约。
+/// 两个分支都通过公共安装状态机触发错误处理，并断言返回值与 activity 级别。
 #[tokio::test]
 async fn test_handle_install_error() {
     // fatal npm 分支会替换 PATH；整项测试隔离，避免前半段断言与后半段分属两个进程。

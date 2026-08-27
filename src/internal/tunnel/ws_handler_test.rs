@@ -26,13 +26,13 @@ use super::{
 #[test]
 fn test_websocket_headers_reject_reserved_handshake_duplicates() {
     let cases = [
-        ("Upgrade", "Upgrade"),
-        ("connection", "Connection"),
-        ("Sec-WebSocket-Key", "Sec-Websocket-Key"),
-        ("sec-websocket-version", "Sec-Websocket-Version"),
-        ("Sec-WebSocket-Extensions", "Sec-Websocket-Extensions"),
+        "Upgrade",
+        "connection",
+        "Sec-WebSocket-Key",
+        "sec-websocket-version",
+        "Sec-WebSocket-Extensions",
     ];
-    for (header_name, canonical_name) in cases {
+    for header_name in cases {
         let error = apply_websocket_tunnel_headers(
             &mut HeaderMap::new(),
             &[Header {
@@ -44,12 +44,15 @@ fn test_websocket_headers_reject_reserved_handshake_duplicates() {
         .expect_err("reserved WebSocket header must fail before dialing");
         assert_eq!(
             error.to_string(),
-            format!("websocket: duplicate header not allowed: {canonical_name}")
+            format!(
+                "websocket: duplicate header not allowed: {}",
+                header_name.to_ascii_lowercase()
+            )
         );
     }
 }
 
-/// `Sec-Websocket-Protocol` 仅在 dialer 已配置 Subprotocols 时属于重复头。
+/// 子协议 header 仅在握手器已经配置子协议时属于重复头。
 #[test]
 fn test_websocket_protocol_header_conflicts_only_with_configured_protocols() {
     let header = Header {
@@ -70,7 +73,7 @@ fn test_websocket_protocol_header_conflicts_only_with_configured_protocols() {
         .expect_err("configured Subprotocols must conflict with request header");
     assert_eq!(
         error.to_string(),
-        "websocket: duplicate header not allowed: Sec-Websocket-Protocol"
+        "websocket: duplicate header not allowed: sec-websocket-protocol"
     );
 }
 
@@ -250,7 +253,7 @@ async fn test_local_websocket_abnormal_eof_is_reported_as_close_1006() {
     let close = sender.wait_close().await;
     assert_eq!(close.tunnel_id, "ws-abnormal-eof");
     assert_eq!(close.code, 1006);
-    assert_eq!(close.reason, "unexpected EOF");
+    assert!(close.reason.contains("closing handshake"));
     assert!(sender.errors.lock().unwrap().is_empty());
     peer.await.unwrap();
 }
@@ -291,7 +294,7 @@ async fn test_local_websocket_invalid_utf8_text_reports_protocol_error() {
 
     let error = sender.wait_error().await;
     assert_eq!(error.tunnel_id, "ws-invalid-utf8");
-    assert!(error.error_message.contains("invalid UTF-8"));
+    assert!(error.error_message.contains("UTF-8"));
     assert!(sender.messages.lock().unwrap().is_empty());
     assert!(sender.closes.lock().unwrap().is_empty());
     cancellation.cancel();
@@ -334,7 +337,7 @@ async fn test_local_websocket_fragmented_invalid_utf8_reports_protocol_error() {
 
     let error = sender.wait_error().await;
     assert_eq!(error.tunnel_id, "ws-fragmented-invalid-utf8");
-    assert!(error.error_message.contains("invalid UTF-8"));
+    assert!(error.error_message.contains("UTF-8"));
     assert!(sender.messages.lock().unwrap().is_empty());
     peer.await.unwrap();
 }
@@ -492,7 +495,7 @@ async fn test_timed_out_local_websocket_is_removed_and_socket_discarded() {
         )
         .await
         .expect_err("a peer that does not read must hit the test write deadline");
-    assert_eq!(error.to_string(), "write websocket message: i/o timeout");
+    assert_eq!(error.to_string(), "write websocket message: timed out");
     assert!(handler.lookup_tunnel("ws-write-timeout").await.is_none());
 
     let later_write = handler

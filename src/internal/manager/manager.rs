@@ -118,9 +118,8 @@ impl Manager {
     ///
     /// 顺序严格保持：环境配置与类型创建、三路并行初始化、非致命 MCP/plugin 处理、
     /// lease、executor、setup-only 或 executor+tunnel 并发，以及逆序清理。
-    /// `registerMCPServersAsync` 已合并为本函数创建并等待的 MCP Tokio task；
-    /// `initializeEnvironmentAsync` 则由同一并行阶段直接执行配置应用和 environment
-    /// future。两条路径都返回拥有所有权的结果，不再通过 join handle 后写裸指针。
+    /// MCP 注册和环境初始化在同一并行阶段执行；两条路径都返回拥有所有权的结果，
+    /// 不通过 join handle 后写裸指针。
     pub async fn run(&mut self, cancellation: &CancellationToken) -> Result<(), ManagerError> {
         let started = Instant::now();
         // 恢复结构保留该字段但 Run 不消费；显式读取避免把协议字段误判为死代码。

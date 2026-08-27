@@ -136,7 +136,7 @@ impl SourceAuthProvider for GitHubSourceAuthProvider {
 ///
 /// URL 序列化 会区分 `https://host` 与 `https://host/`；`url::Url` 内部
 /// 则把前者规范化为后者。Git 会在错误输出中回显该 URL，额外 `/` 会同时改变可见
-/// 文本和 `SanitizeOutput` 的精确替换，因此只有原 URL 明确带 path 时才保留根斜杠。
+/// 文本和后续脱敏的精确替换，因此只有原 URL 明确带 path 时才保留根斜杠。
 fn format_authenticated_url(parsed_url: Url, source_url: &str) -> String {
     let explicit_path = source_url
         .split_once("://")

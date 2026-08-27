@@ -98,7 +98,7 @@ fn optional_string(matches: &ArgMatches, id: &str) -> Option<String> {
         .cloned()
 }
 
-/// `RunE` 实现。
+/// 执行一次 poll 子命令。
 ///
 /// 读取 service key 后先调用 whoami。whoami 失败时，只有调用方同时提供组织和环境
 /// ID 才允许继续；成功时则逐项校验显式 ID。随后执行一次非阻塞 poll，并把空队列

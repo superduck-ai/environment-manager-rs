@@ -835,7 +835,7 @@ fn calculate_backoff_uses_capped_positive_jitter() {
     }
 }
 
-/// code-sign 配置优先读取成对环境变量，并保持 `fmt.Fscanf("%d")` 的前缀语义。
+/// code-sign 配置优先读取成对环境变量，端口允许整数后的非数字后缀。
 #[test]
 fn code_sign_config_reads_environment() {
     // 父测试进程只启动隔离子进程，不在自身读写全局环境。

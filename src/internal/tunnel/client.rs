@@ -58,7 +58,7 @@ const MAX_PROXY_RESPONSE_HEADER: usize = 64 * 1024;
 /// `httparse` 需要调用方提供 header 槽位；代理握手不使用这些字段，只需设置合理上限。
 const MAX_PROXY_RESPONSE_HEADERS: usize = 128;
 
-/// 环境代理选择 第一次使用时捕获的进程级代理配置。
+/// 第一次使用时捕获的进程级代理配置。
 static ENVIRONMENT_PROXY_CONFIG: OnceLock<EnvironmentProxyConfig> = OnceLock::new();
 
 /// WebSocket 代理选择所需的原始环境快照。
@@ -81,48 +81,11 @@ struct ProxySelection {
     password_set: bool,
 }
 
-/// 主 Tunnel ping 写入的失败类别。
-///
-/// timeout 不是 tungstenite 错误，因此单独保存；WebSocket 分支保留原始错误，便于
-/// 以便剥离 Rust 库为底层 `io::Error` 添加的 `IO error:` 前缀。
-pub(super) enum PingWriteFailure {
-    Timeout,
-    WebSocket(WebSocketError),
-}
-
-/// 按取消优先级把 ping 写失败转换为稳定错误文本。
-///
-/// # 参数
-/// - `cancellation`：本轮 Tunnel 的取消信号；在写消息失败后首先检查
-///   取消状态，因此并发取消必须覆盖 timeout 或 socket 错误。
-/// - `failure`：Tokio timeout 或 tungstenite 写错误。
-///
-/// # 返回
-/// 返回供连接重试循环处理的稳定错误，不记录日志也不修改连接状态。
-pub(super) fn ping_write_failure(
-    cancellation: &CancellationToken,
-    failure: PingWriteFailure,
-) -> TunnelError {
-    if cancellation.is_cancelled() {
-        return TunnelError::message("operation cancelled");
-    }
-
-    match failure {
-        PingWriteFailure::Timeout => TunnelError::message("write tunnel ping: i/o timeout"),
-        PingWriteFailure::WebSocket(WebSocketError::Io(error)) => {
-            TunnelError::message(format!("write tunnel ping: {error}"))
-        }
-        PingWriteFailure::WebSocket(error) => {
-            TunnelError::message(format!("write tunnel ping: {error}"))
-        }
-    }
-}
-
 impl EnvironmentProxyConfig {
     /// 按大写优先、小写回退的顺序读取进程环境。
     ///
     /// 返回值会由 [`ENVIRONMENT_PROXY_CONFIG`] 缓存，因此运行期修改环境
-    /// 不会改变后续连接，。
+    /// 不会改变后续连接。
     fn from_process() -> Self {
         Self {
             http_proxy: first_non_empty_environment("HTTP_PROXY", "http_proxy"),
@@ -380,19 +343,19 @@ impl Client {
             let writer = writer
                 .as_mut()
                 .ok_or_else(|| TunnelError::message("not connected"))?;
-            match tokio::time::timeout(WRITE_TIMEOUT, writer.send(Message::Ping(Vec::new().into())))
-                .await
-            {
+            let write =
+                tokio::time::timeout(WRITE_TIMEOUT, writer.send(Message::Ping(Vec::new().into())));
+            let result = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(TunnelError::message("operation cancelled")),
+                result = write => result,
+            };
+            match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    return Err(ping_write_failure(
-                        &cancellation,
-                        PingWriteFailure::WebSocket(error),
-                    ));
+                    return Err(TunnelError::message(format!("write tunnel ping: {error}")));
                 }
-                Err(_) => {
-                    return Err(ping_write_failure(&cancellation, PingWriteFailure::Timeout));
-                }
+                Err(_) => return Err(TunnelError::message("write tunnel ping timed out")),
             }
         }
     }
@@ -502,8 +465,7 @@ impl Client {
         tracing::info!("request_id" = ?(cancel.request_id), "{}", "http_tunnel_request_cancelled");
     }
 
-    ///
-    /// 建立一条后端请求的本地 WebSocket tunnel。显式转换结果使 `asWSOpen` 的错误事件仍有独立、可测试的运行时日志位置。
+    /// 建立一条后端请求的本地 WebSocket tunnel；转换失败拥有独立的运行时日志事件。
     async fn handle_ws_open(
         self: &Arc<Self>,
         cancellation: CancellationToken,
@@ -601,7 +563,7 @@ impl Client {
             .ok_or_else(|| TunnelError::message("not connected"))?;
         tokio::time::timeout(WRITE_TIMEOUT, writer.send(Message::Text(text.into())))
             .await
-            .map_err(|_| TunnelError::message("write response: i/o timeout"))?
+            .map_err(|_| TunnelError::message("write tunnel response timed out"))?
             .map_err(|error| TunnelError::message(format!("write response: {error}")))
     }
 
@@ -623,7 +585,7 @@ impl Client {
         };
         tokio::time::timeout(WRITE_TIMEOUT, writer.send(Message::Close(Some(close))))
             .await
-            .map_err(|_| TunnelError::message("close tunnel websocket: i/o timeout"))?
+            .map_err(|_| TunnelError::message("close tunnel websocket timed out"))?
             .map_err(|error| TunnelError::message(format!("close tunnel websocket: {error}")))
     }
 
@@ -805,10 +767,8 @@ async fn connect_websocket_with_proxy_and_websocket_config(
 
 /// 构造 Tunnel 使用的标准 WebSocket 配置。
 ///
-/// 路径没有调用 `SetReadLimit`，因此 text/binary 消息和单帧都没有
-/// WebSocket 层的 64 MiB/16 MiB 上限。tungstenite 默认值恰好带这两个
-/// 上限，必须显式取消。握手校验、子协议协商和 text UTF-8 校验则直接采用
-/// 上游 Tungstenite 的 RFC 行为，不再维护项目私有的 WebSocket 补丁。
+/// Tunnel text/binary 消息和单帧均不设置大小上限；握手校验、子协议协商和 text
+/// UTF-8 校验直接采用 Tungstenite 的 RFC 行为。
 #[must_use]
 pub(super) fn tunnel_websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
@@ -818,9 +778,8 @@ pub(super) fn tunnel_websocket_config() -> WebSocketConfig {
 
 /// 在一个不可重置的 deadline 内读取下一条 Tunnel 应用消息。
 ///
-/// 这相当于一次设置绝对读取 deadline 后调用 `ReadMessage`。`reader` 的 ping/pong
-/// 和库内部 frame 在同一 deadline
-/// 内继续读，不得通过刷控制帧让连接永不超时。`on_pong` 只更新
+/// `reader` 的 ping/pong 和库内部 frame 在同一绝对 deadline 内继续读，不得通过
+/// 刷控制帧让连接永不超时。`on_pong` 只更新
 /// 独立的 90 秒 pong 存活时钟，不影响本 deadline。
 ///
 /// # 返回
@@ -863,12 +822,12 @@ where
     tokio::select! {
         () = cancellation.cancelled() => Err(TunnelError::message("operation cancelled")),
         result = tokio::time::timeout(read_timeout, read_until_data) => {
-            result.unwrap_or_else(|_| Err(TunnelError::message("read tunnel request: i/o timeout")))
+            result.unwrap_or_else(|_| Err(TunnelError::message("read tunnel request timed out")))
         }
     }
 }
 
-/// 按 环境代理选择 规则为 ws/wss 目标选择代理。
+/// 按环境代理规则为 ws/wss 目标选择代理。
 ///
 /// `ws` 对应 `HTTP_PROXY`，`wss` 对应 `HTTPS_PROXY`。CGI 进程中使用
 /// `HTTP_PROXY` 会在 NO_PROXY 判定前拒绝，以防止 CGI header 注入。
@@ -950,9 +909,8 @@ fn parse_environment_proxy_selection(value: &str) -> Option<ProxySelection> {
 
 /// 检查原始代理 authority 的 user-info 是否包含未转义密码分隔符。
 ///
-/// URL parser 以最后一个 `@` 前的第一个字面 `:` 设置 `passwordSet`。这里先截掉
-/// path/query/fragment，再使用最后一个 `@`，从而允许 percent-encoded 字符且不会把
-/// host 端口冒号误当成密码。
+/// 先截掉 path/query/fragment，再使用最后一个 `@`；这样可正确处理 percent-encoded
+/// 字符，也不会把 host 端口冒号误当成密码。
 fn proxy_url_has_explicit_password(raw_url: &str) -> bool {
     let Some((_, after_scheme)) = raw_url.split_once("://") else {
         return false;
@@ -1138,7 +1096,7 @@ fn websocket_target_authority(target: &Url) -> Result<String, WebSocketError> {
     }
 }
 
-/// 按 WebSocket `proxy_FromURL` 支持的 scheme 建立透明代理连接。
+/// 按代理 URL scheme 建立透明连接。
 ///
 /// `http` 使用 CONNECT，`socks5` 使用 RFC 1928/1929；其他
 /// scheme 返回 WebSocket 风格的 `proxy: unknown scheme` 错误。
@@ -1198,7 +1156,7 @@ async fn connect_via_http_proxy(
 
     let (status_code, reason) = read_proxy_response(&mut stream).await?;
     if status_code != 200 {
-        // WebSocket 对非 200 返回 `resp.Status` 中第一个空格后的 reason。
+        // 优先返回代理提供的 reason；缺失时返回状态码。
         let message = if reason.is_empty() {
             status_code.to_string()
         } else {
@@ -1224,15 +1182,9 @@ async fn connect_via_socks5_proxy(proxy: &Url, target: &Url) -> Result<TcpStream
     // SOCKS5 URL 没有隐式 1080。因此在真正发起 DNS/连接前返回缺端口错误，
     // 避免错误地连到一个未配置的端口。
     let proxy_port = socks5_proxy_port(proxy).ok_or_else(|| {
-        let authority = match proxy.host() {
-            Some(Host::Ipv6(address)) => format!("[{address}]"),
-            Some(Host::Domain(domain)) => domain.to_owned(),
-            Some(Host::Ipv4(address)) => address.to_string(),
-            None => String::new(),
-        };
         WebSocketError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("dial tcp: address {authority}: missing port in address"),
+            "SOCKS5 proxy URL requires an explicit port",
         ))
     })?;
     let proxy_address = match proxy.host() {
@@ -1490,7 +1442,7 @@ pub(super) async fn read_proxy_response(
         if read == 0 {
             return Err(WebSocketError::Io(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "unexpected EOF reading proxy response",
+                "proxy response ended before complete headers",
             )));
         }
 

@@ -621,10 +621,13 @@ async fn test_create_lease_manager_sends_authenticated_heartbeat() {
         .and(header("anthropic-beta", "environments-2025-11-01"))
         .and(header_exists("x-environment-runner-version"))
         .and(query_param("organization_uuid", "org-1"))
-        // 不延长租约可以让测试避开默认健康文件写入，同时 Start 仍按 成功。
+        // 不延长租约可以让测试避开默认健康文件写入，同时初始化仍成功。
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "type": "work_heartbeat",
             "lease_extended": false,
-            "state": "running"
+            "state": "running",
+            "last_heartbeat": chrono::Utc::now(),
+            "ttl_seconds": 3600
         })))
         .expect(1)
         .mount(&server)

@@ -309,7 +309,7 @@ pub(super) fn read_code_sign_config() -> Result<CodeSignConfig, String> {
     ))
 }
 
-/// 模拟 `fmt.Fscanf(..., "%d")`：读取首个有符号十进制整数并要求其大于零。
+/// 读取首个有符号十进制整数并要求其大于零；尾随非数字内容不影响结果。
 pub(super) fn scan_positive_integer(value: &str) -> Option<i64> {
     let value = value.trim_start();
     let mut end = 0;

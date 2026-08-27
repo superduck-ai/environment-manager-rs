@@ -244,7 +244,7 @@ pub struct ManagerLeaseRequest {
     pub organization_uuid: String,
 }
 
-/// 已构造 lease 的运行句柄与执行取消上下文。
+/// 已构造 lease 的运行句柄与执行取消令牌。
 #[derive(Clone)]
 pub struct ManagerLeaseRuntime {
     /// start/stop 生命周期句柄。

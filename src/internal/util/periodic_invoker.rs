@@ -126,7 +126,7 @@ impl PeriodicInvoker {
 
     ///
     /// 先把 `running` 置为 false，再发送取消，并等待所有已启动 callback 完整返回。
-    /// 等待使用 async JoinHandle 而不是阻塞 Tokio worker，但返回边界与 `cancel(); wg.Wait()` 相同：调用方继续执行时不会再收到本 invoker 的副作用。
+    /// 使用 async JoinHandle 等待而不阻塞 Tokio worker；返回后所有 callback 均已结束。
     pub async fn stop(&self) {
         let tasks = {
             let mut state = self

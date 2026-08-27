@@ -807,7 +807,7 @@ struct TaskRunTelemetry {
 
 /// 执行完整 `task-run` 命令。
 ///
-/// RunE。参数已经由 Clap 校验，但 stdin 仍无条件读取；
+/// 参数已经由 Clap 校验，但 stdin 仍无条件读取；
 /// session/work/environment ID 以 stdin 为准，随后严格按 ACK、backend、安装、telemetry、
 /// manager 的顺序推进。
 ///
@@ -940,7 +940,7 @@ pub async fn run_task_run(arguments: &TaskRunArgs) -> Result<(), RuntimeError> {
 ///
 /// 函数依次注册 Anthropic/BYOC environment、构造 stdin API adapter、生成
 /// Claude executor factory，再把这些依赖交给 manager。将组装与前置 ACK、
-/// 安装和 telemetry 分开，是为了保留 RunE 的错误顺序。
+/// 安装和 telemetry 分开，以保持命令现有的错误顺序。
 ///
 /// # 副作用
 /// 可创建 environment 资源、MCP server、lease、tunnel 和 Claude direct child；

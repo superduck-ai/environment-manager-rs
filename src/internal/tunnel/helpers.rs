@@ -22,12 +22,9 @@ where
     serde_json::to_vec(value)
 }
 
-///
 /// 按输入顺序追加非空 header，保留同名多值。无效 header name/value 会返回请求
-/// 构造错误，而不会把未经验证的字节交给本地 HTTP/WS 客户端。`Host`
-/// 特例忽略：把它写入 `Request.Header` 后，Transport 仍只使用
-/// `Request.Host`/目标 URL 生成 Host；Rust 若直接透传则可被后端请求覆盖
-/// loopback 目标 authority，因此必须在这一共享边界丢弃。
+/// 构造错误，而不会把未经验证的字节交给本地 HTTP/WS 客户端。普通 HTTP 转发忽略
+/// `Host`，避免后端请求覆盖 loopback 目标 authority。
 pub fn apply_tunnel_headers(
     destination: &mut HeaderMap,
     headers: &[Header],
@@ -55,8 +52,8 @@ pub fn apply_tunnel_headers(
 /// 忽略。第一值写入握手 request-target 的 authority，不能复用 HTTP transport 忽略
 /// `Host` header 的分支。
 /// WebSocket 自己生成的握手保留头若被调用方重复传入，会在联网前返回
-/// `websocket: duplicate header not allowed`；仅 `Sec-Websocket-Protocol`
-/// 在 dialer 未配置子协议时允许由 header 提供。
+/// `websocket: duplicate header not allowed`；仅子协议 header 在握手器未配置子协议时
+/// 允许由调用方提供。
 pub fn apply_websocket_tunnel_headers(
     destination: &mut HeaderMap,
     headers: &[Header],
@@ -69,11 +66,9 @@ pub fn apply_websocket_tunnel_headers(
         }
         let name = HeaderName::from_bytes(header.name.as_bytes())
             .map_err(|error| TunnelError::message(format!("invalid header name: {error}")))?;
-        if let Some(canonical_name) =
-            websocket_duplicate_header_name(&name, subprotocols_configured)
-        {
+        if is_websocket_handshake_header(&name, subprotocols_configured) {
             return Err(TunnelError::message(format!(
-                "websocket: duplicate header not allowed: {canonical_name}"
+                "websocket: duplicate header not allowed: {name}"
             )));
         }
         let value = HeaderValue::from_str(&header.value)
@@ -90,28 +85,22 @@ pub fn apply_websocket_tunnel_headers(
     Ok(())
 }
 
-/// 返回 WebSocket 禁止由 `requestHeader` 重复提供的握手头规范名称。
+/// 判断 WebSocket 握手器自行生成、调用方不得重复提供的 header。
 ///
-/// `HeaderName` 内部统一为小写，本函数显式返回 canonical HTTP header casing 产生的可观测错误文本。协议头只有在
-/// dialer 已通过 `Subprotocols` 配置时才冲突；否则 WebSocket 允许它作为
-/// request header，并保留全部值。
-fn websocket_duplicate_header_name(
-    name: &HeaderName,
-    subprotocols_configured: bool,
-) -> Option<&'static str> {
+/// 子协议头只在调用方已经配置子协议时冲突；否则允许直接由 header 提供。
+fn is_websocket_handshake_header(name: &HeaderName, subprotocols_configured: bool) -> bool {
     match name.as_str() {
-        "upgrade" => Some("Upgrade"),
-        "connection" => Some("Connection"),
-        "sec-websocket-key" => Some("Sec-Websocket-Key"),
-        "sec-websocket-version" => Some("Sec-Websocket-Version"),
-        "sec-websocket-extensions" => Some("Sec-Websocket-Extensions"),
-        "sec-websocket-protocol" if subprotocols_configured => Some("Sec-Websocket-Protocol"),
-        _ => None,
+        "upgrade"
+        | "connection"
+        | "sec-websocket-key"
+        | "sec-websocket-version"
+        | "sec-websocket-extensions" => true,
+        "sec-websocket-protocol" => subprotocols_configured,
+        _ => false,
     }
 }
 
-///
-/// 名称按字典序排列，每个名称的多个值保持原顺序，并转为 canonical HTTP header casing 风格，以稳定差分输出。
+/// 名称按字典序排列，每个名称的多个值保持原顺序。
 #[must_use]
 pub fn flatten_http_headers(source: &HeaderMap) -> Vec<Header> {
     let mut names = source
@@ -123,31 +112,12 @@ pub fn flatten_http_headers(source: &HeaderMap) -> Vec<Header> {
 
     let mut headers = Vec::new();
     for name in names {
-        let canonical_name = canonical_mime_header_key(&name);
         for value in source.get_all(&name) {
             headers.push(Header {
-                name: canonical_name.clone(),
+                name: name.clone(),
                 value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
             });
         }
     }
     headers
-}
-
-/// 将 ASCII header 名称转为每个连字符分段首字母大写的 MIME 形式。
-pub(crate) fn canonical_mime_header_key(name: &str) -> String {
-    let mut upper_next = true;
-    name.bytes()
-        .map(|byte| {
-            if byte == b'-' {
-                upper_next = true;
-                '-'
-            } else if upper_next {
-                upper_next = false;
-                byte.to_ascii_uppercase() as char
-            } else {
-                byte.to_ascii_lowercase() as char
-            }
-        })
-        .collect()
 }

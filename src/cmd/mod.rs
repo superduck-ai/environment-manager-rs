@@ -97,7 +97,7 @@ pub fn command(version: &'static str) -> Command {
         .subcommand(code_sign::add_code_sign_command())
 }
 
-/// 按 入口的 argv0 规则规范化原始参数。
+/// 按进程入口的 argv0 规则规范化原始参数。
 ///
 /// Git 把 `gpg.ssh.program` 配成名为 `code-sign` 的可执行文件时，不会再传入
 /// `code-sign` 子命令。入口检查 `argv[0]` 的 basename，并在它后面插入

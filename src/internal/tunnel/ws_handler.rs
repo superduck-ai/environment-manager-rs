@@ -181,8 +181,8 @@ impl WsHandler {
 
     /// 使用显式 deadline 向本地 WebSocket 发送一条消息。
     ///
-    /// 写 deadline。生产调用固定为
-    /// 10 秒；参数化仅用于在测试中不真实等待十秒。首次写入超时或底层失败后，
+    /// 生产调用的写入 deadline 固定为 10 秒；参数化仅用于在测试中不真实等待十秒。
+    /// 首次写入超时或底层失败后，
     /// 连接的写状态已经不可判断，因而立即从 registry 移除并取消读循环。后续消息
     /// 会稳定得到 `tunnel not found`，不会尝试复用可能残留半帧的 socket。
     pub(super) async fn send_message_with_timeout(
@@ -214,8 +214,8 @@ impl WsHandler {
         let mut sink = tunnel.sink.lock().await;
         let error = match tokio::time::timeout(write_timeout, sink.send(outbound)).await {
             Ok(Ok(())) => return Ok(()),
-            Ok(Err(error)) => local_websocket_write_error_text(&error),
-            Err(_) => "i/o timeout".to_owned(),
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => "timed out".to_owned(),
         };
 
         // timeout 会先丢弃未完成的 send future；随后必须释放写锁再取消读半部，
@@ -291,7 +291,7 @@ impl WsHandler {
             (write_result, close_result)
         })
         .await
-        .map_err(|_| TunnelError::message("close websocket tunnel: i/o timeout"))?;
+        .map_err(|_| TunnelError::message("close websocket tunnel timed out"))?;
         match (write_result, close_result) {
             (Err(write_error), Err(close_error)) => Err(TunnelError::message(format!(
                 "close websocket tunnel: {write_error}; {close_error}"
@@ -371,15 +371,14 @@ impl WsHandler {
                 Err(error) => {
                     if !tunnel.cancellation.is_cancelled() {
                         if is_abnormal_websocket_eof(&error) {
-                            // WebSocket 把未经 close handshake 的 EOF 包装成
-                            // `CloseError{1006, "unexpected EOF"}`，上层因此必须收到
-                            // WsClose，不能改成普通 WsError。
+                            // 未经 close handshake 的 EOF 是 RFC 6455 异常关闭，
+                            // 因此上层收到 1006 close，而不是普通应用错误。
                             let _ = tunnel
                                 .sender
                                 .send_close(WsTunnelClose {
                                     tunnel_id: tunnel.tunnel_id.clone(),
                                     code: 1006,
-                                    reason: "unexpected EOF".to_owned(),
+                                    reason: error.to_string(),
                                 })
                                 .await;
                         } else {
@@ -387,7 +386,7 @@ impl WsHandler {
                                 .sender
                                 .send_error(WsTunnelError {
                                     tunnel_id: tunnel.tunnel_id.clone(),
-                                    error_message: local_websocket_error_text(&error),
+                                    error_message: error.to_string(),
                                 })
                                 .await;
                         }
@@ -401,12 +400,9 @@ impl WsHandler {
 
     /// 仅当 registry 仍指向给定实例时移除它，并取消读任务。
     ///
-    /// `closeTunnelDone` 通过 recover 保护重复关闭 done channel；Rust 把同一
-    /// 生命周期信号并入可重复调用的 [`CancellationToken::cancel`]。这条
-    /// 清理路径调用的是底层 `Conn.Close`，不发 WebSocket close frame；
-    /// Rust 因此也不调用 `SinkExt::close`，而是让取消的读半部和本实例
-    /// 相继 drop，直接关闭共享底层 socket。这一路径无网络 await，
-    /// 所以 replacement/cancel 不会被不响应的 peer 无限阻塞。
+    /// 清理信号可重复触发；本路径不发 WebSocket close frame，而是取消读半部并让
+    /// 实例释放共享 socket。它不执行网络等待，因此 replacement/cancel 不会被不响应
+    /// 的 peer 无限阻塞。
     async fn close_tunnel_instance(
         tunnels: &tokio::sync::RwLock<BTreeMap<String, Arc<WsTunnel>>>,
         tunnel: Arc<WsTunnel>,
@@ -442,9 +438,9 @@ pub(super) fn websocket_close_message(code: i32, reason: &str) -> Message {
 
 /// 判断 tungstenite 读错是否表示 WebSocket 异常 EOF close。
 ///
-/// 底层 TCP 在没有 WebSocket close handshake 时返回 EOF，tungstenite 将其
-/// 表示为 `ResetWithoutClosingHandshake`；某些 stream wrapper 会直接保留
-/// `UnexpectedEof`。两者在 WebSocket 都是代码 1006、文本 `unexpected EOF`。
+/// 底层 TCP 在没有 WebSocket close handshake 时返回 EOF，Tungstenite 通常表示为
+/// `ResetWithoutClosingHandshake`；某些 stream wrapper 会直接保留 `UnexpectedEof`。
+/// 两者按 RFC 6455 都映射为代码 1006。
 fn is_abnormal_websocket_eof(error: &WebSocketError) -> bool {
     matches!(
         error,
@@ -453,33 +449,6 @@ fn is_abnormal_websocket_eof(error: &WebSocketError) -> bool {
         error,
         WebSocketError::Io(error) if error.kind() == std::io::ErrorKind::UnexpectedEof
     )
-}
-
-/// 把本地 WebSocket 底层写错转换为稳定的首错文本。
-///
-/// tungstenite 的 `Io` display 会额外添加 `IO error:`。这里只移除库外壳；
-/// 协议错误仍保留其原始文本，并由调用点统一添加
-/// `write websocket message:` 或 `close websocket tunnel:`。
-fn local_websocket_write_error_text(error: &WebSocketError) -> String {
-    match error {
-        WebSocketError::Io(error) => error.to_string(),
-        error => error.to_string(),
-    }
-}
-
-/// 把本地 WebSocket 读错转成稳定的协议错误文本。
-///
-/// `Io` 去掉 tungstenite 特有的 `IO error:` 外壳。上游 Tungstenite 会拒绝非法
-/// UTF-8 text 和无效 close reason；
-/// `Utf8` 分支把依赖内部错误转换为稳定、明确的 Tunnel 错误文本。
-fn local_websocket_error_text(error: &WebSocketError) -> String {
-    match error {
-        WebSocketError::Io(error) => error.to_string(),
-        WebSocketError::Utf8(detail) => {
-            format!("websocket: invalid UTF-8 text message: {detail}")
-        }
-        error => error.to_string(),
-    }
 }
 
 /// 发送协议错误并包装 sender 失败。

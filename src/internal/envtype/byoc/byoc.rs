@@ -56,8 +56,7 @@ pub static REGISTRATION: LazyLock<Registration> = LazyLock::new(|| Registration 
 
 /// 把 BYOC 创建参数接到真实 podmonitor 状态机的默认工厂。
 ///
-/// 在 `CreateLeaseManager` 中直接调用 `podmonitor.NewLeaseManager`。Rust 保留
-/// 可注入 factory 仅用于隔离测试，但生产默认值始终使用此适配器，避免调用方额外接线。
+/// 生产默认值始终使用 podmonitor 租约管理器；可注入 factory 只用于隔离测试。
 #[derive(Debug, Default)]
 struct PodmonitorLeaseManagerFactory;
 
@@ -529,9 +528,8 @@ impl ByocEnvironmentType {
 
     /// 在文件缺失时安全写入 Claude settings 和 stop hook。
     ///
-    /// `statPath` 预检查已合并进 `create_new` 原子创建路径；已存在的文件永不
-    /// 覆盖，也不会在检查与写入之间留下 TOCTOU 窗口。新文件使用 create-new 消除
-    /// stat/write 竞争；
+    /// 使用 `create_new` 原子创建；已存在的文件永不覆盖，也不会在检查与写入之间留下
+    /// TOCTOU 窗口。
     /// stop hook 在完整写入并 sync 之后才设为 0755，避免执行半成品。
     pub async fn bootstrap_claude_settings(
         &self,

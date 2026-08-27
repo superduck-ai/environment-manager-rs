@@ -90,8 +90,7 @@ impl AuthContext {
 
     /// 返回 Anthropic OAuth token。
     ///
-    /// 名称 `GetAnthropicOAuthToken` 中的 OAuth 缩写在 Rust 中按一个语义词
-    /// 写作 `oauth`；两者读取的是同一私有凭据字段，不做格式转换。
+    /// 读取私有 OAuth 凭据字段，不做格式转换。
     #[must_use]
     pub fn get_anthropic_oauth_token(&self) -> &str {
         &self.anthropic_oauth_token

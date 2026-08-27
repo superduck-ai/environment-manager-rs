@@ -21,13 +21,13 @@ use crate::internal::api::{ClientOptions, HttpClient};
 
 use super::get_default_health_file_path;
 use super::lease_manager::{
-    claude_code_stuck_threshold_from, is_permanent_heartbeat_error, is_precondition_failed_error,
-    is_retriable_stop_error, new_lease_manager_with_stuck_threshold, read_stop_response_body,
+    is_permanent_heartbeat_error, is_precondition_failed_error, is_retriable_stop_error,
+    read_stop_response_body,
 };
 use super::types::{
-    DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD, DEFAULT_SHUTDOWN_GRACE_PERIOD, HeartbeatError,
-    LeaseManager, LeaseManagerError, NO_SERVER_HEARTBEAT, SHUTDOWN_GRACE_PERIOD_BUFFER,
-    StopApiError, StopRequestError,
+    DEFAULT_SHUTDOWN_GRACE_PERIOD, HeartbeatError, HeartbeatResponse, LeaseManager,
+    LeaseManagerError, NO_SERVER_HEARTBEAT, SHUTDOWN_GRACE_PERIOD_BUFFER, StopApiError,
+    StopRequestError,
 };
 
 /// 创建测试用共享 API client，避免网络故障测试等待生产级五分钟超时。
@@ -42,15 +42,14 @@ fn test_client(base_url: &str) -> HttpClient {
     .unwrap()
 }
 
-/// 创建使用显式 stuck 阈值且不写日志的测试 manager。
+/// 创建使用短网络超时且不写健康文件的测试 manager。
 fn test_manager(
     base_url: &str,
     interval: Duration,
     safety_window: Duration,
     health_file_path: impl Into<PathBuf>,
-    stuck_threshold: Duration,
 ) -> LeaseManager {
-    new_lease_manager_with_stuck_threshold(
+    super::lease_manager::new_lease_manager(
         CancellationToken::new(),
         "session-1",
         "env-1",
@@ -59,7 +58,6 @@ fn test_manager(
         interval,
         safety_window,
         health_file_path,
-        stuck_threshold,
     )
 }
 
@@ -73,40 +71,49 @@ fn query_value(request: &Request, key: &str) -> Option<String> {
 }
 
 /// 生成一次成功延长租约的标准响应。
-fn successful_heartbeat(last_heartbeat: &str, lease_updated_at: DateTime<Utc>) -> Value {
+fn successful_heartbeat(last_heartbeat: &str) -> Value {
     json!({
+        "type": "work_heartbeat",
         "lease_extended": true,
         "state": "running",
         "last_heartbeat": last_heartbeat,
         "ttl_seconds": 3600,
-        "lease_updated_at": lease_updated_at,
     })
 }
 
-/// 验证默认健康路径和环境变量阈值解析。
+/// 验证默认健康路径。
 #[test]
-fn test_default_health_path_and_stuck_threshold() {
+fn test_default_health_path() {
     assert!(get_default_health_file_path().ends_with(Path::new(".agent-health/envmgr-healthy")));
-    assert_eq!(
-        claude_code_stuck_threshold_from(None),
-        DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD
-    );
-    assert_eq!(
-        claude_code_stuck_threshold_from(Some("")),
-        DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD
-    );
-    assert_eq!(
-        claude_code_stuck_threshold_from(Some("7")),
-        Duration::from_secs(7)
-    );
-    assert_eq!(
-        claude_code_stuck_threshold_from(Some("bad")),
-        DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD
-    );
-    assert_eq!(
-        claude_code_stuck_threshold_from(Some("0")),
-        DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD
-    );
+}
+
+/// heartbeat DTO 接受当前后端五字段响应，并拒绝任何必填字段缺失。
+#[test]
+fn heartbeat_response_matches_backend_schema() {
+    let response = json!({
+        "lease_extended": true,
+        "state": "running",
+        "last_heartbeat": "2026-08-17T00:00:00Z",
+        "ttl_seconds": 3600,
+        "type": "work_heartbeat"
+    });
+    serde_json::from_value::<HeartbeatResponse>(response.clone())
+        .expect("current backend heartbeat response must decode with its documented fields");
+
+    for field in [
+        "lease_extended",
+        "state",
+        "last_heartbeat",
+        "ttl_seconds",
+        "type",
+    ] {
+        let mut missing = response.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        assert!(
+            serde_json::from_value::<HeartbeatResponse>(missing).is_err(),
+            "missing {field} must not silently use a zero value"
+        );
+    }
 }
 
 /// 验证连续 heartbeat 更新租约、健康文件和 CAS 前值。
@@ -115,14 +122,13 @@ async fn test_heartbeat_success_updates_lease_health_and_expected_heartbeat() {
     let server = MockServer::start().await;
     let heartbeat_count = Arc::new(AtomicUsize::new(0));
     let response_count = Arc::clone(&heartbeat_count);
+    let server_heartbeat = Utc::now().to_rfc3339();
+    let response_heartbeat = server_heartbeat.clone();
     Mock::given(method("POST"))
         .and(path("/v1/environments/env-1/work/session-1/heartbeat"))
         .respond_with(move |_request: &Request| {
-            let count = response_count.fetch_add(1, Ordering::SeqCst) + 1;
-            ResponseTemplate::new(200).set_body_json(successful_heartbeat(
-                &format!("server-hb-{count}"),
-                Utc::now(),
-            ))
+            response_count.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(successful_heartbeat(&response_heartbeat))
         })
         .expect(2)
         .mount(&server)
@@ -135,7 +141,6 @@ async fn test_heartbeat_success_updates_lease_health_and_expected_heartbeat() {
         Duration::from_secs(3600),
         Duration::ZERO,
         health_file.clone(),
-        Duration::from_secs(3600),
     );
     manager.send_heartbeat().await.unwrap();
     manager.send_heartbeat().await.unwrap();
@@ -157,7 +162,7 @@ async fn test_heartbeat_success_updates_lease_health_and_expected_heartbeat() {
     );
     assert_eq!(
         query_value(heartbeats[1], "expected_last_heartbeat").as_deref(),
-        Some("server-hb-1")
+        Some(server_heartbeat.as_str())
     );
 
     let lease = manager.get_lease_info();
@@ -177,8 +182,11 @@ async fn test_heartbeat_lease_not_extended_stopping_stops_and_cancels() {
     Mock::given(method("POST"))
         .and(path("/v1/environments/env-1/work/session-1/heartbeat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "type": "work_heartbeat",
             "lease_extended": false,
             "state": "stopping",
+            "last_heartbeat": Utc::now(),
+            "ttl_seconds": 3600,
         })))
         .expect(1)
         .mount(&server)
@@ -190,13 +198,7 @@ async fn test_heartbeat_lease_not_extended_stopping_stops_and_cancels() {
         .mount(&server)
         .await;
 
-    let manager = test_manager(
-        &server.uri(),
-        Duration::from_secs(3600),
-        Duration::ZERO,
-        "",
-        Duration::from_secs(3600),
-    );
+    let manager = test_manager(&server.uri(), Duration::from_secs(3600), Duration::ZERO, "");
     manager.send_heartbeat().await.unwrap();
 
     assert!(manager.cancellation_token().is_cancelled());
@@ -226,13 +228,7 @@ async fn test_start_initial_heartbeat_failure_and_stop_after_start() {
         .expect(1)
         .mount(&server)
         .await;
-    let manager = test_manager(
-        &server.uri(),
-        Duration::from_millis(10),
-        Duration::ZERO,
-        "",
-        Duration::from_secs(3600),
-    );
+    let manager = test_manager(&server.uri(), Duration::from_millis(10), Duration::ZERO, "");
 
     let error = manager.start().await.unwrap_err();
     assert!(matches!(error, LeaseManagerError::InitialHeartbeat(_)));
@@ -245,25 +241,20 @@ async fn test_start_initial_heartbeat_failure_and_stop_after_start() {
     );
 }
 
-/// 验证成功 start 后显式 stop 会取消并等待三个后台任务退出。
+/// 验证成功 start 后显式 stop 会取消并等待两个后台任务退出。
 #[tokio::test]
 async fn stop_after_start_waits_for_tracked_tasks() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/environments/env-1/work/session-1/heartbeat"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(successful_heartbeat("server-hb", Utc::now())),
+            ResponseTemplate::new(200)
+                .set_body_json(successful_heartbeat(&Utc::now().to_rfc3339())),
         )
         .expect(1)
         .mount(&server)
         .await;
-    let manager = test_manager(
-        &server.uri(),
-        Duration::from_secs(3600),
-        Duration::ZERO,
-        "",
-        Duration::from_secs(3600),
-    );
+    let manager = test_manager(&server.uri(), Duration::from_secs(3600), Duration::ZERO, "");
     manager.start().await.unwrap();
 
     tokio::time::timeout(Duration::from_secs(1), manager.stop())
@@ -283,7 +274,7 @@ async fn test_heartbeat_loop_permanent_error_stops_session() {
         .respond_with(move |_request: &Request| {
             if response_count.fetch_add(1, Ordering::SeqCst) == 0 {
                 ResponseTemplate::new(200)
-                    .set_body_json(successful_heartbeat("server-hb", Utc::now()))
+                    .set_body_json(successful_heartbeat(&Utc::now().to_rfc3339()))
             } else {
                 ResponseTemplate::new(412).set_body_string("Precondition Failed")
             }
@@ -298,13 +289,7 @@ async fn test_heartbeat_loop_permanent_error_stops_session() {
         .mount(&server)
         .await;
 
-    let manager = test_manager(
-        &server.uri(),
-        Duration::from_millis(10),
-        Duration::ZERO,
-        "",
-        Duration::from_secs(3600),
-    );
+    let manager = test_manager(&server.uri(), Duration::from_millis(10), Duration::ZERO, "");
     let cancellation = manager.cancellation_token();
     manager.start().await.unwrap();
     tokio::time::timeout(Duration::from_secs(1), cancellation.cancelled())
@@ -325,13 +310,7 @@ async fn test_call_stop_api_forced_and_stop_error_classification() {
         .expect(1)
         .mount(&server)
         .await;
-    let manager = test_manager(
-        &server.uri(),
-        Duration::from_secs(3600),
-        Duration::ZERO,
-        "",
-        Duration::from_secs(3600),
-    );
+    let manager = test_manager(&server.uri(), Duration::from_secs(3600), Duration::ZERO, "");
     manager
         .call_stop_api_forced(&CancellationToken::new())
         .await
@@ -358,9 +337,7 @@ async fn test_call_stop_api_forced_and_stop_error_classification() {
     assert!(is_retriable_stop_error(&StopRequestError::Api(
         StopApiError::new(500, "server error")
     )));
-    assert!(!is_retriable_stop_error(&StopRequestError::Cancelled {
-        message: "operation cancelled".to_owned(),
-    }));
+    assert!(!is_retriable_stop_error(&StopRequestError::Cancelled));
     assert!(!is_retriable_stop_error(
         &StopRequestError::DeadlineExceeded
     ));
@@ -377,7 +354,6 @@ async fn test_call_stop_api_observes_pre_cancel_inside_operation() {
         Duration::from_secs(3600),
         Duration::ZERO,
         "",
-        Duration::from_secs(3600),
     );
     let cancellation = CancellationToken::new();
     cancellation.cancel();
@@ -386,11 +362,8 @@ async fn test_call_stop_api_observes_pre_cancel_inside_operation() {
         .call_stop_api(&cancellation, false)
         .await
         .unwrap_err();
-    assert!(matches!(&error, StopRequestError::Cancelled { .. }));
-    assert_eq!(
-        error.to_string(),
-        "stop API request failed: Post \"https://api.example.test/v1/environments/env-1/work/session-1/stop?organization_uuid=org-1\": operation cancelled"
-    );
+    assert!(matches!(&error, StopRequestError::Cancelled));
+    assert_eq!(error.to_string(), "stop API request cancelled");
 }
 
 /// 验证 HTTP 400 stop 错误在第一次尝试后立即返回。
@@ -403,13 +376,7 @@ async fn test_call_stop_api_reports_non_retriable_status_once() {
         .expect(1)
         .mount(&server)
         .await;
-    let manager = test_manager(
-        &server.uri(),
-        Duration::from_secs(3600),
-        Duration::ZERO,
-        "",
-        Duration::from_secs(3600),
-    );
+    let manager = test_manager(&server.uri(), Duration::from_secs(3600), Duration::ZERO, "");
     let error = manager
         .call_stop_api(&CancellationToken::new(), false)
         .await
@@ -425,7 +392,7 @@ async fn test_call_stop_api_reports_non_retriable_status_once() {
 
 /// 服务端发出非 2xx headers 后，即使响应体永久停住，取消也必须及时结束请求。
 ///
-/// 完整读取响应体 由 request context 中断且忽略读取错误；本测试使用原始
+/// 完整读取响应体可由取消令牌中断；本测试使用原始
 /// HTTP server 故意声明更长正文但不结束连接，防止 Reqwest 自行把 EOF 当作完成。
 /// 取消与客户端交付 headers 存在真实竞态，因此允许请求层取消或 HTTP 400 两种结果，
 /// 但两者都必须在一秒内返回；下一个测试再确定性固定已经进入 body 阶段的 partial。
@@ -461,7 +428,6 @@ async fn test_call_stop_api_cancels_stalled_error_body() {
         Duration::from_secs(3600),
         Duration::ZERO,
         "",
-        Duration::from_secs(3600),
     );
     let cancellation = CancellationToken::new();
     let call_cancellation = cancellation.clone();
@@ -479,7 +445,7 @@ async fn test_call_stop_api_cancels_stalled_error_body() {
         .expect_err("HTTP 400 remains an API error after body cancellation");
     assert!(matches!(
         error,
-        StopRequestError::Cancelled { .. }
+        StopRequestError::Cancelled
             | StopRequestError::Api(StopApiError {
                 status_code: 400,
                 ..
@@ -565,48 +531,12 @@ fn test_heartbeat_error_classifiers_and_grace_period() {
         Duration::from_secs(3600),
         Duration::ZERO,
         "",
-        Duration::from_secs(3600),
     );
     manager.inner.state.write().unwrap().lease_expires_at =
         Some(Utc::now() + ChronoDuration::milliseconds(50));
     manager.set_grace_period_and_cancel();
     assert!(manager.cancellation_token().is_cancelled());
     assert!(manager.get_grace_period() >= SHUTDOWN_GRACE_PERIOD_BUFFER);
-}
-
-/// 验证活动时间戳不再推进时，Notify 重算不会推迟卡死退出。
-#[tokio::test]
-async fn repeated_heartbeat_with_same_activity_triggers_stuck_shutdown() {
-    let server = MockServer::start().await;
-    let lease_updated_at = Utc::now();
-    Mock::given(method("POST"))
-        .and(path("/v1/environments/env-1/work/session-1/heartbeat"))
-        .respond_with(move |_request: &Request| {
-            ResponseTemplate::new(200)
-                .set_body_json(successful_heartbeat("same-heartbeat", lease_updated_at))
-        })
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/environments/env-1/work/session-1/stop"))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let manager = test_manager(
-        &server.uri(),
-        Duration::from_millis(10),
-        Duration::ZERO,
-        "",
-        Duration::from_millis(40),
-    );
-    let cancellation = manager.cancellation_token();
-    manager.start().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(1), cancellation.cancelled())
-        .await
-        .expect("unchanged activity must trigger stuck shutdown");
-    manager.stop_and_wait().await;
 }
 
 /// 验证安全窗口到达时租约任务调用 stop 并取消其余任务。
@@ -616,11 +546,11 @@ async fn lease_expiry_safety_window_triggers_shutdown() {
     Mock::given(method("POST"))
         .and(path("/v1/environments/env-1/work/session-1/heartbeat"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "type": "work_heartbeat",
             "lease_extended": true,
             "state": "running",
-            "last_heartbeat": "server-hb",
+            "last_heartbeat": Utc::now(),
             "ttl_seconds": 1,
-            "lease_updated_at": Utc::now(),
         })))
         .expect(1)
         .mount(&server)
@@ -637,7 +567,6 @@ async fn lease_expiry_safety_window_triggers_shutdown() {
         Duration::from_secs(3600),
         Duration::from_millis(950),
         "",
-        Duration::from_secs(3600),
     );
     let cancellation = manager.cancellation_token();
     manager.start().await.unwrap();
@@ -655,7 +584,6 @@ async fn test_update_health_file() {
         Duration::from_secs(3600),
         Duration::ZERO,
         "",
-        Duration::from_secs(3600),
     );
     manager.update_health_file().await.unwrap();
 
@@ -666,7 +594,6 @@ async fn test_update_health_file() {
         Duration::from_secs(3600),
         Duration::ZERO,
         health_file.clone(),
-        Duration::from_secs(3600),
     );
     manager.update_health_file().await.unwrap();
     let content = tokio::fs::read_to_string(health_file).await.unwrap();

@@ -464,7 +464,7 @@ async fn test_removes_consumed_http_framing_headers() {
     result.unwrap();
     assert_eq!(recorded_body(&sender), b"a");
     let headers = &sender.headers.lock().unwrap()[0].headers;
-    assert!(headers.iter().any(|header| header.name == "X-Keep"));
+    assert!(headers.iter().any(|header| header.name == "x-keep"));
     for removed in [
         "Transfer-Encoding",
         "Content-Length",
@@ -655,12 +655,12 @@ async fn test_preserves_content_encoding_without_negotiating_compression() {
     assert!(
         headers
             .iter()
-            .any(|header| header.name == "Content-Encoding" && header.value == "gzip"),
+            .any(|header| header.name == "content-encoding" && header.value == "gzip"),
     );
     assert!(
         headers
             .iter()
-            .any(|header| header.name == "Content-Length" && header.value == "7"),
+            .any(|header| header.name == "content-length" && header.value == "7"),
     );
 }
 

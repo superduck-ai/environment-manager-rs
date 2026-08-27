@@ -6,9 +6,9 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -19,9 +19,6 @@ use crate::internal::api::HttpClient;
 /// 服务端尚未返回过 heartbeat 标识时发送的 CAS sentinel。
 pub(super) const NO_SERVER_HEARTBEAT: &str = "NO_HEARTBEAT";
 
-/// Claude Code 活动时间不再变化时的默认判定阈值。
-pub(super) const DEFAULT_CLAUDE_CODE_STUCK_THRESHOLD: Duration = Duration::from_secs(10 * 60);
-
 /// 没有可用租约过期时间时采用的最短退出宽限期。
 pub(super) const DEFAULT_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
@@ -31,28 +28,17 @@ pub(super) const SHUTDOWN_GRACE_PERIOD_BUFFER: Duration = Duration::from_secs(5)
 /// `/heartbeat` 成功响应的 wire 结构。
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub(super) struct HeartbeatResponse {
+    /// 固定响应 discriminator。
+    #[serde(rename = "type")]
+    pub(super) response_type: String,
     /// 服务端是否实际延长租约。
-    #[serde(default)]
     pub(super) lease_extended: bool,
     /// 环境实例状态。
-    #[serde(default)]
     pub(super) state: String,
-    /// 下一次心跳要作为 CAS 前置条件回传的服务端标识。
-    #[serde(default)]
+    /// 数据库 heartbeat 的 RFC 3339 时间戳；同时用作下一次 CAS 前置条件。
     pub(super) last_heartbeat: String,
     /// 新租约 TTL，单位秒。
-    #[serde(default)]
     pub(super) ttl_seconds: i64,
-    /// 服务端最后观察到 Claude Code 活动并更新租约的时间。
-    #[serde(default = "default_lease_updated_at")]
-    pub(super) lease_updated_at: DateTime<Utc>,
-}
-
-/// 返回公元一年 UTC 零值。
-fn default_lease_updated_at() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(1, 1, 1, 0, 0, 0)
-        .single()
-        .expect("公元一年 UTC 是固定有效时间")
 }
 
 /// `/stop` 请求主体。
@@ -130,12 +116,9 @@ impl HeartbeatError {
 /// stop 请求及其重试过程的稳定错误集合。
 #[derive(Debug, Error)]
 pub enum StopRequestError {
-    /// `CancellationToken` 已被触发，形成取消错误 sentinel。
-    #[error("{message}")]
-    Cancelled {
-        /// 保留 HTTP client 经 source chain 包装后的完整错误文本。
-        message: String,
-    },
+    /// `CancellationToken` 已被触发。
+    #[error("stop API request cancelled")]
+    Cancelled,
     /// 供 deadline 驱动的调用方保留 deadline 错误 sentinel 语义。
     #[error("operation deadline exceeded")]
     DeadlineExceeded,
@@ -189,7 +172,7 @@ pub enum HealthFileError {
 pub struct LeaseInfo {
     /// 最近一次成功延长租约的本地时间。
     pub last_heartbeat: Option<DateTime<Utc>>,
-    /// 由服务端更新时间加 TTL 得到的绝对过期时间。
+    /// 由服务端 heartbeat 时间加 TTL 得到的绝对过期时间。
     pub lease_expires_at: Option<DateTime<Utc>>,
     /// 最近一次服务端实例状态。
     pub instance_state: String,
@@ -203,7 +186,7 @@ pub(super) enum Lifecycle {
     Created,
     /// 初始 heartbeat 正在进行。
     Starting,
-    /// 三个后台任务已经交给 tracker。
+    /// 两个后台任务已经交给 tracker。
     Running,
     /// 已发出取消，不允许再创建后台任务。
     Stopping,
@@ -222,15 +205,6 @@ pub(super) struct LeaseState {
     pub(super) lease_ttl: Duration,
     /// 最近服务端状态。
     pub(super) instance_state: String,
-    /// 最近一次发现 `lease_updated_at` 变化的本地墙钟时间。
-    ///
-    /// 同名字段既参与 `time.Since`，又会原样写入结构化日志；Rust 将日志值
-    /// 单独保留为 UTC 墙钟，从而确保 `last_updated_at` 仍是绝对时间而不是 elapsed。
-    pub(super) last_updated_at: Option<DateTime<Utc>>,
-    /// 与 `last_updated_at` 同时更新的单调时钟，用于抵抗系统时间跳变。
-    pub(super) last_updated_instant: Option<Instant>,
-    /// 最近一个服务端 Claude Code 活动时间戳。
-    pub(super) last_claude_code_activity: Option<DateTime<Utc>>,
     /// fatal 退出时计算出的宽限期。
     pub(super) shutdown_grace_period: Duration,
     /// heartbeat CAS 的服务端前值。
@@ -257,20 +231,16 @@ pub(super) struct LeaseManagerInner {
     pub(super) api_client: HttpClient,
     /// 成功 heartbeat 后更新的健康文件路径；空路径禁用。
     pub(super) health_file_path: PathBuf,
-    /// Claude Code 卡死阈值。
-    pub(super) claude_code_stuck_threshold: Duration,
     /// 短临界区共享状态。
     pub(super) state: RwLock<LeaseState>,
     /// 从调用方 token 派生、由 manager 独占取消权的子 token。
     pub(super) cancellation: CancellationToken,
-    /// 统一追踪 heartbeat、expiry 和 stuck 三个任务。
+    /// 统一追踪 heartbeat 和 expiry 两个任务。
     pub(super) tasks: TaskTracker,
     /// 关闭信号；只有 heartbeat loop 真正退出才触发。
     pub(super) heartbeat_loop_exited: CancellationToken,
     /// heartbeat 更新租约后唤醒 expiry 任务重新计算 deadline。
     pub(super) expiry_changed: Notify,
-    /// heartbeat 更新活动后唤醒 stuck 任务重新计算 deadline。
-    pub(super) activity_changed: Notify,
 }
 
 /// 可克隆的 LeaseManager 句柄。

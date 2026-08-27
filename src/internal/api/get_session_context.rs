@@ -78,7 +78,7 @@ impl SessionsClient {
         }
     }
 
-    /// 解释 `GetSessionContext` 已读取的响应 body，并保持 状态码错误文本。
+    /// 解释已经读取的 session context 响应正文，并保留状态码诊断。
     ///
     /// # 参数
     /// - `status`：后端返回的 HTTP 状态码。

@@ -32,8 +32,8 @@ pub(super) struct Handler {
 impl Handler {
     /// 创建 handler，并保留构造时生成的仓库 token 快照。
     ///
-    /// server 每次 `Start` 都从 `RepoAuths` 构造一张新 map；这里使用 `Arc` 让
-    /// Axum 为并发连接克隆 handler 时不复制敏感字符串，同时保持启动后的配置隔离。
+    /// 构造时固定仓库认证 map；这里使用 `Arc` 让 Axum 为并发连接克隆 handler 时
+    /// 不复制敏感字符串，同时保持启动后的配置隔离。
     pub(super) fn new(
         config: Arc<Config>,
         http_client: reqwest::Client,

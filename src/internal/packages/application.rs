@@ -60,7 +60,7 @@ pub(super) trait CommandRunner: Send + Sync {
     async fn run(&self, context: &ProvisionContext, command: &Command) -> CommandResult;
 }
 
-/// 取消上下文 在 package provisioning 内需要的取消与 deadline 子集。
+/// package provisioning 使用的取消令牌与 deadline。
 #[derive(Debug, Clone)]
 pub(crate) struct ProvisionContext {
     cancellation: CancellationToken,
@@ -319,7 +319,7 @@ where
     }
 
     // 第一遍只判断“是否恰好一个完整 JSON 值”；这样字段类型等 schema 错误不会被
-    // 错误归到 decode。第二遍的手写 visitor 再拒绝未知、重复和大小写不匹配字段。
+    // 错误归到 decode。第二遍由派生的严格 DTO 拒绝未知、重复和大小写不匹配字段。
     // manifest 协议会把 JSON 字符串内的非法 UTF-8 字节替换为 U+FFFD，而不是把整份
     // 输入判成语法错误。先做同样的有损转换，避免输入错误地落入 decode 分支，或在
     // package manager 处理前被拒绝。
@@ -345,14 +345,14 @@ impl PackageManifest {
     /// 统计六个列表的 spec 总数。
     #[must_use]
     fn count(&self) -> usize {
-        self.lists().iter().map(|specs| specs.values.len()).sum()
+        self.lists().iter().map(|specs| specs.len()).sum()
     }
 
     /// 生成严格固定顺序且完全不经过 shell 的 argv。
     #[must_use]
     fn plan(&self) -> Vec<Command> {
         let mut commands = Vec::new();
-        if !self.apt.values.is_empty() {
+        if !self.apt.is_empty() {
             commands.push(Command {
                 manager: Manager::Apt,
                 stage: Stage::Prepare,
@@ -360,7 +360,7 @@ impl PackageManifest {
                 args: vec!["update".to_owned()],
             });
             let mut args = vec!["install".to_owned(), "-y".to_owned(), "--".to_owned()];
-            args.extend(self.apt.values.iter().cloned());
+            args.extend(self.apt.iter().cloned());
             commands.push(Command {
                 manager: Manager::Apt,
                 stage: Stage::Install,
@@ -373,16 +373,10 @@ impl PackageManifest {
             Manager::Cargo,
             "cargo",
             &["install"],
-            &self.cargo.values,
+            &self.cargo,
         );
-        append_batch_command(
-            &mut commands,
-            Manager::Gem,
-            "gem",
-            &["install"],
-            &self.gem.values,
-        );
-        for spec in &self.go.values {
+        append_batch_command(&mut commands, Manager::Gem, "gem", &["install"], &self.gem);
+        for spec in &self.go {
             commands.push(Command {
                 manager: Manager::Go,
                 stage: Stage::Install,
@@ -395,15 +389,9 @@ impl PackageManifest {
             Manager::Npm,
             "npm",
             &["install", "--global", "--"],
-            &self.npm.values,
+            &self.npm,
         );
-        append_batch_command(
-            &mut commands,
-            Manager::Pip,
-            "pip",
-            &["install"],
-            &self.pip.values,
-        );
+        append_batch_command(&mut commands, Manager::Pip, "pip", &["install"], &self.pip);
         commands
     }
 }

@@ -515,8 +515,8 @@ impl GitHandler<'_> {
         environment: &[(String, String)],
         args: &[String],
     ) -> SourcesResult<()> {
-        // 在进入 `runGitCommand` 后立即启动计时，参数复制、脱敏和命令构造都属于
-        // `duration_ms`；起点不能下移到 spawn，否则短命令的毫秒边界会产生差分。
+        // 进入命令执行函数后立即启动计时；参数复制、脱敏和命令构造都计入
+        // `duration_ms`，避免短命令漏记准备耗时。
         let command_started = Instant::now();
         let mut git_args = vec!["-c".to_owned(), GIT_HTTP_PROXY_AUTH_CONFIG.to_owned()];
         git_args.extend_from_slice(args);
@@ -897,7 +897,7 @@ impl GitHandler<'_> {
         .await?;
 
         let clone_duration_ms = elapsed_milliseconds(clone_started);
-        // 在 后台任务 中计算 pack size，并与 post-clone Hook 并行。这里用
+        // 在后台任务中计算 pack size，并与 post-clone hook 并行。这里用
         // spawn_blocking 保持相同时序，也避免同步目录遍历占住 Tokio worker。
         let pack_path = repo_path.to_owned();
         let pack_task = tokio::task::spawn_blocking(move || {
@@ -912,8 +912,7 @@ impl GitHandler<'_> {
             Err(error) => (0, 0, Some(error.to_string())),
         };
         if let Some(error) = pack_error {
-            // 只有一个 `result.err != `None`` 日志调用点；即便 Tokio worker 自身异常，
-            // 也汇入同一调用点，避免 Rust 分支凭空增加一条记录。
+            // pack 统计错误和 worker 异常汇入同一日志调用点。
             tracing::warn!("error" = ?(error), "{}", "Failed to calculate repo size");
             pack_size_bytes = -1;
         }

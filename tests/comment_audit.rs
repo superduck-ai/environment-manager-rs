@@ -3,7 +3,8 @@
 //! 该测试扫描手写生产源码，保证每个模块和函数都具有中文文档注释。自动生成的
 //! 生成器产物位于 Cargo `OUT_DIR`，不进入扫描；`src/gen` 中的手写 wrapper 仍参与
 //! 审计。测试模块不参与函数 rustdoc 门禁，避免测试样板产生噪声；但其中的 unsafe
-//! 仍必须说明。`vendor` 位于扫描根之外，第三方补丁由各依赖目录单独审计。
+//! 仍必须说明。迁移期旧符号也不得留在注释中，避免实现说明重新依赖已经删除的代码。
+//! `vendor` 位于扫描根之外，第三方补丁由各依赖目录单独审计。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -256,6 +257,83 @@ fn unsafe_blocks_have_chinese_safety_comments() {
     assert!(
         failures.is_empty(),
         "unsafe 中文说明审计失败:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// 验证注释没有重新引用已经删除的迁移期符号。
+#[test]
+fn comments_do_not_reference_removed_migration_symbols() {
+    const FORBIDDEN_TERMS: &[&str] = &[
+        "RunE",
+        "fmt.Fscanf",
+        "runTaskRunManager",
+        "Cmd.Run",
+        "cmd.Stdin",
+        "Cmd.Dir",
+        "bytes.Buffer",
+        "os/exec",
+        "skipStdinCopyError",
+        "PathError",
+        "registerMCPServersAsync",
+        "initializeEnvironmentAsync",
+        "GetSessionContext",
+        "ClientOptions.Timeout",
+        "isEventData",
+        "api.LogCategory",
+        "closeTunnelDone",
+        "Conn.Close",
+        "runGitCommand",
+        "CreateLeaseManager",
+        "podmonitor.NewLeaseManager",
+        "statPath",
+        "GetAnthropicOAuthToken",
+        "SanitizeOutput",
+        "proxy_FromURL",
+        "resp.Status",
+        "passwordSet",
+        "asWSOpen",
+        "SetReadLimit",
+        "ReadMessage",
+        "RepoAuths",
+        "time.Since",
+        "cancel(); wg.Wait()",
+        "requestHeader",
+        "Request.Header",
+        "Request.Host",
+        "NewToolResultText",
+        "NewToolResultError",
+        "handleInstallError",
+        "result.err",
+        "gitproxy.Manager",
+    ];
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut failures = Vec::new();
+
+    for file in unsafe_audit_sources(&root) {
+        let source = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("读取 {} 失败: {error}", file.display()));
+        for (index, line) in source.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if !(trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*'))
+            {
+                continue;
+            }
+            for term in FORBIDDEN_TERMS {
+                if line.contains(term) {
+                    failures.push(format!(
+                        "{}:{} 注释仍引用迁移期符号 `{term}`",
+                        file.display(),
+                        index + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "迁移注释审计失败:\n{}",
         failures.join("\n")
     );
 }

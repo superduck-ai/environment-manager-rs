@@ -1,8 +1,8 @@
 //! Claude Code 主子进程的参数、环境、FD、stdio 与生命周期实现。
 //!
 //! 本模块由 `manager` 创建，向下
-//! 调用配置、认证、会话活动记录与 tailer；结构上把 `Cmd.Run` 拆为 Tokio
-//! child、两个有界生命周期 stream task 和显式清理阶段，但保持外部顺序与副作用。
+//! 调用配置、认证、会话活动记录与 tailer；进程由 Tokio child、两个有界生命周期
+//! stream task 和显式清理阶段共同管理，同时保持外部顺序与副作用。
 //!
 //! stdout/stderr 以原始字节同时写入内存和 `/tmp/claude-code.log`，因此 stream-json
 //! 与 NDJSON 不会经历解析或重编码。敏感 token 先写入匿名 pipe，再在 `pre_exec`
@@ -498,8 +498,8 @@ impl ClaudeCodeExecutor {
 
         let working_dir = self.resolve_working_directory(configured_working_dir);
         if local_testing_mode {
-            // 在构造 `cmd.Stdin` 时立即记录此事件；实际字节仍由 Tokio 在 spawn
-            // 后写入匿名 stdin pipe，但日志顺序必须保持在环境和文件准备之前。
+            // 构造命令前立即记录此事件；实际字节在 spawn 后写入匿名 stdin pipe，
+            // 但日志顺序必须保持在环境和文件准备之前。
             tracing::info!("Passing user message via stdin (WebSocket disabled)");
         }
         let mut environment = self.build_child_environment();
@@ -521,8 +521,8 @@ impl ClaudeCodeExecutor {
             .env_clear()
             .envs(environment)
             .kill_on_drop(true);
-        // 当前目录读取 失败时 保持 `Cmd.Dir == ""`，让 exec 继承当前目录；给 Tokio
-        // 传空 Path 会变成一次失败的 chdir，所以 None 分支必须完全不调用 current_dir。
+        // 当前目录读取失败时继承进程工作目录；向 Tokio 传空 Path 会触发一次失败的
+        // chdir，所以 None 分支完全不调用 current_dir。
         if let Some(directory) = working_dir.as_deref() {
             command.current_dir(directory);
         }
@@ -834,8 +834,7 @@ impl ClaudeCodeExecutor {
         drop(command);
         let mut stdin = child.stdin.take().expect("stdin configured as piped");
         if local_testing_mode {
-            // 把 `bytes.Buffer` 交给 `os/exec`，child 提前退出造成的 EPIPE 会由
-            // `skipStdinCopyError` 忽略，也不会产生应用日志；Rust 同样只尽力写入。
+            // 测试消息只尽力写入；若 child 提前退出造成 EPIPE，不产生应用日志。
             let _ = stdin.write_all(b"update README.md with hello world").await;
         }
         drop(stdin);
@@ -955,7 +954,7 @@ impl ClaudeCodeExecutor {
 
         if let Some(error) = run.error.as_deref() {
             // 日志文件和 JSON 属性必须是合法 UTF-8；只在这些观测旁路生成替换
-            // 视图，最终返回的 ClaudeError 仍拼接原始 PathError 字节。
+            // 视图，最终返回的 ClaudeError 仍拼接原始路径错误字节。
             let error_view = String::from_utf8_lossy(error);
             append_log(
                 log_file,
@@ -1304,7 +1303,7 @@ where
 /// 汇合 stream task，将 panic/cancel 与 I/O 错误压成单层原始字节。
 ///
 /// 当前 Tokio join/I/O 文案都是 UTF-8，但统一使用字节类型可避免它与 spawn 的
-/// 非 UTF-8 `PathError` 在 `ExecutionRun` 汇合时被迫提前转换。
+/// 非 UTF-8 路径错误在 `ExecutionRun` 汇合时被迫提前转换。
 async fn join_stream(task: JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, Vec<u8>> {
     task.await
         .map_err(|error| error.to_string().into_bytes())?

@@ -114,8 +114,7 @@ impl HttpClient {
     ///
     /// 重试 attempt/backoff 事件直接写入进程 tracing subscriber。
     pub fn with_options(base_url: &str, options: ClientOptions) -> Result<Self, ApiError> {
-        // 把 `ClientOptions.Timeout == 0` 当作未配置，而不是“立即超时”。Rust 用
-        // Option 表达缺省，但调用方仍可能显式传入 Duration::ZERO，必须合并处理。
+        // 零时长与缺省值都使用五分钟默认超时，避免把显式零解释为立即超时。
         let timeout = options
             .timeout
             .filter(|timeout| !timeout.is_zero())

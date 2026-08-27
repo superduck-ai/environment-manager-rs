@@ -206,9 +206,8 @@ pub struct EnvManagerLogEventData {
 impl EnvManagerLogEventData {
     /// 表明该结构可以序列化到 session event 的动态 data 槽位。
     ///
-    /// 空 marker `isEventData` 只承担编译期类型约束；Rust 构造函数会先把该
-    /// 结构序列化为 `serde_json::Value`。返回 true 的强类型谓词表达同一事实，且
-    /// 不伪造一个没有业务行为的空回调。
+    /// 构造函数会先把该结构序列化为 `serde_json::Value`；此强类型谓词表明它可以
+    /// 放入 session event 的动态 data 槽位。
     #[must_use]
     pub const fn is_event_data(&self) -> bool {
         true
@@ -223,8 +222,7 @@ pub enum LogCategory {
     Init,
     /// Claude Code 主执行过程。
     ///
-    /// 公开常量只声明 `init`，但 executor 通过开放字符串类型显式发送
-    /// `api.LogCategory("execute")`；Rust 闭合枚举必须把该实际 wire 值列出。
+    /// executor 发送到后端的 wire 值为 `execute`。
     Execute,
 }
 

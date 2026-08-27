@@ -456,7 +456,7 @@ fn task_run_normal_runtime_error_is_rendered_once() {
     assert_eq!(rendered, b"Error: ordinary failure\n");
 }
 
-/// `runTaskRunManager` 测试双：立即返回指定结果，不触发真实信号。
+/// task-run manager 测试双：立即返回指定结果，不触发真实信号。
 struct FakeTaskRunManager {
     result: Option<Result<(), ManagerError>>,
 }

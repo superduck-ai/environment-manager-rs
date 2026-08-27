@@ -204,7 +204,7 @@ pub struct CallToolResult {
     pub extra: Map<String, Value>,
 }
 
-/// 创建与 MCP wire `NewToolResultText` 相同的单文本成功结果。
+/// 创建只包含一个文本块的成功工具结果。
 #[must_use]
 pub fn new_tool_result_text(text: impl Into<String>) -> CallToolResult {
     CallToolResult {
@@ -217,7 +217,7 @@ pub fn new_tool_result_text(text: impl Into<String>) -> CallToolResult {
     }
 }
 
-/// 创建与 MCP wire `NewToolResultError` 相同的单文本工具错误。
+/// 创建只包含一个文本块的工具错误结果。
 #[must_use]
 pub fn new_tool_result_error(text: impl Into<String>) -> CallToolResult {
     CallToolResult {
