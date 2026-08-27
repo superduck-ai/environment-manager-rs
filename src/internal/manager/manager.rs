@@ -533,7 +533,7 @@ impl Manager {
         self.configure_git_signing(cancellation).await;
     }
 
-    /// 创建 `/tmp/code-sign` 并尽力写入四项全局 Git SSH 签名配置。
+    /// 创建 `/tmp/code-sign` 并尽力写入全局 Git 身份与 SSH 签名配置。
     ///
     /// 路径或 symlink 失败会提前降级；单项 `git config` 失败只 warning 并继续。取消
     /// 通过 [`run_combined_command`] 只 kill 当前 direct child。
@@ -574,6 +574,8 @@ impl Manager {
             |home| PathBuf::from(home).join(".ssh/commit_signing_key.pub"),
         );
         let git_configurations = [
+            ("user.name", OsString::from("oma")),
+            ("user.email", OsString::from("oma@superduck.ai")),
             ("gpg.format", OsString::from("ssh")),
             ("gpg.ssh.program", OsString::from(CODE_SIGN_PATH)),
             ("commit.gpgsign", OsString::from("true")),
