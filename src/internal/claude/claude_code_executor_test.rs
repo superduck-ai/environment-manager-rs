@@ -23,6 +23,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::internal::{
+    codesign::{CONTEXT_ENV as CODESIGN_CONTEXT_ENV, CodeSignContext},
     config::{ClaudeConfig, McpConfigFile, StartupContext},
     session::NoopActivityRecorder,
 };
@@ -262,6 +263,17 @@ fn agent_proxy_uses_final_api_base_url_priority() {
         .find(|(key, _)| key == "ANTHROPIC_BASE_URL")
         .map(|(_, value)| value.to_string_lossy());
     assert_eq!(final_value.as_deref(), Some("https://startup.example.test"));
+
+    let code_sign_context = environment
+        .iter()
+        .rev()
+        .find(|(key, _)| key == CODESIGN_CONTEXT_ENV)
+        .map(|(_, value)| serde_json::from_slice::<CodeSignContext>(value.as_encoded_bytes()))
+        .expect("code-sign context must be injected")
+        .expect("code-sign context must be valid JSON");
+    assert_eq!(code_sign_context.session_id, "session-123");
+    assert!(!code_sign_context.use_code_sessions);
+    assert!(code_sign_context.sources.is_empty());
 }
 
 /// 开启 CCRv2 relay 却没有 ingress token 时必须在 spawn Claude 前失败。

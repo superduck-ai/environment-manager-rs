@@ -1,24 +1,27 @@
 //! 隐藏签名包装命令。
 //!
 //! Git 的 `gpg.ssh.program` 会传入 OpenSSH 的 `-Y`、
-//! `-f`、`-n` 等值必须原样保留。本文件还实现配置发现、Git object format 探测、
-//! loopback MCP JSON-RPC、指数退避以及 `.sig` 文件副作用校验。
+//! `-f`、`-n` 等值必须原样保留。本文件还实现 Git object format 探测，并使用
+//! session ingress token 直接请求远端签名 API、写出同名 `.sig` 文件。
 
-use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use clap::builder::OsStringValueParser;
 use clap::{Arg, ArgMatches, Command};
-use rand::Rng as _;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::io::AsyncWriteExt as _;
 
 use super::error::CliError;
-use super::types::{
-    CodeSignConfig, McpRequest, McpResponse, McpToolCallParams, McpToolResult, RetryConfig,
+use crate::internal::{
+    codesign::{CONTEXT_ENV as CODESIGN_CONTEXT_ENV, CodeSignContext},
+    util::{claude_code_version, version},
 };
+
+const SESSION_INGRESS_TOKEN_FILE_ENV: &str = "CLAUDE_SESSION_INGRESS_TOKEN_FILE";
 
 /// 禁用 flag 解析后捕获到的 code-sign 原始 argv。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +34,7 @@ impl CodeSignArgs {
     /// 根据参数序列识别受支持的签名操作。
     ///
     /// 当前只支持参数序列中出现 `-Y sign` 的 SSH 签名。该方法不访问文件系统，
-    /// 相对路径的绝对化、配置读取与 MCP 调用留给执行层完成。
+    /// 相对路径的绝对化、凭据读取与远端 API 调用留给执行层完成。
     pub fn parse_operation(&self) -> Result<CodeSignOperation, String> {
         let (found_sign_operation, filtered) = remove_ssh_sign_marker(&self.raw_args);
         if !found_sign_operation {
@@ -65,8 +68,8 @@ pub struct SshSignArgs {
 /// 构造隐藏且完全关闭 help/flag 解析的 `code-sign` 子命令。
 pub(crate) fn add_code_sign_command() -> Command {
     Command::new("code-sign")
-        .about("Act as a GPG/SSH signing wrapper using the MCP codesign server")
-        .long_about("This command acts as a GPG/SSH signing wrapper that invokes the MCP \ncodesign server for signing operations. It's designed to be used with git's \ngpg.ssh.program configuration.")
+        .about("Act as a GPG/SSH signing wrapper using the remote signing API")
+        .long_about("This command acts as a GPG/SSH signing wrapper that invokes the remote \nsigning API using the current session ingress token. It's designed to be used \nwith git's gpg.ssh.program configuration.")
         .hide(true)
         .disable_help_flag(true)
         .disable_version_flag(true)
@@ -163,21 +166,6 @@ fn starts_with_dash(value: &OsStr) -> bool {
 }
 
 ///
-/// attempt 为零时直接返回初始值；其余轮次先按指数因子计算并截断到最大值，再添加
-/// `[0%, 30%)` 的正抖动。最大值只约束抖动前基础值，这是 的刻意行为。
-pub(super) fn calculate_backoff(attempt: usize, config: RetryConfig) -> Duration {
-    if attempt == 0 {
-        return config.initial_backoff;
-    }
-    let initial = config.initial_backoff.as_secs_f64();
-    let exponent = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
-    let base =
-        (initial * config.backoff_factor.powi(exponent)).min(config.max_backoff.as_secs_f64());
-    let jitter = rand::rng().random_range(0.0_f64..1.0) * 0.3 * base;
-    Duration::from_secs_f64(base + jitter)
-}
-
-///
 /// 识别原始 `-Y sign` 操作并转交 SSH 签名实现。任何其他 GPG/SSH 操作都返回明确
 /// 的稳定错误；本函数不会把原始 argv（可能含路径或其他敏感参数）写入日志。
 pub async fn run_code_sign(arguments: &CodeSignArgs) -> Result<(), String> {
@@ -187,14 +175,13 @@ pub async fn run_code_sign(arguments: &CodeSignArgs) -> Result<(), String> {
 }
 
 ///
-/// 将文件路径绝对化，探测仓库 object format，从环境或临时文件读取 MCP 配置，调用
-/// `sign_file` 工具并确认服务端创建了同名 `.sig` 文件。`-n` 与 `-f` 仅打印调试
-/// 提示，继续由服务端选择实际签名 key。
+/// 将文件路径绝对化，探测仓库 object format，从 Claude child 环境读取非敏感签名
+/// 上下文和 ingress token 文件，直接请求远端签名 API 并以 0600 写出 `.sig`。
+/// `-n` 与 `-f` 仅打印调试提示，继续由远端服务选择实际签名 key。
 ///
 /// # 副作用
-/// 读取工作目录和配置、执行 `git config`、访问 loopback HTTP server、读取签名文件
-/// 元数据并写 stderr。HTTP 调用和重试不受外层命令取消影响，只受 10 秒
-/// 客户端超时约束。
+/// 读取工作目录、配置和待签名文件，执行 `git config`，访问远端 HTTP API，创建签名
+/// 文件并写 stderr。等待 response headers 最多 30 秒。
 pub(super) async fn handle_ssh_sign(arguments: &SshSignArgs) -> Result<(), String> {
     let original_path = arguments.file_path.to_string_lossy().into_owned();
     let file_path = if arguments.file_path.is_absolute() {
@@ -226,106 +213,71 @@ pub(super) async fn handle_ssh_sign(arguments: &SshSignArgs) -> Result<(), Strin
         }
     };
     let git_object_format = get_git_object_format(&working_dir);
-    let config = read_code_sign_config()
-        .map_err(|error| format!("failed to read codesign server configuration: {error}"))?;
-    let request_id = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    let request = McpRequest {
-        jsonrpc: "2.0".to_owned(),
-        id: format!("sign-{request_id}"),
-        method: "tools/call".to_owned(),
-        params: McpToolCallParams {
-            name: "sign_file".to_owned(),
-            arguments: BTreeMap::from([
-                ("file_path".to_owned(), json!(file_path.to_string_lossy())),
-                (
-                    "repo_directory".to_owned(),
-                    json!(working_dir.to_string_lossy()),
-                ),
-                ("git_object_format".to_owned(), json!(git_object_format)),
-            ]),
-        },
-    };
-    let result_raw = call_mcp_server(&config, &request)
+    let context = read_code_sign_context()?;
+    let ingress_token = read_session_ingress_token()?;
+    let bytes = tokio::fs::read(&file_path)
         .await
-        .map_err(|error| format!("failed to call MCP server: {error}"))?;
-    let tool_result: McpToolResult = serde_json::from_slice(&result_raw)
-        .map_err(|error| format!("failed to parse tool result: {error}"))?;
-    if tool_result.is_error {
-        let message = tool_result
-            .content
-            .first()
-            .and_then(|content| {
-                // 类型字段不参与错误文案，但读取它可明确表明未知 MCP content 类型也
-                // 仍按 使用首个非空 text，而不是拒绝整个响应。
-                let _content_type = &content.r#type;
-                (!content.text.is_empty()).then_some(content.text.as_str())
-            })
-            .unwrap_or("unknown error");
-        return Err(format!("signing failed: {message}"));
+        .map_err(|error| format!("cannot open file {}: {error}", file_path.display()))?;
+    let content = String::from_utf8_lossy(&bytes).into_owned();
+    if content.is_empty() {
+        return Err("content to sign cannot be empty".to_owned());
     }
-
+    let source = context.source_for_repository(&working_dir);
+    let signature = request_signature(
+        &context,
+        &ingress_token,
+        RemoteSignRequest {
+            contents: content,
+            source,
+            git_object_format: git_object_format.to_owned(),
+        },
+    )
+    .await?;
     let signature_path = PathBuf::from(format!("{}.sig", file_path.to_string_lossy()));
-    match std::fs::metadata(&signature_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(format!(
-            "signature file not created: {}",
-            signature_path.display()
-        )),
-        // 只针对 not-found 判定 失败；权限等其他 stat 错误会被忽略，不能在错误处理时
-        // 擅自收紧为“所有 metadata 错误都失败”。
-        _ => Ok(()),
-    }
+    write_signature(&signature_path, signature.as_bytes()).await
 }
 
-///
-/// 先尝试同时存在的 `CODESIGN_MCP_PORT`/`CODESIGN_MCP_TOKEN`；端口不是正整数时静默
-/// 回退 `/tmp/codesign-mcp-config.json`。文件缺失、JSON 无效或字段不完整统一折叠为
-/// “configuration not found”，避免泄露 token 或产生来源相关分支。
-pub(super) fn read_code_sign_config() -> Result<CodeSignConfig, String> {
-    const CONFIG_PATH: &str = "/tmp/codesign-mcp-config.json";
-    let port_env = std::env::var("CODESIGN_MCP_PORT").unwrap_or_default();
-    let token_env = std::env::var("CODESIGN_MCP_TOKEN").unwrap_or_default();
-    if !port_env.is_empty()
-        && !token_env.is_empty()
-        && let Some(port) = scan_positive_integer(&port_env)
-    {
-        return Ok(CodeSignConfig {
-            port,
-            bearer_token: token_env,
-        });
-    }
-
-    if let Ok(data) = std::fs::read(CONFIG_PATH)
-        && let Ok(config) = serde_json::from_slice::<CodeSignConfig>(&data)
-        && config.port > 0
-        && !config.bearer_token.is_empty()
-    {
-        return Ok(config);
-    }
-    Err(format!(
-        "codesign server configuration not found: checked CODESIGN_MCP_PORT/CODESIGN_MCP_TOKEN env vars and {CONFIG_PATH}"
-    ))
+/// 发送给远端签名 API 的稳定 JSON body。
+#[derive(Debug, Serialize)]
+struct RemoteSignRequest {
+    contents: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<Value>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    git_object_format: String,
 }
 
-/// 读取首个有符号十进制整数并要求其大于零；尾随非数字内容不影响结果。
-pub(super) fn scan_positive_integer(value: &str) -> Option<i64> {
-    let value = value.trim_start();
-    let mut end = 0;
-    for (index, character) in value.char_indices() {
-        if index == 0 && matches!(character, '+' | '-') {
-            end = character.len_utf8();
-            continue;
-        }
-        if character.is_ascii_digit() {
-            end = index + character.len_utf8();
-        } else {
-            break;
-        }
+/// 远端签名 API 的成功响应。
+#[derive(Debug, Deserialize)]
+struct RemoteSignResponse {
+    #[serde(default)]
+    signature: String,
+}
+
+/// 从 Claude child 的可信环境项读取直接签名上下文。
+pub(super) fn read_code_sign_context() -> Result<CodeSignContext, String> {
+    let raw = std::env::var(CODESIGN_CONTEXT_ENV)
+        .map_err(|_| format!("code-sign context not found in {CODESIGN_CONTEXT_ENV}"))?;
+    serde_json::from_str(&raw).map_err(|error| format!("invalid code-sign context: {error}"))
+}
+
+/// 从 executor 创建的 0600 文件读取 session ingress token。
+pub(super) fn read_session_ingress_token() -> Result<String, String> {
+    let path = std::env::var_os(SESSION_INGRESS_TOKEN_FILE_ENV)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            format!("session ingress token file not found in {SESSION_INGRESS_TOKEN_FILE_ENV}")
+        })?;
+    let token = std::fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "failed to read session ingress token file {}: {error}",
+            PathBuf::from(&path).display()
+        )
+    })?;
+    if token.is_empty() {
+        return Err("session ingress token is required for authentication".to_owned());
     }
-    let parsed = value.get(..end)?.parse::<i64>().ok()?;
-    (parsed > 0).then_some(parsed)
+    Ok(token)
 }
 
 ///
@@ -351,119 +303,62 @@ pub(super) fn get_git_object_format(working_dir: &std::path::Path) -> &'static s
 }
 
 ///
-/// 发送一次带 JSON content type 和 Bearer token 的 POST，请求成功必须同时满足 HTTP
-/// 200、合法 JSON-RPC response、没有 error 且存在 result。JSON-RPC 允许
-/// `result: null`，因此该值仍区别于字段缺失并原样返回。
-pub(super) async fn do_single_attempt(
-    client: &reqwest::Client,
-    url: &str,
-    request_data: &[u8],
-    bearer_token: &str,
-) -> Result<Vec<u8>, String> {
-    let request = client
-        .post(url)
+/// 使用 session ingress token 调用一次远端签名接口并验证签名响应。
+async fn request_signature(
+    context: &CodeSignContext,
+    ingress_token: &str,
+    request: RemoteSignRequest,
+) -> Result<String, String> {
+    let endpoint = context.endpoint()?;
+    let client = reqwest::Client::new();
+    let mut request_builder = client
+        .post(&endpoint)
         .header(CONTENT_TYPE, "application/json")
-        .header(AUTHORIZATION, format!("Bearer {bearer_token}"))
-        .body(request_data.to_vec())
-        .build()
-        .map_err(|error| format!("failed to create request: {error}"))?;
-    let response = client
-        .execute(request)
+        .header("anthropic-version", "2023-06-01")
+        .header("x-environment-runner-version", version())
+        .header(AUTHORIZATION, format!("Bearer {ingress_token}"))
+        .json(&request);
+    if let Some(claude_version) = claude_code_version().filter(|value| !value.is_empty()) {
+        request_builder = request_builder.header("x-claude-code-version", claude_version);
+    }
+    let response = tokio::time::timeout(Duration::from_secs(30), request_builder.send())
         .await
-        .map_err(|error| format!("failed to send request: {error}"))?;
+        .map_err(|_| "failed to call signing server: response header timeout".to_owned())?
+        .map_err(|error| format!("failed to call signing server: {error}"))?;
     let status = response.status();
     let response_body = response
         .bytes()
         .await
-        .map_err(|error| format!("failed to read response: {error}"))?;
+        .map_err(|error| format!("failed to read signing response: {error}"))?;
     if status != reqwest::StatusCode::OK {
         return Err(format!(
-            "MCP server returned status {}: {}",
+            "signing server returned status {}: {}",
             status.as_u16(),
             String::from_utf8_lossy(&response_body)
         ));
     }
-
-    let value: Value = serde_json::from_slice(&response_body)
-        .map_err(|error| format!("failed to parse response: {error}"))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| "failed to parse response: expected a JSON object".to_owned())?;
-    let response: McpResponse = serde_json::from_value(value.clone())
-        .map_err(|error| format!("failed to parse response: {error}"))?;
-    // jsonrpc、id 和 typed result 不参与 控制流，但读取后保留类型作为协议审计点。
-    let _protocol_fields = (&response.jsonrpc, &response.id, &response.result);
-    if let Some(error) = response.error {
-        let _error_code = error.code;
-        return Err(format!("MCP error: {}", error.message));
+    let response: RemoteSignResponse = serde_json::from_slice(&response_body)
+        .map_err(|error| format!("failed to parse signing response: {error}"))?;
+    if response.signature.is_empty() {
+        return Err("no signature returned from server".to_owned());
     }
-    let result = object
-        .get("result")
-        .ok_or_else(|| "no result in MCP response".to_owned())?;
-    serde_json::to_vec(result).map_err(|error| format!("failed to parse response: {error}"))
+    Ok(response.signature)
 }
 
-///
-/// 总尝试次数为 `max_retries + 1`。每次失败在 stderr 打印当前尝试、总次数、带抖动
-/// 的等待和原始错误；最后一次失败不再 sleep，并用“after N retries”包装最后原因。
-pub(super) async fn do_attempts_with_retry(
-    client: &reqwest::Client,
-    url: &str,
-    request_data: &[u8],
-    bearer_token: &str,
-    retry_config: RetryConfig,
-) -> Result<Vec<u8>, String> {
-    let mut last_error = String::new();
-    for attempt in 0..=retry_config.max_retries {
-        match do_single_attempt(client, url, request_data, bearer_token).await {
-            Ok(result) => return Ok(result),
-            Err(error) => last_error = error,
-        }
-        if attempt >= retry_config.max_retries {
-            continue;
-        }
-        let backoff = calculate_backoff(attempt + 1, retry_config);
-        eprintln!(
-            "MCP server request failed (attempt {}/{}), retrying in {:?}: {}",
-            attempt + 1,
-            retry_config.max_retries + 1,
-            backoff,
-            last_error
-        );
-        tokio::time::sleep(backoff).await;
-    }
-    Err(format!(
-        "MCP server request failed after {} retries: {}",
-        retry_config.max_retries, last_error
-    ))
-}
-
-///
-/// 将请求编码为紧凑 JSON，创建 10 秒总超时客户端，并访问固定 loopback `/mcp`
-/// 路径。默认最多重试两次，基础退避 100ms、上限 2s、指数因子 2。
-pub(super) async fn call_mcp_server(
-    config: &CodeSignConfig,
-    request: &McpRequest,
-) -> Result<Vec<u8>, String> {
-    let request_data = serde_json::to_vec(request)
-        .map_err(|error| format!("failed to serialize request: {error}"))?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|error| format!("failed to create request: {error}"))?;
-    let url = format!("http://127.0.0.1:{}/mcp", config.port);
-    let retry_config = RetryConfig {
-        max_retries: 2,
-        initial_backoff: Duration::from_millis(100),
-        max_backoff: Duration::from_secs(2),
-        backoff_factor: 2.0,
-    };
-    do_attempts_with_retry(
-        &client,
-        &url,
-        &request_data,
-        &config.bearer_token,
-        retry_config,
-    )
-    .await
+/// 创建或截断 Git 约定的 `.sig` 文件，并在返回前 flush 完整签名。
+async fn write_signature(path: &std::path::Path, signature: &[u8]) -> Result<(), String> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true).mode(0o600);
+    let mut output = options
+        .open(path)
+        .await
+        .map_err(|error| format!("failed to write signature to {}: {error}", path.display()))?;
+    output
+        .write_all(signature)
+        .await
+        .map_err(|error| format!("failed to write signature to {}: {error}", path.display()))?;
+    output
+        .flush()
+        .await
+        .map_err(|error| format!("failed to write signature to {}: {error}", path.display()))
 }

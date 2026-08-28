@@ -45,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 use crate::internal::{
     api::{ClaudeCodeExecutionError, LogCategory, LogLevel},
     auth::AuthContext,
+    codesign::{CONTEXT_ENV as CODESIGN_CONTEXT_ENV, CodeSignContext},
     config::{ClaudeConfig, Source, StartupContext},
     logger::LogWriter,
     process::terminate_and_reap,
@@ -678,6 +679,25 @@ impl ClaudeCodeExecutor {
                 tracing::info!(api_base_url = %value, "Using ANTHROPIC_BASE_URL from environment config");
             }
         }
+        let working_directory = self
+            .cfg
+            .as_ref()
+            .map(|configuration| configuration.working_dir.as_str())
+            .filter(|directory| !directory.is_empty())
+            .map_or_else(PathBuf::new, PathBuf::from);
+        let code_sign_context = CodeSignContext::from_runtime(
+            &self.session_id,
+            &self.startup_context,
+            &working_directory,
+        );
+        let serialized_context = serde_json::to_string(&code_sign_context)
+            .expect("CodeSign context contains only serializable values");
+        // 放在用户环境之后，防止 startup environment 覆盖 session、端点或 source
+        // 选择；JWT 仍由 prepare_authentication 的专用 token 文件单独注入。
+        environment.push((
+            OsString::from(CODESIGN_CONTEXT_ENV),
+            OsString::from(serialized_context),
+        ));
         environment
     }
 

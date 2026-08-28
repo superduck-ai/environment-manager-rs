@@ -686,15 +686,15 @@ async fn test_init_git_repo_initializes_repository() {
         .unwrap();
     assert_eq!(
         git_output(temp.path(), &["log", "--format=%s", "-1"]),
-        "Initial project from Baku template"
+        "Initial project"
     );
     assert_eq!(
         git_output(temp.path(), &["config", "--get", "user.email"]),
-        "claude@anthropic.com"
+        "oma@superduck.ai"
     );
     assert_eq!(
         git_output(temp.path(), &["config", "--get", "user.name"]),
-        "Claude"
+        "oma"
     );
     assert_eq!(
         git_output(temp.path(), &["config", "--get", "gc.auto"]),
@@ -702,8 +702,9 @@ async fn test_init_git_repo_initializes_repository() {
     );
     assert_eq!(
         git_output(temp.path(), &["config", "--get", "commit.gpgsign"]),
-        "false"
+        "true"
     );
+    assert!(!git_output(temp.path(), &["cat-file", "commit", "HEAD"]).contains("gpgsig "));
 }
 
 /// 运行单条测试 Git 查询并返回去空白文本。

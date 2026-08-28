@@ -5,6 +5,7 @@
 pub mod api;
 pub mod auth;
 pub mod claude;
+pub mod codesign;
 pub mod config;
 pub mod envtype;
 pub mod gitproxy;
