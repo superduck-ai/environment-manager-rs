@@ -194,6 +194,7 @@ mod tests {
                     }),
                     ..GitInfo::default()
                 },
+                ..GitRepositorySource::default()
             })],
             ..StartupContext::default()
         };

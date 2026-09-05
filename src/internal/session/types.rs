@@ -69,6 +69,17 @@ pub trait ActivityRecorder: Send + Sync {
         extra: BTreeMap<String, Value>,
     );
 
+    /// 等待关键活动发送完成；同步记录器可沿用普通记录方法。
+    async fn record_activity_and_wait(
+        &self,
+        level: LogLevel,
+        category: LogCategory,
+        message: String,
+        extra: BTreeMap<String, Value>,
+    ) {
+        self.record_activity(level, category, message, extra);
+    }
+
     /// 启动长任务进度日志并返回可幂等停止的句柄。
     fn record_long_running_activity(
         &self,

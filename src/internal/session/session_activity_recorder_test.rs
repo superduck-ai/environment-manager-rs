@@ -12,7 +12,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ActivityRecorderError, EventPoster, NoopActivityRecorder, RecorderOptions,
+    ActivityRecorder, ActivityRecorderError, EventPoster, NoopActivityRecorder, RecorderOptions,
     new_activity_recorder,
 };
 use crate::internal::api::{ApiError, LogCategory, LogLevel, SessionError, SessionEvent};
@@ -296,4 +296,23 @@ async fn test_noop_activity_recorder() {
         .expect("noop recorder 不应返回错误");
     let stopper = recorder.record_long_running_activity(LogCategory::Init, "ignored".to_owned());
     stopper.stop().await;
+}
+
+/// 关键活动返回时已发送，且不继承失败路径的取消信号。
+#[tokio::test]
+async fn test_awaited_activity_is_posted_before_return_after_parent_cancelled() {
+    let parent = CancellationToken::new();
+    parent.cancel();
+    let poster = new_recording_event_poster();
+    let recorder = new_activity_recorder(parent, poster.clone(), None);
+    recorder
+        .record_activity_and_wait(
+            LogLevel::Error,
+            LogCategory::Init,
+            "Git repository preparation failed".to_owned(),
+            BTreeMap::new(),
+        )
+        .await;
+    assert_eq!(poster.events.lock().unwrap().len(), 1);
+    assert_eq!(poster.cancellation_states(), vec![false]);
 }

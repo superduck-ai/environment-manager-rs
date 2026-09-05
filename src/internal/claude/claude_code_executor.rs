@@ -310,7 +310,9 @@ impl ClaudeCodeExecutor {
 
     /// 判断当前会话是否由 environment-manager 启动 CCRv2 relay。
     pub(super) fn should_start_agent_proxy(&self, local_testing_mode: bool) -> bool {
-        !local_testing_mode && self.should_prepare_ccr_upstream_proxy_token()
+        !local_testing_mode
+            && !self.startup_context.managed_agent_proxy_started
+            && self.should_prepare_ccr_upstream_proxy_token()
     }
 
     /// 合并 sandbox gateway 参数、本地追加 prompt，并按需写出 gateway MCP 文件。

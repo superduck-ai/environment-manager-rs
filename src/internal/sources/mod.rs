@@ -5,6 +5,7 @@
 
 mod git;
 mod gitproxy_adapter;
+mod managed_git;
 #[allow(clippy::module_inception)]
 mod sources;
 mod types;

@@ -73,14 +73,14 @@ const NO_PROXY_LIST: &str = concat!(
 );
 
 /// 启动 relay 所需的会话配置；所有字段只在 Claude 子系统内构造。
-pub(super) struct AgentProxyConfig {
-    pub(super) api_base_url: String,
-    pub(super) session_id: String,
-    pub(super) token: String,
+pub(crate) struct AgentProxyConfig {
+    pub(crate) api_base_url: String,
+    pub(crate) session_id: String,
+    pub(crate) token: String,
 }
 
 /// 已启动的本地 relay。显式 shutdown 负责等待 listener 退出，Drop 仅兜底取消。
-pub(super) struct AgentProxyHandle {
+pub(crate) struct AgentProxyHandle {
     environment: Vec<(OsString, OsString)>,
     cancellation: CancellationToken,
     failure: oneshot::Receiver<String>,
@@ -88,7 +88,7 @@ pub(super) struct AgentProxyHandle {
 }
 
 /// CCRv2 relay 的无状态构造入口。
-pub(super) struct AgentProxy;
+pub(crate) struct AgentProxy;
 
 struct AgentProxyPaths {
     system_ca: PathBuf,
@@ -142,7 +142,7 @@ impl AgentProxyPaths {
 
 impl AgentProxy {
     /// 准备 CA 并启动只监听回环地址的本地 relay。
-    pub(super) async fn start(config: AgentProxyConfig) -> Result<AgentProxyHandle, ClaudeError> {
+    pub(crate) async fn start(config: AgentProxyConfig) -> Result<AgentProxyHandle, ClaudeError> {
         let paths = AgentProxyPaths::production().map_err(agent_proxy_start_error)?;
         Self::start_with_paths(config, paths)
             .await
@@ -213,12 +213,12 @@ impl AgentProxy {
 
 impl AgentProxyHandle {
     /// 返回必须最后覆盖到 Claude child 的代理环境。
-    pub(super) fn environment(&self) -> &[(OsString, OsString)] {
+    pub(crate) fn environment(&self) -> &[(OsString, OsString)] {
         &self.environment
     }
 
     /// 仅在 listener 意外退出时完成；正常关闭发生在 Claude 已经结束之后。
-    pub(super) async fn wait_failure(&mut self) -> String {
+    pub(crate) async fn wait_failure(&mut self) -> String {
         match (&mut self.failure).await {
             Ok(error) => error,
             Err(_) => "CCR upstream proxy relay stopped unexpectedly".to_owned(),
@@ -226,7 +226,7 @@ impl AgentProxyHandle {
     }
 
     /// 取消 listener 和连接任务，并等待主任务退出。
-    pub(super) async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(mut self) {
         self.cancellation.cancel();
         if let Some(task) = self.listener_task.take()
             && let Err(error) = task.await

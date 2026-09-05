@@ -239,6 +239,25 @@ fn test_should_prepare_ccr_upstream_proxy_token() {
     }
 }
 
+/// Manager 已启动 relay 时，Claude 必须复用环境而非再启动一份代理。
+#[test]
+fn managed_sources_reuse_the_running_proxy() {
+    let mut startup = StartupContext {
+        use_code_sessions: true,
+        managed_agent_proxy_started: true,
+        ..StartupContext::default()
+    };
+    startup
+        .environment_variables
+        .insert("CLAUDE_CODE_REMOTE".to_owned(), "true".to_owned());
+    startup
+        .environment_variables
+        .insert("CCR_UPSTREAM_PROXY_ENABLED".to_owned(), "true".to_owned());
+    let executor = make_executor(empty_config(), startup);
+    assert!(executor.should_prepare_ccr_upstream_proxy_token());
+    assert!(!executor.should_start_agent_proxy(false));
+}
+
 /// 最终 API base 必须遵守宿主、config、startup 依次覆盖的现有优先级。
 #[test]
 fn agent_proxy_uses_final_api_base_url_priority() {

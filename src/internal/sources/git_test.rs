@@ -86,6 +86,44 @@ fn git_handler_has_production_proxy_factory_by_default() {
     );
 }
 
+/// 直接调用旧 source 入口也不能利用 mount_path 删除或改写 base_dir 外的目录。
+#[tokio::test]
+async fn legacy_git_entrypoints_reject_resource_mounts_before_mutation() {
+    let _guard = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
+    let outside = TempDir::new().unwrap();
+    let sentinel = outside.path().join("keep.txt");
+    std::fs::write(&sentinel, "keep").unwrap();
+    let base = TempDir::new().unwrap();
+    let mut source = git_test_source(Path::new("/missing-origin"), Some("main"));
+    source.mount_path = Some(outside.path().display().to_string());
+    source.git_info.url = Some("https://example.test/repo".to_owned());
+    let handler = new_git_handler(
+        base.path(),
+        None,
+        "",
+        None,
+        None,
+        ProcessMode::from("fresh"),
+        false,
+    );
+    let cancellation = CancellationToken::new();
+    assert!(handler.process(&cancellation, &source).await.is_err());
+    assert!(
+        handler
+            .update_remote_url(&cancellation, &source)
+            .await
+            .is_err()
+    );
+    assert!(
+        handler
+            .setup_git_proxy_after_sources_processed(&cancellation, &[Some(&source)])
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+    assert_eq!(std::fs::read_dir(base.path()).unwrap().count(), 0);
+}
+
 /// 验证 fresh 模式从本地 bare repository 拉取指定 ref，并保留公开 origin URL。
 #[tokio::test]
 async fn test_git_handler_process_fresh_clones_local_repository() {
@@ -182,6 +220,7 @@ async fn test_git_handler_update_remote_url() {
             url: Some("https://example.test/new.git".to_owned()),
             ..GitInfo::default()
         },
+        ..GitRepositorySource::default()
     };
     let handler = new_git_handler(
         base_dir.path(),
@@ -425,6 +464,7 @@ fn git_test_source(repo: &Path, git_ref: Option<&str>) -> GitRepositorySource {
             git_ref: git_ref.map(str::to_owned),
             ..GitInfo::default()
         },
+        ..GitRepositorySource::default()
     }
 }
 

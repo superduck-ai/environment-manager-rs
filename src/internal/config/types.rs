@@ -85,6 +85,28 @@ pub struct GitRepositorySource {
     /// 仓库连接与 ref 信息。
     #[serde(default)]
     pub git_info: GitInfo,
+    /// Managed Agents 仓库的绝对目录；省略时保留旧版 basename 规则。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mount_path: Option<String>,
+    /// Managed Agents 的显式 branch/commit checkout，避免把 SHA 当成分支。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<GitCheckout>,
+}
+
+/// 与 Managed Agents API 相同的仓库 checkout 联合类型。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GitCheckout {
+    /// 克隆指定远端分支。
+    Branch {
+        /// 远端分支名。
+        name: String,
+    },
+    /// 按完整对象 ID 浅 fetch 后 detached checkout。
+    Commit {
+        /// Git commit 对象 ID；API 接受 7–64 位十六进制字符。
+        sha: String,
+    },
 }
 
 /// 当前版本支持的 source 联合类型。
@@ -246,6 +268,12 @@ pub struct Session {
 /// stdin 或 work secret 派生出的启动上下文。
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct StartupContext {
+    /// 调用来源；只有 managed_agents_api 使用资源 clone 合同。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
+    /// Manager 已启动的 relay，只在当前进程内传递，不能由 stdin 设置。
+    #[serde(skip)]
+    pub managed_agent_proxy_started: bool,
     /// 需要准备的源码列表。
     #[serde(default)]
     pub sources: Vec<Source>,

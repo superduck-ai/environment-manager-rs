@@ -231,6 +231,34 @@ impl ActivityRecorder for SessionActivityRecorder {
         SessionActivityRecorder::record_activity(self, level, category, message, extra);
     }
 
+    /// 关键状态在退出前完成发送，复用失败结果的独立五秒窗口。
+    async fn record_activity_and_wait(
+        &self,
+        level: LogLevel,
+        category: LogCategory,
+        message: String,
+        extra: BTreeMap<String, Value>,
+    ) {
+        let event = new_env_manager_log_event(new_env_manager_log_event_data(
+            level,
+            category,
+            message,
+            Some(extra),
+        ));
+        let cancellation = CancellationToken::new();
+        match tokio::time::timeout(
+            FAILURE_RESULT_TIMEOUT,
+            self.poster.post_event(&cancellation, &event),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(error = %error, "Failed to post activity event"),
+            Err(_) => tracing::error!("Activity event timed out"),
+        }
+        cancellation.cancel();
+    }
+
     /// 通过统一接口启动长任务进度日志。
     fn record_long_running_activity(
         &self,

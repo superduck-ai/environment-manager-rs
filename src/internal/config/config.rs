@@ -20,6 +20,9 @@ pub enum ConfigError {
     /// Git source 缺少仓库名。
     #[error("repository is required")]
     RepositoryRequired,
+    /// Managed Agents 的路径、URL 或 checkout 无效。
+    #[error("invalid Git resource: {0}")]
+    InvalidGitResource(String),
     /// MCP 同时提供了远端和本地字段。
     #[error(
         "MCP server config cannot have both remote fields (type/url) and local fields (command/args)"
@@ -99,6 +102,17 @@ impl BaseSource {
 }
 
 impl GitRepositorySource {
+    /// 旧 source 执行路径不能接收资源专属字段，避免扩大其删除和 remote 改写范围。
+    pub(crate) fn validate_legacy_fields(&self) -> Result<(), ConfigError> {
+        if self.mount_path.is_some() || self.checkout.is_some() {
+            return Err(ConfigError::InvalidGitResource(
+                "mount_path and checkout require managed_agents_api resource preparation"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// 验证 source 类型和仓库名均非空。
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.base.source_type.is_empty() {
@@ -116,11 +130,15 @@ impl GitRepositorySource {
         true
     }
 
-    /// 用仓库名最后一个路径分量计算 clone 目录。
+    /// Managed Agents 使用已校验的 mount_path；旧 source 使用仓库 basename。
     ///
-    /// 空仓库名和无法取得文件名的异常路径会安全回退到 base directory。
+    /// 旧 Git 写入入口另行拒绝资源字段，防止绝对 mount 扩大旧 fresh 删除范围。
+    /// 空仓库名和无法取得文件名的旧 source 会回退到 base directory。
     #[must_use]
     pub fn get_directory(&self, base_dir: impl AsRef<Path>) -> PathBuf {
+        if let Some(mount_path) = &self.mount_path {
+            return PathBuf::from(mount_path);
+        }
         if self.git_info.repo.is_empty() {
             return base_dir.as_ref().to_path_buf();
         }
@@ -208,6 +226,13 @@ impl StartupContext {
                     index,
                     source: Box::new(source),
                 })?;
+        }
+        if self.origin == "managed_agents_api" {
+            super::git_resources::validate_resources(&self.sources)?;
+        } else {
+            for Source::GitRepository(source) in &self.sources {
+                source.validate_legacy_fields()?;
+            }
         }
         Ok(())
     }

@@ -128,6 +128,19 @@ impl ActivityRecorder for ScopedActivityRecorder<'_> {
         self.inner.record_activity(level, category, message, extra);
     }
 
+    /// 等待内层记录器完成关键活动上报。
+    async fn record_activity_and_wait(
+        &self,
+        level: ApiLogLevel,
+        category: LogCategory,
+        message: String,
+        extra: BTreeMap<String, Value>,
+    ) {
+        self.inner
+            .record_activity_and_wait(level, category, message, extra)
+            .await;
+    }
+
     /// 同步创建并转发长任务 stopper。
     fn record_long_running_activity(
         &self,
@@ -423,6 +436,11 @@ impl AnthropicEnvironmentType {
             .startup_context
             .as_ref()
             .expect("has_sources guarantees startup context");
+        if context.origin == "managed_agents_api" {
+            return self
+                .process_managed_git_sources(cancellation, context, activity_recorder)
+                .await;
+        }
         let scoped: SharedScopedRecorder<'_> = Arc::new(ScopedActivityRecorder {
             inner: activity_recorder,
         });
@@ -472,6 +490,49 @@ impl AnthropicEnvironmentType {
         // 与局部 manager 的生命周期一致；类型系统同时保证 recorder wrapper
         // 不可能越过当前 initialize 调用。
         drop(manager);
+        Ok(())
+    }
+
+    /// Managed Agents 复用 Git 执行器，通过已就绪的共享 relay 准备每个资源。
+    async fn process_managed_git_sources(
+        &self,
+        cancellation: &CancellationToken,
+        context: &StartupContext,
+        activity_recorder: &(dyn ActivityRecorder + Send + Sync),
+    ) -> Result<(), AnthropicError> {
+        context
+            .validate()
+            .map_err(|error| AnthropicError::with_source("invalid Git resources", error))?;
+        if !context.managed_agent_proxy_started {
+            return Err(AnthropicError::message(
+                "Git resources require a ready upstream proxy",
+            ));
+        }
+        let recorder: SharedScopedRecorder<'_> = Arc::new(ScopedActivityRecorder {
+            inner: activity_recorder,
+        });
+        let handler = crate::internal::sources::new_git_handler(
+            self.config_ref().cwd.clone(),
+            self.auth_context.clone().map(Arc::new),
+            context.api_base_url.clone(),
+            None,
+            Some(recorder),
+            ProcessMode::from("allow-prefetched"),
+            false,
+        );
+        let environment = context
+            .environment_variables
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        for crate::internal::config::Source::GitRepository(source) in &context.sources {
+            handler
+                .process_managed_repository(cancellation, source, &environment)
+                .await
+                .map_err(|error| {
+                    AnthropicError::with_source("failed to prepare Git resource", error)
+                })?;
+        }
         Ok(())
     }
 

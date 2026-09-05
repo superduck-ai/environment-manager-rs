@@ -45,6 +45,33 @@ const CODE_SIGN_PATH: &str = "/tmp/code-sign";
 const OFFICIAL_PLUGIN_MARKETPLACE: &str =
     "https://github.com/anthropics/claude-plugins-official.git";
 
+/// 把已启动 relay 的非敏感环境同时传给 source 命令和 Claude，去掉 GitHub 绕行。
+fn apply_managed_proxy_environment(
+    context: &mut config::StartupContext,
+    environment: &[(OsString, OsString)],
+) {
+    for (key, value) in environment {
+        let key = key.to_string_lossy().into_owned();
+        let value = value.to_string_lossy();
+        let value = if key.eq_ignore_ascii_case("no_proxy") {
+            value
+                .split(',')
+                .filter(|host| !host.contains("github"))
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            value.into_owned()
+        };
+        context.environment_variables.insert(key, value);
+    }
+    if let Some(ca_bundle) = context.environment_variables.get("SSL_CERT_FILE").cloned() {
+        context
+            .environment_variables
+            .insert("GIT_SSL_CAINFO".to_owned(), ca_bundle);
+    }
+    context.managed_agent_proxy_started = true;
+}
+
 /// 构造完整 manager，并安装默认 tunnel factory。
 ///
 /// 参数顺序可选配置使用 owned clone，
@@ -121,6 +148,64 @@ impl Manager {
     /// MCP 注册和环境初始化在同一并行阶段执行；两条路径都返回拥有所有权的结果，
     /// 不通过 join handle 后写裸指针。
     pub async fn run(&mut self, cancellation: &CancellationToken) -> Result<(), ManagerError> {
+        let managed_sources = self
+            .session_config
+            .as_ref()
+            .and_then(|session| session.startup_context.as_ref())
+            .is_some_and(|context| {
+                context.origin == "managed_agents_api" && !context.sources.is_empty()
+            });
+        if !managed_sources {
+            return self.run_with_environment(cancellation).await;
+        }
+        let session = self
+            .session_config
+            .as_mut()
+            .expect("managed sources require session");
+        let context = session
+            .startup_context
+            .as_mut()
+            .expect("managed sources require context");
+        context
+            .validate()
+            .map_err(|error| ManagerError::message(error.to_string()))?;
+        let token = self
+            .api_client
+            .get_auth_context()
+            .map(|auth| auth.get_session_ingress_token().to_owned())
+            .unwrap_or_default();
+        let mut proxy =
+            claude::agent_proxy::AgentProxy::start(claude::agent_proxy::AgentProxyConfig {
+                api_base_url: context.api_base_url.clone(),
+                session_id: session.session_id.clone(),
+                token,
+            })
+            .await
+            .map_err(|error| ManagerError::message(error.to_string()))?;
+        apply_managed_proxy_environment(context, proxy.environment());
+        // relay 从 sources 初始化前一直存活到 Claude 结束，同一会话只启动一个 relay。
+        let operation_cancellation = cancellation.child_token();
+        let result = {
+            let operation = self.run_with_environment(&operation_cancellation);
+            tokio::pin!(operation);
+            tokio::select! {
+                result = &mut operation => result,
+                error = proxy.wait_failure() => {
+                    operation_cancellation.cancel();
+                    let _ = tokio::time::timeout(CLEANUP_TIMEOUT, &mut operation).await;
+                    Err(ManagerError::message(error))
+                }
+            }
+        };
+        proxy.shutdown().await;
+        result
+    }
+
+    /// 在出口准备完成后执行既有环境、Claude 和 tunnel 生命周期。
+    async fn run_with_environment(
+        &mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ManagerError> {
         let started = Instant::now();
         // 恢复结构保留该字段但 Run 不消费；显式读取避免把协议字段误判为死代码。
         let _ = self.process_start_time;
@@ -910,4 +995,59 @@ fn attributes<const N: usize>(entries: [(&str, Value); N]) -> BTreeMap<String, V
 /// 将单调时钟耗时饱和转换为日志协议使用的有符号毫秒数。
 fn duration_milliseconds(started: Instant) -> i64 {
     i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod git_resources_tests {
+    use super::*;
+
+    /// 同一份环境让 clone 和 Claude 复用 relay，GitHub 不绕过受控出口。
+    #[test]
+    fn managed_proxy_environment_is_shared_and_cannot_be_forged_on_wire() {
+        let mut context: config::StartupContext = serde_json::from_value(json!({
+            "managed_agent_proxy_started": true,
+            "environment_variables": {"HTTPS_PROXY": "http://old", "GIT_SSL_CAINFO": "/old"}
+        }))
+        .unwrap();
+        assert!(!context.managed_agent_proxy_started);
+        apply_managed_proxy_environment(
+            &mut context,
+            &[
+                ("HTTPS_PROXY".into(), "http://127.0.0.1:4321".into()),
+                (
+                    "NO_PROXY".into(),
+                    "localhost,github.com,*.github.com,*.githubusercontent.com,api.example.test"
+                        .into(),
+                ),
+                (
+                    "no_proxy".into(),
+                    "localhost,github.com,api.example.test".into(),
+                ),
+                ("SSL_CERT_FILE".into(), "/ready/ca.pem".into()),
+            ],
+        );
+        assert!(context.managed_agent_proxy_started);
+        assert_eq!(
+            context.environment_variables["HTTPS_PROXY"],
+            "http://127.0.0.1:4321"
+        );
+        assert_eq!(
+            context.environment_variables["NO_PROXY"],
+            "localhost,api.example.test"
+        );
+        assert_eq!(
+            context.environment_variables["no_proxy"],
+            "localhost,api.example.test"
+        );
+        assert_eq!(
+            context.environment_variables["GIT_SSL_CAINFO"],
+            "/ready/ca.pem"
+        );
+        assert!(
+            serde_json::to_value(&context)
+                .unwrap()
+                .get("managed_agent_proxy_started")
+                .is_none()
+        );
+    }
 }

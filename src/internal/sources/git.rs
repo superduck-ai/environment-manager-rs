@@ -101,6 +101,9 @@ impl GitHandler<'_> {
         let git_source = source
             .as_git_repository()
             .ok_or_else(|| SourcesError::message("source is not a GitRepositorySource"))?;
+        git_source
+            .validate_legacy_fields()
+            .map_err(|error| SourcesError::message(error.to_string()))?;
         let process_started = Instant::now();
         let process_mode = self.process_mode.as_str();
         let operation = if process_mode == "fresh" {
@@ -505,7 +508,7 @@ impl GitHandler<'_> {
     /// 日志中的命令参数会脱敏；错误输出还会交给 auth provider 二次清理。实际 argv
     /// 始终使用原字符串直接传给 `git`，不会经过 shell 或重新编码。
     #[allow(clippy::too_many_arguments)]
-    async fn run_git_command(
+    pub(super) async fn run_git_command(
         &self,
         cancellation: &CancellationToken,
         dir: Option<&Path>,
@@ -1419,6 +1422,9 @@ impl GitHandler<'_> {
         let git_source = source
             .as_git_repository()
             .ok_or_else(|| SourcesError::message("source is not a GitRepositorySource"))?;
+        git_source
+            .validate_legacy_fields()
+            .map_err(|error| SourcesError::message(error.to_string()))?;
         let Some(custom_url) = git_source
             .git_info
             .url
@@ -1494,6 +1500,9 @@ impl GitHandler<'_> {
             let Some(git_source) = source.as_git_repository() else {
                 continue;
             };
+            git_source
+                .validate_legacy_fields()
+                .map_err(|error| SourcesError::message(error.to_string()))?;
             let Some(auth) = git_source
                 .git_info
                 .auth
@@ -1742,7 +1751,7 @@ impl Drop for ActivityStopGuard {
 /// 启动外部命令、并发排空 stdout/stderr，并响应上层取消。
 ///
 /// 共享执行器只终止并回收直接子进程，不设置 process group，也不遍历后代。
-async fn run_external_command(
+pub(super) async fn run_external_command(
     cancellation: &CancellationToken,
     program: &str,
     args: &[String],

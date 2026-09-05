@@ -33,6 +33,7 @@ fn test_default_claude_config_and_sources() {
             git_ref: Some("main".into()),
             ..GitInfo::default()
         },
+        ..GitRepositorySource::default()
     };
     source.validate().expect("valid source should pass");
     assert!(source.is_repository());
