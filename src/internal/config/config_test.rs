@@ -6,6 +6,33 @@ use serde_json::json;
 
 use super::*;
 
+/// 显式目录的序列化合同及缺省时的兼容行为。
+#[test]
+fn git_mount_path_round_trips_and_overrides_repo_name() {
+    let mut source: GitRepositorySource = serde_json::from_value(json!({
+        "type": "git_repository",
+        "mount_path": "/workspace/service",
+        "git_info": {"repo": "group/nested/repository"}
+    }))
+    .unwrap();
+    assert_eq!(
+        source.get_directory("/other"),
+        PathBuf::from("/workspace/service")
+    );
+    assert_eq!(
+        serde_json::to_value(&source).unwrap()["mount_path"],
+        "/workspace/service"
+    );
+    source.mount_path.clear();
+    let legacy = serde_json::to_value(&source).unwrap();
+    assert!(legacy.get("mount_path").is_none());
+    let decoded: GitRepositorySource = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        decoded.get_directory("/workspace"),
+        PathBuf::from("/workspace/repository")
+    );
+}
+
 /// 验证 Claude 默认值与 source 路径、校验辅助函数。
 #[test]
 fn test_default_claude_config_and_sources() {
@@ -33,6 +60,7 @@ fn test_default_claude_config_and_sources() {
             git_ref: Some("main".into()),
             ..GitInfo::default()
         },
+        ..GitRepositorySource::default()
     };
     source.validate().expect("valid source should pass");
     assert!(source.is_repository());

@@ -12,7 +12,10 @@ mod outcomes;
 mod session_urls;
 mod types;
 
+pub use agent_proxy::AgentProxyHandle;
+pub(crate) use agent_proxy::wait_for_agent_proxy_failure;
 pub use claude_code_executor::new_claude_code_executor;
+pub(crate) use claude_code_executor::prepare_session_agent_proxy;
 pub use config_helpers::get_claude_path;
 pub use init::{run_init, run_init_with_observability};
 pub use install::{

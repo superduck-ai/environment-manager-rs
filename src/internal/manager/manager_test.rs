@@ -43,6 +43,8 @@ use super::{
 #[derive(Default)]
 struct FakeEnvironmentState {
     initialized: bool,
+    source_environment: Vec<(OsString, OsString)>,
+    proxy_ready_during_initialize: bool,
     session_mode: Option<SessionMode>,
     startup_context: Option<StartupContext>,
     auth_context: Option<AuthContext>,
@@ -55,6 +57,7 @@ struct FakeEnvironment {
     cwd: String,
     environment: BTreeMap<String, String>,
     initialization_error: Option<String>,
+    pause_initialization: bool,
     lease_manager: Option<Arc<FakeLeaseManager>>,
 }
 
@@ -94,6 +97,33 @@ impl EnvironmentType for FakeEnvironment {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .initialized = true;
+        let network = crate::internal::sources::GIT_ENVIRONMENT
+            .try_with(Clone::clone)
+            .unwrap_or_default();
+        self.state.lock().unwrap().source_environment = network.clone();
+        if !network.is_empty() {
+            let ca = network
+                .iter()
+                .find(|(key, _)| key == "GIT_SSL_CAINFO")
+                .unwrap();
+            assert!(
+                std::path::Path::new(&ca.1).is_file(),
+                "CA must exist before sources"
+            );
+            let proxy = network
+                .iter()
+                .find(|(key, _)| key == "HTTPS_PROXY")
+                .unwrap();
+            let url = url::Url::parse(proxy.1.to_str().unwrap()).unwrap();
+            let stream =
+                tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+                    .await?;
+            drop(stream);
+            self.state.lock().unwrap().proxy_ready_during_initialize = true;
+        }
+        if self.pause_initialization {
+            _cancellation.cancelled().await;
+        }
         match &self.initialization_error {
             Some(error) => Err(Box::new(std::io::Error::other(error.clone()))),
             None => Ok(()),
@@ -176,6 +206,7 @@ struct FakeExecutor {
     execute_called: AtomicBool,
     execute_received_cancelled: AtomicBool,
     destroy_called: AtomicBool,
+    proxy_environment: Mutex<Vec<(OsString, OsString)>>,
     execution_error: Option<Vec<u8>>,
 }
 
@@ -186,6 +217,7 @@ impl FakeExecutor {
             execute_called: AtomicBool::new(false),
             execute_received_cancelled: AtomicBool::new(false),
             destroy_called: AtomicBool::new(false),
+            proxy_environment: Mutex::new(Vec::new()),
             execution_error: execution_error.map(<[u8]>::to_vec),
         }
     }
@@ -193,6 +225,21 @@ impl FakeExecutor {
 
 #[async_trait]
 impl Executor for FakeExecutor {
+    async fn execute_with_agent_proxy(
+        &self,
+        cancellation: &CancellationToken,
+        proxy: Option<crate::internal::claude::AgentProxyHandle>,
+    ) -> Result<(), ClaudeError> {
+        if let Some(handle) = proxy.as_ref() {
+            *self.proxy_environment.lock().unwrap() = handle.environment().to_vec();
+        }
+        let result = self.execute(cancellation).await;
+        if let Some(handle) = proxy {
+            handle.shutdown().await;
+        }
+        result
+    }
+
     /// 标记执行并返回预设错误。
     async fn execute(&self, cancellation: &CancellationToken) -> Result<(), ClaudeError> {
         self.execute_called.store(true, Ordering::SeqCst);
@@ -379,6 +426,7 @@ fn fake_environment(initialization_error: Option<&str>) -> FakeEnvironment {
             "https://api.example.com".to_owned(),
         )]),
         initialization_error: initialization_error.map(str::to_owned),
+        pause_initialization: false,
         lease_manager: None,
     }
 }
@@ -403,6 +451,254 @@ fn new_test_auth_context() -> AuthContext {
     let mut context = AuthContext::default();
     context.set_session_ingress_token("session-token");
     context
+}
+
+/// 新 Sandbox 必须先准备 CA/relay；成功交接同一 listener，任意失败都回收它。
+#[tokio::test]
+async fn session_proxy_precedes_sources_and_is_reused_and_cleaned_up() {
+    if !crate::internal::enter_isolated_process_test(concat!(
+        module_path!(),
+        "::session_proxy_precedes_sources_and_is_reused_and_cleaned_up"
+    )) {
+        return;
+    }
+    let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
+    for (ca_status, initialization_error, execution_error, cancel_initialization) in [
+        (200, None, None, false),
+        (200, Some("source failed"), None, false),
+        (200, None, Some("executor failed"), false),
+        (503, None, None, false),
+        (200, None, None, true),
+    ] {
+        let home = TempDir::new().unwrap();
+        let _environment_restore = configure_process_environment(&home);
+        let original_proxy = std::env::var_os("HTTPS_PROXY");
+        let original_ca = std::env::var_os("GIT_SSL_CAINFO");
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/code/upstreamproxy/ca-cert"))
+            .respond_with(wiremock::ResponseTemplate::new(ca_status).set_body_string("test CA"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut environment = fake_environment(initialization_error);
+        environment.pause_initialization = cancel_initialization;
+        let state = Arc::clone(&environment.state);
+        let (mut manager, executor, _) =
+            new_manager_for_test("fake", environment, SessionMode::New, true, execution_error);
+        let startup = manager
+            .session_config
+            .as_mut()
+            .unwrap()
+            .startup_context
+            .as_mut()
+            .unwrap();
+        startup.use_code_sessions = true;
+        startup.environment_variables.extend([
+            ("CLAUDE_CODE_REMOTE".to_owned(), "1".to_owned()),
+            ("CCR_UPSTREAM_PROXY_ENABLED".to_owned(), "1".to_owned()),
+            ("ANTHROPIC_BASE_URL".to_owned(), server.uri()),
+        ]);
+        let cancellation = CancellationToken::new();
+        let cancel_during_sources = async {
+            if cancel_initialization {
+                loop {
+                    if state.lock().unwrap().proxy_ready_during_initialize {
+                        cancellation.cancel();
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(manager.run(&cancellation), cancel_during_sources)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            result.is_ok(),
+            ca_status == 200
+                && initialization_error.is_none()
+                && execution_error.is_none()
+                && !cancel_initialization
+        );
+        assert_eq!(std::env::var_os("HTTPS_PROXY"), original_proxy);
+        assert_eq!(std::env::var_os("GIT_SSL_CAINFO"), original_ca);
+        let (initialized, ready, network) = {
+            let state = state.lock().unwrap();
+            (
+                state.initialized,
+                state.proxy_ready_during_initialize,
+                state.source_environment.clone(),
+            )
+        };
+        if ca_status != 200 {
+            assert!(!initialized, "failed CA download must stop before sources");
+            assert!(!executor.execute_called.load(Ordering::SeqCst));
+            continue;
+        }
+        assert!(initialized && ready);
+        if initialization_error.is_none() && !cancel_initialization {
+            assert_eq!(*executor.proxy_environment.lock().unwrap(), network);
+        } else {
+            assert!(!executor.execute_called.load(Ordering::SeqCst));
+        }
+        let proxy = network
+            .iter()
+            .find(|(key, _)| key == "HTTPS_PROXY")
+            .unwrap();
+        let url = url::Url::parse(proxy.1.to_str().unwrap()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if tokio::net::TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("relay must stop on success and initialization/executor errors");
+    }
+}
+
+/// 真实 executor 子进程必须接管 Source 使用的 listener，并覆盖旧的网络环境。
+#[tokio::test]
+async fn session_proxy_environment_reaches_real_executor_child() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if !crate::internal::enter_isolated_process_test(concat!(
+        module_path!(),
+        "::session_proxy_environment_reaches_real_executor_child"
+    )) {
+        return;
+    }
+    let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
+    let home = TempDir::new().unwrap();
+    let _environment_restore = configure_process_environment(&home);
+    let original_proxy = std::env::var_os("HTTPS_PROXY");
+    let original_ca = std::env::var_os("GIT_SSL_CAINFO");
+    let capture = home.path().join("child-network.json");
+    let child = home.path().join("fake-claude");
+    std::fs::write(
+        &child,
+        r#"#!/bin/sh
+exec python3 - <<'PY'
+import json, os, pathlib, socket, urllib.parse
+keys = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "SSL_CERT_FILE",
+        "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"]
+environment = {key: os.environ[key] for key in keys}
+assert pathlib.Path(environment["GIT_SSL_CAINFO"]).is_file()
+proxy = urllib.parse.urlsplit(environment["HTTPS_PROXY"])
+with socket.create_connection((proxy.hostname, proxy.port), timeout=2) as connection:
+    connection.sendall(b"GET / HTTP/1.1\r\nHost: relay.test\r\n\r\n")
+    response = connection.makefile("rb").readline()
+    assert response == b"HTTP/1.1 405 Method Not Allowed\r\n", response
+pathlib.Path(os.environ["NETWORK_CAPTURE_PATH"]).write_text(json.dumps(environment))
+print('{"type":"result"}')
+PY
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/v1/code/upstreamproxy/ca-cert"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("test CA"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut environment = fake_environment(None);
+    environment.cwd = home.path().display().to_string();
+    let state = Arc::clone(&environment.state);
+    let (mut manager, _, _) =
+        new_manager_for_test("fake", environment, SessionMode::New, true, None);
+    let configuration = manager.claude_config.as_mut().unwrap();
+    configuration.claude_path = child.display().to_string();
+    configuration.environment.insert(
+        "NETWORK_CAPTURE_PATH".to_owned(),
+        capture.display().to_string(),
+    );
+    let startup = manager
+        .session_config
+        .as_mut()
+        .unwrap()
+        .startup_context
+        .as_mut()
+        .unwrap();
+    startup.use_code_sessions = true;
+    startup.environment_variables.extend([
+        ("CLAUDE_CODE_REMOTE".to_owned(), "1".to_owned()),
+        ("CCR_UPSTREAM_PROXY_ENABLED".to_owned(), "1".to_owned()),
+        ("ANTHROPIC_BASE_URL".to_owned(), server.uri()),
+        ("HTTPS_PROXY".to_owned(), "http://127.0.0.1:1".to_owned()),
+        ("GIT_SSL_CAINFO".to_owned(), "/missing-ca.pem".to_owned()),
+    ]);
+    manager.executor_factory = Arc::new(
+        |configuration,
+         session_id,
+         startup,
+         auth,
+         registrations,
+         outcomes,
+         activity_recorder,
+         lease| {
+            let registrations = registrations
+                .into_iter()
+                .map(|registration| {
+                    registration as Arc<dyn crate::internal::claude::McpServerRegistration>
+                })
+                .collect();
+            Ok(Arc::new(crate::internal::claude::new_claude_code_executor(
+                Some(configuration),
+                session_id,
+                startup.unwrap_or_default(),
+                Some(auth),
+                registrations,
+                Some(outcomes),
+                activity_recorder,
+                lease,
+                "current",
+            )?) as Arc<dyn Executor>)
+        },
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        manager.run(&CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let network = {
+        let state = state.lock().unwrap();
+        assert!(state.proxy_ready_during_initialize);
+        state
+            .source_environment
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.to_str().unwrap().to_owned(),
+                    value.to_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let captured: BTreeMap<String, String> =
+        serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+    assert_eq!(captured, network);
+    let proxy = url::Url::parse(&network["HTTPS_PROXY"]).unwrap();
+    assert!(
+        tokio::net::TcpStream::connect((proxy.host_str().unwrap(), proxy.port().unwrap()))
+            .await
+            .is_err(),
+        "executor must wait for the shared listener to stop"
+    );
+    assert_eq!(std::env::var_os("HTTPS_PROXY"), original_proxy);
+    assert_eq!(std::env::var_os("GIT_SSL_CAINFO"), original_ca);
+    server.verify().await;
 }
 
 /// 创建标准 manager、executor 和 factory 调用记录。

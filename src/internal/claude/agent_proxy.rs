@@ -80,7 +80,7 @@ pub(super) struct AgentProxyConfig {
 }
 
 /// 已启动的本地 relay。显式 shutdown 负责等待 listener 退出，Drop 仅兜底取消。
-pub(super) struct AgentProxyHandle {
+pub struct AgentProxyHandle {
     environment: Vec<(OsString, OsString)>,
     cancellation: CancellationToken,
     failure: oneshot::Receiver<String>,
@@ -212,13 +212,13 @@ impl AgentProxy {
 }
 
 impl AgentProxyHandle {
-    /// 返回必须最后覆盖到 Claude child 的代理环境。
-    pub(super) fn environment(&self) -> &[(OsString, OsString)] {
+    /// 返回必须最后覆盖到 source 和 Claude 子进程的代理环境。
+    pub(crate) fn environment(&self) -> &[(OsString, OsString)] {
         &self.environment
     }
 
     /// 仅在 listener 意外退出时完成；正常关闭发生在 Claude 已经结束之后。
-    pub(super) async fn wait_failure(&mut self) -> String {
+    pub(crate) async fn wait_failure(&mut self) -> String {
         match (&mut self.failure).await {
             Ok(error) => error,
             Err(_) => "CCR upstream proxy relay stopped unexpectedly".to_owned(),
@@ -226,7 +226,7 @@ impl AgentProxyHandle {
     }
 
     /// 取消 listener 和连接任务，并等待主任务退出。
-    pub(super) async fn shutdown(mut self) {
+    pub(crate) async fn shutdown(mut self) {
         self.cancellation.cancel();
         if let Some(task) = self.listener_task.take()
             && let Err(error) = task.await
@@ -326,6 +326,7 @@ fn proxy_environment(
         ("NO_PROXY", no_proxy.as_str()),
         ("no_proxy", no_proxy.as_str()),
         ("SSL_CERT_FILE", ca_bundle),
+        ("GIT_SSL_CAINFO", ca_bundle),
         ("NODE_EXTRA_CA_CERTS", ca_bundle),
         ("REQUESTS_CA_BUNDLE", ca_bundle),
         ("CURL_CA_BUNDLE", ca_bundle),
@@ -627,7 +628,7 @@ async fn write_bad_gateway(client_writer: &mut (impl AsyncWrite + Unpin)) {
 }
 
 /// 让没有 relay 的执行路径提供一个永不完成的健康信号。
-pub(super) async fn wait_for_agent_proxy_failure(proxy: Option<&mut AgentProxyHandle>) -> String {
+pub(crate) async fn wait_for_agent_proxy_failure(proxy: Option<&mut AgentProxyHandle>) -> String {
     match proxy {
         Some(proxy) => proxy.wait_failure().await,
         None => pending().await,
@@ -710,6 +711,7 @@ mod tests {
         assert!(environment["NO_PROXY"].ends_with(",control.example.test"));
         assert!(!environment.contains_key("HTTP_PROXY"));
         for key in [
+            "GIT_SSL_CAINFO",
             "SSL_CERT_FILE",
             "NODE_EXTRA_CA_CERTS",
             "REQUESTS_CA_BUNDLE",

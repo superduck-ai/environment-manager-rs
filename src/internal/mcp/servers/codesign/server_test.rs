@@ -142,6 +142,7 @@ fn git_source_with_secrets() -> Source {
             }),
             ..GitInfo::default()
         },
+        ..GitRepositorySource::default()
     })
 }
 

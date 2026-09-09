@@ -122,6 +122,19 @@ pub trait Executor: Send + Sync {
     /// 执行单个 Claude 会话；取消只向 direct child 发送 SIGKILL。
     async fn execute(&self, cancellation: &CancellationToken) -> Result<(), ClaudeError>;
 
+    /// 接管初始化阶段已经启动的代理；同一个 listener 持续服务整个会话。
+    async fn execute_with_agent_proxy(
+        &self,
+        cancellation: &CancellationToken,
+        proxy: Option<super::AgentProxyHandle>,
+    ) -> Result<(), ClaudeError> {
+        let result = self.execute(cancellation).await;
+        if let Some(proxy) = proxy {
+            proxy.shutdown().await;
+        }
+        result
+    }
+
     /// 幂等清理 session token 文件，不终止其他进程。
     async fn destroy(&self, cancellation: &CancellationToken) -> Result<(), ClaudeError>;
 }
