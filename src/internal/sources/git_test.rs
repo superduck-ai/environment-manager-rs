@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -17,7 +17,7 @@ use tempfile::TempDir;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use super::git::{ActivityStopGuard, GitTransfer, pack_size};
+use super::git::{ActivityStopGuard, pack_size};
 use super::*;
 use crate::internal::{
     api::{LogCategory, LogLevel, SessionError},
@@ -625,9 +625,9 @@ async fn repository_sources_clone_empty_remote() {
     }
 }
 
-/// Clone 复用传输重试，第四次使用 HTTP/1.1，并清除每次失败留下的内容。
+/// Fetch 保留协议回退和重试，同时不清理已有仓库内容。
 #[tokio::test]
-async fn repository_sources_clone_retries_with_http1_fallback() {
+async fn repository_sources_fetch_retries_with_http1_fallback() {
     let (_fixture, origin, initial) = create_bare_git_repo();
     let base = TempDir::new().unwrap();
     let bin = base.path().join("bin");
@@ -637,19 +637,13 @@ async fn repository_sources_clone_retries_with_http1_fallback() {
         &wrapper,
         r#"#!/bin/sh
 case " $* " in
-  *" clone "*)
+  *" fetch "*)
     count=0
     if [ -f "$GIT_RETRY_STATE" ]; then count=$(cat "$GIT_RETRY_STATE"); fi
     count=$((count + 1))
     echo "$count" > "$GIT_RETRY_STATE"
-    if [ -e "$GIT_RETRY_TARGET/partial" ]; then
-      echo 'previous clone was not cleaned' >&2
-      exit 1
-    fi
     if [ "$count" -lt 4 ]; then
-      mkdir -p "$GIT_RETRY_TARGET/.git"
-      touch "$GIT_RETRY_TARGET/partial"
-      echo 'simulated transient clone failure' >&2
+      echo 'simulated transient fetch failure' >&2
       exit 128
     fi
     case " $* " in
@@ -673,16 +667,17 @@ exec "$REAL_GIT" "$@"
             .unwrap();
     let target = base.path().join("repository");
     std::fs::create_dir(&target).unwrap();
-    let original_inode = std::fs::metadata(&target).unwrap().ino();
+    git_run(&target, &["init"]);
+    std::fs::write(target.join("keep"), "local data").unwrap();
     let state = base.path().join("attempts");
     let git_url = format!("file://{}", origin.display());
     let args = vec![
-        "clone".to_owned(),
-        "--branch".to_owned(),
-        "main".to_owned(),
+        "fetch".to_owned(),
+        "--depth=1".to_owned(),
+        "--no-tags".to_owned(),
         "--".to_owned(),
         git_url.clone(),
-        target.display().to_string(),
+        "refs/heads/main".to_owned(),
     ];
     let handler = new_git_handler(
         base.path(),
@@ -699,11 +694,10 @@ exec "$REAL_GIT" "$@"
                 ("PATH".into(), test_path),
                 ("REAL_GIT".into(), real_git.into_os_string()),
                 ("GIT_RETRY_STATE".into(), state.clone().into_os_string()),
-                ("GIT_RETRY_TARGET".into(), target.clone().into_os_string()),
             ],
-            handler.run_git_transfer_with_retry_delay(
+            handler.run_git_fetch_with_retry_delay(
                 &CancellationToken::new(),
-                GitTransfer::Clone(&target),
+                &target,
                 &git_url,
                 &git_url,
                 None,
@@ -714,9 +708,11 @@ exec "$REAL_GIT" "$@"
         .await
         .unwrap();
     assert_eq!(std::fs::read_to_string(state).unwrap().trim(), "4");
-    assert_eq!(git_output(&target, &["rev-parse", "HEAD"]), initial);
-    assert_eq!(std::fs::metadata(&target).unwrap().ino(), original_inode);
-    assert!(!target.join("partial").exists());
+    assert_eq!(git_output(&target, &["rev-parse", "FETCH_HEAD"]), initial);
+    assert_eq!(
+        std::fs::read_to_string(target.join("keep")).unwrap(),
+        "local data"
+    );
 }
 
 /// 不允许 fresh 模式删除目标中的用户数据或穿过符号链接。
@@ -851,9 +847,9 @@ async fn repository_sources_lifecycle_is_independent_of_directory_selection() {
     }
 }
 
-/// 分支输入不能退化为同名 tag，失败清理只涉及本次创建的目录。
+/// 分支输入不能退化为同名 tag；失败保留现场，再次首次初始化拒绝覆盖。
 #[tokio::test]
-async fn repository_sources_reject_tag_as_branch_and_clean_only_owned_targets() {
+async fn repository_sources_reject_tag_as_branch_without_cleanup() {
     let (fixture, origin, _) = create_bare_git_repo();
     let worktree = fixture.path().join("worktree");
     git_run(&worktree, &["tag", "tag-only"]);
@@ -876,7 +872,6 @@ async fn repository_sources_reject_tag_as_branch_and_clean_only_owned_targets() 
             if existing {
                 std::fs::create_dir(&target).unwrap();
             }
-            let original_inode = existing.then(|| std::fs::metadata(&target).unwrap().ino());
             let mut source = git_test_source(&origin, Some("refs/heads/tag-only"));
             source.git_info.url = Some(format!("file://{}", origin.display()));
             source.git_info.repo = target.file_name().unwrap().to_str().unwrap().to_owned();
@@ -889,31 +884,33 @@ async fn repository_sources_reject_tag_as_branch_and_clean_only_owned_targets() 
                     .await
                     .is_err()
             );
-            assert_eq!(target.exists(), existing);
-            if existing {
-                assert!(std::fs::read_dir(&target).unwrap().next().is_none());
-                assert_eq!(
-                    Some(std::fs::metadata(&target).unwrap().ino()),
-                    original_inode
-                );
-            }
+            assert!(target.join(".git").is_dir());
+            assert_eq!(
+                std::fs::read_to_string(target.join("README.md")).unwrap(),
+                "hello\n"
+            );
             source.git_info.git_ref = Some("refs/heads/main".to_owned());
-            handler
+            let error = handler
                 .process(&CancellationToken::new(), &source)
                 .await
-                .unwrap();
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("repository directory must be empty")
+            );
             assert_eq!(
-                git_output(&target, &["rev-parse", "HEAD"]),
-                git_output(&worktree, &["rev-parse", "HEAD"])
+                std::fs::read_to_string(target.join("README.md")).unwrap(),
+                "hello\n"
             );
         }
     }
 }
 
-/// 取消令牌和直接丢弃 future 都必须遵守目录所有权。
+/// 取消或丢弃初始化只停止执行，保留已写入内容，不进行目录清理或原地重试。
 #[tokio::test]
-async fn repository_sources_cancel_and_abort_clean_only_owned_targets() {
-    let (fixture, origin, _) = create_bare_git_repo();
+async fn repository_sources_cancel_and_abort_leave_partial_repository() {
+    let (_fixture, origin, _) = create_bare_git_repo();
     let base = TempDir::new().unwrap();
     for explicit_path in [false, true] {
         for abort in [false, true] {
@@ -924,7 +921,6 @@ async fn repository_sources_cancel_and_abort_clean_only_owned_targets() {
                 if existing {
                     std::fs::create_dir(&target).unwrap();
                 }
-                let original_inode = existing.then(|| std::fs::metadata(&target).unwrap().ino());
                 let branch = format!("delayed-{explicit_path}-{abort}-{existing}");
                 let mut source = git_test_source(&origin, Some(&branch));
                 source.git_info.url = Some(format!("file://{}", origin.display()));
@@ -969,97 +965,8 @@ async fn repository_sources_cancel_and_abort_clean_only_owned_targets() {
                 } else {
                     assert!(result.unwrap().is_err());
                 }
-                assert_eq!(target.exists(), existing);
-                if existing {
-                    assert!(std::fs::read_dir(&target).unwrap().next().is_none());
-                    assert_eq!(
-                        Some(std::fs::metadata(&target).unwrap().ino()),
-                        original_inode
-                    );
-                }
-                // 远端 ref 在中断后变得可用；同一 source 可直接重新 fresh 初始化。
-                git_run(
-                    &fixture.path().join("worktree"),
-                    &[
-                        "push",
-                        path_text(&origin),
-                        &format!("HEAD:refs/heads/{branch}"),
-                    ],
-                );
-                let retry = new_git_handler(
-                    base.path(),
-                    None,
-                    "",
-                    None,
-                    None,
-                    ProcessMode::from("fresh"),
-                    false,
-                );
-                retry
-                    .process(&CancellationToken::new(), &source)
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    std::fs::read_to_string(target.join("README.md")).unwrap(),
-                    "hello\n"
-                );
+                assert!(target.join(".git/config").is_file());
             }
-        }
-    }
-}
-
-/// 初始化期间目标被换成 symlink 或另一目录后，清理不得触及替换目标的数据。
-#[tokio::test]
-async fn repository_sources_cleanup_refuses_replaced_roots() {
-    let (_fixture, origin, _) = create_bare_git_repo();
-    for existing in [false, true] {
-        for symlink in [false, true] {
-            let base = TempDir::new().unwrap();
-            let target = base.path().join("repository");
-            if existing {
-                std::fs::create_dir(&target).unwrap();
-            }
-            let mut source = git_test_source(&origin, Some("missing-ref"));
-            source.mount_path = target.display().to_string();
-            let base_path = base.path().to_owned();
-            let task = tokio::spawn(async move {
-                let handler = new_git_handler(
-                    base_path,
-                    None,
-                    "",
-                    None,
-                    None,
-                    ProcessMode::from("fresh"),
-                    false,
-                );
-                handler.process(&CancellationToken::new(), &source).await
-            });
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                while !target.join(".git/config").exists() {
-                    assert!(!task.is_finished());
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap();
-            std::fs::rename(&target, base.path().join("original")).unwrap();
-            let replacement = if symlink {
-                let outside = base.path().join("outside");
-                std::fs::create_dir(&outside).unwrap();
-                std::os::unix::fs::symlink(&outside, &target).unwrap();
-                outside
-            } else {
-                std::fs::create_dir(&target).unwrap();
-                target.clone()
-            };
-            std::fs::write(replacement.join("sentinel"), "keep").unwrap();
-            task.abort();
-            assert!(task.await.unwrap_err().is_cancelled());
-            assert_eq!(
-                std::fs::read_to_string(replacement.join("sentinel")).unwrap(),
-                "keep"
-            );
-            assert!(target.exists());
         }
     }
 }

@@ -7,10 +7,7 @@ use std::{
     collections::HashMap,
     fs::OpenOptions,
     io::{self, Write},
-    os::{
-        fd::AsRawFd,
-        unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
-    },
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -38,185 +35,56 @@ use super::types::SharedAuthProvider;
 
 const GIT_HTTP_PROXY_AUTH_CONFIG: &str = "http.proxyAuthMethod=basic";
 
-/// 回滚本次初始化的内容，保留调用方原有的空目录。
-struct RepositoryPreparation {
-    cleanup: Option<RepositoryDirectory>,
-    new_repository: bool,
-}
-
-/// 保存初始化目录的身份与根目录所有权，避免回收被替换的路径。
-struct RepositoryDirectory {
-    path: PathBuf,
-    identity: (u64, u64),
-    remove_root: bool,
-}
-
-impl RepositoryPreparation {
-    /// 在首次 await 前完成检查、创建和所有权登记，覆盖取消及 future drop。
-    fn prepare(path: &Path, process_mode: &str) -> SourcesResult<Self> {
-        if !path.is_absolute()
-            || path
-                .components()
-                .any(|part| matches!(part, Component::ParentDir))
-        {
-            return Err(SourcesError::message(
-                "repository directory must be absolute without parent traversal",
-            ));
-        }
-        let prepare = || -> io::Result<Self> {
-            for ancestor in path.ancestors() {
-                match std::fs::symlink_metadata(ancestor) {
-                    Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
-                        return Err(io::Error::other(
-                            "repository directory must not contain symlinks or non-directories",
-                        ));
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
-            if path.try_exists()? {
-                if process_mode != "fresh"
-                    && std::fs::symlink_metadata(path.join(".git"))
-                        .is_ok_and(|metadata| !metadata.file_type().is_symlink())
-                {
-                    return Ok(Self {
-                        cleanup: None,
-                        new_repository: false,
-                    });
-                }
-                if process_mode != "fresh" && process_mode != "allow-prefetched" {
-                    return Err(io::Error::other("repository does not exist in resume mode"));
-                }
-                if std::fs::read_dir(path)?.next().transpose()?.is_some() {
-                    return Err(io::Error::other("repository directory must be empty"));
-                }
-                return Ok(Self {
-                    cleanup: Some(RepositoryDirectory {
-                        path: path.to_owned(),
-                        identity: repository_directory_identity(path)?,
-                        remove_root: false,
-                    }),
-                    new_repository: true,
-                });
-            }
-            if process_mode != "fresh" && process_mode != "allow-prefetched" {
-                return Err(io::Error::other("repository does not exist in resume mode"));
-            }
-            if let Some(parent) = path.parent() {
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o755)
-                    .create(parent)?;
-            }
-            std::fs::DirBuilder::new().mode(0o755).create(path)?;
-            Ok(Self {
-                cleanup: Some(RepositoryDirectory {
-                    path: path.to_owned(),
-                    identity: repository_directory_identity(path)?,
-                    remove_root: true,
-                }),
-                new_repository: true,
-            })
-        };
-        prepare().map_err(|error| {
-            SourcesError::message(format!(
-                "cannot prepare repository directory {}: {error}",
-                path.display()
-            ))
-        })
-    }
-}
-
-impl Drop for RepositoryPreparation {
-    /// 同步清理保证 future 被直接丢弃时仍然执行。
-    fn drop(&mut self) {
-        let Some(directory) = &self.cleanup else {
-            return;
-        };
-        let path = &directory.path;
-        // kill_on_drop 发出终止信号后，Git 仍可能短暂完成一个目录写入。
-        // 只重试 ENOTEMPTY，避免把这个退出竞态误当成永久清理失败。
-        let deadline = Instant::now() + Duration::from_millis(100);
-        loop {
-            let cleanup = remove_repository_contents(path, directory.identity).and_then(|()| {
-                if directory.remove_root {
-                    check_repository_directory(path, directory.identity)?;
-                    std::fs::remove_dir(path)
-                } else {
-                    Ok(())
-                }
-            });
-            match cleanup {
-                Ok(()) => return,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-                Err(error)
-                    if error.kind() == io::ErrorKind::DirectoryNotEmpty
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(error) => {
-                    tracing::warn!(path = %path.display(), %error, "Failed to clean up incomplete repository");
-                    return;
-                }
-            }
-        }
-    }
-}
-
-/// 固定打开本次初始化的目录后清空内容，不跟随并发替换的路径或删除调用方根目录。
-fn remove_repository_contents(path: &Path, identity: (u64, u64)) -> io::Result<()> {
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)?;
-    let metadata = directory.metadata()?;
-    if (metadata.dev(), metadata.ino()) != identity {
-        return Err(io::Error::other("repository directory was replaced"));
-    }
-    // 项目仅支持 Linux GNU；通过已验证的目录 FD 遍历，避免检查后根路径被替换。
-    let entries = std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))?;
-    for entry in entries {
-        let entry = entry?;
-        let result = if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(entry.path())
-        } else {
-            std::fs::remove_file(entry.path())
-        };
-        if let Err(error) = result
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            return Err(error);
-        }
-    }
-    Ok(())
-}
-
-/// 不跟随替换后的根 symlink，也不回收被其他目录替换的同名路径。
-fn repository_directory_identity(path: &Path) -> io::Result<(u64, u64)> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(io::Error::other(
-            "repository directory is no longer a directory",
+/// 检查首次 clone 的目标目录，返回是否需要创建仓库；已有 resume 仓库沿用原流程。
+fn prepare_repository_directory(path: &Path, process_mode: &str) -> SourcesResult<bool> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err(SourcesError::message(
+            "repository directory must be absolute without parent traversal",
         ));
     }
-    Ok((metadata.dev(), metadata.ino()))
-}
-
-/// 清理前确认路径仍指向本次初始化登记的目录。
-fn check_repository_directory(path: &Path, identity: (u64, u64)) -> io::Result<()> {
-    if repository_directory_identity(path)? != identity {
-        return Err(io::Error::other("repository directory was replaced"));
-    }
-    Ok(())
-}
-
-/// Clone 只处理新仓库，重试时可安全回滚上次传输；fetch 保留现有仓库。
-pub(super) enum GitTransfer<'a> {
-    Clone(&'a Path),
-    Fetch(&'a Path),
+    let prepare = || -> io::Result<bool> {
+        for ancestor in path.ancestors() {
+            match std::fs::symlink_metadata(ancestor) {
+                Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                    return Err(io::Error::other(
+                        "repository directory must not contain symlinks or non-directories",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if path.try_exists()? {
+            if process_mode != "fresh"
+                && std::fs::symlink_metadata(path.join(".git"))
+                    .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+            {
+                return Ok(false);
+            }
+            if std::fs::read_dir(path)?.next().transpose()?.is_some() {
+                return Err(io::Error::other("repository directory must be empty"));
+            }
+        }
+        if process_mode != "fresh" && process_mode != "allow-prefetched" {
+            return Err(io::Error::other("repository does not exist in resume mode"));
+        }
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(path)?;
+        Ok(true)
+    };
+    prepare().map_err(|error| {
+        SourcesError::message(format!(
+            "cannot prepare repository directory {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 /// 保存全部配置并读取 post-clone Hook 环境变量。
@@ -323,8 +191,7 @@ impl GitHandler<'_> {
             tracing::info!("repo_url" = ?(&git_url), "repo" = ?(&git_source.git_info.repo), "{}", "Using custom git URL");
         }
         let repo_path = git_source.get_directory(&self.base_dir);
-        let mut preparation = RepositoryPreparation::prepare(&repo_path, process_mode)?;
-        let new_repository = preparation.new_repository;
+        let new_repository = prepare_repository_directory(&repo_path, process_mode)?;
 
         let auth_provider = if git_source
             .git_info
@@ -442,7 +309,6 @@ impl GitHandler<'_> {
             if cancellation.is_cancelled() {
                 return Err(SourcesError::message("repository preparation cancelled"));
             }
-            preparation.cleanup = None;
             Ok(())
         }
         .await;
@@ -491,23 +357,23 @@ impl GitHandler<'_> {
         }
     }
 
-    /// 最多执行五次指数退避 Git 传输。
+    /// 最多执行五次指数退避 Git fetch；clone 失败直接终止初始化。
     ///
     /// 第四、五次在原参数前加 `-c http.version=HTTP/1.1`；第五次额外设置
     /// `GIT_TRACE_PACKET=1`。退避由 cancellation 打断时保留 文案中的
     /// `cancelled` 双 l 拼写。
-    async fn run_git_transfer_with_retry(
+    async fn run_git_fetch_with_retry(
         &self,
         cancellation: &CancellationToken,
-        transfer: GitTransfer<'_>,
+        repo_path: &Path,
         git_url: &str,
         authenticated_url: &str,
         auth_provider: Option<&(dyn SourceAuthProvider + Send + Sync)>,
         args: &[String],
     ) -> SourcesResult<()> {
-        self.run_git_transfer_with_retry_delay(
+        self.run_git_fetch_with_retry_delay(
             cancellation,
-            transfer,
+            repo_path,
             git_url,
             authenticated_url,
             auth_provider,
@@ -517,12 +383,12 @@ impl GitHandler<'_> {
         .await
     }
 
-    /// 允许传输测试缩短退避，不改变生产重试次数、协议回退或环境变量。
+    /// 允许 fetch 测试缩短退避，不改变生产重试次数、协议回退或环境变量。
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn run_git_transfer_with_retry_delay(
+    pub(super) async fn run_git_fetch_with_retry_delay(
         &self,
         cancellation: &CancellationToken,
-        transfer: GitTransfer<'_>,
+        repo_path: &Path,
         git_url: &str,
         authenticated_url: &str,
         auth_provider: Option<&(dyn SourceAuthProvider + Send + Sync)>,
@@ -531,23 +397,11 @@ impl GitHandler<'_> {
     ) -> SourcesResult<()> {
         const MAX_ATTEMPTS: usize = 5;
         let mut last_error = None;
-        let (operation, dir) = match transfer {
-            GitTransfer::Clone(_) => ("clone", None),
-            GitTransfer::Fetch(path) => ("fetch", Some(path)),
-        };
-        let clone_identity = match transfer {
-            GitTransfer::Clone(path) => {
-                Some(repository_directory_identity(path).map_err(|error| {
-                    SourcesError::message(format!("cannot inspect clone directory: {error}"))
-                })?)
-            }
-            GitTransfer::Fetch(_) => None,
-        };
 
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
                 let delay = base_delay * (1_u32 << (attempt - 1));
-                tracing::info!(operation, "attempt" = ?(attempt + 1), "max_attempts" = ?(MAX_ATTEMPTS), "delay_seconds" = ?(delay.as_secs()), "base_delay_seconds" = ?(base_delay.as_secs()), "{}", "Retrying git transfer after failure");
+                tracing::info!(operation = "fetch", "attempt" = ?(attempt + 1), "max_attempts" = ?(MAX_ATTEMPTS), "delay_seconds" = ?(delay.as_secs()), "base_delay_seconds" = ?(base_delay.as_secs()), "{}", "Retrying git transfer after failure");
                 tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => {
@@ -556,13 +410,6 @@ impl GitHandler<'_> {
                         ));
                     }
                     _ = tokio::time::sleep(delay) => {}
-                }
-                if let (GitTransfer::Clone(path), Some(identity)) = (&transfer, clone_identity) {
-                    remove_repository_contents(path, identity).map_err(|error| {
-                        SourcesError::message(format!(
-                            "failed to clean up repository before clone retry: {error}"
-                        ))
-                    })?;
                 }
             }
 
@@ -580,7 +427,7 @@ impl GitHandler<'_> {
             match self
                 .run_git_command(
                     cancellation,
-                    dir,
+                    Some(repo_path),
                     git_url,
                     authenticated_url,
                     auth_provider,
@@ -591,23 +438,23 @@ impl GitHandler<'_> {
             {
                 Ok(()) => {
                     if attempt > 0 {
-                        tracing::info!(operation, "attempt" = ?(attempt + 1), "max_attempts" = ?(MAX_ATTEMPTS), "{}", "Git transfer succeeded after retry");
+                        tracing::info!(operation = "fetch", "attempt" = ?(attempt + 1), "max_attempts" = ?(MAX_ATTEMPTS), "{}", "Git transfer succeeded after retry");
                     }
                     return Ok(());
                 }
                 Err(error) => {
                     last_error = Some(error.to_string());
                     if attempt < MAX_ATTEMPTS - 1 {
-                        tracing::warn!(operation, "attempt" = ?(attempt + 1), "max_attempts" = ?(MAX_ATTEMPTS), "error" = ?(error.to_string()), "{}", "Git transfer failed, will retry");
+                        tracing::warn!(operation = "fetch", "attempt" = ?(attempt + 1), "max_attempts" = ?(MAX_ATTEMPTS), "error" = ?(error.to_string()), "{}", "Git transfer failed, will retry");
                     }
                 }
             }
         }
 
         let last_error = last_error.unwrap_or_default();
-        tracing::error!(operation, "attempts" = ?(MAX_ATTEMPTS), "error" = ?(&last_error), "{}", "Git transfer failed after all retries");
+        tracing::error!(operation = "fetch", "attempts" = ?(MAX_ATTEMPTS), "error" = ?(&last_error), "{}", "Git transfer failed after all retries");
         Err(SourcesError::message(format!(
-            "git {operation} failed after {MAX_ATTEMPTS} attempts: {last_error}"
+            "git fetch failed after {MAX_ATTEMPTS} attempts: {last_error}"
         )))
     }
 
@@ -847,12 +694,13 @@ impl GitHandler<'_> {
                 authenticated_url.to_owned(),
                 repo_path.display().to_string(),
             ]);
-            self.run_git_transfer_with_retry(
+            self.run_git_command(
                 cancellation,
-                GitTransfer::Clone(repo_path),
+                None,
                 git_url,
                 authenticated_url,
                 auth_provider,
+                &[],
                 &args,
             )
             .await?;
@@ -1042,9 +890,9 @@ impl GitHandler<'_> {
             }
             fetch_args.extend(["origin".to_owned(), ref_name.to_owned()]);
             if let Err(error) = self
-                .run_git_transfer_with_retry(
+                .run_git_fetch_with_retry(
                     cancellation,
-                    GitTransfer::Fetch(repo_path),
+                    repo_path,
                     git_url,
                     authenticated_url,
                     auth_provider,
@@ -1080,9 +928,9 @@ impl GitHandler<'_> {
             if process_mode == "resume" {
                 tracing::info!("{}", "Fetching latest HEAD for resume");
                 if let Err(error) = self
-                    .run_git_transfer_with_retry(
+                    .run_git_fetch_with_retry(
                         cancellation,
-                        GitTransfer::Fetch(repo_path),
+                        repo_path,
                         git_url,
                         authenticated_url,
                         auth_provider,
