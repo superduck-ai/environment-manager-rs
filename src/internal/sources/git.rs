@@ -30,7 +30,7 @@ use crate::internal::{
     config::{GitInfo, GitRepositorySource},
     process::{CaptureMode, CommandFailure, CommandOutput, run_command},
     session::ActivityRecorder,
-    util::{Stopper, update_remote_tracking_branch},
+    util::Stopper,
 };
 
 use super::gitproxy_adapter::ProductionGitProxyFactory;
@@ -891,6 +891,24 @@ impl GitHandler<'_> {
                 }
                 tracing::info!(repo_path = %repo_path.display(), "Repository is empty, skipping checkout");
             }
+            // 首次下载仍限定单分支；后续 fetch/push 必须能更新新分支的远端跟踪引用。
+            let config_args = vec![
+                "config".to_owned(),
+                "--local".to_owned(),
+                "--replace-all".to_owned(),
+                "remote.origin.fetch".to_owned(),
+                "+refs/heads/*:refs/remotes/origin/*".to_owned(),
+            ];
+            self.run_git_command(
+                cancellation,
+                Some(repo_path),
+                git_url,
+                authenticated_url,
+                auth_provider,
+                &[],
+                &config_args,
+            )
+            .await?;
             return self
                 .finish_clone(cancellation, repo_path, git_url, clone_started)
                 .await;
@@ -1500,9 +1518,8 @@ impl GitHandler<'_> {
     }
 
     ///
-    /// 从当前 HEAD 创建本地目标 branch，随后通过 `internal/util/git.rs` 的统一封装
-    /// 创建 `refs/remotes/origin/<branch>`。checkout 时关闭 hooks，避免实现意外
-    /// 执行仓库脚本。
+    /// 从当前 HEAD 创建本地目标 branch。远端跟踪引用只由真实 fetch/push 更新，
+    /// 不能把尚未推送的本地 HEAD 当作远端状态。checkout 时关闭 hooks，避免执行仓库脚本。
     ///
     /// # 参数
     /// - `cancellation`：上层 context 的取消信号；只作用于当前直接 Git 子进程。
@@ -1510,7 +1527,7 @@ impl GitHandler<'_> {
     /// - `target_branch`：要创建的 branch 名称，不经 shell 解释。
     ///
     /// # 返回
-    /// checkout 和 remote-tracking ref 都成功时返回 `Ok(())`；任一步失败时保留 `source chain` 包装文本并返回 [`SourcesError`]。
+    /// checkout 成功时返回 `Ok(())`；失败时保留 `source chain` 包装文本并返回 [`SourcesError`]。
     ///
     /// # 副作用
     /// 创建 Git 子进程、修改本地 branch/ref，并按 消息、级别和属性顺序记录
@@ -1564,10 +1581,6 @@ impl GitHandler<'_> {
                 "failed to create branch {target_branch}: {error}"
             )));
         }
-
-        update_remote_tracking_branch(cancellation, repo_path, "origin", target_branch, "HEAD")
-            .await
-            .map_err(|error| SourcesError::message(error.to_string()))?;
 
         tracing::info!(target_branch, "Successfully created new branch locally");
         Ok(())

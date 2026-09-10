@@ -184,7 +184,7 @@ async fn test_git_handler_process_fresh_clones_local_repository() {
     drop(root);
 }
 
-/// 验证 outcome branch 从当前 HEAD 创建，并建立 `refs/remotes/origin/*` tracking ref。
+/// 新 outcome branch 不伪造远端引用；真实推送后必须建立可用的 upstream。
 #[tokio::test]
 async fn test_git_handler_process_creates_outcome_branch() {
     let _process_state = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -214,11 +214,24 @@ async fn test_git_handler_process_creates_outcome_branch() {
         "task-branch"
     );
     assert!(
-        !git_output(
+        git_output(
             &repo_path,
-            &["rev-parse", "--verify", "refs/remotes/origin/task-branch"]
+            &["for-each-ref", "refs/remotes/origin/task-branch"]
         )
         .is_empty()
+    );
+    git_run(&repo_path, &["config", "user.email", "test@example.com"]);
+    git_run(&repo_path, &["config", "user.name", "Test User"]);
+    git_run(&repo_path, &["config", "commit.gpgsign", "false"]);
+    git_run(&repo_path, &["commit", "--allow-empty", "-m", "task work"]);
+    git_run(&repo_path, &["push", "-u", "origin", "task-branch"]);
+    assert_eq!(
+        git_output(&repo_path, &["rev-parse", "origin/task-branch"]),
+        git_output(&repo_path, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        git_output(&repo_path, &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+        "origin/task-branch"
     );
 }
 
@@ -558,6 +571,10 @@ async fn repository_sources_clone_default_branch_named_branch_and_commit() {
                 assert_eq!(
                     git_output(&target, &["remote", "get-url", "origin"]),
                     format!("file://{}", origin.display())
+                );
+                assert_eq!(
+                    git_output(&target, &["config", "--get-all", "remote.origin.fetch"]),
+                    "+refs/heads/*:refs/remotes/origin/*"
                 );
                 if let Some(branch) = branch {
                     assert_eq!(

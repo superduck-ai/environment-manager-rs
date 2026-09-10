@@ -56,22 +56,73 @@ if [[ -n "$untracked_files" ]]; then
 fi
 
 current_branch=$(git branch --show-current)
-if [[ -n "$current_branch" ]]; then
-  if git rev-parse "origin/$current_branch" >/dev/null 2>&1; then
-    # Branch exists on remote - compare against it
-    unpushed=$(git rev-list "origin/$current_branch..HEAD" --count 2>/dev/null) || unpushed=0
-    if [[ "$unpushed" -gt 0 ]]; then
-      echo "There are $unpushed unpushed commit(s) on branch '$current_branch'. Please push these changes to the remote repository." >&2
-      exit 2
-    fi
+if [[ -z "$current_branch" ]]; then
+  exit 0
+fi
+
+cannot_verify_push() {
+  echo "Cannot verify whether branch '$current_branch' is pushed. $1" >&2
+  exit 2
+}
+
+# A missing tracking ref is not evidence that the branch is absent remotely.
+# Resolve the configured upstream, including differently named branches/remotes.
+remote=$(git config --get "branch.$current_branch.remote") || remote=origin
+remote_ref=$(git config --get "branch.$current_branch.merge") || remote_ref="refs/heads/$current_branch"
+if [[ "$remote" = "." || "$remote_ref" != refs/heads/* ]]; then
+  cannot_verify_push "Configure an upstream branch on a remote repository."
+fi
+git check-ref-format "$remote_ref" >/dev/null 2>&1 || cannot_verify_push "The upstream branch is invalid."
+
+# Bound remote I/O and never expose raw Git errors, which may contain credentials.
+remote_refs=$(GIT_TERMINAL_PROMPT=0 timeout -k 2s 15s git ls-remote --exit-code -- "$remote" HEAD "$remote_ref" 2>/dev/null)
+remote_status=$?
+if [[ "$remote_status" -ne 0 && "$remote_status" -ne 2 ]]; then
+  cannot_verify_push "The remote query failed or timed out. Check access and retry."
+fi
+remote_head=$(printf '%s\n' "$remote_refs" | awk -v ref="$remote_ref" '$2 == ref { print $1; exit }')
+remote_branch_missing=false
+if [[ -z "$remote_head" ]]; then
+  remote_branch_missing=true
+  # Preserve the no-change case: a new branch can still point at the remote default HEAD.
+  remote_ref=HEAD
+  remote_head=$(printf '%s\n' "$remote_refs" | awk '$2 == "HEAD" { print $1; exit }')
+fi
+if [[ -z "$remote_head" ]]; then
+  echo "Branch '$current_branch' has no remote branch. Please push it to preserve the commits." >&2
+  exit 2
+fi
+
+# A successful push can be verified without fetching or inventing a tracking ref.
+local_head=$(git rev-parse --verify HEAD) || cannot_verify_push "Could not read the local commit."
+if [[ "$local_head" = "$remote_head" ]]; then
+  exit 0
+fi
+if ! git cat-file -e "$remote_head^{commit}" 2>/dev/null; then
+  GIT_TERMINAL_PROMPT=0 timeout -k 2s 15s git fetch --no-tags --no-recurse-submodules -- "$remote" "$remote_ref" >/dev/null 2>&1 ||
+    cannot_verify_push "Could not fetch the upstream history. Check access and retry."
+  remote_head=$(git rev-parse --verify 'FETCH_HEAD^{commit}') || cannot_verify_push "Could not read the fetched commit."
+fi
+
+git merge-base --is-ancestor HEAD "$remote_head" 2>/dev/null
+ancestor_status=$?
+if [[ "$ancestor_status" -eq 0 ]]; then
+  exit 0
+elif [[ "$ancestor_status" -ne 1 ]]; then
+  cannot_verify_push "Could not compare local and remote commits."
+fi
+shallow=$(git rev-parse --is-shallow-repository) || cannot_verify_push "Could not inspect the repository history."
+if [[ "$shallow" = true ]] && ! git merge-base --is-ancestor "$remote_head" HEAD 2>/dev/null; then
+  cannot_verify_push "Shallow history is insufficient. Fetch more history and retry."
+fi
+unpushed=$(git rev-list "$remote_head..HEAD" --count 2>/dev/null) || cannot_verify_push "Could not count local commits."
+if [[ "$unpushed" -gt 0 ]]; then
+  if [[ "$remote_branch_missing" = true ]]; then
+    echo "Branch '$current_branch' has $unpushed commit(s) beyond the remote default branch and no remote branch. Please push these changes." >&2
   else
-    # Branch doesn't exist on remote - compare against default branch
-    unpushed=$(git rev-list "origin/HEAD..HEAD" --count 2>/dev/null) || unpushed=0
-    if [[ "$unpushed" -gt 0 ]]; then
-      echo "Branch '$current_branch' has $unpushed unpushed commit(s) and no remote branch. Please push these changes to the remote repository." >&2
-      exit 2
-    fi
+    echo "There are $unpushed unpushed commit(s) on branch '$current_branch'. Please push these changes to the remote repository." >&2
   fi
+  exit 2
 fi
 
 exit 0
