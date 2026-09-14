@@ -67,9 +67,7 @@ struct UpstreamProxyChunk {
 
 const NO_PROXY_LIST: &str = concat!(
     "localhost,127.0.0.1,::1,169.254.0.0/16,10.0.0.0/8,172.16.0.0/12,",
-    "192.168.0.0/16,anthropic.com,.anthropic.com,*.anthropic.com,github.com,",
-    "api.github.com,*.github.com,*.githubusercontent.com,registry.npmjs.org,pypi.org,",
-    "files.pythonhosted.org,index.crates.io,proxy.golang.org"
+    "192.168.0.0/16"
 );
 
 /// 启动 relay 所需的会话配置；所有字段只在 Claude 子系统内构造。
@@ -707,7 +705,7 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         assert_eq!(environment["HTTPS_PROXY"], "http://127.0.0.1:4321");
         assert_eq!(environment["https_proxy"], environment["HTTPS_PROXY"]);
-        assert!(environment["NO_PROXY"].contains("*.github.com"));
+        assert!(!environment["NO_PROXY"].contains("*.github.com"));
         assert!(environment["NO_PROXY"].ends_with(",control.example.test"));
         assert!(!environment.contains_key("HTTP_PROXY"));
         for key in [
