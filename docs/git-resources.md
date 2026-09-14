@@ -30,8 +30,12 @@ authenticates the CONNECT relay and is never a repository URL/config value.
 
 The Manager prepares the CA bundle and starts the existing CONNECT-over-WebSocket
 relay before environment/source initialization. Source Git commands and Claude
-share this relay. GitHub bypass entries are removed for these sessions; source
-Git commands do not honor `NO_PROXY`. Clone failure fails environment startup.
+share this relay. Both `NO_PROXY` and `no_proxy` retain only local/private-network
+and control-plane exceptions, removing Anthropic, GitHub, and package registry
+bypasses. Clients honoring the proxy environment use the relay; network policy
+and credential checks still apply. `GIT_SSL_CAINFO` points to the combined CA
+bundle. Source Git commands additionally clear both bypass variables. Clone
+failure fails environment startup.
 
 Branches use `clone --depth=1 --single-branch --no-tags` and must produce the exact
 `refs/heads/<name>` symbolic HEAD; a same-named tag cannot satisfy branch checkout.
