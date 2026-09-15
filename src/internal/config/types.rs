@@ -85,6 +85,9 @@ pub struct GitRepositorySource {
     /// 仓库连接与 ref 信息。
     #[serde(default)]
     pub git_info: GitInfo,
+    /// 可选的绝对挂载目录；留空时沿用仓库名推导目录。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mount_path: String,
 }
 
 /// 当前版本支持的 source 联合类型。

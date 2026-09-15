@@ -23,6 +23,7 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 use crate::internal::{
+    auth::AuthContext,
     codesign::{CONTEXT_ENV as CODESIGN_CONTEXT_ENV, CodeSignContext},
     config::{ClaudeConfig, McpConfigFile, StartupContext},
     session::NoopActivityRecorder,
@@ -32,7 +33,8 @@ use super::{
     Executor, build_session_urls,
     claude_code_executor::{
         add_token_via_file_descriptor, filter_init_only_from_environ, install_token_descriptors,
-        new_claude_code_executor, tail_string, write_ccr_upstream_proxy_token,
+        new_claude_code_executor, prepare_session_agent_proxy, remove_stale_agent_proxy_token,
+        tail_string, write_ccr_upstream_proxy_token,
     },
 };
 
@@ -276,6 +278,150 @@ fn agent_proxy_uses_final_api_base_url_priority() {
     assert!(code_sign_context.sources.is_empty());
 }
 
+/// 提前准备的禁用路径不依赖 Claude session、认证、端点或其他执行器配置。
+#[tokio::test]
+async fn disabled_session_agent_proxy_needs_no_executor_configuration() {
+    if !crate::internal::enter_isolated_process_test(concat!(
+        module_path!(),
+        "::disabled_session_agent_proxy_needs_no_executor_configuration"
+    )) {
+        return;
+    }
+    // SAFETY: 独立测试进程只运行本测试，后续所有环境覆盖均通过局部配置传递。
+    unsafe {
+        std::env::set_var("CLAUDE_CODE_REMOTE", "true");
+        std::env::set_var("CCR_UPSTREAM_PROXY_ENABLED", "true");
+    }
+    for (local_testing, code_session, config_remote, startup_proxy) in [
+        (true, true, "true", "true"),
+        (false, false, "true", "true"),
+        (false, true, "false", "true"),
+        (false, true, "true", "false"),
+    ] {
+        let mut cfg = empty_config();
+        cfg.local_testing_mode = local_testing;
+        cfg.environment
+            .insert("CLAUDE_CODE_REMOTE".to_owned(), config_remote.to_owned());
+        let startup = StartupContext {
+            api_base_url: "invalid endpoint".to_owned(),
+            use_code_sessions: code_session,
+            environment_variables: [(
+                "CCR_UPSTREAM_PROXY_ENABLED".to_owned(),
+                startup_proxy.to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            ..StartupContext::default()
+        };
+        assert!(
+            prepare_session_agent_proxy(&cfg, "", Some(&startup), &AuthContext::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(
+        prepare_session_agent_proxy(&empty_config(), "", None, &AuthContext::default())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// 从实际 CA HTTP 请求确认端点优先级；显式空值必须拒绝，不能回退到低优先级。
+#[tokio::test]
+async fn session_agent_proxy_download_uses_effective_endpoint() {
+    if !crate::internal::enter_isolated_process_test(concat!(
+        module_path!(),
+        "::session_agent_proxy_download_uses_effective_endpoint"
+    )) {
+        return;
+    }
+    let home = TempDir::new().unwrap();
+    let mut servers = Vec::new();
+    for _ in 0..4 {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/code/upstreamproxy/ca-cert"))
+            // 只验证请求路由，下载失败不创建 CA 文件或 listener。
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        servers.push(server);
+    }
+    let endpoints = servers
+        .iter()
+        .map(wiremock::MockServer::uri)
+        .collect::<Vec<_>>();
+    // SAFETY: 独立测试进程只运行本测试；在发起任何客户端请求前完成宿主环境设置。
+    unsafe {
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("CLAUDE_CODE_REMOTE", "true");
+        std::env::set_var("CCR_UPSTREAM_PROXY_ENABLED", "true");
+        std::env::set_var("ANTHROPIC_BASE_URL", &endpoints[0]);
+        std::env::set_var("NO_PROXY", "127.0.0.1");
+        std::env::set_var("no_proxy", "127.0.0.1");
+    }
+    let mut auth = AuthContext::default();
+    auth.set_session_ingress_token("session-token");
+    for (fallback, configured, startup_value, missing_endpoint) in [
+        ("", None, None, false),
+        (endpoints[1].as_str(), None, None, false),
+        (
+            endpoints[1].as_str(),
+            Some(endpoints[2].as_str()),
+            None,
+            false,
+        ),
+        (
+            endpoints[1].as_str(),
+            Some(endpoints[2].as_str()),
+            Some(endpoints[3].as_str()),
+            false,
+        ),
+        (endpoints[1].as_str(), Some(""), None, true),
+        (
+            endpoints[1].as_str(),
+            Some(endpoints[2].as_str()),
+            Some(""),
+            true,
+        ),
+    ] {
+        let mut cfg = empty_config();
+        if let Some(value) = configured {
+            cfg.environment
+                .insert("ANTHROPIC_BASE_URL".to_owned(), value.to_owned());
+        }
+        let mut startup = StartupContext {
+            api_base_url: fallback.to_owned(),
+            use_code_sessions: true,
+            ..StartupContext::default()
+        };
+        if let Some(value) = startup_value {
+            startup
+                .environment_variables
+                .insert("ANTHROPIC_BASE_URL".to_owned(), value.to_owned());
+        }
+        let error = prepare_session_agent_proxy(&cfg, "session-123", Some(&startup), &auth)
+            .await
+            .err()
+            .expect("missing endpoint or failing CA endpoint must fail preparation");
+        if missing_endpoint {
+            assert_eq!(
+                error.to_string(),
+                "CCR upstream proxy requires ANTHROPIC_BASE_URL"
+            );
+        } else {
+            assert!(error.to_string().contains("503"), "{error}");
+        }
+    }
+    for server in &servers {
+        server.verify().await;
+    }
+    assert!(!home.path().join(".ccr/ca-bundle.crt").exists());
+}
+
 /// 开启 CCRv2 relay 却没有 ingress token 时必须在 spawn Claude 前失败。
 #[tokio::test]
 async fn enabled_agent_proxy_requires_session_ingress_token() {
@@ -310,10 +456,9 @@ fn test_write_ccr_upstream_proxy_token() {
     let temp = TempDir::new().unwrap();
     let token = temp.path().join("session_token");
     fs::write(&token, "old-token").unwrap();
-    let executor = make_executor(empty_config(), StartupContext::default());
-    executor.remove_stale_agent_proxy_token(&token).unwrap();
+    remove_stale_agent_proxy_token(&token).unwrap();
     assert!(!token.exists());
-    executor.remove_stale_agent_proxy_token(&token).unwrap();
+    remove_stale_agent_proxy_token(&token).unwrap();
 }
 
 /// 旧 token writer 必须保持停用，且不可删除的遗留目标必须 fail-closed。
@@ -325,10 +470,9 @@ fn test_write_ccr_upstream_proxy_token_rejects_empty_inputs() {
     assert!(write_ccr_upstream_proxy_token(&token, "token").is_err());
     assert!(!token.exists());
 
-    let executor = make_executor(empty_config(), StartupContext::default());
     let directory = temp.path().join("directory");
     fs::create_dir(&directory).unwrap();
-    assert!(executor.remove_stale_agent_proxy_token(&directory).is_err());
+    assert!(remove_stale_agent_proxy_token(&directory).is_err());
 }
 
 ///

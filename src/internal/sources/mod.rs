@@ -17,6 +17,12 @@ pub use types::{
     SourcesResult,
 };
 
+tokio::task_local! {
+    /// 仅在 source 初始化 future 被 poll 时生效，不修改全局进程环境。
+    /// source Git 在当前任务中执行；若将来改为 spawn，必须显式传递此 scope。
+    pub(crate) static GIT_ENVIRONMENT: Vec<(std::ffi::OsString, std::ffi::OsString)>;
+}
+
 #[cfg(test)]
 #[path = "git_test.rs"]
 mod git_test;

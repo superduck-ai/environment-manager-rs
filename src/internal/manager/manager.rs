@@ -223,6 +223,23 @@ impl Manager {
             None => Arc::new(NoopActivityRecorder),
         };
 
+        self.configure_environment(cancellation, environment.as_mut(), &auth_context)
+            .await;
+        self.apply_environment_config(environment.as_ref(), &mut claude_config);
+        // Source Git 会先于 Claude 运行；CA 与 relay 必须在任何 source I/O 之前就绪。
+        let mut agent_proxy = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Ok(()),
+            result = claude::prepare_session_agent_proxy(
+                &claude_config,
+                &session_id,
+                self.session_config.as_ref().and_then(|session| session.startup_context.as_ref()),
+                &auth_context,
+            ) => result.map_err(|error| ManagerError::message(format!(
+                "failed to prepare environment network: {error}"
+            )))?,
+        };
+
         tracing::info!(
             "{}",
             "Starting parallel initialization: MCP servers, plugin marketplace, and environment setup"
@@ -271,12 +288,23 @@ impl Manager {
             }))
         };
 
-        self.configure_environment(cancellation, environment.as_mut(), &auth_context)
-            .await;
-        self.apply_environment_config(environment.as_ref(), &mut claude_config);
-        let environment_initialization = environment
-            .initialize(cancellation, Some(activity_recorder.as_ref()))
-            .await;
+        let source_environment = agent_proxy
+            .as_ref()
+            .map_or_else(Vec::new, |proxy| proxy.environment().to_vec());
+        let initialize = crate::internal::sources::GIT_ENVIRONMENT.scope(
+            source_environment,
+            environment.initialize(cancellation, Some(activity_recorder.as_ref())),
+        );
+        let environment_initialization = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(Box::new(ManagerError::message(
+                "environment initialization cancelled"
+            )) as crate::internal::util::BoxError),
+            failure = claude::wait_for_agent_proxy_failure(agent_proxy.as_mut()) => {
+                Err(Box::new(ManagerError::message(failure)) as crate::internal::util::BoxError)
+            }
+            result = initialize => result,
+        };
 
         let (mcp_batch, mcp_error) = match mcp_task.await {
             Ok(batch) => (batch, None),
@@ -360,8 +388,17 @@ impl Manager {
                 "{}",
                 "ENVRUNNER_SKIP_CLAUDE_CODE mode: environment initialized, waiting for shutdown signal"
             );
-            wait_for_shutdown_signal(cancellation).await;
-            return Ok(());
+            let result = tokio::select! {
+                biased;
+                () = wait_for_shutdown_signal(cancellation) => Ok(()),
+                failure = claude::wait_for_agent_proxy_failure(agent_proxy.as_mut()) => {
+                    Err(ManagerError::message(failure))
+                }
+            };
+            if let Some(proxy) = agent_proxy.take() {
+                proxy.shutdown().await;
+            }
+            return result;
         }
 
         let outcomes = match self.api_client.get_outcomes() {
@@ -488,6 +525,7 @@ impl Manager {
                 Arc::clone(&executor),
                 started,
                 lease_runtime.is_some(),
+                agent_proxy.take(),
             )
             .await
         };
@@ -495,6 +533,9 @@ impl Manager {
         self.cleanup_mcp_and_executor(&mcp_batch.servers, &executor)
             .await;
         stop_lease(lease_runtime.as_ref()).await;
+        if let Some(proxy) = agent_proxy.take() {
+            proxy.shutdown().await;
+        }
         operation_result
     }
 
@@ -665,6 +706,7 @@ impl Manager {
     }
 
     /// 创建可选 tunnel，令它与 Claude executor 并发运行，并解释取消为正常退出。
+    #[allow(clippy::too_many_arguments)]
     async fn execute_claude_and_tunnel(
         &self,
         executor_cancellation: &CancellationToken,
@@ -673,6 +715,7 @@ impl Manager {
         executor: Arc<dyn Executor>,
         manager_started: Instant,
         using_lease_context: bool,
+        agent_proxy: Option<claude::AgentProxyHandle>,
     ) -> Result<(), ManagerError> {
         let mut tunnel_client = None;
         if is_tunnel_enabled(self.create_tunnel_client_func.as_ref()) {
@@ -710,7 +753,9 @@ impl Manager {
         let execute_token = run_cancellation.clone();
         let cancel_after_execute = run_cancellation.clone();
         let execute_future = async move {
-            let result = executor.execute(&execute_token).await;
+            let result = executor
+                .execute_with_agent_proxy(&execute_token, agent_proxy)
+                .await;
             let was_cancelled = execute_token.is_cancelled();
             cancel_after_execute.cancel();
             (result, was_cancelled)

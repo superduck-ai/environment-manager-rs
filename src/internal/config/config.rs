@@ -116,11 +116,14 @@ impl GitRepositorySource {
         true
     }
 
-    /// 用仓库名最后一个路径分量计算 clone 目录。
+    /// 优先使用显式挂载目录，否则用仓库名最后一个路径分量计算 clone 目录。
     ///
     /// 空仓库名和无法取得文件名的异常路径会安全回退到 base directory。
     #[must_use]
     pub fn get_directory(&self, base_dir: impl AsRef<Path>) -> PathBuf {
+        if !self.mount_path.is_empty() {
+            return PathBuf::from(&self.mount_path);
+        }
         if self.git_info.repo.is_empty() {
             return base_dir.as_ref().to_path_buf();
         }

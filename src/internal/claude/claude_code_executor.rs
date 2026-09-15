@@ -274,6 +274,120 @@ pub(super) fn add_token_via_file_descriptor(
     Ok(target)
 }
 
+/// 在环境初始化前准备 CA 与 relay，不构造或启动 Claude 执行器。
+pub(crate) async fn prepare_session_agent_proxy(
+    config: &ClaudeConfig,
+    session_id: &str,
+    startup_context: Option<&StartupContext>,
+    auth_context: &AuthContext,
+) -> Result<Option<super::AgentProxyHandle>, ClaudeError> {
+    let Some(startup_context) = startup_context else {
+        return Ok(None);
+    };
+    prepare_agent_proxy(
+        Some(config),
+        session_id,
+        startup_context,
+        Some(auth_context),
+    )
+    .await
+}
+
+/// 读取代理所需的有效环境值，保持 child 环境的覆盖顺序与 API base fallback。
+fn effective_environment_value(
+    config: Option<&ClaudeConfig>,
+    startup_context: &StartupContext,
+    key: &str,
+) -> String {
+    startup_context
+        .environment_variables
+        .get(key)
+        .or_else(|| config.and_then(|config| config.environment.get(key)))
+        .cloned()
+        .or_else(|| {
+            (key == "ANTHROPIC_BASE_URL" && !startup_context.api_base_url.is_empty())
+                .then(|| startup_context.api_base_url.clone())
+        })
+        .unwrap_or_else(|| std::env::var(key).unwrap_or_default())
+}
+
+/// 判断远程 code session 是否启用 relay；禁用时无需认证或网络配置。
+fn agent_proxy_enabled(
+    config: Option<&ClaudeConfig>,
+    startup_context: &StartupContext,
+    local_testing_mode: bool,
+) -> bool {
+    !local_testing_mode
+        && startup_context.use_code_sessions
+        && is_truthy_environment_value(&effective_environment_value(
+            config,
+            startup_context,
+            CLAUDE_CODE_REMOTE_ENVIRONMENT_KEY,
+        ))
+        && is_truthy_environment_value(&effective_environment_value(
+            config,
+            startup_context,
+            CCR_UPSTREAM_PROXY_ENABLED_ENVIRONMENT_KEY,
+        ))
+}
+
+/// Source 提前准备与 Claude 直接执行共用的代理启动路径。
+async fn prepare_agent_proxy(
+    config: Option<&ClaudeConfig>,
+    session_id: &str,
+    startup_context: &StartupContext,
+    auth_context: Option<&AuthContext>,
+) -> Result<Option<super::AgentProxyHandle>, ClaudeError> {
+    if !agent_proxy_enabled(
+        config,
+        startup_context,
+        config.is_some_and(|config| config.local_testing_mode),
+    ) {
+        return Ok(None);
+    }
+    if session_id.is_empty() {
+        return Err(ClaudeError::message("sessionID cannot be empty"));
+    }
+    remove_stale_agent_proxy_token(Path::new(super::agent_proxy::STALE_RELAY_TOKEN_PATH))?;
+    let token = auth_context
+        .map(AuthContext::get_session_ingress_token)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            ClaudeError::message("CCR upstream proxy requires a non-empty session ingress token")
+        })?;
+    let api_base_url = effective_environment_value(config, startup_context, "ANTHROPIC_BASE_URL");
+    if api_base_url.is_empty() {
+        return Err(ClaudeError::message(
+            "CCR upstream proxy requires ANTHROPIC_BASE_URL",
+        ));
+    }
+    let proxy = super::agent_proxy::AgentProxy::start(super::agent_proxy::AgentProxyConfig {
+        api_base_url,
+        session_id: session_id.to_owned(),
+        token: token.to_owned(),
+    })
+    .await?;
+    tracing::info!(
+        path = "environment-manager memory",
+        "Prepared session ingress token for CCR upstream proxy relay"
+    );
+    Ok(Some(proxy))
+}
+
+/// 删除旧 Claude relay 遗留的固定 token；非 NotFound 错误按 fail-closed 返回。
+pub(super) fn remove_stale_agent_proxy_token(path: &Path) -> Result<(), ClaudeError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            tracing::warn!(error = %error, path = %path.display(), "Failed to remove CCR upstream proxy token file");
+            Err(ClaudeError::message(format!(
+                "failed to remove stale CCR upstream proxy token: {error}"
+            )))
+        }
+    }
+}
+
 impl ClaudeCodeExecutor {
     /// 注入真实 o11y adapter；未调用时所有 o11y 事件被明确省略而非伪造。
     pub fn set_observability(&mut self, observability: Arc<dyn ClaudeObservability>) {
@@ -285,32 +399,9 @@ impl ClaudeCodeExecutor {
         self.claude_path = path.into();
     }
 
-    /// 按“宿主 < ClaudeConfig < StartupContext”读取有效环境值。
-    fn effective_environment_value(&self, key: &str) -> String {
-        let mut value = std::env::var(key).unwrap_or_default();
-        if let Some(configured) = self.cfg.as_ref().and_then(|cfg| cfg.environment.get(key)) {
-            value.clone_from(configured);
-        }
-        if let Some(configured) = self.startup_context.environment_variables.get(key) {
-            value.clone_from(configured);
-        }
-        value
-    }
-
-    /// 判断远程 code session 是否配置了 CCRv2 relay。
-    pub(super) fn should_prepare_ccr_upstream_proxy_token(&self) -> bool {
-        self.startup_context.use_code_sessions
-            && is_truthy_environment_value(
-                &self.effective_environment_value(CLAUDE_CODE_REMOTE_ENVIRONMENT_KEY),
-            )
-            && is_truthy_environment_value(
-                &self.effective_environment_value(CCR_UPSTREAM_PROXY_ENABLED_ENVIRONMENT_KEY),
-            )
-    }
-
     /// 判断当前会话是否由 environment-manager 启动 CCRv2 relay。
     pub(super) fn should_start_agent_proxy(&self, local_testing_mode: bool) -> bool {
-        !local_testing_mode && self.should_prepare_ccr_upstream_proxy_token()
+        agent_proxy_enabled(self.cfg.as_ref(), &self.startup_context, local_testing_mode)
     }
 
     /// 合并 sandbox gateway 参数、本地追加 prompt，并按需写出 gateway MCP 文件。
@@ -408,7 +499,11 @@ impl ClaudeCodeExecutor {
     }
 
     /// 执行完整 Claude child 生命周期，并保持 参数、环境和副作用。
-    async fn execute_inner(&self, cancellation: &CancellationToken) -> Result<(), ClaudeError> {
+    async fn execute_inner(
+        &self,
+        cancellation: &CancellationToken,
+        mut agent_proxy: Option<super::AgentProxyHandle>,
+    ) -> Result<(), ClaudeError> {
         tracing::info!(session_id = %self.session_id, "Starting ClaudeCodeExecutor");
         let local_testing_mode = self.cfg.as_ref().is_some_and(|cfg| cfg.local_testing_mode);
         let mut args = vec![
@@ -506,9 +601,15 @@ impl ClaudeCodeExecutor {
         let mut environment = self.build_child_environment();
         let mut descriptors = Vec::new();
         self.prepare_authentication(local_testing_mode, &mut environment, &mut descriptors)?;
-        let mut agent_proxy = self
-            .start_agent_proxy(local_testing_mode, &environment)
+        if agent_proxy.is_none() {
+            agent_proxy = prepare_agent_proxy(
+                self.cfg.as_ref(),
+                &self.session_id,
+                &self.startup_context,
+                self.auth_context.as_ref(),
+            )
             .await?;
+        }
         if let Some(proxy) = agent_proxy.as_ref() {
             environment.extend(proxy.environment().iter().cloned());
         }
@@ -762,62 +863,6 @@ impl ClaudeCodeExecutor {
             ));
         }
         Ok(())
-    }
-
-    /// 使用最终 child 环境中的 API base 和 session ingress token 启动本地 relay。
-    async fn start_agent_proxy(
-        &self,
-        local_testing_mode: bool,
-        environment: &[(OsString, OsString)],
-    ) -> Result<Option<super::agent_proxy::AgentProxyHandle>, ClaudeError> {
-        if !self.should_start_agent_proxy(local_testing_mode) {
-            return Ok(None);
-        }
-        self.remove_stale_agent_proxy_token(Path::new(super::agent_proxy::STALE_RELAY_TOKEN_PATH))?;
-        let token = self
-            .auth_context
-            .as_ref()
-            .map(AuthContext::get_session_ingress_token)
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| {
-                ClaudeError::message(
-                    "CCR upstream proxy requires a non-empty session ingress token",
-                )
-            })?;
-        let api_base_url = environment
-            .iter()
-            .rev()
-            .find(|(key, _)| key == OsStr::new("ANTHROPIC_BASE_URL"))
-            .and_then(|(_, value)| value.to_str())
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                ClaudeError::message("CCR upstream proxy requires ANTHROPIC_BASE_URL")
-            })?;
-        let proxy = super::agent_proxy::AgentProxy::start(super::agent_proxy::AgentProxyConfig {
-            api_base_url: api_base_url.to_owned(),
-            session_id: self.session_id.clone(),
-            token: token.to_owned(),
-        })
-        .await?;
-        tracing::info!(
-            path = "environment-manager memory",
-            "Prepared session ingress token for CCR upstream proxy relay"
-        );
-        Ok(Some(proxy))
-    }
-
-    /// 删除旧 Claude relay 遗留的固定 token；非 NotFound 错误按 fail-closed 返回。
-    pub(super) fn remove_stale_agent_proxy_token(&self, path: &Path) -> Result<(), ClaudeError> {
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => {
-                tracing::warn!(error = %error, path = %path.display(), "Failed to remove CCR upstream proxy token file");
-                Err(ClaudeError::message(format!(
-                    "failed to remove stale CCR upstream proxy token: {error}"
-                )))
-            }
-        }
     }
 
     /// spawn child、写 stdin、并发复制两个 stream，并只等待 direct child。
@@ -1093,7 +1138,16 @@ impl ClaudeCodeExecutor {
 impl Executor for ClaudeCodeExecutor {
     /// 执行 Claude Code 并保留 direct-child 取消语义。
     async fn execute(&self, cancellation: &CancellationToken) -> Result<(), ClaudeError> {
-        self.execute_inner(cancellation).await
+        self.execute_inner(cancellation, None).await
+    }
+
+    /// 复用 manager 在 source 初始化前准备的代理，避免重启 listener 或重复下载 CA。
+    async fn execute_with_agent_proxy(
+        &self,
+        cancellation: &CancellationToken,
+        proxy: Option<super::AgentProxyHandle>,
+    ) -> Result<(), ClaudeError> {
+        self.execute_inner(cancellation, proxy).await
     }
 
     /// 清理 token 文件；取消参数不影响幂等安全清理。

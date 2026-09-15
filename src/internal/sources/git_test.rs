@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -86,6 +87,68 @@ fn git_handler_has_production_proxy_factory_by_default() {
     );
 }
 
+/// 子进程配置必须贯穿访问验证和实际 fetch，且不能写入父进程全局环境。
+#[tokio::test]
+async fn source_network_environment_reaches_validation_and_clone() {
+    let _process_state = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
+    let before = std::env::var_os("GIT_CONFIG_COUNT");
+    let clone_in_scope = |marker: &'static str| async move {
+        let (fixture, origin, _) = create_bare_git_repo();
+        let worktree = fixture.path().join("worktree");
+        git_run(&worktree, &["commit", "--allow-empty", "-m", marker]);
+        git_run(&worktree, &["push", path_text(&origin), "main"]);
+        let expected_head = git_output(&worktree, &["rev-parse", "HEAD"]);
+        let base = TempDir::new().unwrap();
+        let mut source = git_test_source(&origin, Some("main"));
+        source.git_info.url = Some("https://source-environment.invalid/repository.git".to_owned());
+        source.mount_path = base.path().join("repository").display().to_string();
+        // 两个任务使用同一 URL、不同本地源；串用配置会得到错误的 HEAD。
+        let environment = [
+            ("GIT_CONFIG_COUNT".to_owned(), "1".to_owned()),
+            (
+                "GIT_CONFIG_KEY_0".to_owned(),
+                format!("url.file://{}.insteadOf", origin.display()),
+            ),
+            (
+                "GIT_CONFIG_VALUE_0".to_owned(),
+                source.git_info.url.clone().unwrap(),
+            ),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
+        let manager = new_source_handler_manager(
+            base.path(),
+            None,
+            "",
+            None,
+            None,
+            ProcessMode::from("fresh"),
+            true,
+        )
+        .unwrap();
+        GIT_ENVIRONMENT
+            .scope(
+                environment,
+                manager.process_sources(&CancellationToken::new(), &[&source]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            git_output(Path::new(&source.mount_path), &["rev-parse", "HEAD"]),
+            expected_head
+        );
+        assert!(GIT_ENVIRONMENT.try_with(|_| ()).is_err());
+    };
+    let (first, second) = tokio::join!(
+        tokio::spawn(clone_in_scope("one")),
+        tokio::spawn(clone_in_scope("two"))
+    );
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(std::env::var_os("GIT_CONFIG_COUNT"), before);
+}
+
 /// 验证 fresh 模式从本地 bare repository 拉取指定 ref，并保留公开 origin URL。
 #[tokio::test]
 async fn test_git_handler_process_fresh_clones_local_repository() {
@@ -121,7 +184,7 @@ async fn test_git_handler_process_fresh_clones_local_repository() {
     drop(root);
 }
 
-/// 验证 outcome branch 从当前 HEAD 创建，并建立 `refs/remotes/origin/*` tracking ref。
+/// 新 outcome branch 不伪造远端引用；真实推送后必须建立可用的 upstream。
 #[tokio::test]
 async fn test_git_handler_process_creates_outcome_branch() {
     let _process_state = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -151,11 +214,24 @@ async fn test_git_handler_process_creates_outcome_branch() {
         "task-branch"
     );
     assert!(
-        !git_output(
+        git_output(
             &repo_path,
-            &["rev-parse", "--verify", "refs/remotes/origin/task-branch"]
+            &["for-each-ref", "refs/remotes/origin/task-branch"]
         )
         .is_empty()
+    );
+    git_run(&repo_path, &["config", "user.email", "test@example.com"]);
+    git_run(&repo_path, &["config", "user.name", "Test User"]);
+    git_run(&repo_path, &["config", "commit.gpgsign", "false"]);
+    git_run(&repo_path, &["commit", "--allow-empty", "-m", "task work"]);
+    git_run(&repo_path, &["push", "-u", "origin", "task-branch"]);
+    assert_eq!(
+        git_output(&repo_path, &["rev-parse", "origin/task-branch"]),
+        git_output(&repo_path, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        git_output(&repo_path, &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+        "origin/task-branch"
     );
 }
 
@@ -182,6 +258,7 @@ async fn test_git_handler_update_remote_url() {
             url: Some("https://example.test/new.git".to_owned()),
             ..GitInfo::default()
         },
+        ..GitRepositorySource::default()
     };
     let handler = new_git_handler(
         base_dir.path(),
@@ -425,6 +502,472 @@ fn git_test_source(repo: &Path, git_ref: Option<&str>) -> GitRepositorySource {
             git_ref: git_ref.map(str::to_owned),
             ..GitInfo::default()
         },
+        ..GitRepositorySource::default()
+    }
+}
+
+/// 显式目录和默认目录使用相同的浅克隆、分支、提交及 upstream 语义。
+#[tokio::test]
+async fn repository_sources_clone_default_branch_named_branch_and_commit() {
+    let (fixture, origin, initial) = create_bare_git_repo();
+    let worktree = fixture.path().join("worktree");
+    for revision in ["second", "third"] {
+        std::fs::write(worktree.join("README.md"), revision).unwrap();
+        git_run(&worktree, &["commit", "-am", revision]);
+    }
+    let main_sha = git_output(&worktree, &["rev-parse", "HEAD"]);
+    git_run(&worktree, &["checkout", "-b", "feature/nested"]);
+    std::fs::write(worktree.join("README.md"), "feature").unwrap();
+    git_run(&worktree, &["commit", "-am", "feature"]);
+    let feature_sha = git_output(&worktree, &["rev-parse", "HEAD"]);
+    git_run(&worktree, &["tag", "feature/nested", &initial]);
+    git_run(&worktree, &["push", "--mirror", path_text(&origin)]);
+    let base = TempDir::new().unwrap();
+    for explicit_path in [false, true] {
+        for mode in ["fresh", "allow-prefetched"] {
+            let handler = new_git_handler(
+                base.path().join(format!("{mode}-{explicit_path}")),
+                None,
+                "",
+                None,
+                None,
+                ProcessMode::from(mode),
+                false,
+            );
+            for (name, git_ref, expected_sha, branch) in [
+                ("default", None, &main_sha, Some("main")),
+                (
+                    "branch",
+                    Some("refs/heads/feature/nested"),
+                    &feature_sha,
+                    Some("feature/nested"),
+                ),
+                ("commit", Some(initial.as_str()), &initial, None),
+            ] {
+                let target = base
+                    .path()
+                    .join(format!("{mode}-{explicit_path}"))
+                    .join(name);
+                if name == "branch" {
+                    std::fs::create_dir_all(&target).unwrap();
+                }
+                let mut source = git_test_source(&origin, git_ref);
+                source.git_info.url = Some(format!("file://{}", origin.display()));
+                source.git_info.repo = name.to_owned();
+                if explicit_path {
+                    source.mount_path = target.display().to_string();
+                }
+                handler
+                    .process(&CancellationToken::new(), &source)
+                    .await
+                    .unwrap();
+                assert_eq!(git_output(&target, &["rev-parse", "HEAD"]), *expected_sha);
+                assert_eq!(git_output(&target, &["rev-list", "--count", "HEAD"]), "1");
+                assert_eq!(
+                    git_output(&target, &["rev-parse", "--is-shallow-repository"]),
+                    "true"
+                );
+                assert!(git_output(&target, &["tag", "--list"]).is_empty());
+                assert_eq!(
+                    git_output(&target, &["remote", "get-url", "origin"]),
+                    format!("file://{}", origin.display())
+                );
+                assert_eq!(
+                    git_output(&target, &["config", "--get-all", "remote.origin.fetch"]),
+                    "+refs/heads/*:refs/remotes/origin/*"
+                );
+                if let Some(branch) = branch {
+                    assert_eq!(
+                        git_output(&target, &["symbolic-ref", "--short", "HEAD"]),
+                        branch
+                    );
+                    assert_eq!(
+                        git_output(&target, &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+                        format!("origin/{branch}")
+                    );
+                } else {
+                    assert!(
+                        !std::fs::read_to_string(target.join(".git/HEAD"))
+                            .unwrap()
+                            .starts_with("ref:")
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// 空远端允许创建首个提交；未请求具体 ref 时不要求 HEAD 已有 commit。
+#[tokio::test]
+async fn repository_sources_clone_empty_remote() {
+    let fixture = TempDir::new().unwrap();
+    let origin = fixture.path().join("empty.git");
+    git_run(
+        Path::new(""),
+        &["init", "--bare", "-b", "main", path_text(&origin)],
+    );
+    for mode in ["fresh", "allow-prefetched"] {
+        let base = fixture.path().join(mode);
+        let target = base.join("repository");
+        let mut source = git_test_source(&origin, None);
+        source.mount_path = target.display().to_string();
+        let handler = new_git_handler(&base, None, "", None, None, ProcessMode::from(mode), true);
+        handler
+            .process(&CancellationToken::new(), &source)
+            .await
+            .unwrap();
+        assert!(target.join(".git").is_dir());
+        assert!(git_output(&target, &["for-each-ref", "--format=%(refname)"]).is_empty());
+        git_run(&target, &["config", "user.email", "test@example.com"]);
+        git_run(&target, &["config", "user.name", "Test User"]);
+        git_run(&target, &["commit", "--allow-empty", "-m", "first"]);
+        assert_eq!(git_output(&target, &["rev-list", "--count", "HEAD"]), "1");
+    }
+}
+
+/// Fetch 保留协议回退和重试，同时不清理已有仓库内容。
+#[tokio::test]
+async fn repository_sources_fetch_retries_with_http1_fallback() {
+    let (_fixture, origin, initial) = create_bare_git_repo();
+    let base = TempDir::new().unwrap();
+    let bin = base.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let wrapper = bin.join("git");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+case " $* " in
+  *" fetch "*)
+    count=0
+    if [ -f "$GIT_RETRY_STATE" ]; then count=$(cat "$GIT_RETRY_STATE"); fi
+    count=$((count + 1))
+    echo "$count" > "$GIT_RETRY_STATE"
+    if [ "$count" -lt 4 ]; then
+      echo 'simulated transient fetch failure' >&2
+      exit 128
+    fi
+    case " $* " in
+      *" http.version=HTTP/1.1 "*) ;;
+      *) echo 'HTTP/1.1 fallback missing' >&2; exit 1 ;;
+    esac
+    ;;
+esac
+exec "$REAL_GIT" "$@"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let inherited_path = std::env::var_os("PATH").unwrap();
+    let real_git = std::env::split_paths(&inherited_path)
+        .map(|path| path.join("git"))
+        .find(|path| path.is_file())
+        .unwrap();
+    let test_path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&inherited_path)))
+            .unwrap();
+    let target = base.path().join("repository");
+    std::fs::create_dir(&target).unwrap();
+    git_run(&target, &["init"]);
+    std::fs::write(target.join("keep"), "local data").unwrap();
+    let state = base.path().join("attempts");
+    let git_url = format!("file://{}", origin.display());
+    let args = vec![
+        "fetch".to_owned(),
+        "--depth=1".to_owned(),
+        "--no-tags".to_owned(),
+        "--".to_owned(),
+        git_url.clone(),
+        "refs/heads/main".to_owned(),
+    ];
+    let handler = new_git_handler(
+        base.path(),
+        None,
+        "",
+        None,
+        None,
+        ProcessMode::from("fresh"),
+        false,
+    );
+    GIT_ENVIRONMENT
+        .scope(
+            vec![
+                ("PATH".into(), test_path),
+                ("REAL_GIT".into(), real_git.into_os_string()),
+                ("GIT_RETRY_STATE".into(), state.clone().into_os_string()),
+            ],
+            handler.run_git_fetch_with_retry_delay(
+                &CancellationToken::new(),
+                &target,
+                &git_url,
+                &git_url,
+                None,
+                &args,
+                std::time::Duration::ZERO,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(state).unwrap().trim(), "4");
+    assert_eq!(git_output(&target, &["rev-parse", "FETCH_HEAD"]), initial);
+    assert_eq!(
+        std::fs::read_to_string(target.join("keep")).unwrap(),
+        "local data"
+    );
+}
+
+/// 不允许 fresh 模式删除目标中的用户数据或穿过符号链接。
+#[tokio::test]
+async fn repository_sources_reject_nonempty_symlink_and_parent_paths() {
+    let base = TempDir::new().unwrap();
+    let occupied = base.path().join("occupied");
+    std::fs::create_dir(&occupied).unwrap();
+    std::fs::write(occupied.join("keep"), "user data").unwrap();
+    let symlink = base.path().join("link");
+    std::os::unix::fs::symlink(&occupied, &symlink).unwrap();
+    let broken = base.path().join("broken");
+    std::os::unix::fs::symlink(base.path().join("missing"), &broken).unwrap();
+    for mode in ["fresh", "allow-prefetched", "resume"] {
+        let handler = new_git_handler(
+            base.path(),
+            None,
+            "",
+            None,
+            None,
+            ProcessMode::from(mode),
+            false,
+        );
+        for target in [
+            occupied.clone(),
+            symlink.clone(),
+            symlink.join("child"),
+            broken.clone(),
+            base.path().join("../escape"),
+            PathBuf::from("relative"),
+        ] {
+            let mut source = git_test_source(Path::new("/nonexistent.git"), None);
+            source.mount_path = target.display().to_string();
+            let error = handler
+                .process(&CancellationToken::new(), &source)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("repository directory"),
+                "{error}"
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(occupied.join("keep")).unwrap(),
+        "user data"
+    );
+    assert!(!occupied.join("child").exists());
+}
+
+/// 新建、拒绝覆盖、prefetched 保留本地修改和 resume 更新均与目录来源无关。
+#[tokio::test]
+async fn repository_sources_lifecycle_is_independent_of_directory_selection() {
+    let (fixture, origin, _) = create_bare_git_repo();
+    let base = TempDir::new().unwrap();
+    for explicit_path in [false, true] {
+        let mut source = git_test_source(&origin, None);
+        source.git_info.url = Some(format!("file://{}", origin.display()));
+        source.git_info.repo = format!("repo-{explicit_path}");
+        let target = base.path().join(&source.git_info.repo);
+        if explicit_path {
+            source.mount_path = target.display().to_string();
+        }
+        let fresh = new_git_handler(
+            base.path(),
+            None,
+            "",
+            None,
+            None,
+            ProcessMode::from("fresh"),
+            false,
+        );
+        fresh
+            .process(&CancellationToken::new(), &source)
+            .await
+            .unwrap();
+        std::fs::write(target.join("README.md"), "local changes").unwrap();
+        assert!(
+            fresh
+                .process(&CancellationToken::new(), &source)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("README.md")).unwrap(),
+            "local changes"
+        );
+        let prefetched = new_git_handler(
+            base.path(),
+            None,
+            "",
+            None,
+            None,
+            ProcessMode::from("allow-prefetched"),
+            false,
+        );
+        prefetched
+            .process(&CancellationToken::new(), &source)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("README.md")).unwrap(),
+            "local changes"
+        );
+
+        let worktree = fixture.path().join("worktree");
+        let content = format!("upstream-{explicit_path}");
+        std::fs::write(worktree.join("README.md"), &content).unwrap();
+        git_run(&worktree, &["commit", "-am", &content]);
+        git_run(&worktree, &["push", path_text(&origin), "main"]);
+        let resume = new_git_handler(
+            base.path(),
+            None,
+            "",
+            None,
+            None,
+            ProcessMode::from("resume"),
+            false,
+        );
+        resume
+            .process(&CancellationToken::new(), &source)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(target.join("README.md")).unwrap(),
+            content
+        );
+        assert_eq!(
+            git_output(&target, &["rev-parse", "HEAD"]),
+            git_output(&worktree, &["rev-parse", "HEAD"])
+        );
+    }
+}
+
+/// 分支输入不能退化为同名 tag；失败保留现场，再次首次初始化拒绝覆盖。
+#[tokio::test]
+async fn repository_sources_reject_tag_as_branch_without_cleanup() {
+    let (fixture, origin, _) = create_bare_git_repo();
+    let worktree = fixture.path().join("worktree");
+    git_run(&worktree, &["tag", "tag-only"]);
+    git_run(&worktree, &["push", "--tags", path_text(&origin)]);
+    let base = TempDir::new().unwrap();
+    let handler = new_git_handler(
+        base.path(),
+        None,
+        "",
+        None,
+        None,
+        ProcessMode::from("fresh"),
+        false,
+    );
+    for explicit_path in [false, true] {
+        for existing in [false, true] {
+            let target = base
+                .path()
+                .join(format!("target-{explicit_path}-{existing}"));
+            if existing {
+                std::fs::create_dir(&target).unwrap();
+            }
+            let mut source = git_test_source(&origin, Some("refs/heads/tag-only"));
+            source.git_info.url = Some(format!("file://{}", origin.display()));
+            source.git_info.repo = target.file_name().unwrap().to_str().unwrap().to_owned();
+            if explicit_path {
+                source.mount_path = target.display().to_string();
+            }
+            assert!(
+                handler
+                    .process(&CancellationToken::new(), &source)
+                    .await
+                    .is_err()
+            );
+            assert!(target.join(".git").is_dir());
+            assert_eq!(
+                std::fs::read_to_string(target.join("README.md")).unwrap(),
+                "hello\n"
+            );
+            source.git_info.git_ref = Some("refs/heads/main".to_owned());
+            let error = handler
+                .process(&CancellationToken::new(), &source)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("repository directory must be empty")
+            );
+            assert_eq!(
+                std::fs::read_to_string(target.join("README.md")).unwrap(),
+                "hello\n"
+            );
+        }
+    }
+}
+
+/// 取消或丢弃初始化只停止执行，保留已写入内容，不进行目录清理或原地重试。
+#[tokio::test]
+async fn repository_sources_cancel_and_abort_leave_partial_repository() {
+    let (_fixture, origin, _) = create_bare_git_repo();
+    let base = TempDir::new().unwrap();
+    for explicit_path in [false, true] {
+        for abort in [false, true] {
+            for existing in [false, true] {
+                let target = base
+                    .path()
+                    .join(format!("target-{explicit_path}-{abort}-{existing}"));
+                if existing {
+                    std::fs::create_dir(&target).unwrap();
+                }
+                let branch = format!("delayed-{explicit_path}-{abort}-{existing}");
+                let mut source = git_test_source(&origin, Some(&branch));
+                source.git_info.url = Some(format!("file://{}", origin.display()));
+                source.git_info.repo = target.file_name().unwrap().to_str().unwrap().to_owned();
+                if explicit_path {
+                    source.mount_path = target.display().to_string();
+                }
+                let cancellation = CancellationToken::new();
+                let task_cancellation = cancellation.clone();
+                let base_path = base.path().to_owned();
+                let task_source = source.clone();
+                let task = tokio::spawn(async move {
+                    let handler = new_git_handler(
+                        base_path,
+                        None,
+                        "",
+                        None,
+                        None,
+                        ProcessMode::from("fresh"),
+                        false,
+                    );
+                    handler.process(&task_cancellation, &task_source).await
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while !target.join(".git/config").exists() {
+                        assert!(!task.is_finished(), "preparation unexpectedly finished");
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                if abort {
+                    task.abort();
+                } else {
+                    cancellation.cancel();
+                }
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                    .await
+                    .unwrap();
+                if abort {
+                    assert!(result.unwrap_err().is_cancelled());
+                } else {
+                    assert!(result.unwrap().is_err());
+                }
+                assert!(target.join(".git/config").is_file());
+            }
+        }
     }
 }
 
