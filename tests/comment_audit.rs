@@ -131,8 +131,9 @@ fn production_sources(root: &Path) -> Vec<PathBuf> {
 
 /// 返回全部手写 Rust 源文件，包括需要审计 unsafe 说明的测试文件。
 fn handwritten_sources(root: &Path) -> Vec<PathBuf> {
-    WalkDir::new(root.join("src"))
+    [root.join("src"), root.join("crates/qoder-mcp-server/src")]
         .into_iter()
+        .flat_map(|path| WalkDir::new(path).into_iter())
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .map(|entry| entry.into_path())
@@ -142,18 +143,22 @@ fn handwritten_sources(root: &Path) -> Vec<PathBuf> {
 
 /// 返回需要检查 `unsafe` 说明的全部项目手写 Rust 文件。
 ///
-/// 函数级中文 rustdoc 门禁只针对 `src` 下的生产模块；`unsafe` 约束更严格，还要
+/// 函数级中文 rustdoc 门禁覆盖主包与兼容 MCP crate 的生产模块；`unsafe` 约束更严格，还要
 /// 覆盖集成测试和根构建脚本，避免测试 fixture 或代码生成入口留下未解释的裸指针、
 /// 环境变量写入与系统调用。第三方 `vendor` 与 Cargo `OUT_DIR` 生成物不在扫描根内。
 fn unsafe_audit_sources(root: &Path) -> Vec<PathBuf> {
     let mut sources = handwritten_sources(root);
     sources.extend(
-        WalkDir::new(root.join("tests"))
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-            .map(|entry| entry.into_path())
-            .filter(|path| path.extension().is_some_and(|extension| extension == "rs")),
+        [
+            root.join("tests"),
+            root.join("crates/qoder-mcp-server/tests"),
+        ]
+        .into_iter()
+        .flat_map(|path| WalkDir::new(path).into_iter())
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "rs")),
     );
     let build_script = root.join("build.rs");
     if build_script.is_file() {
