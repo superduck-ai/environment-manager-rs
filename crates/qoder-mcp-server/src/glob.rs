@@ -532,7 +532,7 @@ pub async fn run(work: &Path, cancel: CancellationToken, a: &Value) -> ToolResul
     let full = patterns
         .iter()
         .any(|p| negation(p).1 || p.contains('[') || has_extglob(p));
-    let executable = match util::executable("rg") {
+    let executable = match util::executable("rg").await {
         Ok(p) => p,
         Err(e) => return ToolResult::error(format!("glob (rg) err: {e}: ")),
     };
@@ -583,7 +583,7 @@ pub async fn run(work: &Path, cancel: CancellationToken, a: &Value) -> ToolResul
     if total > 100 {
         text.push_str("\n(Results are truncated. Consider using a more specific path or pattern.)");
     }
-    ToolResult::text(util::truncate(text, "glob"))
+    ToolResult::text(util::truncate(text, "glob").await)
 }
 /// 判断是否包含未转义的 extglob 起始标记。
 fn has_extglob(p: &str) -> bool {

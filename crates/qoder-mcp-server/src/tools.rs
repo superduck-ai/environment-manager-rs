@@ -179,7 +179,7 @@ impl Tool for Builtin {
     fn definition(&self) -> Value {
         self.definition.clone()
     }
-    /// 分派异步命令和搜索；文件操作放到阻塞任务中。
+    /// 异步分派命令、搜索与文件操作；图片编解码由内部阻塞任务处理。
     async fn handle(
         &self,
         cancellation: CancellationToken,
@@ -196,17 +196,9 @@ impl Tool for Builtin {
             .await),
             "grep" => Ok(search::grep(&self.workdir, cancellation, &arguments).await),
             "glob" => Ok(glob::run(&self.workdir, cancellation, &arguments).await),
-            _ => {
-                let name = name.to_owned();
-                let workdir = self.workdir.clone();
-                tokio::task::spawn_blocking(move || match name.as_str() {
-                    "read" => files::read(&arguments),
-                    "write" => files::write(&workdir, &arguments),
-                    _ => files::edit(&workdir, &arguments),
-                })
-                .await
-                .map_err(|e| e.to_string())
-            }
+            "read" => Ok(files::read(&arguments).await),
+            "write" => Ok(files::write(&self.workdir, &arguments).await),
+            _ => Ok(files::edit(&self.workdir, &arguments).await),
         }
     }
 }

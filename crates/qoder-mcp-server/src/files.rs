@@ -3,14 +3,16 @@ use super::{ToolResult, diff, images};
 use crate::util;
 use serde_json::Value;
 use std::{
-    fs::{self, OpenOptions},
-    io::{Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+};
+use tokio::{
+    fs::{self, OpenOptions},
+    io::{AsyncReadExt, AsyncWriteExt},
 };
 
 /// 读取文本范围或图片，并保留文件路径检查的顺序。
-pub fn read(a: &Value) -> ToolResult {
+pub async fn read(a: &Value) -> ToolResult {
     let p = util::string(a, "file_path");
     if p.is_empty() {
         return ToolResult::error("file_path is required");
@@ -45,13 +47,13 @@ pub fn read(a: &Value) -> ToolResult {
             .to_lowercase()
             .as_str(),
     ) {
-        return images::read(path);
+        return images::read(path).await;
     }
-    let info = match fs::metadata(path) {
+    let info = match fs::metadata(path).await {
         Ok(info) => info,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut message = format!("File not found: {p}");
-            if let Some(s) = similar(path) {
+            if let Some(s) = similar(path).await {
                 message.push_str(&format!("\nDid you mean: {}?", s.display()));
             }
             return ToolResult::error(message);
@@ -75,7 +77,7 @@ pub fn read(a: &Value) -> ToolResult {
             10 << 20
         ));
     }
-    let mut file = match fs::File::open(path) {
+    let mut file = match fs::File::open(path).await {
         Ok(f) => f,
         Err(e) => {
             return ToolResult::error(format!(
@@ -85,13 +87,13 @@ pub fn read(a: &Value) -> ToolResult {
         }
     };
     let mut sample = [0; 8192];
-    let n = file.read(&mut sample).unwrap_or(0);
+    let n = file.read(&mut sample).await.unwrap_or(0);
     if sample[..n].contains(&0) {
         return ToolResult::error(format!(
             "Cannot read {p}: binary file detected (contains null bytes). Use Bash to inspect binary files if needed (e.g., xxd, hexdump, strings)."
         ));
     }
-    let data = match fs::read(path) {
+    let data = match fs::read(path).await {
         Ok(d) => d,
         Err(e) => {
             return ToolResult::error(format!(
@@ -124,26 +126,33 @@ pub fn read(a: &Value) -> ToolResult {
             ));
         }
     }
-    ToolResult::text(util::truncate(
-        lines[s as usize..e as usize]
-            .iter()
-            .enumerate()
-            .map(|(i, line)| format!("{}\t{line}", i + s as usize + 1))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        "read",
-    ))
+    ToolResult::text(
+        util::truncate(
+            lines[s as usize..e as usize]
+                .iter()
+                .enumerate()
+                .map(|(i, line)| format!("{}\t{line}", i + s as usize + 1))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "read",
+        )
+        .await,
+    )
 }
 /// 根据文件名评分给出拼写建议，平分时保持目录排序。
-fn similar(path: &Path) -> Option<PathBuf> {
+async fn similar(path: &Path) -> Option<PathBuf> {
     let parent = path.parent()?;
     let base = path.file_name()?.to_string_lossy().to_lowercase();
-    let mut entries: Vec<_> = fs::read_dir(parent).ok()?.filter_map(Result::ok).collect();
+    let mut directory = fs::read_dir(parent).await.ok()?;
+    let mut entries = Vec::new();
+    while let Some(entry) = directory.next_entry().await.ok()? {
+        entries.push(entry);
+    }
     entries.sort_by_key(|e| e.file_name());
     let mut best = None;
     let mut best_score = 2;
     for e in entries {
-        if e.file_type().ok()?.is_dir() {
+        if e.file_type().await.ok()?.is_dir() {
             continue;
         }
         let name = e.file_name().to_string_lossy().into_owned();
@@ -195,7 +204,7 @@ fn write_error(e: &std::io::Error, p: &Path, op: &str, actual: &Path) -> ToolRes
     })
 }
 /// 创建同目录临时文件并替换目标；重命名失败时保留原工具的直接写回退。
-fn atomic(
+async fn atomic(
     path: &Path,
     data: &[u8],
     mode: u32,
@@ -205,39 +214,52 @@ fn atomic(
         path.file_name().unwrap_or_default().to_string_lossy(),
         rand::random::<u64>() & i64::MAX as u64
     ));
-    let result = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(&temp)
-        .and_then(|mut f| f.write_all(data));
+    let result = async {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&temp)
+            .await?;
+        file.write_all(data).await?;
+        file.flush().await
+    }
+    .await;
     if let Err(e) = result {
-        let _ = fs::remove_file(&temp);
+        let _ = fs::remove_file(&temp).await;
         return Err((e, temp, "open"));
     }
-    if fs::rename(&temp, path).is_err() {
-        let _ = fs::remove_file(&temp);
-        fs::write(path, data).map_err(|e| (e, path.to_owned(), "open"))?;
+    if fs::rename(&temp, path).await.is_err() {
+        let _ = fs::remove_file(&temp).await;
+        fs::write(path, data)
+            .await
+            .map_err(|e| (e, path.to_owned(), "open"))?;
     }
     Ok(())
 }
 /// 写文件并返回实际写入内容的统一差异。
-pub fn write(work: &Path, a: &Value) -> ToolResult {
+pub async fn write(work: &Path, a: &Value) -> ToolResult {
     let p = util::string(a, "file_path");
     if p.is_empty() {
         return ToolResult::error("file_path is required");
     }
     let display = util::resolve(work, p);
-    let path = fs::canonicalize(&display).unwrap_or_else(|_| display.clone());
-    let info = fs::metadata(&path).ok();
+    let path = fs::canonicalize(&display)
+        .await
+        .unwrap_or_else(|_| display.clone());
+    let info = fs::metadata(&path).await.ok();
     if info.as_ref().is_some_and(|i| i.is_dir()) {
         return ToolResult::error(format!(
             "Cannot write to {}: path is an existing directory. Remove it first or choose a different path.",
             display.display()
         ));
     }
-    let old = info.as_ref().and_then(|_| fs::read(&path).ok());
+    let old = if info.is_some() {
+        fs::read(&path).await.ok()
+    } else {
+        None
+    };
     let mut data = util::string(a, "content").as_bytes().to_vec();
     let mode = info.as_ref().map_or(0o644, |i| i.permissions().mode());
     if let Some(old) = &old {
@@ -256,10 +278,10 @@ pub fn write(work: &Path, a: &Value) -> ToolResult {
         }
     }
     let parent = path.parent().unwrap_or(Path::new("."));
-    if let Err(e) = util::create_dir_all(parent) {
+    if let Err(e) = util::create_dir_all(parent).await {
         return write_error(&e, &display, "mkdir", parent);
     }
-    if let Err((e, p, op)) = atomic(&path, &data, mode) {
+    if let Err((e, p, op)) = atomic(&path, &data, mode).await {
         return write_error(&e, &display, op, &p);
     }
     let path_text = display.to_string_lossy();
@@ -280,10 +302,10 @@ pub fn write(work: &Path, a: &Value) -> ToolResult {
     } else {
         format!("Write file {path_text} successfully (empty file)")
     };
-    ToolResult::text(util::truncate(text, "write"))
+    ToolResult::text(util::truncate(text, "write").await)
 }
 /// 唯一匹配替换，空旧字符串走直接创建分支。
-pub fn edit(work: &Path, a: &Value) -> ToolResult {
+pub async fn edit(work: &Path, a: &Value) -> ToolResult {
     let p = util::string(a, "file_path");
     if p.is_empty() {
         return ToolResult::error("file_path is required");
@@ -295,32 +317,37 @@ pub fn edit(work: &Path, a: &Value) -> ToolResult {
     if old.is_empty() && new.is_empty() {
         return ToolResult::error("old_string and new_string cannot both be empty");
     }
-    if fs::metadata(&path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    if fs::metadata(&path)
+        .await
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
         && !old.is_empty()
     {
         return ToolResult::error(format!("file {p} does not exist"));
     }
     if old.is_empty() {
         let dir = path.parent().unwrap_or(Path::new("."));
-        if let Err(e) = util::create_dir_all(dir) {
+        if let Err(e) = util::create_dir_all(dir).await {
             return ToolResult::error(format!(
                 "edit: failed to create directory {}: {}",
                 dir.display(),
                 util::io_error("mkdir", dir, &e)
             ));
         }
-        if let Err((e, op)) = util::write_file(&path, new.as_bytes()) {
+        if let Err((e, op)) = util::write_file(&path, new.as_bytes()).await {
             return ToolResult::error(format!(
                 "edit: failed to create file {p}: {}",
                 util::io_error(op, &path, &e)
             ));
         }
-        return ToolResult::text(util::truncate(
-            format!("Created file {p}\n\n{}", diff::unified("", new, &p)),
-            "edit",
-        ));
+        return ToolResult::text(
+            util::truncate(
+                format!("Created file {p}\n\n{}", diff::unified("", new, &p)),
+                "edit",
+            )
+            .await,
+        );
     }
-    let bytes = match fs::read(&path) {
+    let bytes = match fs::read(&path).await {
         Ok(b) => b,
         Err(e) => {
             return ToolResult::error(format!(
@@ -366,17 +393,20 @@ pub fn edit(work: &Path, a: &Value) -> ToolResult {
     let mut after = bytes[..at].to_vec();
     after.extend_from_slice(new.as_bytes());
     after.extend_from_slice(&bytes[at + old.len()..]);
-    if let Err((e, op)) = util::write_file(&path, &after) {
+    if let Err((e, op)) = util::write_file(&path, &after).await {
         return ToolResult::error(format!(
             "failed to write output to file '{p}': {}",
             util::io_error(op, &path, &e)
         ));
     }
-    ToolResult::text(util::truncate(
-        format!(
-            "Replaced content in file {p}\n\n{}",
-            diff::unified(old, new, &p)
-        ),
-        "edit",
-    ))
+    ToolResult::text(
+        util::truncate(
+            format!(
+                "Replaced content in file {p}\n\n{}",
+                diff::unified(old, new, &p)
+            ),
+            "edit",
+        )
+        .await,
+    )
 }

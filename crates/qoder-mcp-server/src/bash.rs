@@ -9,15 +9,19 @@ use regex::Regex;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    os::unix::{fs::OpenOptionsExt, process::ExitStatusExt},
+    io::SeekFrom,
+    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::OnceLock,
     time::Duration,
 };
-use tokio::{process::Command, task::JoinHandle};
+use tokio::{
+    fs::{self, OpenOptions},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    process::Command,
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 const NON_INTERACTIVE: &[(&str, &str)] = &[
     ("TERM", "xterm-256color"),
@@ -124,7 +128,7 @@ fn go_quote(s: &str) -> String {
     serde_json::to_string(s).unwrap()
 }
 /// 创建名称为十进制数字的私有临时文件。
-fn temp(prefix: &str, suffix: &str) -> std::io::Result<(PathBuf, fs::File)> {
+async fn temp(prefix: &str, suffix: &str) -> std::io::Result<(PathBuf, fs::File)> {
     for _ in 0..100 {
         let path =
             Path::new(util::OUTPUT_DIR).join(format!("{prefix}{}{suffix}", rand::random::<u32>()));
@@ -133,6 +137,7 @@ fn temp(prefix: &str, suffix: &str) -> std::io::Result<(PathBuf, fs::File)> {
             .create_new(true)
             .mode(0o600)
             .open(&path)
+            .await
         {
             Ok(f) => return Ok((path, f)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -142,13 +147,13 @@ fn temp(prefix: &str, suffix: &str) -> std::io::Result<(PathBuf, fs::File)> {
     Err(std::io::Error::other("temporary file collision"))
 }
 /// 从输出文件末尾读取，并跳过开头被截断的 UTF-8 续字节。
-fn tail(path: &Path, max: usize) -> std::io::Result<(String, usize)> {
-    let mut f = fs::File::open(path)?;
-    let len = f.metadata()?.len() as usize;
+async fn tail(path: &Path, max: usize) -> std::io::Result<(String, usize)> {
+    let mut f = fs::File::open(path).await?;
+    let len = f.metadata().await?.len() as usize;
     let start = len.saturating_sub(max);
-    f.seek(SeekFrom::Start(start as u64))?;
+    f.seek(SeekFrom::Start(start as u64)).await?;
     let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes)?;
+    f.read_to_end(&mut bytes).await?;
     let skip = if start > 0 {
         bytes.iter().take_while(|b| **b & 0xc0 == 0x80).count()
     } else {
@@ -228,29 +233,34 @@ pub async fn run(
     if cancellation.is_cancelled() {
         return ToolResult::error("not started: context canceled");
     }
-    if let Err(e) = util::create_dir_all(util::OUTPUT_DIR) {
+    if let Err(e) = util::create_dir_all(util::OUTPUT_DIR).await {
         return ToolResult::error(format!(
             "failed to create output dir: {}",
             util::io_error("mkdir", Path::new(util::OUTPUT_DIR), &e)
         ));
     }
-    let (output, out) = match temp("bash_", ".log") {
+    let (output, out) = match temp("bash_", ".log").await {
         Ok(v) => v,
         Err(e) => return ToolResult::error(format!("failed to create output file: {e}")),
     };
-    let (script, mut script_file) = match temp("bash-", ".sh") {
+    let (script, mut script_file) = match temp("bash-", ".sh").await {
         Ok(v) => v,
         Err(e) => {
-            let _ = fs::remove_file(&output);
+            let _ = fs::remove_file(&output).await;
             return ToolResult::error(format!("failed to write command script: {e}"));
         }
     };
-    if let Err(e) = write!(
-        script_file,
+    let script_content = format!(
         "source \"${{QODER_VAULT_ENV_FILE:-/etc/profile.d/vault-env.sh}}\" 2>/dev/null || true\n{command}"
-    ) {
-        let _ = fs::remove_file(&script);
-        let _ = fs::remove_file(&output);
+    );
+    let written = async {
+        script_file.write_all(script_content.as_bytes()).await?;
+        script_file.flush().await
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = fs::remove_file(&script).await;
+        let _ = fs::remove_file(&output).await;
         return ToolResult::error(format!("failed to write command script: {e}"));
     }
     drop(script_file);
@@ -265,8 +275,8 @@ pub async fn run(
                 }
             }
             Err(e) => {
-                let _ = fs::remove_file(&script);
-                let _ = fs::remove_file(&output);
+                let _ = fs::remove_file(&script).await;
+                let _ = fs::remove_file(&output).await;
                 return ToolResult::error(format!("failed to load runtime environment: {e}"));
             }
         }
@@ -282,20 +292,22 @@ pub async fn run(
         .iter()
         .any(|(k, v)| k.as_bytes().contains(&0) || v.as_bytes().contains(&0))
     {
-        let _ = fs::remove_file(&script);
-        let _ = fs::remove_file(&output);
+        let _ = fs::remove_file(&script).await;
+        let _ = fs::remove_file(&output).await;
         return ToolResult::error(
             "failed to execute command: exec: environment variable contains NUL",
         );
     }
-    let executable = match util::executable("bash") {
+    let executable = match util::executable("bash").await {
         Ok(p) => p,
         Err(e) => {
-            let _ = fs::remove_file(&script);
-            let _ = fs::remove_file(&output);
+            let _ = fs::remove_file(&script).await;
+            let _ = fs::remove_file(&output).await;
             return ToolResult::error(format!("failed to execute command: {e}"));
         }
     };
+    let stdout = out.try_clone().await.unwrap().into_std().await;
+    let stderr = out.try_clone().await.unwrap().into_std().await;
     let mut cmd = Command::new(&executable);
     cmd.arg(&script)
         .current_dir(&work)
@@ -315,8 +327,8 @@ pub async fn run(
             }
         }))
         .stdin(Stdio::null())
-        .stdout(Stdio::from(out.try_clone().unwrap()))
-        .stderr(Stdio::from(out.try_clone().unwrap()));
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
     // SAFETY: pre_exec 中只调用异步信号安全的 setsid，不分配内存或使用锁。
     unsafe {
         cmd.pre_exec(|| {
@@ -330,8 +342,8 @@ pub async fn run(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = fs::remove_file(&output);
-            let _ = fs::remove_file(&script);
+            let _ = fs::remove_file(&output).await;
+            let _ = fs::remove_file(&script).await;
             return ToolResult::error(format!(
                 "failed to execute command: fork/exec {}: {}",
                 executable.display(),
@@ -348,14 +360,21 @@ pub async fn run(
             .await
             .map(status)
             .unwrap_or((-1, "[exit code: -1]".into()));
-        let _ = fs::remove_file(script);
-        let written = OpenOptions::new()
-            .append(true)
-            .open(&output_copy)
-            .map_err(|e| util::io_error("open", &output_copy, &e))
-            .and_then(|mut f| {
-                writeln!(f, "\n{text}").map_err(|e| util::io_error("write", &output_copy, &e))
-            });
+        let _ = fs::remove_file(script).await;
+        let written = async {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&output_copy)
+                .await
+                .map_err(|e| util::io_error("open", &output_copy, &e))?;
+            file.write_all(format!("\n{text}\n").as_bytes())
+                .await
+                .map_err(|e| util::io_error("write", &output_copy, &e))?;
+            file.flush()
+                .await
+                .map_err(|e| util::io_error("write", &output_copy, &e))
+        }
+        .await;
         if let Err(error) = written {
             crate::logging::warn(
                 "bash: failed to write exit status line",
@@ -371,7 +390,7 @@ pub async fn run(
     let mut reason = String::new();
     let mut result = None;
     tokio::select! {v=&mut finished=>{result=Some(v);},_=cancellation.cancelled()=>reason="[cancelled; process group terminated]".into(),_=tokio::time::sleep(Duration::from_secs(timeout))=>{
-        if on_timeout=="background"{crate::logging::info("bash: command continues in background", &[("pid", &pid.to_string()), ("output_file", &output.to_string_lossy()), ("waited_seconds", &timeout.to_string())]);let preview=tail(&output,2000).map(|(s,_)|if s.is_empty(){"(no output yet)".into()}else{s}).unwrap_or_else(|e|{let error=util::io_error("open", &output, &e);crate::logging::warn("bash: failed to read background output preview", &[("pid", &pid.to_string()), ("output_file", &output.to_string_lossy()), ("error", &error)]);format!("(output not readable: {error})")});return ToolResult::text(format!("[backgrounded] Command did not finish within {timeout}s and continues running in the background.\npid: {pid}\noutput_file: {}\n\nOutput so far:\n{preview}",output.display()));}
+        if on_timeout=="background"{crate::logging::info("bash: command continues in background", &[("pid", &pid.to_string()), ("output_file", &output.to_string_lossy()), ("waited_seconds", &timeout.to_string())]);let preview=tail(&output,2000).await.map(|(s,_)|if s.is_empty(){"(no output yet)".into()}else{s}).unwrap_or_else(|e|{let error=util::io_error("open", &output, &e);crate::logging::warn("bash: failed to read background output preview", &[("pid", &pid.to_string()), ("output_file", &output.to_string_lossy()), ("error", &error)]);format!("(output not readable: {error})")});return ToolResult::text(format!("[backgrounded] Command did not finish within {timeout}s and continues running in the background.\npid: {pid}\noutput_file: {}\n\nOutput so far:\n{preview}",output.display()));}
         reason=format!("[timed out after {timeout}s; process group terminated]");
     }}
     if result.is_none() {
@@ -399,7 +418,7 @@ pub async fn run(
         });
     }
     let (code, status) = result.unwrap().unwrap_or((-1, "[exit code: -1]".into()));
-    let (tail, total) = match tail(&output, 30000) {
+    let (tail, total) = match tail(&output, 30000).await {
         Ok(v) => v,
         Err(e) => {
             crate::logging::warn(
@@ -433,7 +452,7 @@ pub async fn run(
             output.display()
         );
     } else {
-        let _ = fs::remove_file(&output);
+        let _ = fs::remove_file(&output).await;
     }
     if text.is_empty() {
         text = "(no output)".into();

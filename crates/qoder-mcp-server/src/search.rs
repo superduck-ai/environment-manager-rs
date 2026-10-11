@@ -3,7 +3,8 @@ use super::ToolResult;
 use crate::util;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::Value;
-use std::{fs, path::Path, process::Output};
+use std::{path::Path, process::Output};
+use tokio::fs;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
@@ -16,7 +17,7 @@ async fn execute(
 ) -> Result<Output, String> {
     let mut args = arguments.to_vec();
     loop {
-        let executable = util::executable("rg")?;
+        let executable = util::executable("rg").await?;
         let mut cmd = Command::new(&executable);
         cmd.args(&args)
             .arg(path)
@@ -186,7 +187,7 @@ pub async fn grep(work: &Path, cancel: CancellationToken, a: &Value) -> ToolResu
         mode
     };
     let path = util::resolve(work, util::string(a, "path"));
-    if let Err(e) = fs::metadata(&path) {
+    if let Err(e) = fs::metadata(&path).await {
         return ToolResult::error(if e.kind() == std::io::ErrorKind::NotFound {
             format!("search path does not exist: {}", path.display())
         } else {
@@ -316,10 +317,12 @@ pub async fn grep(work: &Path, cancel: CancellationToken, a: &Value) -> ToolResu
             text
         }
         _ => {
-            lines.sort_by(|a, b| {
-                let time = |p: &str| fs::metadata(p).and_then(|m| m.modified()).ok();
-                time(b).cmp(&time(a)).then_with(|| a.cmp(b))
-            });
+            let mut times = std::collections::HashMap::new();
+            for path in &lines {
+                let time = fs::metadata(path).await.and_then(|m| m.modified()).ok();
+                times.insert(path.clone(), time);
+            }
+            lines.sort_by(|a, b| times[b].cmp(&times[a]).then_with(|| a.cmp(b)));
             let (lines, info) = paginate(lines, a);
             if lines.is_empty() {
                 "No files found".into()
@@ -343,5 +346,5 @@ pub async fn grep(work: &Path, cancel: CancellationToken, a: &Value) -> ToolResu
             }
         }
     };
-    ToolResult::text(util::truncate(response, "grep"))
+    ToolResult::text(util::truncate(response, "grep").await)
 }

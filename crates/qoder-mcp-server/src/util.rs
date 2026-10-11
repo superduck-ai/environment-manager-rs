@@ -1,10 +1,11 @@
 //! 文件路径、系统错误和输出持久化的兼容辅助函数。
 use serde_json::Value;
 use std::{
-    fs, io,
+    io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::{fs, io::AsyncWriteExt};
 
 pub const OUTPUT_DIR: &str = "/tmp/tool-outputs";
 
@@ -154,7 +155,7 @@ pub fn size(n: usize) -> String {
     )
 }
 /// 超阈值时保留读取分页提示，或将完整输出写入文件。
-pub fn truncate(text: String, tool: &str) -> String {
+pub async fn truncate(text: String, tool: &str) -> String {
     let threshold = match tool {
         "bash" | "run_in_terminal" => 30000,
         "grep" | "grep_run" => 20000,
@@ -171,9 +172,8 @@ pub fn truncate(text: String, tool: &str) -> String {
         );
     }
     let path = format!("{OUTPUT_DIR}/{tool}_{}.txt", timestamp());
-    if fs::create_dir_all(OUTPUT_DIR)
-        .and_then(|_| fs::write(&path, text.as_bytes()))
-        .is_err()
+    if fs::create_dir_all(OUTPUT_DIR).await.is_err()
+        || fs::write(&path, text.as_bytes()).await.is_err()
     {
         return text;
     }
@@ -191,11 +191,14 @@ pub fn truncate(text: String, tool: &str) -> String {
 }
 
 /// 使用服务器进程的 PATH 定位可执行文件，不受工具调用环境覆盖影响。
-pub fn executable(name: &str) -> Result<PathBuf, String> {
+pub async fn executable(name: &str) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
     for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
         let p = dir.join(name);
-        if fs::metadata(&p).is_ok_and(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0) {
+        if fs::metadata(&p)
+            .await
+            .is_ok_and(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
+        {
             if !p.is_absolute() {
                 return Err(format!(
                     "exec: {name:?}: cannot run executable found relative to current directory"
@@ -210,8 +213,8 @@ pub fn executable(name: &str) -> Result<PathBuf, String> {
 }
 
 /// 创建目录树，现有普通文件使用参考接口的 ENOTDIR 文本。
-pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
-    fs::create_dir_all(path).map_err(|e| {
+pub async fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+    fs::create_dir_all(path).await.map_err(|e| {
         if e.raw_os_error() == Some(libc::EEXIST) {
             io::Error::from_raw_os_error(libc::ENOTDIR)
         } else {
@@ -220,10 +223,10 @@ pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     })
 }
 /// 写入文件并保留错误发生在打开或写入阶段的信息。
-pub fn write_file(path: &Path, bytes: &[u8]) -> Result<(), (io::Error, &'static str)> {
-    use io::Write;
-    let mut file = fs::File::create(path).map_err(|e| (e, "open"))?;
-    file.write_all(bytes).map_err(|e| (e, "write"))
+pub async fn write_file(path: &Path, bytes: &[u8]) -> Result<(), (io::Error, &'static str)> {
+    let mut file = fs::File::create(path).await.map_err(|e| (e, "open"))?;
+    file.write_all(bytes).await.map_err(|e| (e, "write"))?;
+    file.flush().await.map_err(|e| (e, "write"))
 }
 
 /// 按参考运行时逐个无效字节替换 UTF-8，完整字符串无需分配。

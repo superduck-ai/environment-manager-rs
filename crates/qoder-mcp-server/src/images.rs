@@ -4,10 +4,11 @@ use crate::util;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use image::{DynamicImage, ImageFormat, ImageReader};
 use std::{
-    fs,
     io::{Read, Seek, SeekFrom},
     path::Path,
 };
+use tokio::fs;
+use tokio_util::io::SyncIoBridge;
 const BUDGET: usize = 5 << 20;
 /// 根据实际解码格式确定 MIME 类型。
 fn media(format: ImageFormat) -> &'static str {
@@ -38,8 +39,8 @@ fn fits(n: usize) -> bool {
     n.div_ceil(3) * 4 <= BUDGET
 }
 /// 读取图片，小图片逐字保留原数据，大图片逐级缩放与重编码。
-pub fn read(path: &Path) -> ToolResult {
-    let info = match fs::metadata(path) {
+pub async fn read(path: &Path) -> ToolResult {
+    let info = match fs::metadata(path).await {
         Ok(v) => v,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return ToolResult::error(format!("Image file not found: {}", path.display()));
@@ -57,8 +58,8 @@ pub fn read(path: &Path) -> ToolResult {
             path.display()
         ));
     }
-    let reader = match fs::File::open(path).map(|f| ImageReader::new(std::io::BufReader::new(f))) {
-        Ok(r) => r,
+    let file = match fs::File::open(path).await {
+        Ok(file) => file,
         Err(e) => {
             return ToolResult::error(format!(
                 "failed to prepare image file: open image file: {}",
@@ -66,44 +67,75 @@ pub fn read(path: &Path) -> ToolResult {
             ));
         }
     };
+    let reader = ImageReader::new(std::io::BufReader::new(SyncIoBridge::new(file)));
+    let owned_path = path.to_owned();
+    let image_size = info.len();
+    let (format, w, h) =
+        match tokio::task::spawn_blocking(move || inspect_image(reader, &owned_path, image_size))
+            .await
+        {
+            Ok(Ok(dimensions)) => dimensions,
+            Ok(Err(result)) => return result,
+            Err(e) => return ToolResult::error(e.to_string()),
+        };
+    let raw = match fs::read(path).await {
+        Ok(raw) => raw,
+        Err(e) => {
+            return ToolResult::error(format!(
+                "failed to prepare image file: read image file: {}",
+                util::io_error("open", path, &e)
+            ));
+        }
+    };
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || prepare_read(&path, image_size, raw, format, w, h))
+        .await
+        .unwrap_or_else(|e| ToolResult::error(e.to_string()))
+}
+/// 在阻塞任务内解析头部，通过异步桥接读取文件，先检查像素预算。
+fn inspect_image(
+    reader: ImageReader<std::io::BufReader<SyncIoBridge<fs::File>>>,
+    path: &Path,
+    image_size: u64,
+) -> Result<(ImageFormat, u32, u32), ToolResult> {
     let mut reader = match reader.with_guessed_format() {
         Ok(r) => r,
         Err(e) => {
-            return ToolResult::error(format!(
+            return Err(ToolResult::error(format!(
                 "failed to prepare image file: invalid or unsupported image data: {e}"
-            ));
+            )));
         }
     };
     reader.no_limits();
     let Some(format) = reader.format() else {
-        return ToolResult::error(
+        return Err(ToolResult::error(
             "failed to prepare image file: invalid or unsupported image data: image: unknown format",
-        );
+        ));
     };
     if !matches!(
         format,
         ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP
     ) {
-        return ToolResult::error(
+        return Err(ToolResult::error(
             "failed to prepare image file: invalid or unsupported image data: image: unknown format",
-        );
+        ));
     }
     let mut header = [0u8; 33];
     let mut input = reader.into_inner();
     let bytes = match input.read(&mut header) {
         Ok(bytes) => bytes,
         Err(e) => {
-            return ToolResult::error(format!(
+            return Err(ToolResult::error(format!(
                 "failed to prepare image file: invalid or unsupported image data: {}",
                 util::io_error("read", path, &e)
-            ));
+            )));
         }
     };
     if let Err(e) = input.seek(SeekFrom::Start(0)) {
-        return ToolResult::error(format!(
+        return Err(ToolResult::error(format!(
             "failed to prepare image file: invalid or unsupported image data: {}",
             util::io_error("seek", path, &e)
-        ));
+        )));
     }
     let mut reader = ImageReader::with_format(input, format);
     reader.no_limits();
@@ -118,53 +150,55 @@ pub fn read(path: &Path) -> ToolResult {
             None
         };
         if let Some(error) = error {
-            return ToolResult::error(format!(
+            return Err(ToolResult::error(format!(
                 "failed to prepare image file: invalid or unsupported image data: {error}"
-            ));
+            )));
         }
     }
     if format == ImageFormat::Gif {
         let error = if bytes < 13 {
             Some("gif: reading header: unexpected EOF")
-        } else if header[10] & 128 != 0 && info.len() < 13 + 3 * (1 << ((header[10] & 7) + 1)) {
+        } else if header[10] & 128 != 0 && image_size < 13 + 3 * (1 << ((header[10] & 7) + 1)) {
             Some("gif: reading color table: unexpected EOF")
         } else {
             None
         };
         if let Some(error) = error {
-            return ToolResult::error(format!(
+            return Err(ToolResult::error(format!(
                 "failed to prepare image file: invalid or unsupported image data: {error}"
-            ));
+            )));
         }
     }
     let (w, h) = match reader.into_dimensions() {
         Ok(v) => v,
         Err(e) => {
-            return ToolResult::error(format!(
+            return Err(ToolResult::error(format!(
                 "failed to prepare image file: invalid or unsupported image data: {}",
                 decode_error(format, &e)
-            ));
+            )));
         }
     };
     if w == 0 || h == 0 {
-        return ToolResult::error(format!(
+        return Err(ToolResult::error(format!(
             "failed to prepare image file: invalid image dimensions: {w}x{h}"
-        ));
+        )));
     }
     if w as u64 * h as u64 > 50_000_000 {
-        return ToolResult::error(format!(
+        return Err(ToolResult::error(format!(
             "failed to prepare image file: image dimensions too large: {w}x{h} (max 50000000 pixels)"
-        ));
+        )));
     }
-    let raw = match fs::read(path) {
-        Ok(v) => v,
-        Err(e) => {
-            return ToolResult::error(format!(
-                "failed to prepare image file: read image file: {}",
-                util::io_error("open", path, &e)
-            ));
-        }
-    };
+    Ok((format, w, h))
+}
+/// 图片缩放、编解码与 base64 编码只处理内存数据。
+fn prepare_read(
+    path: &Path,
+    image_size: u64,
+    raw: Vec<u8>,
+    format: ImageFormat,
+    w: u32,
+    h: u32,
+) -> ToolResult {
     let (data, mime, tw, th, reencoded) = if fits(raw.len()) && w <= 2000 && h <= 2000 {
         (raw, media(format), w, h, false)
     } else {
@@ -206,7 +240,7 @@ pub fn read(path: &Path) -> ToolResult {
     let mut summary = format!(
         "Read image: {}\nOriginal: {w}x{h}, {}, {ext}\nReturned: {tw}x{th}, {}, {mime}, {action}",
         path.display(),
-        size(info.len() as usize),
+        size(image_size as usize),
         size(data.len())
     );
     if resized {
