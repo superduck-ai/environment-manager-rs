@@ -1,4 +1,5 @@
 //! 独立 Rust 回归测试；不依赖参考服务、Docker 或外部源码。
+mod common;
 use async_trait::async_trait;
 use qoder_mcp_server::{
     Config, Registry, Server, Tool, ToolResult,
@@ -15,104 +16,16 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-fn server(dir: &std::path::Path) -> Server {
-    Server::new(
+fn server(dir: &std::path::Path) -> Arc<Server> {
+    Arc::new(Server::new(
         Arc::new(Registry::builtin(dir.into(), None)),
         Arc::new(Manager::default()),
         Config::default(),
-    )
+    ))
 }
-async fn call(server: &Server, name: &str, arguments: Value) -> Value {
-    server.dispatch(&serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}})).unwrap(),CancellationToken::new()).await.unwrap()["result"].clone()
+async fn call(server: &Arc<Server>, name: &str, arguments: Value) -> Value {
+    common::rpc(server.clone(), json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}})).await["result"].clone()
 }
-#[tokio::test]
-async fn protocol_shapes_notifications_and_duplicate_fields() {
-    let dir = tempfile::tempdir().unwrap();
-    let s = server(dir.path());
-    for (input, expected) in [
-        (
-            r#"{"jsonrpc":"2.0","id":false,"method":"ping"}"#,
-            json!({"jsonrpc":"2.0","id":false,"result":{}}),
-        ),
-        (
-            r#"{"JSONRPC":"2.0","ID":1,"METHOD":"ping"}"#,
-            json!({"jsonrpc":"2.0","id":1,"result":{}}),
-        ),
-        (
-            r#"{"jsonrpc":"bad","jsonrpc":"2.0","id":1,"method":"ping"}"#,
-            json!({"jsonrpc":"2.0","id":1,"result":{}}),
-        ),
-        (
-            "[]",
-            json!({"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error"}}),
-        ),
-        (
-            "{}",
-            json!({"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"}}),
-        ),
-        (
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#,
-            json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid params: unexpected end of JSON input"}}),
-        ),
-    ] {
-        assert_eq!(
-            s.dispatch(input.as_bytes(), CancellationToken::new()).await,
-            Some(expected),
-            "{input}"
-        );
-    }
-    assert!(
-        s.dispatch(
-            br#"{"jsonrpc":"2.0","method":"ping"}"#,
-            CancellationToken::new()
-        )
-        .await
-        .is_none()
-    );
-    assert_eq!(
-        serde_json::to_value(ToolResult::text("")).unwrap(),
-        json!({"content":[{"type":"text"}]})
-    );
-}
-/// 重复参数对象合并已有字段，重名字段覆盖，null 清空已有参数。
-#[tokio::test]
-async fn repeated_arguments_merge_and_null_resets() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("lines"), "first\nsecond\nthird\n").unwrap();
-    let s = server(dir.path());
-    for (fields, expected) in [
-        (
-            r#""arguments":{"file_path":"lines"},"arguments":{"start_line":0}"#,
-            json!({"file_path":"lines","start_line":0}),
-        ),
-        (
-            r#""arguments":{"file_path":"missing","start_line":0},"ARGUMENTS":{"file_path":"lines"}"#,
-            json!({"file_path":"lines","start_line":0}),
-        ),
-        (
-            r#""arguments":{"file_path":"lines"},"arguments":null,"arguments":{"start_line":0}"#,
-            json!({"start_line":0}),
-        ),
-        (
-            r#""arguments":{"file_path":"missing"},"arguments":null,"arguments":{"file_path":"lines"}"#,
-            json!({"file_path":"lines"}),
-        ),
-    ] {
-        let request = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"read",{fields}}}}}"#
-        );
-        let response = s
-            .dispatch(request.as_bytes(), CancellationToken::new())
-            .await
-            .unwrap();
-        assert_eq!(
-            response["result"],
-            call(&s, "read", expected).await,
-            "{request}"
-        );
-    }
-}
-
 /// 完整的大型快照带尾部空白时，无需等待 socket 关闭即可返回。
 #[tokio::test]
 async fn large_environment_snapshot_with_whitespace_keeps_connection_open() {
@@ -244,13 +157,11 @@ async fn environment_cancellation_releases_stream_decoder() {
 async fn declarations_and_alias_arguments() {
     let dir = tempfile::tempdir().unwrap();
     let s = server(dir.path());
-    let response = s
-        .dispatch(
-            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
+    let response = common::rpc(
+        s.clone(),
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+    )
+    .await;
     let tools = response["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 12);
     for name in [
@@ -421,11 +332,11 @@ async fn plugin_lifecycle_and_dispatch() {
         .register(Arc::new(TestPlugin(count.clone())))
         .await
         .unwrap();
-    let s = Server::new(
+    let s = Arc::new(Server::new(
         Arc::new(Registry::default()),
         manager.clone(),
         Config::default(),
-    );
+    ));
     assert_eq!(
         call(&s, "plugin_tool", json!({})).await["content"][0]["text"],
         "plugin result"
@@ -499,15 +410,6 @@ async fn image_pixels_and_encoded_bytes_match_reference_goldens() {
     }
 }
 
-#[test]
-fn wire_encoding_preserves_struct_field_order_and_go_numeric_format() {
-    let result =
-        json!({"jsonrpc":"2.0","id":1e20,"result":{"content":[{"type":"text","text":"<&>"}]}});
-    assert_eq!(qoder_mcp_server::protocol::encode(&result),br#"{"jsonrpc":"2.0","id":100000000000000000000,"result":{"content":[{"type":"text","text":"\u003c\u0026\u003e"}]}}"#);
-    let result = json!({"jsonrpc":"2.0","id":1e-7,"result":{"serverInfo":{"name":"name","version":"version"},"capabilities":{"tools":{}},"protocolVersion":"2024-11-05"}});
-    assert_eq!(qoder_mcp_server::protocol::encode(&result),br#"{"jsonrpc":"2.0","id":1e-7,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"name","version":"version"}}}"#);
-}
-
 #[tokio::test]
 async fn gif_subframe_keeps_reference_bounds() {
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -528,20 +430,9 @@ async fn gif_subframe_keeps_reference_bounds() {
 }
 
 #[tokio::test]
-async fn invalid_utf8_is_replaced_per_byte_and_unsupported_images_are_rejected() {
+async fn unsupported_image_data_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let s = server(dir.path());
-    let response = s
-        .dispatch(
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"\xe4\xb8\"}",
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        response["error"]["message"],
-        "Method not found: \u{fffd}\u{fffd}"
-    );
     let path = dir.path().join("unsupported.png");
     std::fs::write(&path, b"BM\0\0\0\0\0\0\0\0\0\0\0\0\0\0").unwrap();
     assert_eq!(
@@ -554,7 +445,7 @@ async fn invalid_utf8_is_replaced_per_byte_and_unsupported_images_are_rejected()
 async fn wildcard_http_listener_serves_ipv4_and_ipv6() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dir = tempfile::tempdir().unwrap();
-    let s = Arc::new(server(dir.path()));
+    let s = server(dir.path());
     let reservation = std::net::TcpListener::bind("[::]:0").unwrap();
     let port = reservation.local_addr().unwrap().port();
     drop(reservation);
@@ -570,13 +461,14 @@ async fn wildcard_http_listener_serves_ipv4_and_ipv6() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         let mut stream = stream.unwrap();
-        let body = r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#;
-        stream.write_all(format!("POST /mcp HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+        let body = common::request(json!(1), "server/discover", json!({})).to_string();
+        stream.write_all(format!("POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: server/discover\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.unwrap();
         let response = String::from_utf8(response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(response.ends_with("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n"));
+        assert!(response.contains("2026-07-28"));
+        assert!(response.contains("supportedVersions"));
     }
     task.abort();
 }

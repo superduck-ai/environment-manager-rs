@@ -73,7 +73,24 @@ async fn main() {
         );
         Manager::with_service(&core)
     });
-    let server = Arc::new(Server::new(registry, plugins.clone(), Config::default()));
+    let mut config = Config::default();
+    if let Ok(hosts) = std::env::var("MCP_ALLOWED_HOSTS") {
+        config.allowed_hosts = hosts
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+    if let Ok(origins) = std::env::var("MCP_ALLOWED_ORIGINS") {
+        config.allowed_origins = origins
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+    let server = Arc::new(Server::new(registry, plugins.clone(), config));
     let result = match transport.as_str() {
         "stdio" => server.serve_stdio().await,
         "http" => server.serve_http(&addr).await,

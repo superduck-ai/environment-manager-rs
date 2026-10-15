@@ -1,9 +1,8 @@
-//! 与 sandbox-runtime-tools 兼容的本地 MCP 服务。
-//!
-//! 工具实现使用 Rust 标准库、Tokio 和主流编解码库；兼容层保留工具的原始
-//! 参数转换、错误文本和内容块字段省略规则。
+//! Runtime tools exposed through the official rmcp SDK using MCP 2026-07-28.
+//! Tool execution remains independent of the protocol and transport adapter.
 
 pub mod environment;
+pub mod execution;
 mod json;
 pub mod logging;
 pub mod plugins;

@@ -1,0 +1,101 @@
+{
+  "type": "object",
+  "properties": {
+    "stdout": {
+      "description": "Captured stdout, without status messages or placeholders. Empty output is an empty string. May contain only the tail when stdout_truncated is true.",
+      "type": "string"
+    },
+    "stderr": {
+      "description": "Captured stderr, without tool error messages. Empty output is an empty string. May contain only the tail when stderr_truncated is true.",
+      "type": "string"
+    },
+    "exit_code": {
+      "description": "Bash exit code after completion; null when not started or still running. Signal termination uses -1 and includes signal.",
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "status": {
+      "description": "Execution lifecycle state. completed means the process ended, not necessarily that it succeeded.",
+      "type": "string",
+      "enum": [
+        "not_started",
+        "running",
+        "completed",
+        "timed_out",
+        "cancelled"
+      ]
+    },
+    "duration_ms": {
+      "description": "Elapsed execution time in milliseconds; zero when not started.",
+      "type": "integer"
+    },
+    "timed_out": {
+      "description": "True when the timeout terminated the process group; false for a command continuing in the background.",
+      "type": "boolean"
+    },
+    "cancelled": {
+      "description": "True when request cancellation terminated the process group.",
+      "type": "boolean"
+    },
+    "pid": {
+      "description": "Bash process ID, present when a process was started.",
+      "type": "integer"
+    },
+    "signal": {
+      "description": "Termination signal name, present for signal termination.",
+      "type": "string"
+    },
+    "stdout_bytes": {
+      "description": "Total stdout bytes captured at the time of this snapshot, before tail truncation.",
+      "type": "integer"
+    },
+    "stderr_bytes": {
+      "description": "Total stderr bytes captured at the time of this snapshot, before tail truncation.",
+      "type": "integer"
+    },
+    "stdout_truncated": {
+      "description": "Whether stdout contains only the tail. Limit: 30000 bytes for completed commands, 2000 bytes for background snapshots.",
+      "type": "boolean"
+    },
+    "stderr_truncated": {
+      "description": "Whether stderr contains only the tail. Limit: 30000 bytes for completed commands, 2000 bytes for background snapshots.",
+      "type": "boolean"
+    },
+    "output_file": {
+      "description": "Retained combined log path for background execution, truncation or a read failure. Includes the final status line when finished.",
+      "type": "string"
+    },
+    "stdout_file": {
+      "description": "Retained stdout log path for background execution, truncation or a read failure. Contains no status line.",
+      "type": "string"
+    },
+    "stderr_file": {
+      "description": "Retained stderr log path for background execution, truncation or a read failure. Contains no status line.",
+      "type": "string"
+    },
+    "error": {
+      "description": "Tool startup, capture or read error. This is not command stderr and may exist even when exit_code is zero.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "stdout",
+    "stderr",
+    "exit_code",
+    "status",
+    "duration_ms",
+    "timed_out",
+    "cancelled",
+    "stdout_bytes",
+    "stderr_bytes",
+    "stdout_truncated",
+    "stderr_truncated"
+  ],
+  "additionalProperties": false
+}

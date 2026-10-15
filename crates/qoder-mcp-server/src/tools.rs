@@ -56,6 +56,12 @@ pub struct ToolResult {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub is_error: bool,
+    #[serde(
+        rename = "structuredContent",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub structured_content: Option<Box<crate::execution::ExecutionResult>>,
 }
 impl ToolResult {
     /// 创建一个文本内容块，空文本省略 text 字段。
@@ -68,6 +74,7 @@ impl ToolResult {
                 mime_type: String::new(),
             }],
             is_error: false,
+            structured_content: None,
         }
     }
     /// 创建工具级错误结果。
@@ -83,6 +90,10 @@ impl ToolResult {
 pub trait Tool: Send + Sync {
     /// 返回完整 MCP 工具声明。
     fn definition(&self) -> Value;
+    /// Build a tool-specific failure, preserving any declared output schema.
+    fn error_result(&self, message: String) -> ToolResult {
+        ToolResult::error(message)
+    }
     /// 验证必需字段，不额外收紧兼容接口的参数类型。
     fn validate(&self, arguments: &Value) -> Result<(), String> {
         for key in self.definition()["inputSchema"]["required"]
@@ -177,7 +188,18 @@ struct Builtin {
 impl Tool for Builtin {
     /// 内置工具使用从参考服务提取的精确声明。
     fn definition(&self) -> Value {
-        self.definition.clone()
+        let mut definition = self.definition.clone();
+        if util::string(&definition, "name") == "bash" {
+            definition["outputSchema"] = crate::execution::output_schema();
+        }
+        definition
+    }
+    fn error_result(&self, message: String) -> ToolResult {
+        if util::string(&self.definition, "name") == "bash" {
+            bash::not_started(message)
+        } else {
+            ToolResult::error(message)
+        }
     }
     /// 异步分派命令、搜索与文件操作；图片编解码由内部阻塞任务处理。
     async fn handle(
@@ -238,6 +260,9 @@ impl Tool for Alias {
         let mut d = self.target.definition();
         d["name"] = json!(self.name);
         d
+    }
+    fn error_result(&self, message: String) -> ToolResult {
+        self.target.error_result(message)
     }
     /// 映射后再执行必需字段验证。
     fn validate(&self, arguments: &Value) -> Result<(), String> {

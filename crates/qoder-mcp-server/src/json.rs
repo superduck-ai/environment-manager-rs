@@ -96,14 +96,6 @@ impl Json {
         }
     }
 }
-/// 解析过的请求；params 保留独立结构体的大小写和 null 语义。
-pub struct Request {
-    pub jsonrpc: String,
-    pub method: String,
-    pub id: Value,
-    pub params: Option<Value>,
-    pub params_error: Option<String>,
-}
 /// 修复 JSON 字符串里的孤立 UTF-16 代理项；合法配对原样保留。
 fn repair(body: &[u8]) -> String {
     let s = crate::util::lossy(body);
@@ -165,98 +157,6 @@ fn repair(body: &[u8]) -> String {
         i += ch.len_utf8();
     }
     out
-}
-/// 对请求结构体按输入字段顺序进行兼容解码。
-pub fn request(body: &[u8]) -> Result<Request, ()> {
-    let root: Json = serde_json::from_str(&repair(body)).map_err(|_| ())?;
-    let mut out = Request {
-        jsonrpc: String::new(),
-        method: String::new(),
-        id: Value::Null,
-        params: None,
-        params_error: None,
-    };
-    let fields = match root {
-        Json::Null => return Ok(out),
-        Json::Object(v) => v,
-        _ => return Err(()),
-    };
-    for (k, v) in fields {
-        if k.eq_ignore_ascii_case("jsonrpc") || k.eq_ignore_ascii_case("method") {
-            let target = if k.eq_ignore_ascii_case("jsonrpc") {
-                &mut out.jsonrpc
-            } else {
-                &mut out.method
-            };
-            match v {
-                Json::Null => {}
-                Json::String(v) => *target = v,
-                _ => return Err(()),
-            }
-        } else if k.eq_ignore_ascii_case("id") {
-            out.id = v.value();
-        } else if k.eq_ignore_ascii_case("params") {
-            let (value, error) = params(v);
-            out.params = Some(value);
-            out.params_error = error;
-        }
-    }
-    Ok(out)
-}
-/// 参数结构体兼容解码，未知字段不会产生类型错误。
-fn params(v: Json) -> (Value, Option<String>) {
-    let fields = match v {
-        Json::Null => return (Value::Null, None),
-        Json::Object(v) => v,
-        v => {
-            let v = v.value();
-            return (
-                v.clone(),
-                Some(format!(
-                    "json: cannot unmarshal {} into Go value of type mcp.toolCallParams",
-                    type_name(&v)
-                )),
-            );
-        }
-    };
-    let mut name = Value::Null;
-    let mut arguments = Value::Null;
-    let mut error = None;
-    for (k, v) in fields {
-        if k.eq_ignore_ascii_case("name") {
-            match v {
-                Json::Null => {}
-                Json::String(v) => name = Value::String(v),
-                v => {
-                    if error.is_none() {
-                        error = Some(format!(
-                            "json: cannot unmarshal {} into Go struct field toolCallParams.name of type string",
-                            type_name(&v.value())
-                        ));
-                    }
-                }
-            }
-        } else if k.eq_ignore_ascii_case("arguments") {
-            let v = v.value();
-            if !v.is_null() && !v.is_object() {
-                if error.is_none() {
-                    error = Some(format!(
-                        "json: cannot unmarshal {} into Go struct field toolCallParams.arguments of type map[string]interface {{}}",
-                        type_name(&v)
-                    ));
-                }
-            } else if let (Value::Object(existing), Value::Object(incoming)) = (&mut arguments, &v)
-            {
-                existing.extend(incoming.clone());
-            } else {
-                arguments = v;
-            }
-        }
-    }
-    (
-        serde_json::json!({"name":name,"arguments":arguments}),
-        error,
-    )
 }
 /// 生成兼容解码器类型名称。
 fn type_name(v: &Value) -> &'static str {

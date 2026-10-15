@@ -1,10 +1,14 @@
 //! 无终端命令执行、独立进程组、后台输出和超时清理。
 use super::ToolResult;
+use crate::execution::{ExecutionResult, ExecutionStatus};
+#[path = "bash_output.rs"]
+mod output;
 use crate::{environment::EnvironmentProvider, util};
 use nix::{
     sys::signal::{Signal, kill},
     unistd::Pid,
 };
+pub(super) use output::not_started;
 use regex::Regex;
 use serde_json::Value;
 use std::{
@@ -13,14 +17,15 @@ use std::{
     os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
-    sync::OnceLock,
-    time::Duration,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     process::Command,
-    task::JoinHandle,
+    sync::Mutex,
+    task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
 const NON_INTERACTIVE: &[(&str, &str)] = &[
@@ -153,7 +158,7 @@ async fn tail(path: &Path, max: usize) -> std::io::Result<(String, usize)> {
     let start = len.saturating_sub(max);
     f.seek(SeekFrom::Start(start as u64)).await?;
     let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes).await?;
+    f.take((len - start) as u64).read_to_end(&mut bytes).await?;
     let skip = if start > 0 {
         bytes.iter().take_while(|b| **b & 0xc0 == 0x80).count()
     } else {
@@ -191,7 +196,7 @@ fn status(s: ExitStatus) -> (i32, String) {
 fn signal_group(pid: u32, signal: Signal) {
     let _ = kill(Pid::from_raw(-(pid as i32)), signal);
 }
-/// 运行命令，将子进程输出直接写入日志以避免阻塞管道。
+/// Run Bash while draining both pipes into independent and combined logs.
 pub async fn run(
     work: &Path,
     provider: Option<&dyn EnvironmentProvider>,
@@ -200,14 +205,14 @@ pub async fn run(
 ) -> ToolResult {
     let command = util::string(a, "command");
     if command.trim().is_empty() {
-        return ToolResult::error("command is required");
+        return not_started("command is required");
     }
     if let Some(e) = interactive(command) {
-        return ToolResult::error(e);
+        return not_started(e);
     }
     let env = match call_env(a) {
         Ok(e) => e,
-        Err(e) => return ToolResult::error(e),
+        Err(e) => return not_started(e),
     };
     let timeout = a
         .get("timeout")
@@ -219,7 +224,7 @@ pub async fn run(
         match v.as_str() {
             Some("kill") => "kill",
             Some("background") => "background",
-            _ => return ToolResult::error("on_timeout must be \"kill\" or \"background\""),
+            _ => return not_started("on_timeout must be \"kill\" or \"background\""),
         }
     } else {
         "kill"
@@ -231,23 +236,23 @@ pub async fn run(
         util::resolve(work, dir)
     };
     if cancellation.is_cancelled() {
-        return ToolResult::error("not started: context canceled");
+        return not_started("not started: context canceled");
     }
     if let Err(e) = util::create_dir_all(util::OUTPUT_DIR).await {
-        return ToolResult::error(format!(
+        return not_started(format!(
             "failed to create output dir: {}",
             util::io_error("mkdir", Path::new(util::OUTPUT_DIR), &e)
         ));
     }
     let (output, out) = match temp("bash_", ".log").await {
         Ok(v) => v,
-        Err(e) => return ToolResult::error(format!("failed to create output file: {e}")),
+        Err(e) => return not_started(format!("failed to create output file: {e}")),
     };
     let (script, mut script_file) = match temp("bash-", ".sh").await {
         Ok(v) => v,
         Err(e) => {
             let _ = fs::remove_file(&output).await;
-            return ToolResult::error(format!("failed to write command script: {e}"));
+            return not_started(format!("failed to write command script: {e}"));
         }
     };
     let script_content = format!(
@@ -261,7 +266,7 @@ pub async fn run(
     if let Err(e) = written {
         let _ = fs::remove_file(&script).await;
         let _ = fs::remove_file(&output).await;
-        return ToolResult::error(format!("failed to write command script: {e}"));
+        return not_started(format!("failed to write command script: {e}"));
     }
     drop(script_file);
     let mut merged: BTreeMap<_, _> = std::env::vars_os().collect();
@@ -277,7 +282,7 @@ pub async fn run(
             Err(e) => {
                 let _ = fs::remove_file(&script).await;
                 let _ = fs::remove_file(&output).await;
-                return ToolResult::error(format!("failed to load runtime environment: {e}"));
+                return not_started(format!("failed to load runtime environment: {e}"));
             }
         }
     }
@@ -294,20 +299,31 @@ pub async fn run(
     {
         let _ = fs::remove_file(&script).await;
         let _ = fs::remove_file(&output).await;
-        return ToolResult::error(
-            "failed to execute command: exec: environment variable contains NUL",
-        );
+        return not_started("failed to execute command: exec: environment variable contains NUL");
     }
     let executable = match util::executable("bash").await {
         Ok(p) => p,
         Err(e) => {
             let _ = fs::remove_file(&script).await;
             let _ = fs::remove_file(&output).await;
-            return ToolResult::error(format!("failed to execute command: {e}"));
+            return not_started(format!("failed to execute command: {e}"));
         }
     };
-    let stdout = out.try_clone().await.unwrap().into_std().await;
-    let stderr = out.try_clone().await.unwrap().into_std().await;
+    let streams = output::Streams::new(&output);
+    let (stdout, stderr) = match streams.open().await {
+        Ok(files) => files,
+        Err(error) => {
+            let _ = fs::remove_file(&script).await;
+            let _ = fs::remove_file(&output).await;
+            return not_started(format!("failed to create stream files: {error}"));
+        }
+    };
+    if cancellation.is_cancelled() {
+        streams.remove().await;
+        let _ = fs::remove_file(&script).await;
+        let _ = fs::remove_file(&output).await;
+        return not_started("not started: context canceled");
+    }
     let mut cmd = Command::new(&executable);
     cmd.arg(&script)
         .current_dir(&work)
@@ -327,8 +343,8 @@ pub async fn run(
             }
         }))
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     // SAFETY: pre_exec 中只调用异步信号安全的 setsid，不分配内存或使用锁。
     unsafe {
         cmd.pre_exec(|| {
@@ -339,27 +355,66 @@ pub async fn run(
             }
         });
     }
+    let started = Instant::now();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            streams.remove().await;
             let _ = fs::remove_file(&output).await;
             let _ = fs::remove_file(&script).await;
-            return ToolResult::error(format!(
+            return not_started(format!(
                 "failed to execute command: fork/exec {}: {}",
                 executable.display(),
                 util::errno(&e)
             ));
         }
     };
-    drop(out);
     let pid = child.id().unwrap();
+    let combined = Arc::new(Mutex::new(out));
+    let mut captures = JoinSet::new();
+    captures.spawn(output::capture(
+        child.stdout.take().unwrap(),
+        stdout,
+        combined.clone(),
+    ));
+    captures.spawn(output::capture(
+        child.stderr.take().unwrap(),
+        stderr,
+        combined.clone(),
+    ));
     let output_copy = output.clone();
-    let mut finished: JoinHandle<(i32, String)> = tokio::spawn(async move {
-        let (code, text) = child
-            .wait()
-            .await
-            .map(status)
-            .unwrap_or((-1, "[exit code: -1]".into()));
+    let mut finished = tokio::spawn(async move {
+        let waited = child.wait().await;
+        let signal = waited
+            .as_ref()
+            .ok()
+            .and_then(|s| s.signal())
+            .map(signal_name)
+            .unwrap_or_default();
+        let mut errors = Vec::new();
+        if let Err(error) = &waited {
+            errors.push(format!("wait failed: {error}"));
+        }
+        let (code, text) = waited.map(status).unwrap_or((-1, "[exit code: -1]".into()));
+        // Like Go's WaitDelay, bound capture when descendants retain the pipes.
+        if tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(captured) = captures.join_next().await {
+                match captured {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => errors.push(format!("output capture failed: {error}")),
+                    Err(error) => errors.push(format!("output capture task failed: {error}")),
+                }
+            }
+        })
+        .await
+        .is_err()
+        {
+            errors.push("output pipes remained open after process exit".into());
+            captures.abort_all();
+            while captures.join_next().await.is_some() {}
+        }
+        let duration_ms = started.elapsed().as_millis() as u64;
+        drop(combined);
         let _ = fs::remove_file(script).await;
         let written = async {
             let mut file = OpenOptions::new()
@@ -385,14 +440,32 @@ pub async fn run(
                 ],
             );
         }
-        (code, text)
+        (code, text, signal, duration_ms, errors.join("; "))
     });
     let mut reason = String::new();
     let mut result = None;
-    tokio::select! {v=&mut finished=>{result=Some(v);},_=cancellation.cancelled()=>reason="[cancelled; process group terminated]".into(),_=tokio::time::sleep(Duration::from_secs(timeout))=>{
-        if on_timeout=="background"{crate::logging::info("bash: command continues in background", &[("pid", &pid.to_string()), ("output_file", &output.to_string_lossy()), ("waited_seconds", &timeout.to_string())]);let preview=tail(&output,2000).await.map(|(s,_)|if s.is_empty(){"(no output yet)".into()}else{s}).unwrap_or_else(|e|{let error=util::io_error("open", &output, &e);crate::logging::warn("bash: failed to read background output preview", &[("pid", &pid.to_string()), ("output_file", &output.to_string_lossy()), ("error", &error)]);format!("(output not readable: {error})")});return ToolResult::text(format!("[backgrounded] Command did not finish within {timeout}s and continues running in the background.\npid: {pid}\noutput_file: {}\n\nOutput so far:\n{preview}",output.display()));}
-        reason=format!("[timed out after {timeout}s; process group terminated]");
-    }}
+    let mut execution_status = ExecutionStatus::Completed;
+    tokio::select! {
+        v = &mut finished => { result = Some(v); },
+        _ = cancellation.cancelled() => {
+            reason = "[cancelled; process group terminated]".into();
+            execution_status = ExecutionStatus::Cancelled;
+        },
+        _ = tokio::time::sleep(Duration::from_secs(timeout)) => {
+            if on_timeout == "background" {
+                crate::logging::info("bash: command continues in background", &[("pid", &pid.to_string()), ("output_file", &output.to_string_lossy()), ("waited_seconds", &timeout.to_string())]);
+                let preview = tail(&output, 2000).await.map(|(text, _)| if text.is_empty() { "(no output yet)".into() } else { text }).unwrap_or_else(|e| format!("(output not readable: {e})"));
+                let mut execution = ExecutionResult {
+                    status: ExecutionStatus::Running, pid: Some(pid), duration_ms: started.elapsed().as_millis() as u64,
+                    output_file: output.to_string_lossy().into_owned(), ..Default::default()
+                };
+                streams.snapshot(&mut execution, 2000).await;
+                return output::result(format!("[backgrounded] Command did not finish within {timeout}s and continues running in the background.\npid: {pid}\noutput_file: {}\n\nOutput so far:\n{preview}", output.display()), !execution.error.is_empty(), execution);
+            }
+            reason = format!("[timed out after {timeout}s; process group terminated]");
+            execution_status = ExecutionStatus::TimedOut;
+        }
+    }
     if result.is_none() {
         crate::logging::info(
             "bash: terminating command",
@@ -417,7 +490,27 @@ pub async fn run(
             Err(_) => finished.await,
         });
     }
-    let (code, status) = result.unwrap().unwrap_or((-1, "[exit code: -1]".into()));
+    let (code, status, signal, duration_ms, wait_error) = result.unwrap().unwrap_or_else(|error| {
+        (
+            -1,
+            "[exit code: -1]".into(),
+            String::new(),
+            started.elapsed().as_millis() as u64,
+            error.to_string(),
+        )
+    });
+    let mut execution = ExecutionResult {
+        status: execution_status,
+        pid: Some(pid),
+        exit_code: Some(code),
+        signal,
+        duration_ms,
+        timed_out: execution_status == ExecutionStatus::TimedOut,
+        cancelled: execution_status == ExecutionStatus::Cancelled,
+        error: wait_error,
+        ..Default::default()
+    };
+    streams.snapshot(&mut execution, 30000).await;
     let (tail, total) = match tail(&output, 30000).await {
         Ok(v) => v,
         Err(e) => {
@@ -429,11 +522,14 @@ pub async fn run(
                     ("error", &util::io_error("open", &output, &e)),
                 ],
             );
-            return ToolResult::error(format!(
+            let message = format!(
                 "command finished ({status}) but its output could not be read from {}: {}",
                 output.display(),
                 util::io_error("open", &output, &e)
-            ));
+            );
+            execution.error = message.clone();
+            execution.output_file = output.to_string_lossy().into_owned();
+            return output::result(message, true, execution);
         }
     };
     let tail_len = tail.len();
@@ -447,6 +543,7 @@ pub async fn run(
         text.push_str(&format!("\n{status}"));
     }
     if total > 30000 {
+        execution.output_file = output.to_string_lossy().into_owned();
         text = format!(
             "[output truncated: showing the last {tail_len} of {total} bytes; full output in {}]\n{text}",
             output.display()
@@ -457,9 +554,9 @@ pub async fn run(
     if text.is_empty() {
         text = "(no output)".into();
     }
-    if code != 0 || !reason.is_empty() {
-        ToolResult::error(text)
-    } else {
-        ToolResult::text(text)
-    }
+    output::result(
+        text,
+        code != 0 || !reason.is_empty() || !execution.error.is_empty(),
+        execution,
+    )
 }
