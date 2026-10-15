@@ -6,3 +6,6 @@
 
 pub mod codesign;
 pub mod supabase;
+
+/// 本地文件、命令和搜索工具的兼容 MCP 服务。
+pub use qoder_mcp_server as runtime_tools;

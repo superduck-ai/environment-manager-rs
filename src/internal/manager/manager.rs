@@ -121,6 +121,19 @@ impl Manager {
     /// MCP 注册和环境初始化在同一并行阶段执行；两条路径都返回拥有所有权的结果，
     /// 不通过 join handle 后写裸指针。
     pub async fn run(&mut self, cancellation: &CancellationToken) -> Result<(), ManagerError> {
+        let mut runtime_mcp = None;
+        let result = self.run_session(cancellation, &mut runtime_mcp).await;
+        if let Some(runtime) = runtime_mcp {
+            runtime.shutdown().await;
+        }
+        result
+    }
+
+    async fn run_session(
+        &mut self,
+        cancellation: &CancellationToken,
+        runtime_mcp: &mut Option<super::runtime_mcp::RuntimeMcpServer>,
+    ) -> Result<(), ManagerError> {
         let started = Instant::now();
         // 恢复结构保留该字段但 Run 不消费；显式读取避免把协议字段误判为死代码。
         let _ = self.process_start_time;
@@ -382,6 +395,12 @@ impl Manager {
             self.log_diag("plugin_marketplace_failed", BTreeMap::new());
             tracing::warn!("error" = ?(error.to_string()), "{}", "Plugin marketplace installation failed (parallel)");
         }
+
+        if cancellation.is_cancelled() {
+            return Ok(());
+        }
+        *runtime_mcp =
+            Some(super::runtime_mcp::RuntimeMcpServer::start(&claude_config, cancellation).await?);
 
         if skip_claude_code {
             tracing::info!(

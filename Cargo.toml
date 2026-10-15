@@ -11,6 +11,7 @@ name = "environment-manager"
 path = "src/main.rs"
 
 [dependencies]
+qoder-mcp-server = { path = "crates/qoder-mcp-server" }
 anyhow = "1.0.100"
 async-trait = "0.1.89"
 axum = { version = "0.8.9", features = ["http1", "json", "tokio"] }
@@ -87,3 +88,8 @@ broken_intra_doc_links = "deny"
 dbg_macro = "deny"
 todo = "deny"
 undocumented_unsafe_blocks = "deny"
+
+[workspace]
+members = ["crates/qoder-mcp-server"]
+default-members = [".", "crates/qoder-mcp-server"]
+resolver = "3"
