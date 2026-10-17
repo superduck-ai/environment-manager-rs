@@ -28,6 +28,7 @@ impl RuntimeMcpServer {
     pub async fn start(
         configuration: &ClaudeConfig,
         parent: &CancellationToken,
+        proxy: Option<&crate::internal::claude::AgentProxyHandle>,
     ) -> Result<Self, ManagerError> {
         let address =
             std::env::var("ENVRUNNER_RUNTIME_MCP_ADDR").unwrap_or_else(|_| "0.0.0.0:3001".into());
@@ -58,16 +59,23 @@ impl RuntimeMcpServer {
         if let Ok(origins) = std::env::var("MCP_ALLOWED_ORIGINS") {
             config.allowed_origins = comma_values(&origins);
         }
+        let mut environment: BTreeMap<String, String> = configuration
+            .environment
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if let Some(proxy) = proxy {
+            environment.extend(proxy.environment().iter().map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            }));
+        }
         let server = Arc::new(Server::new(
             Arc::new(Registry::builtin(
                 working_directory,
-                Some(Arc::new(RuntimeEnvironment(
-                    configuration
-                        .environment
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect(),
-                ))),
+                Some(Arc::new(RuntimeEnvironment(environment))),
             )),
             Arc::new(Manager::default()),
             config,

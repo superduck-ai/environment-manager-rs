@@ -589,7 +589,7 @@ async fn session_proxy_environment_reaches_real_executor_child() {
         r#"#!/bin/sh
 exec python3 - <<'PY'
 import json, os, pathlib, socket, urllib.parse
-keys = ["HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "SSL_CERT_FILE",
+keys = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy", "SSL_CERT_FILE",
         "GIT_SSL_CAINFO", "NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"]
 environment = {key: os.environ[key] for key in keys}
 assert pathlib.Path(environment["GIT_SSL_CAINFO"]).is_file()
@@ -1268,6 +1268,7 @@ async fn runtime_mcp_starts_in_skip_mode_and_stops_with_manager() {
     let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
     let home = TempDir::new().unwrap();
     let mut restore = configure_process_environment(&home);
+    restore.set("RUNTIME_MCP_PROCESS_VALUE", "from-process");
     let reservation = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
     let port = reservation.local_addr().unwrap().port();
     drop(reservation);
@@ -1280,11 +1281,47 @@ async fn runtime_mcp_starts_in_skip_mode_and_stops_with_manager() {
     let (mut manager, executor, _) =
         new_manager_for_test("fake", environment, SessionMode::SetupOnly, true, None);
     manager.claude_config.as_mut().unwrap().skip_claude_code = true;
+    let configuration = manager.claude_config.as_mut().unwrap();
+    configuration
+        .environment
+        .insert("RUNTIME_MCP_CONFIG_VALUE".into(), "from-config".into());
+    configuration
+        .environment
+        .insert("RUNTIME_MCP_SHARED_VALUE".into(), "from-config".into());
+    let startup = manager
+        .session_config
+        .as_mut()
+        .unwrap()
+        .startup_context
+        .as_mut()
+        .unwrap();
+    let proxy_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/v1/code/upstreamproxy/ca-cert"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("test CA"))
+        .expect(1)
+        .mount(&proxy_server)
+        .await;
+    startup.use_code_sessions = true;
+    startup.environment_variables.extend([
+        ("CLAUDE_CODE_REMOTE".into(), "1".into()),
+        ("CCR_UPSTREAM_PROXY_ENABLED".into(), "1".into()),
+        ("ANTHROPIC_BASE_URL".into(), proxy_server.uri()),
+        ("http_proxy".into(), "http://127.0.0.1:1".into()),
+        ("NO_PROXY".into(), "*".into()),
+    ]);
+    startup.environment_variables.insert(
+        "RUNTIME_MCP_STARTUP_VALUE".into(),
+        "opaque-vault-placeholder".into(),
+    );
+    startup
+        .environment_variables
+        .insert("RUNTIME_MCP_SHARED_VALUE".into(), "from-startup".into());
     let cancellation = CancellationToken::new();
     let run_token = cancellation.clone();
     let task = tokio::spawn(async move { manager.run(&run_token).await });
     let url = format!("http://127.0.0.1:{port}/mcp");
-    let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bash","arguments":{"command":"printf '%s|%s' \"$PWD\" \"$RUNTIME_MCP_TEST_VALUE\""},"_meta":qoder_mcp_server::protocol::request_meta()}});
+    let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bash","arguments":{"command":"test -n \"$http_proxy\" && test \"$http_proxy\" = \"$https_proxy\" && test \"$http_proxy\" != http://127.0.0.1:1 && test \"$NO_PROXY\" != '*' && test -f \"$SSL_CERT_FILE\" && printf '%s|%s|%s|%s|%s|%s' \"$PWD\" \"$RUNTIME_MCP_PROCESS_VALUE\" \"$RUNTIME_MCP_TEST_VALUE\" \"$RUNTIME_MCP_CONFIG_VALUE\" \"$RUNTIME_MCP_STARTUP_VALUE\" \"$RUNTIME_MCP_SHARED_VALUE\""},"_meta":qoder_mcp_server::protocol::request_meta()}});
     let client = reqwest::Client::new();
     let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -1317,10 +1354,7 @@ async fn runtime_mcp_starts_in_skip_mode_and_stops_with_manager() {
                 .filter(|value| value.get("result").is_some())
         })
         .expect("SSE tool result");
-    assert_eq!(
-        result["result"]["structuredContent"]["stdout"],
-        format!("{}|from-environment", home.path().display())
-    );
+    let stdout = result["result"]["structuredContent"]["stdout"].clone();
     let mut long_request = request.clone();
     long_request["id"] = json!(2);
     long_request["params"]["arguments"]["command"] =
@@ -1361,6 +1395,14 @@ async fn runtime_mcp_starts_in_skip_mode_and_stops_with_manager() {
     })
     .await
     .expect("shutdown cancelled the active Bash process group");
+    assert_eq!(
+        stdout,
+        format!(
+            "{}|from-process|from-environment|from-config|opaque-vault-placeholder|from-startup",
+            home.path().display()
+        )
+    );
+    assert!(std::env::var_os("RUNTIME_MCP_STARTUP_VALUE").is_none());
     assert!(!executor.execute_called.load(Ordering::SeqCst));
 }
 
