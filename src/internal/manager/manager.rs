@@ -399,8 +399,14 @@ impl Manager {
         if cancellation.is_cancelled() {
             return Ok(());
         }
-        *runtime_mcp =
-            Some(super::runtime_mcp::RuntimeMcpServer::start(&claude_config, cancellation).await?);
+        *runtime_mcp = Some(
+            super::runtime_mcp::RuntimeMcpServer::start(
+                &claude_config,
+                cancellation,
+                agent_proxy.as_ref(),
+            )
+            .await?,
+        );
 
         if skip_claude_code {
             tracing::info!(
@@ -675,6 +681,15 @@ impl Manager {
         claude_config
             .environment
             .extend(environment.get_claude_environment_variables());
+        if let Some(startup) = self
+            .session_config
+            .as_ref()
+            .and_then(|session| session.startup_context.as_ref())
+        {
+            claude_config
+                .environment
+                .extend(startup.environment_variables.clone());
+        }
         let working_directory = environment.get_cwd();
         if working_directory.is_empty() {
             tracing::info!("{}", "No working directory specified in environment config");

@@ -117,6 +117,7 @@ impl RelayConfig {
 struct ConnectRequest {
     target: String,
     trailing: Vec<u8>,
+    http_head: Option<String>,
 }
 
 enum ConnectParse {
@@ -319,6 +320,8 @@ fn proxy_environment(
         .ok_or_else(|| anyhow!("upstream proxy CA bundle path is not UTF-8"))?;
     let no_proxy = format!("{NO_PROXY_LIST},{api_host}");
     Ok([
+        ("HTTP_PROXY", proxy_url.as_str()),
+        ("http_proxy", proxy_url.as_str()),
         ("HTTPS_PROXY", proxy_url.as_str()),
         ("https_proxy", proxy_url.as_str()),
         ("NO_PROXY", no_proxy.as_str()),
@@ -421,10 +424,16 @@ async fn handle_connection_with_handshake_timeout(
     // 送给服务端的首个 WebSocket chunk 是：
     // CONNECT api.example.com:443 HTTP/1.1
     // Proxy-Authorization: Basic ...
-    let connect_head = format!(
-        "CONNECT {} HTTP/1.1\r\nProxy-Authorization: {}\r\n\r\n",
-        request.target, config.proxy_authorization
-    );
+    let connect_head = match request.http_head {
+        Some(head) => format!(
+            "{head}Proxy-Authorization: {}\r\n\r\n",
+            config.proxy_authorization
+        ),
+        None => format!(
+            "CONNECT {} HTTP/1.1\r\nProxy-Authorization: {}\r\n\r\n",
+            request.target, config.proxy_authorization
+        ),
+    };
     if let Err(error) = send_chunked(&mut websocket_writer, connect_head.as_bytes()).await {
         write_bad_gateway(&mut client_stream).await;
         return Err(error);
@@ -564,18 +573,49 @@ fn parse_connect_request(buffer: &[u8]) -> ConnectParse {
         Ok(_) | Err(_) => return ConnectParse::Reject(BAD_REQUEST),
     };
 
-    let valid = request
+    let is_connect = request
         .method
-        .is_some_and(|method| method.eq_ignore_ascii_case("CONNECT"))
+        .is_some_and(|method| method.eq_ignore_ascii_case("CONNECT"));
+    let is_http = request
+        .path
+        .and_then(|path| Url::parse(path).ok())
+        .is_some_and(|url| {
+            url.scheme() == "http"
+                && url.host_str().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.fragment().is_none()
+                && url.port_or_known_default().is_some_and(|port| port != 0)
+        });
+    let valid = (is_connect || is_http)
         && request.path.is_some_and(|target| !target.is_empty())
         && matches!(request.version, Some(0) | Some(1));
     if !valid {
         return ConnectParse::Reject(METHOD_NOT_ALLOWED);
     }
 
+    let http_head = if is_connect {
+        None
+    } else {
+        let mut head = format!(
+            "{} {} HTTP/1.1\r\n",
+            request.method.unwrap(),
+            request.path.unwrap()
+        );
+        for header in request.headers.iter() {
+            if !header.name.eq_ignore_ascii_case("proxy-authorization") {
+                let Ok(value) = std::str::from_utf8(header.value) else {
+                    return ConnectParse::Reject(BAD_REQUEST);
+                };
+                head.push_str(&format!("{}: {}\r\n", header.name, value));
+            }
+        }
+        Some(head)
+    };
     ConnectParse::Request(ConnectRequest {
         target: request.path.unwrap().to_owned(),
         trailing: buffer[header_end..].to_vec(),
+        http_head,
     })
 }
 
@@ -661,6 +701,29 @@ mod tests {
     }
 
     #[test]
+    fn http_parser_validates_absolute_target_and_retains_body() {
+        for request in [
+            b"POST https://receiver.example/x HTTP/1.1\r\n\r\n".as_slice(),
+            b"POST http://user:pass@receiver.example/x HTTP/1.1\r\n\r\n".as_slice(),
+            b"POST http://receiver.example:0/x HTTP/1.1\r\n\r\n".as_slice(),
+        ] {
+            assert!(matches!(
+                parse_connect_request(request),
+                ConnectParse::Reject(_)
+            ));
+        }
+        match parse_connect_request(b"POST http://receiver.example:6788/probe?q=nonce HTTP/1.1\r\nHost: receiver.example:6788\r\nProxy-Authorization: forged\r\nContent-Length: 4\r\n\r\nbody") {
+            ConnectParse::Request(request) => {
+                let head = request.http_head.unwrap();
+                assert!(head.starts_with("POST http://receiver.example:6788/probe?q=nonce HTTP/1.1\r\n"));
+                assert!(!head.contains("forged"));
+                assert_eq!(request.trailing, b"body");
+            }
+            _ => panic!("HTTP request should parse"),
+        }
+    }
+
+    #[test]
     fn connect_parser_handles_fragments_trailing_data_and_rejections() {
         assert!(matches!(
             parse_connect_request(b"CONNECT example.com:443 HTTP/1.1\r\n"),
@@ -707,7 +770,8 @@ mod tests {
         assert_eq!(environment["https_proxy"], environment["HTTPS_PROXY"]);
         assert!(!environment["NO_PROXY"].contains("*.github.com"));
         assert!(environment["NO_PROXY"].ends_with(",control.example.test"));
-        assert!(!environment.contains_key("HTTP_PROXY"));
+        assert_eq!(environment["HTTP_PROXY"], environment["HTTPS_PROXY"]);
+        assert_eq!(environment["http_proxy"], environment["HTTP_PROXY"]);
         for key in [
             "GIT_SSL_CAINFO",
             "SSL_CERT_FILE",
@@ -826,6 +890,58 @@ mod tests {
                 .is_err()
         );
         assert!(!output.exists());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_forwards_absolute_http_and_body_without_connect_response() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = upstream.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let first = websocket.next().await.unwrap().unwrap().into_data();
+            let first = String::from_utf8(decode_chunk(&first).unwrap()).unwrap();
+            assert!(first.starts_with("POST http://receiver.example:6788/probe HTTP/1.1\r\n"));
+            assert!(first.contains("Proxy-Authorization: Basic owned\r\n"));
+            assert!(!first.contains("forged"));
+            let body = websocket.next().await.unwrap().unwrap().into_data();
+            assert_eq!(decode_chunk(&body).unwrap(), b"body");
+            websocket
+                .send(Message::Binary(
+                    encode_chunk(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+        });
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let local = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let config = RelayConfig {
+                websocket_url: Url::parse(&format!("ws://{address}")).unwrap(),
+                websocket_authorization: HeaderValue::from_static("Bearer owned"),
+                proxy_authorization: "Basic owned".into(),
+            };
+            let _ = handle_connection(socket, &config, &CancellationToken::new()).await;
+        });
+        let mut client = TcpStream::connect(local).await.unwrap();
+        client.write_all(b"POST http://receiver.example:6788/probe HTTP/1.1\r\nHost: receiver.example:6788\r\nProxy-Authorization: forged\r\nContent-Length: 4\r\n\r\nbody").await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+        );
+        relay.await.unwrap();
         server.await.unwrap();
     }
 
