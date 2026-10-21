@@ -131,7 +131,7 @@ fn production_sources(root: &Path) -> Vec<PathBuf> {
 
 /// 返回全部手写 Rust 源文件，包括需要审计 unsafe 说明的测试文件。
 fn handwritten_sources(root: &Path) -> Vec<PathBuf> {
-    [root.join("src"), root.join("crates/qoder-mcp-server/src")]
+    [root.join("src"), root.join("crates/mcp-server/src")]
         .into_iter()
         .flat_map(|path| WalkDir::new(path).into_iter())
         .filter_map(Result::ok)
@@ -149,16 +149,13 @@ fn handwritten_sources(root: &Path) -> Vec<PathBuf> {
 fn unsafe_audit_sources(root: &Path) -> Vec<PathBuf> {
     let mut sources = handwritten_sources(root);
     sources.extend(
-        [
-            root.join("tests"),
-            root.join("crates/qoder-mcp-server/tests"),
-        ]
-        .into_iter()
-        .flat_map(|path| WalkDir::new(path).into_iter())
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.into_path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "rs")),
+        [root.join("tests"), root.join("crates/mcp-server/tests")]
+            .into_iter()
+            .flat_map(|path| WalkDir::new(path).into_iter())
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .map(|entry| entry.into_path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "rs")),
     );
     let build_script = root.join("build.rs");
     if build_script.is_file() {

@@ -1321,7 +1321,7 @@ async fn runtime_mcp_starts_in_skip_mode_and_stops_with_manager() {
     let run_token = cancellation.clone();
     let task = tokio::spawn(async move { manager.run(&run_token).await });
     let url = format!("http://127.0.0.1:{port}/mcp");
-    let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bash","arguments":{"command":"test -n \"$http_proxy\" && test \"$http_proxy\" = \"$https_proxy\" && test \"$http_proxy\" != http://127.0.0.1:1 && test \"$NO_PROXY\" != '*' && test -f \"$SSL_CERT_FILE\" && printf '%s|%s|%s|%s|%s|%s' \"$PWD\" \"$RUNTIME_MCP_PROCESS_VALUE\" \"$RUNTIME_MCP_TEST_VALUE\" \"$RUNTIME_MCP_CONFIG_VALUE\" \"$RUNTIME_MCP_STARTUP_VALUE\" \"$RUNTIME_MCP_SHARED_VALUE\""},"_meta":qoder_mcp_server::protocol::request_meta()}});
+    let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bash","arguments":{"command":"test -n \"$http_proxy\" && test \"$http_proxy\" = \"$https_proxy\" && test \"$http_proxy\" != http://127.0.0.1:1 && test \"$NO_PROXY\" != '*' && test -f \"$SSL_CERT_FILE\" && printf '%s|%s|%s|%s|%s|%s' \"$PWD\" \"$RUNTIME_MCP_PROCESS_VALUE\" \"$RUNTIME_MCP_TEST_VALUE\" \"$RUNTIME_MCP_CONFIG_VALUE\" \"$RUNTIME_MCP_STARTUP_VALUE\" \"$RUNTIME_MCP_SHARED_VALUE\""},"_meta":mcp_server::protocol::request_meta()}});
     let client = reqwest::Client::new();
     let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {

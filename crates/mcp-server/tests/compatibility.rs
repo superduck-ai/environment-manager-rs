@@ -1,7 +1,7 @@
 //! 独立 Rust 回归测试；不依赖参考服务、Docker 或外部源码。
 mod common;
 use async_trait::async_trait;
-use qoder_mcp_server::{
+use mcp_server::{
     Config, Registry, Server, Tool, ToolResult,
     environment::{EnvironmentProvider, UnixSocketProvider},
     plugins::{Manager, Plugin, ServiceClient},

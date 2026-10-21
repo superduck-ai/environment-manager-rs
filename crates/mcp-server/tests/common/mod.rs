@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use qoder_mcp_server::Server;
+use mcp_server::Server;
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
@@ -7,7 +7,7 @@ pub fn request(id: Value, method: &str, mut params: Value) -> Value {
     if !params.is_object() {
         params = json!({});
     }
-    params["_meta"] = qoder_mcp_server::protocol::request_meta();
+    params["_meta"] = mcp_server::protocol::request_meta();
     json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
 }
 pub struct Connection {
@@ -52,7 +52,7 @@ pub async fn rpc(server: Arc<Server>, mut message: Value) -> Value {
     if !message["params"].is_object() {
         message["params"] = json!({});
     }
-    message["params"]["_meta"] = qoder_mcp_server::protocol::request_meta();
+    message["params"]["_meta"] = mcp_server::protocol::request_meta();
     let mut connection = Connection::new(server).await;
     connection.send(&message).await;
     connection.receive().await

@@ -1,5 +1,5 @@
 //! 独立 MCP 可执行入口，兼容单横线和双横线参数。
-use qoder_mcp_server::{
+use mcp_server::{
     Config, Registry, Server,
     environment::{EnvironmentProvider, UnixSocketProvider},
     plugins::Manager,
@@ -57,7 +57,7 @@ async fn main() {
     let environment: Option<Arc<dyn EnvironmentProvider>> = if socket.is_empty() {
         None
     } else {
-        qoder_mcp_server::logging::info(
+        mcp_server::logging::info(
             "runtime environment provider enabled",
             &[("source", "core_socket")],
         );
@@ -67,10 +67,7 @@ async fn main() {
     let plugins = Arc::new(if core.is_empty() {
         Manager::default()
     } else {
-        qoder_mcp_server::logging::info(
-            "plugin service management enabled",
-            &[("core_addr", &core)],
-        );
+        mcp_server::logging::info("plugin service management enabled", &[("core_addr", &core)]);
         Manager::with_service(&core)
     });
     let mut config = Config::default();
@@ -95,13 +92,13 @@ async fn main() {
         "stdio" => server.serve_stdio().await,
         "http" => server.serve_http(&addr).await,
         _ => {
-            qoder_mcp_server::logging::error("unsupported transport", &[("transport", &transport)]);
+            mcp_server::logging::error("unsupported transport", &[("transport", &transport)]);
             std::process::exit(1);
         }
     };
     plugins.shutdown_all().await;
     if let Err(error) = result {
-        qoder_mcp_server::logging::error("server error", &[("error", &error.to_string())]);
+        mcp_server::logging::error("server error", &[("error", &error.to_string())]);
         std::process::exit(1);
     }
 }

@@ -43,10 +43,10 @@ def compare(go, rust):
 def main():
     """使用隔离容器运行两份相同测试，始终记录二进制 SHA256。"""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--go-binary', type=Path, default=Path('/Users/arthur/GolandProjects/qoder-mcp-server/mcp-server'))
-    parser.add_argument('--rust-build-image', default=os.environ.get('QODER_RUST_BUILD_IMAGE', 'rust:1.97.0-bookworm'))
+    parser.add_argument('--go-binary', type=Path, required=True)
+    parser.add_argument('--rust-build-image', default=os.environ.get('MCP_RUST_BUILD_IMAGE', 'rust:1.97.0-bookworm'))
     parser.add_argument('--profile', choices=('release', 'debug'), default='release')
-    parser.add_argument('--output', type=Path, default=ROOT / 'target/qoder-binary-e2e')
+    parser.add_argument('--output', type=Path, default=ROOT / 'target/mcp-binary-e2e')
     args = parser.parse_args()
     source = args.go_binary.resolve(strict=True)
     header = source.read_bytes()[:20]
@@ -60,12 +60,12 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     for platform in sorted({'amd64', native}):
-        command(['docker', 'build', '--platform', f'linux/{platform}', '-t', f'qoder-binary-e2e:{platform}', HERE])
+        command(['docker', 'build', '--platform', f'linux/{platform}', '-t', f'mcp-binary-e2e:{platform}', HERE])
     # 仅编译 Rust；不挂载 Go 源码，也不调用 Go 工具链。
     command(['docker', 'run', '--rm', '--platform', f'linux/{native}', '--entrypoint', 'bash',
-             '-v', f'{ROOT}:/workspace', '-v', 'qoder-rust-cargo-cache:/cargo-cache',
+             '-v', f'{ROOT}:/workspace', '-v', 'mcp-rust-cargo-cache:/cargo-cache',
              '-w', '/workspace', args.rust_build_image, '-lc',
-             'CARGO_HOME=/cargo-cache CARGO_TARGET_DIR=/workspace/target/binary-e2e-linux cargo build --locked -p qoder-mcp-server'
+             'CARGO_HOME=/cargo-cache CARGO_TARGET_DIR=/workspace/target/binary-e2e-linux cargo build --locked -p mcp-server'
              + (' --release' if args.profile == 'release' else '')])
     rust = ROOT / f'target/binary-e2e-linux/{args.profile}/mcp-server'
     reports = {}
@@ -73,8 +73,8 @@ def main():
         # 只读挂载输入，chmod 只作用于即将销毁的容器副本。
         command(['docker', 'run', '--rm', '--platform', f'linux/{platform}', '--init',
                  '-v', f'{binary}:/input/mcp-server:ro', '-v', f'{HERE}:/suite:ro',
-                 '-v', f'{ROOT}/crates/qoder-mcp-server/tests/fixtures:/image-fixtures:ro',
-                 '-v', f'{output}:/reports', f'qoder-binary-e2e:{platform}', 'bash', '-lc',
+                 '-v', f'{ROOT}/crates/mcp-server/tests/fixtures:/image-fixtures:ro',
+                 '-v', f'{output}:/reports', f'mcp-binary-e2e:{platform}', 'bash', '-lc',
                  f'cp /input/mcp-server /tmp/mcp-server && chmod 755 /tmp/mcp-server && '
                  f'python3 /suite/suite.py /tmp/mcp-server /reports/{label}.json'])
         reports[label] = json.loads((output / f'{label}.json').read_text())

@@ -1,7 +1,7 @@
 //! Wire-level tests of the official SDK configuration and our tool adapter.
 mod common;
 use common::{Connection, http, http_result, post, request};
-use qoder_mcp_server::{Config, Registry, Server, Tool, ToolResult, plugins::Manager};
+use mcp_server::{Config, Registry, Server, Tool, ToolResult, plugins::Manager};
 use serde_json::{Value, json};
 use std::{
     sync::{

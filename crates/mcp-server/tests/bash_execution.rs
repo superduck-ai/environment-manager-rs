@@ -1,6 +1,6 @@
 //! Regression coverage for the Go Bash execution-result contract.
 mod common;
-use qoder_mcp_server::{
+use mcp_server::{
     Config, Registry, Server, ToolResult,
     execution::{ExecutionResult, ExecutionStatus, output_schema},
     plugins::Manager,

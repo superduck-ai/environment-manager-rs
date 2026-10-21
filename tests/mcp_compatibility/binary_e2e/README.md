@@ -1,6 +1,6 @@
 # 现成 Go 二进制与 Rust 的 MCP 功能 E2E
 
-参考输入是用户提供的 Linux x86-64 可执行文件 `/Users/arthur/GolandProjects/qoder-mcp-server/mcp-server`。测试不访问 Go 源码、不调用 Go 工具链。参考文件只读挂载，执行权限只添加到容器内的临时副本。
+参考输入是用户提供的 Linux x86-64 可执行文件，通过必填参数 `--go-binary` 指定。以下 `/path/to/reference-mcp-server` 为占位路径，需替换为实际位置。测试不访问 Go 源码、不调用 Go 工具链。参考文件只读挂载，执行权限只添加到容器内的临时副本。
 
 `run.py` 构建当前工作区的 Rust `mcp-server`，默认使用 release profile，然后分别在同配置的 Ubuntu 24.04 容器运行 Go 和 Rust。Go 使用 `linux/amd64`；Rust 使用 Docker 的原生 ARM64 或 AMD64。两端检查 bash/ripgrep 版本一致，不比较跨架构运行时间的精确毫秒值。
 
@@ -9,24 +9,26 @@
 从项目根目录运行：
 
 ```sh
-python3 tests/qoder_compatibility/binary_e2e/run.py \
-  --go-binary /Users/arthur/GolandProjects/qoder-mcp-server/mcp-server
+python3 tests/mcp_compatibility/binary_e2e/run.py \
+  --go-binary /path/to/reference-mcp-server/mcp-server
 
 # 当前机器已有 Rust 构建环境时可以复用，避免重新下载构建镜像。
-python3 tests/qoder_compatibility/binary_e2e/run.py \
-  --rust-build-image environment-manager-qoder-oracle:latest \
-  --output target/qoder-binary-e2e-fixed-release
+python3 tests/mcp_compatibility/binary_e2e/run.py \
+  --go-binary /path/to/reference-mcp-server/mcp-server \
+  --rust-build-image environment-manager-rust:1.97.0-arm64 \
+  --output target/mcp-binary-e2e-fixed-release
 
 # debug 诊断，使用独立报告目录。
-python3 tests/qoder_compatibility/binary_e2e/run.py \
-  --profile debug --output target/qoder-binary-e2e-fixed-debug
+python3 tests/mcp_compatibility/binary_e2e/run.py \
+  --go-binary /path/to/reference-mcp-server/mcp-server \
+  --profile debug --output target/mcp-binary-e2e-fixed-debug
 
 # 对比较器注入错误，验证不会把共同失败、缺失步骤或类型变化判为通过。
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
-  -s tests/qoder_compatibility/binary_e2e -p 'test_*.py'
+  -s tests/mcp_compatibility/binary_e2e -p 'test_*.py'
 ```
 
-需要 Python 3 和可运行 AMD64 容器的 Docker。Python 测试本身只用标准库。默认 Rust 构建镜像为 `rust:1.97.0-bookworm`，可用 `--rust-build-image` 或 `QODER_RUST_BUILD_IMAGE` 指定已有镜像。构建产物放在 `target/binary-e2e-linux`，Cargo 下载使用命名缓存卷。
+需要 Python 3 和可运行 AMD64 容器的 Docker。Python 测试本身只用标准库。默认 Rust 构建镜像为 `rust:1.97.0-bookworm`，可用 `--rust-build-image` 或 `MCP_RUST_BUILD_IMAGE` 指定已有镜像。构建产物放在 `target/binary-e2e-linux`，Cargo 下载使用命名缓存卷。
 
 任何响应差异、文件副作用差异、独立断言失败或用例缺失，都会使命令以非零状态退出。不会把已知差异加入豁免列表。Docker/编译/测试执行失败也不能算作验收成功。
 
@@ -64,4 +66,4 @@ Rust release 和 debug 均完成每端 **502 个步骤**（stdio 245、HTTP 257�
 Rust release SHA256：`fc37af37e808d670f5a5979a6c77ccfafbeebae3b97511f700f66a027bfe90dc`。
 Rust debug SHA256：`105cab8d441f2661e0e589b27b99fb1729cebf37418e25f17d09fb8217973497`。
 
-完整记录分别位于 `target/qoder-binary-e2e-fixed-release/` 和 `target/qoder-binary-e2e-fixed-debug/` 的 `go.json`、`rust.json`、`comparison.json`。修复前报告仍保留在原有目录，可核对实际消除的差异。这些结果是当前有限功能语料的实测，不等同于对所有输入的证明。
+历史完整记录包含 `go.json`、`rust.json`、`comparison.json`。上述命令现将报告分别写入 `target/mcp-binary-e2e-fixed-release/` 和 `target/mcp-binary-e2e-fixed-debug/`；历史产物未随本次命名修改迁移。修复前报告仍保留在原有目录，可核对实际消除的差异。这些结果是当前有限功能语料的实测，不等同于对所有输入的证明。

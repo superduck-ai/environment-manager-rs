@@ -1,9 +1,9 @@
-# qoder-mcp-server（Rust）
+# mcp-server（Rust）
 
-`qoder-mcp-server` 的完整运行功能已迁入此 Cargo workspace，提供独立 `mcp-server` 可执行文件和可嵌入的 Rust 库。生产构建和运行无需 Go。
+`mcp-server` 的完整运行功能已迁入此 Cargo workspace，提供独立 `mcp-server` 可执行文件和可嵌入的 Rust 库。生产构建和运行无需 Go。
 
 ```sh
-cargo build --locked --release -p qoder-mcp-server
+cargo build --locked --release -p mcp-server
 ./target/release/mcp-server -transport stdio -workdir /data
 ./target/release/mcp-server -transport http -addr :3001 -workdir /data
 ```
@@ -69,10 +69,10 @@ HTTP 默认允许 loopback Host，拒绝所有带有未授权 Origin 的浏览�
 ## 验证
 
 ```sh
-cargo test --locked -p qoder-mcp-server
-cargo clippy --locked -p qoder-mcp-server --all-targets -- -D warnings
+cargo test --locked -p mcp-server
+cargo clippy --locked -p mcp-server --all-targets -- -D warnings
 ```
 
 `tests/protocol_2026.rs` 通过真实 SDK stdio 和 HTTP 传输验证发现、元数据、版本拒绝、路由头、来源检查、并发取消及请求隔离。`tests/bash_execution.rs` 验证结构化 Bash 结果和输出采集；`tests/compatibility.rs` 保留文件、图片、环境和插件的行为回归。
 
-历史 Go 二进制对照及验收记录见 [迁移验收记录](../../tests/qoder_compatibility/VERIFICATION.md)。该记录针对旧版协议；当前仅支持新版协议，因此旧协议端到端零差异脚本不能作为当前协议验收门禁。主项目自身限定 Linux GNU，workspace 全量门禁需在相应平台运行。
+历史 Go 二进制对照及验收记录见 [迁移验收记录](../../tests/mcp_compatibility/VERIFICATION.md)。该记录针对旧版协议；当前仅支持新版协议，因此旧协议端到端零差异脚本不能作为当前协议验收门禁。主项目自身限定 Linux GNU，workspace 全量门禁需在相应平台运行。

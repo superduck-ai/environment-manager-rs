@@ -256,7 +256,7 @@ pub async fn run(
         }
     };
     let script_content = format!(
-        "source \"${{QODER_VAULT_ENV_FILE:-/etc/profile.d/vault-env.sh}}\" 2>/dev/null || true\n{command}"
+        "source \"${{MCP_VAULT_ENV_FILE:-/etc/profile.d/vault-env.sh}}\" 2>/dev/null || true\n{command}"
     );
     let written = async {
         script_file.write_all(script_content.as_bytes()).await?;
