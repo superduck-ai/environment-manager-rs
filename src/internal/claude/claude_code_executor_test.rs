@@ -1,0 +1,753 @@
+//! Claude 执行器的参数、环境、MCP、token FD 与 direct-child 取消测试。
+
+use std::{
+    fs,
+    io::Read,
+    os::{
+        fd::{AsFd as _, AsRawFd as _},
+        unix::{fs::PermissionsExt as _, process::CommandExt as _},
+    },
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
+
+use nix::{
+    fcntl::{FcntlArg, fcntl},
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
+use tempfile::TempDir;
+use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
+
+use crate::internal::{
+    auth::AuthContext,
+    codesign::{CONTEXT_ENV as CODESIGN_CONTEXT_ENV, CodeSignContext},
+    config::{ClaudeConfig, McpConfigFile, StartupContext},
+    session::NoopActivityRecorder,
+};
+
+use super::{
+    Executor, build_session_urls,
+    claude_code_executor::{
+        add_token_via_file_descriptor, filter_init_only_from_environ, install_token_descriptors,
+        new_claude_code_executor, prepare_session_agent_proxy, remove_stale_agent_proxy_token,
+        tail_string, write_ccr_upstream_proxy_token,
+    },
+};
+
+/// 创建字段均为空的 Claude config。
+fn empty_config() -> ClaudeConfig {
+    ClaudeConfig {
+        command: String::new(),
+        args: Vec::new(),
+        environment: Default::default(),
+        working_dir: String::new(),
+        timeout: Duration::ZERO,
+        allowed_tools: String::new(),
+        local_testing_mode: false,
+        disallowed_tools: String::new(),
+        verbose_logging: false,
+        local_append_system_prompt: String::new(),
+        claude_path: String::new(),
+        print_code_logs: false,
+        skip_claude_code: false,
+    }
+}
+
+/// 写入 mode 0700 的 shell 脚本。
+fn script(temp: &TempDir, name: &str, body: &str) -> PathBuf {
+    let path = temp.path().join(name);
+    fs::write(&path, body).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+/// 构造测试执行器并返回独立的 OTEL 记录缓冲。
+fn make_executor(cfg: ClaudeConfig, startup: StartupContext) -> super::ClaudeCodeExecutor {
+    new_claude_code_executor(
+        Some(cfg),
+        "session-123",
+        startup,
+        None,
+        Vec::new(),
+        None,
+        Arc::new(NoopActivityRecorder),
+        None,
+        "latest",
+    )
+    .unwrap()
+}
+
+///
+/// 验证 gateway MCP Base64 内容、默认 mode 与显式 path。
+#[tokio::test]
+async fn test_write_mcp_config_file_from_gateway() {
+    use base64::Engine as _;
+
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("mcp.json");
+    let content = br#"{"mcpServers":{}}"#;
+    let startup = StartupContext {
+        mcp_config_file: Some(McpConfigFile {
+            path: path.to_string_lossy().into_owned(),
+            content: base64::engine::general_purpose::STANDARD.encode(content),
+            mode: 0,
+        }),
+        ..StartupContext::default()
+    };
+    let executor = make_executor(empty_config(), startup);
+    assert_eq!(
+        executor.write_mcp_config_file_from_gateway().await.unwrap(),
+        path.to_string_lossy()
+    );
+    assert_eq!(fs::read(&path).unwrap(), content);
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+///
+/// 验证首个 token 获得 FD 3，pipe 内容带唯一换行。
+#[test]
+fn test_add_token_via_file_descriptor() {
+    let mut descriptors = Vec::new();
+    let fd = add_token_via_file_descriptor("secret-token", "test token", &mut descriptors).unwrap();
+    assert_eq!(fd, 3);
+    assert_eq!(descriptors.len(), 1);
+    assert_eq!(descriptors[0].target, 3);
+    let cloned = descriptors[0].source.as_fd().try_clone_to_owned().unwrap();
+    let mut reader = fs::File::from(cloned);
+    let mut content = String::new();
+    reader.read_to_string(&mut content).unwrap();
+    assert_eq!(content, "secret-token\n");
+}
+
+/// 验证 stderr tail 在截断前后使用统一的有损 UTF-8 规则。
+#[test]
+fn stderr_tail_uses_lossy_utf8() {
+    assert_eq!(tail_string(b"\xff\xfe", 8), "\u{fffd}\u{fffd}");
+    assert_eq!(tail_string(b"a\xff\xfeb", 3), "\u{fffd}\u{fffd}b");
+    assert_eq!(tail_string("有效\u{fffd}".as_bytes(), 64), "有效\u{fffd}");
+}
+
+/// 验证三个 token 在真实 exec 后固定继承为 FD 3/4/5，且高位中转 FD 被关闭。
+///
+/// 第一段 `pre_exec` 先用 stdin 占据 FD 3/4，模拟目标槽位已被 runtime 内部 FD
+/// 使用的情况；生产映射必须随后用 `dup2` 正确覆盖它们。
+#[tokio::test]
+async fn token_descriptors_survive_exec_without_leaking_source_fds() {
+    let mut descriptors = Vec::new();
+    assert_eq!(
+        add_token_via_file_descriptor("first-token", "first", &mut descriptors).unwrap(),
+        3
+    );
+    assert_eq!(
+        add_token_via_file_descriptor("second-token", "second", &mut descriptors).unwrap(),
+        4
+    );
+    assert_eq!(
+        add_token_via_file_descriptor("third-token", "third", &mut descriptors).unwrap(),
+        5
+    );
+    let source_fds = descriptors
+        .iter()
+        .map(|descriptor| descriptor.source.as_raw_fd())
+        .collect::<Vec<_>>();
+    assert!(source_fds.iter().all(|fd| *fd >= 64));
+    for descriptor in &descriptors {
+        let flags = fcntl(&descriptor.source, FcntlArg::F_GETFD).unwrap();
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "父进程高位 source FD 必须带 CLOEXEC"
+        );
+    }
+
+    let source_checks = source_fds
+        .iter()
+        .map(|fd| format!("[ ! -e /proc/self/fd/{fd} ] || exit 90;"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let shell = format!(
+        "{source_checks} IFS= read -r first <&3 || exit 91; IFS= read -r second <&4 || exit 92; IFS= read -r third <&5 || exit 93; printf '%s|%s|%s' \"$first\" \"$second\" \"$third\""
+    );
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", &shell])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // 与生产映射一样，nix 0.30 的任意目标 `dup2` 需要 `OwnedFd`，不适用于这些原始目标槽。
+    // SAFETY: closure 在 fork 后、exec 前只调用 async-signal-safe 的 dup2；FD 0 已由
+    // Command 配成 /dev/null。先占据 3/4 是测试夹具，随后生产映射必须覆盖它们。
+    unsafe {
+        command.as_std_mut().pre_exec(|| {
+            for target in [3, 4, 5] {
+                if libc::dup2(libc::STDIN_FILENO, target) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    install_token_descriptors(&mut command, &descriptors).unwrap();
+
+    let output = command.output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "child status={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"first-token|second-token|third-token");
+}
+
+/// 验证 startup 环境覆盖 config，且本地测试模式永不启动 relay。
+#[test]
+fn test_should_prepare_ccr_upstream_proxy_token() {
+    let cases = [
+        ("true", "true", true, None, false, true),
+        ("true", "true", true, None, true, false),
+        ("true", "true", false, None, false, false),
+        ("false", "true", true, None, false, false),
+        ("true", "false", true, None, false, false),
+        ("true", "true", true, Some("false"), false, false),
+    ];
+    for (remote, proxy, code_session, startup_proxy, local_testing, expected) in cases {
+        let mut cfg = empty_config();
+        cfg.environment
+            .insert("CLAUDE_CODE_REMOTE".to_owned(), remote.to_owned());
+        cfg.environment
+            .insert("CCR_UPSTREAM_PROXY_ENABLED".to_owned(), proxy.to_owned());
+        let mut startup = StartupContext {
+            use_code_sessions: code_session,
+            ..StartupContext::default()
+        };
+        if let Some(value) = startup_proxy {
+            startup
+                .environment_variables
+                .insert("CCR_UPSTREAM_PROXY_ENABLED".to_owned(), value.to_owned());
+        }
+        let executor = make_executor(cfg, startup);
+        assert_eq!(
+            executor.should_start_agent_proxy(local_testing),
+            expected,
+            "remote={remote} proxy={proxy} code_session={code_session} startup={startup_proxy:?} local={local_testing}"
+        );
+    }
+}
+
+/// 最终 API base 必须遵守宿主、config、startup 依次覆盖的现有优先级。
+#[test]
+fn agent_proxy_uses_final_api_base_url_priority() {
+    let mut cfg = empty_config();
+    cfg.environment.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "https://config.example.test".to_owned(),
+    );
+    let mut startup = StartupContext {
+        api_base_url: "https://fallback.example.test".to_owned(),
+        ..StartupContext::default()
+    };
+    startup.environment_variables.insert(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "https://startup.example.test".to_owned(),
+    );
+    let executor = make_executor(cfg, startup);
+    let environment = executor.build_child_environment();
+    let final_value = environment
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "ANTHROPIC_BASE_URL")
+        .map(|(_, value)| value.to_string_lossy());
+    assert_eq!(final_value.as_deref(), Some("https://startup.example.test"));
+
+    let code_sign_context = environment
+        .iter()
+        .rev()
+        .find(|(key, _)| key == CODESIGN_CONTEXT_ENV)
+        .map(|(_, value)| serde_json::from_slice::<CodeSignContext>(value.as_encoded_bytes()))
+        .expect("code-sign context must be injected")
+        .expect("code-sign context must be valid JSON");
+    assert_eq!(code_sign_context.session_id, "session-123");
+    assert!(!code_sign_context.use_code_sessions);
+    assert!(code_sign_context.sources.is_empty());
+}
+
+/// 提前准备的禁用路径不依赖 Claude session、认证、端点或其他执行器配置。
+#[tokio::test]
+async fn disabled_session_agent_proxy_needs_no_executor_configuration() {
+    if !crate::internal::enter_isolated_process_test(concat!(
+        module_path!(),
+        "::disabled_session_agent_proxy_needs_no_executor_configuration"
+    )) {
+        return;
+    }
+    // SAFETY: 独立测试进程只运行本测试，后续所有环境覆盖均通过局部配置传递。
+    unsafe {
+        std::env::set_var("CLAUDE_CODE_REMOTE", "true");
+        std::env::set_var("CCR_UPSTREAM_PROXY_ENABLED", "true");
+    }
+    for (local_testing, code_session, config_remote, startup_proxy) in [
+        (true, true, "true", "true"),
+        (false, false, "true", "true"),
+        (false, true, "false", "true"),
+        (false, true, "true", "false"),
+    ] {
+        let mut cfg = empty_config();
+        cfg.local_testing_mode = local_testing;
+        cfg.environment
+            .insert("CLAUDE_CODE_REMOTE".to_owned(), config_remote.to_owned());
+        let startup = StartupContext {
+            api_base_url: "invalid endpoint".to_owned(),
+            use_code_sessions: code_session,
+            environment_variables: [(
+                "CCR_UPSTREAM_PROXY_ENABLED".to_owned(),
+                startup_proxy.to_owned(),
+            )]
+            .into_iter()
+            .collect(),
+            ..StartupContext::default()
+        };
+        assert!(
+            prepare_session_agent_proxy(&cfg, "", Some(&startup), &AuthContext::default())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(
+        prepare_session_agent_proxy(&empty_config(), "", None, &AuthContext::default())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// 从实际 CA HTTP 请求确认端点优先级；显式空值必须拒绝，不能回退到低优先级。
+#[tokio::test]
+async fn session_agent_proxy_download_uses_effective_endpoint() {
+    if !crate::internal::enter_isolated_process_test(concat!(
+        module_path!(),
+        "::session_agent_proxy_download_uses_effective_endpoint"
+    )) {
+        return;
+    }
+    let home = TempDir::new().unwrap();
+    let mut servers = Vec::new();
+    for _ in 0..4 {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/code/upstreamproxy/ca-cert"))
+            // 只验证请求路由，下载失败不创建 CA 文件或 listener。
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        servers.push(server);
+    }
+    let endpoints = servers
+        .iter()
+        .map(wiremock::MockServer::uri)
+        .collect::<Vec<_>>();
+    // SAFETY: 独立测试进程只运行本测试；在发起任何客户端请求前完成宿主环境设置。
+    unsafe {
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("CLAUDE_CODE_REMOTE", "true");
+        std::env::set_var("CCR_UPSTREAM_PROXY_ENABLED", "true");
+        std::env::set_var("ANTHROPIC_BASE_URL", &endpoints[0]);
+        std::env::set_var("NO_PROXY", "127.0.0.1");
+        std::env::set_var("no_proxy", "127.0.0.1");
+    }
+    let mut auth = AuthContext::default();
+    auth.set_session_ingress_token("session-token");
+    for (fallback, configured, startup_value, missing_endpoint) in [
+        ("", None, None, false),
+        (endpoints[1].as_str(), None, None, false),
+        (
+            endpoints[1].as_str(),
+            Some(endpoints[2].as_str()),
+            None,
+            false,
+        ),
+        (
+            endpoints[1].as_str(),
+            Some(endpoints[2].as_str()),
+            Some(endpoints[3].as_str()),
+            false,
+        ),
+        (endpoints[1].as_str(), Some(""), None, true),
+        (
+            endpoints[1].as_str(),
+            Some(endpoints[2].as_str()),
+            Some(""),
+            true,
+        ),
+    ] {
+        let mut cfg = empty_config();
+        if let Some(value) = configured {
+            cfg.environment
+                .insert("ANTHROPIC_BASE_URL".to_owned(), value.to_owned());
+        }
+        let mut startup = StartupContext {
+            api_base_url: fallback.to_owned(),
+            use_code_sessions: true,
+            ..StartupContext::default()
+        };
+        if let Some(value) = startup_value {
+            startup
+                .environment_variables
+                .insert("ANTHROPIC_BASE_URL".to_owned(), value.to_owned());
+        }
+        let error = prepare_session_agent_proxy(&cfg, "session-123", Some(&startup), &auth)
+            .await
+            .err()
+            .expect("missing endpoint or failing CA endpoint must fail preparation");
+        if missing_endpoint {
+            assert_eq!(
+                error.to_string(),
+                "CCR upstream proxy requires ANTHROPIC_BASE_URL"
+            );
+        } else {
+            assert!(error.to_string().contains("503"), "{error}");
+        }
+    }
+    for server in &servers {
+        server.verify().await;
+    }
+    assert!(!home.path().join(".ccr/ca-bundle.crt").exists());
+}
+
+/// 开启 CCRv2 relay 却没有 ingress token 时必须在 spawn Claude 前失败。
+#[tokio::test]
+async fn enabled_agent_proxy_requires_session_ingress_token() {
+    let mut cfg = empty_config();
+    cfg.environment = [
+        ("CLAUDE_CODE_REMOTE".to_owned(), "true".to_owned()),
+        ("CCR_UPSTREAM_PROXY_ENABLED".to_owned(), "true".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    let startup = StartupContext {
+        api_base_url: "https://api.example.test".to_owned(),
+        use_code_sessions: true,
+        ..StartupContext::default()
+    };
+    let executor = make_executor(cfg, startup);
+    let error = executor
+        .execute(&CancellationToken::new())
+        .await
+        .expect_err("missing relay token must be fail-closed");
+    assert!(
+        error
+            .to_string()
+            .contains("requires a non-empty session ingress token"),
+        "{error}"
+    );
+}
+
+/// 旧 Claude relay 的 token 必须在启动前被删除。
+#[test]
+fn test_write_ccr_upstream_proxy_token() {
+    let temp = TempDir::new().unwrap();
+    let token = temp.path().join("session_token");
+    fs::write(&token, "old-token").unwrap();
+    remove_stale_agent_proxy_token(&token).unwrap();
+    assert!(!token.exists());
+    remove_stale_agent_proxy_token(&token).unwrap();
+}
+
+/// 旧 token writer 必须保持停用，且不可删除的遗留目标必须 fail-closed。
+#[test]
+fn test_write_ccr_upstream_proxy_token_rejects_empty_inputs() {
+    let temp = TempDir::new().unwrap();
+    let token = temp.path().join("session_token");
+    assert!(write_ccr_upstream_proxy_token(&token, "").is_err());
+    assert!(write_ccr_upstream_proxy_token(&token, "token").is_err());
+    assert!(!token.exists());
+
+    let directory = temp.path().join("directory");
+    fs::create_dir(&directory).unwrap();
+    assert!(remove_stale_agent_proxy_token(&directory).is_err());
+}
+
+///
+/// 验证 gateway prompt 与本地 prompt 合并，同时跳过空 gateway 值。
+#[tokio::test]
+async fn test_build_args_from_gateway_config_merges_append_system_prompt() {
+    let mut cfg = empty_config();
+    cfg.local_append_system_prompt = "local prompt".to_owned();
+    let startup = StartupContext {
+        claude_code_args: [
+            (
+                "append-system-prompt".to_owned(),
+                "gateway prompt".to_owned(),
+            ),
+            ("empty".to_owned(), String::new()),
+            ("model".to_owned(), "claude-sonnet".to_owned()),
+        ]
+        .into_iter()
+        .collect(),
+        ..StartupContext::default()
+    };
+    let executor = make_executor(cfg, startup);
+    let args = executor
+        .build_args_from_gateway_config(vec!["--base".to_owned()])
+        .await
+        .unwrap();
+    assert_flag_value(&args, "--model", "claude-sonnet");
+    assert_flag_value(
+        &args,
+        "--append-system-prompt",
+        "gateway prompt\n\nlocal prompt",
+    );
+    assert!(!has_flag(&args, "--empty"));
+}
+
+///
+/// 当 gateway 未提供 append prompt 时，验证本地 prompt 仍作为独立 flag 附加。
+#[tokio::test]
+async fn test_build_args_from_gateway_config_appends_local_prompt() {
+    let mut cfg = empty_config();
+    cfg.local_append_system_prompt = "local prompt".to_owned();
+    let startup = StartupContext {
+        claude_code_args: [("model".to_owned(), "claude-sonnet".to_owned())]
+            .into_iter()
+            .collect(),
+        ..StartupContext::default()
+    };
+    let executor = make_executor(cfg, startup);
+    let args = executor
+        .build_args_from_gateway_config(vec!["--base".to_owned()])
+        .await
+        .unwrap();
+    assert_flag_value(&args, "--model", "claude-sonnet");
+    assert_flag_value(&args, "--append-system-prompt", "local prompt");
+}
+
+/// 返回 flag 后的单个值。
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|window| window[0] == flag)
+        .map(|window| window[1].as_str())
+}
+
+/// 断言一个双参数 flag 存在且值完全相同。
+fn assert_flag_value(args: &[String], flag: &str, expected: &str) {
+    assert_eq!(
+        flag_value(args, flag),
+        Some(expected),
+        "参数 {flag} 的值不兼容：{args:?}"
+    );
+}
+
+/// 判断参数列表中是否出现指定 flag。
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|argument| argument == flag)
+}
+
+/// 验证本地模式参数、cwd、环境覆盖、stderr OTEL 行与原始 NDJSON 落盘。
+#[tokio::test]
+async fn test_execute_runs_claude_command_with_expected_args_and_env() {
+    let temp = TempDir::new().unwrap();
+    let capture = temp.path().join("capture.txt");
+    let fake = script(
+        &temp,
+        "fake-claude",
+        "#!/bin/sh\n{\nprintf 'PWD=%s\\n' \"$PWD\"\nprintf 'ARGS=%s\\n' \"$*\"\nprintf 'SESSION=%s\\n' \"$CLAUDE_CODE_SESSION_ID\"\nprintf 'REMOTE_SESSION=%s\\n' \"$CLAUDE_CODE_REMOTE_SESSION_ID\"\nprintf 'BASE_URL=%s\\n' \"$ANTHROPIC_BASE_URL\"\nprintf 'CUSTOM_ENV=%s\\n' \"$CUSTOM_ENV\"\n} > \"$CAPTURE_FILE\"\nprintf '{\"type\":\"result\"}\\n'\nprintf 'stderr-marker\\n' >&2\n",
+    );
+    let mut cfg = empty_config();
+    cfg.claude_path = fake.to_string_lossy().into_owned();
+    cfg.local_testing_mode = true;
+    cfg.working_dir = temp.path().to_string_lossy().into_owned();
+    cfg.environment = [
+        (
+            "CAPTURE_FILE".to_owned(),
+            capture.to_string_lossy().into_owned(),
+        ),
+        ("CUSTOM_ENV".to_owned(), "from-config".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    let startup = StartupContext {
+        api_base_url: "https://api.example.test".to_owned(),
+        claude_code_args: [("model".to_owned(), "claude-test".to_owned())]
+            .into_iter()
+            .collect(),
+        ..StartupContext::default()
+    };
+    let executor = make_executor(cfg, startup);
+    executor.execute(&CancellationToken::new()).await.unwrap();
+
+    let captured = fs::read_to_string(capture).unwrap();
+    let canonical = fs::canonicalize(temp.path()).unwrap();
+    for expected in [
+        format!("PWD={}", canonical.display()),
+        "ARGS=--output-format=stream-json --verbose --include-partial-messages --model claude-test"
+            .to_owned(),
+        "SESSION=session-123".to_owned(),
+        "REMOTE_SESSION=session-123".to_owned(),
+        "BASE_URL=https://api.example.test".to_owned(),
+        "CUSTOM_ENV=from-config".to_owned(),
+    ] {
+        assert!(
+            captured.contains(&expected),
+            "missing {expected:?}: {captured}"
+        );
+    }
+    assert!(!captured.contains("--sdk-url"));
+    assert!(
+        fs::read(CLAUDE_LOG_PATH_FOR_TEST)
+            .unwrap()
+            .windows(br#"{"type":"result"}"#.len())
+            .any(|window| window == br#"{"type":"result"}"#)
+    );
+}
+
+const CLAUDE_LOG_PATH_FOR_TEST: &str = "/tmp/claude-code.log";
+
+/// 验证取消只杀 shell direct child，已脱离 stdio 的孙进程仍存活。
+#[tokio::test]
+async fn cancellation_does_not_kill_process_group() {
+    // fake Claude 通过 PATH 调用 sleep/mv；与全局 PATH 写入测试串行，确保 PID
+    // marker 的时序只反映 direct-child 取消语义。
+    let _process_state = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let pid_file = temp.path().join("grandchild.pid");
+    let fake = script(
+        &temp,
+        "fake-claude",
+        // 先写同目录临时文件再 rename，否则高并发全仓测试可在
+        // open/truncate 与 PID 数字写完之间读到一个合法但截断的 PID。
+        "#!/bin/sh\nsleep 30 </dev/null >/dev/null 2>&1 &\nprintf '%s' \"$!\" > \"$GRANDCHILD_PID_FILE.tmp\"\nmv \"$GRANDCHILD_PID_FILE.tmp\" \"$GRANDCHILD_PID_FILE\"\nwhile :; do :; done\n",
+    );
+    let mut cfg = empty_config();
+    cfg.claude_path = fake.to_string_lossy().into_owned();
+    cfg.local_testing_mode = true;
+    cfg.working_dir = temp.path().to_string_lossy().into_owned();
+    cfg.environment.insert(
+        "GRANDCHILD_PID_FILE".to_owned(),
+        pid_file.to_string_lossy().into_owned(),
+    );
+    let executor = make_executor(cfg, StartupContext::default());
+    let cancellation = CancellationToken::new();
+    let execution = tokio::spawn({
+        let cancellation = cancellation.clone();
+        async move { executor.execute(&cancellation).await }
+    });
+    for _ in 0..100 {
+        if pid_file.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pid: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(5), execution)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.to_string(), "claude code execution was cancelled");
+    assert_eq!(kill(Pid::from_raw(pid), None::<Signal>), Ok(()));
+    let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+}
+
+/// 验证 Claude direct child 被取消后，继承 stdio 的孙进程会延迟 Execute 返回。
+///
+/// 执行器会等待 stdout/stderr copy 后台任务；只有显式结束孙进程、让两个 pipe
+/// 到达 EOF 后，才能返回取消错误，不能擅自关闭 reader。
+#[tokio::test]
+async fn claude_cancellation_waits_for_descendant_pipe_eof() {
+    // pipe-holder fixture 同样依赖 PATH 中的 sleep/mv，必须保护到孙进程清理完成。
+    let _process_state = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
+    let temp = TempDir::new().unwrap();
+    let pid_file = temp.path().join("pipe-holder.pid");
+    let fake = script(
+        &temp,
+        "fake-claude-pipe-holder",
+        "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > \"$GRANDCHILD_PID_FILE.tmp\"\nmv \"$GRANDCHILD_PID_FILE.tmp\" \"$GRANDCHILD_PID_FILE\"\nwhile :; do :; done\n",
+    );
+    let mut cfg = empty_config();
+    cfg.claude_path = fake.to_string_lossy().into_owned();
+    cfg.local_testing_mode = true;
+    cfg.working_dir = temp.path().to_string_lossy().into_owned();
+    cfg.environment.insert(
+        "GRANDCHILD_PID_FILE".to_owned(),
+        pid_file.to_string_lossy().into_owned(),
+    );
+    let executor = make_executor(cfg, StartupContext::default());
+    let cancellation = CancellationToken::new();
+    let mut execution = tokio::spawn({
+        let cancellation = cancellation.clone();
+        async move { executor.execute(&cancellation).await }
+    });
+    for _ in 0..100 {
+        if pid_file.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pid: i32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+    cancellation.cancel();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut execution)
+            .await
+            .is_err(),
+        "继承 pipe 的孙进程存活时 Claude Execute 不应返回"
+    );
+    assert_eq!(kill(Pid::from_raw(pid), Signal::SIGKILL), Ok(()));
+    let error = tokio::time::timeout(Duration::from_secs(5), execution)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.to_string(), "claude code execution was cancelled");
+}
+
+/// 验证 init-only 环境过滤仅删除精确的 `CCR_PLUGINS_JSON` 键。
+#[test]
+fn init_only_environment_filter_is_exact() {
+    let filtered = filter_init_only_from_environ([
+        ("CCR_PLUGINS_JSON", "secret"),
+        ("CCR_PLUGINS_JSON_SUFFIX", "kept"),
+        ("NORMAL", "value"),
+    ]);
+    assert_eq!(
+        filtered,
+        vec![
+            ("CCR_PLUGINS_JSON_SUFFIX".into(), "kept".into()),
+            ("NORMAL".into(), "value".into())
+        ]
+    );
+}
+
+/// 验证远端、本地、path/query 和 code-session URL 拼接。
+#[test]
+fn session_urls_use_literal_string_transforms() {
+    assert_eq!(
+        build_session_urls("https://api.example.com/path?q=1", "s", "v2", false),
+        (
+            "wss://api.example.com/v2/session_ingress/ws/s".to_owned(),
+            "https://api.example.com/v2/session_ingress/session/s".to_owned()
+        )
+    );
+    assert_eq!(
+        build_session_urls("https://localhost:8080", "s", "v1", false),
+        (
+            "ws://localhost:8080/v1/session_ingress/ws/s".to_owned(),
+            "http://localhost:8080/v1/session_ingress/session/s".to_owned()
+        )
+    );
+    assert_eq!(
+        build_session_urls("http://api.example.com", "s", "v2", true),
+        (
+            "http://api.example.com/v1/code/sessions/s".to_owned(),
+            "http://api.example.com/v1/code/sessions/s".to_owned()
+        )
+    );
+}

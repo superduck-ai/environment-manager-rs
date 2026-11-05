@@ -1,0 +1,8 @@
+/target/
+/dist/
+/.idea/
+*.log
+__pycache__/
+*.py[cod]
+.DS_Store
+compact

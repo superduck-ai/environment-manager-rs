@@ -1,0 +1,13 @@
+//! 本地 Baku 草稿快照 action。
+//!
+//! 实现位于相邻 `action.rs`，并严格限制
+//! 文件类型、symlink、单文件和总读取量。
+
+mod action;
+mod types;
+
+pub use action::{SNAPSHOT_TIMEOUT, new_snapshot_action};
+pub use types::SnapshotAction;
+
+#[cfg(test)]
+mod action_test;

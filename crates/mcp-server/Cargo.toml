@@ -1,0 +1,39 @@
+[package]
+name = "mcp-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Runtime tools served through the official MCP Rust SDK"
+license = "UNLICENSED"
+
+[[bin]]
+name = "mcp-server"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+gif = "0.14.2"
+image-webp = "0.2.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+jsonschema = { version = "0.30", default-features = false }
+rmcp = { version = "3.5.1", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
+libc = "0.2"
+nix = { version = "0.30", features = ["signal", "process"] }
+rand = "0.9"
+regex = "1.12"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.52", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

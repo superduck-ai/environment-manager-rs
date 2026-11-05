@@ -1,0 +1,67 @@
+[
+  [
+    "(?i)^(sudo\\s+)?\\b(vim|vi|nvim|nano|emacs|pico|joe)\\b",
+    "editor",
+    "Use the Write or Edit tool to modify files instead of an interactive editor."
+  ],
+  [
+    "(?i)^(sudo\\s+)?\\b(less|more)\\b",
+    "pager",
+    "Use `cat <file>` or the Read tool instead of a pager."
+  ],
+  [
+    "(?i)^(sudo\\s+)?\\bman\\b",
+    "man page",
+    "Use `<command> --help` or the Read tool instead of man."
+  ],
+  [
+    "(?i)^(sudo\\s+)?\\bpython[23]?\\s*$",
+    "python REPL",
+    "Use `python -c '<code>'` or `python <script.py>` instead of the interactive REPL."
+  ],
+  [
+    "(?i)^(sudo\\s+)?\\bnode\\s*$",
+    "node REPL",
+    "Use `node -e '<code>'` or `node <script.js>` instead of the interactive REPL."
+  ],
+  [
+    "(?i)^(sudo\\s+)?\\birb\\s*$",
+    "irb REPL",
+    "Use `ruby -e '<code>'` or `ruby <script.rb>` instead of the interactive REPL."
+  ],
+  [
+    "(?i)^(sudo\\s+)?\\b(mysql|psql|sqlite3)\\s*$",
+    "database REPL",
+    "Add `-e '<query>'` or provide a SQL file instead of the interactive client."
+  ],
+  [
+    "(?i)\\bgit\\s+(add\\s+-p|add\\s+--patch)\\b",
+    "git add -p",
+    "Use `git add .` or `git add <file>` instead of interactive staging."
+  ],
+  [
+    "(?i)\\bgit\\s+(rebase\\s+-i|rebase\\s+--interactive)\\b",
+    "git rebase -i",
+    "Use `git rebase --no-edit <branch>` instead of interactive rebase."
+  ],
+  [
+    "(?i)^(sudo\\s+)?\\bcat\\s*$",
+    "cat (stdin)",
+    "Use `cat <file>` to read a file instead of reading from stdin."
+  ],
+  [
+    "(?i)\\btail\\s+.*-[fF]\\b",
+    "tail -f",
+    "Use `tail -n <lines> <file>` for a fixed number of lines instead of follow mode."
+  ],
+  [
+    "(?i)^(sudo\\s+)?\\b(top|htop|btop|atop|glances)\\b",
+    "system monitor",
+    "Use `ps aux`, `free -h`, or `vmstat` for one-shot system information."
+  ],
+  [
+    "(?i)^(sudo\\s+)?\\bwatch\\b",
+    "watch",
+    "Run the target command directly for one-shot output instead of using watch."
+  ]
+]

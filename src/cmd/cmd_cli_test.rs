@@ -1,0 +1,1035 @@
+//! 命令面测试。
+//!
+//! 测试覆盖 argv0、默认值和显式 flag 来源。HTTP 路径使用 loopback mock
+//! server；安装路径只验证 skip/current 与 PATH 预检，不访问公网或真实安装 npm 包。
+
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
+
+use serde_json::{Value, json};
+use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
+use wiremock::matchers::{body_partial_json, header, method, path, query_param};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+use super::setup::{
+    check_npm_available, install_sandbox_runtime, load_service_key, run_api_healthcheck,
+};
+use super::*;
+use crate::internal::codesign::{
+    CONTEXT_ENV as CODESIGN_CONTEXT_ENV, CodeSignContext, CodeSignSource,
+};
+
+/// 根命令应注册全部公开命令，并从普通帮助中隐藏 code-sign。
+#[test]
+fn root_command_exposes_expected_surface() {
+    let root = command("1.2.3");
+    let names: Vec<_> = root
+        .get_subcommands()
+        .map(clap::Command::get_name)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "completion",
+            "orchestrator",
+            "task-run",
+            "provision-packages",
+            "poll",
+            "print-sandbox-settings",
+            "setup",
+            "code-sign",
+        ]
+    );
+
+    let help = command("1.2.3").render_long_help().to_string();
+    assert!(help.contains("Environment Runner handles the lifecycle of agentic sessions"));
+    assert!(help.contains("orchestrator"));
+    assert!(help.contains("task-run"));
+    assert!(help.contains("completion"));
+    assert!(!help.contains("code-sign"));
+}
+
+/// completion 命令应解析 shell 并从当前命令树生成脚本。
+#[test]
+fn completion_command_uses_current_clap_tree() {
+    let Invocation::Completion(args) =
+        parse_from("dev", ["environment-runner", "completion", "zsh"])
+            .expect("completion command must parse")
+    else {
+        panic!("unexpected invocation");
+    };
+    assert_eq!(args.shell, CompletionShell::Zsh);
+    let script = render_completion_for_root("dev", args.shell);
+    let script = String::from_utf8(script).expect("generated completion is UTF-8");
+    assert!(script.contains("environment-runner"));
+    assert!(script.contains("task-run"));
+}
+
+/// 仅运行根命令应由 Clap 报告缺少子命令。
+#[test]
+fn root_without_subcommand_is_a_usage_error() {
+    let error = parse_from("dev", ["environment-runner"]).expect_err("root must require a command");
+    assert_eq!(error.kind(), CliErrorKind::Usage);
+    assert_eq!(error.exit_code(), 2);
+    assert_eq!(error.stream(), OutputStream::Stderr);
+    assert!(error.rendered().contains("Usage:"));
+}
+
+/// 版本 flag 应保留 Clap 的正常文本和零退出码。
+#[test]
+fn version_is_successful_early_exit() {
+    const VERSION: &str = "9.8.7 (git abc123, built 2026-08-12T06:48:05Z)";
+    for flag in ["--version", "-v", "-V"] {
+        let error = parse_from(VERSION, ["environment-runner", flag])
+            .expect_err("every version flag must be an early exit");
+        assert_eq!(error.kind(), CliErrorKind::Version);
+        assert_eq!(error.exit_code(), 0);
+        assert_eq!(error.stream(), OutputStream::Stdout);
+        assert_eq!(
+            error.rendered(),
+            "environment-runner 9.8.7 (git abc123, built 2026-08-12T06:48:05Z)\n"
+        );
+    }
+}
+
+/// 布尔参数使用 Clap 原生的无值开关语法。
+#[test]
+fn boolean_flags_use_native_clap_syntax() {
+    let error = parse_from(
+        "dev",
+        ["environment-runner", "setup", "--skip-claude-code=false"],
+    )
+    .expect_err("boolean values are not accepted for SetTrue flags");
+    assert_eq!(error.kind(), CliErrorKind::Usage);
+    assert_eq!(error.exit_code(), 2);
+
+    let Invocation::Setup(args) =
+        parse_from("dev", ["environment-runner", "setup", "--skip-claude-code"])
+            .expect("plain boolean switch must parse")
+    else {
+        panic!("unexpected invocation");
+    };
+    assert!(args.skip_claude_code);
+    assert!(!args.skip_sandbox_runtime);
+}
+
+/// orchestrator 默认值必须命令。
+#[test]
+fn orchestrator_defaults_match_cli_contract() {
+    let Invocation::Orchestrator(args) = parse_from("dev", ["environment-runner", "orchestrator"])
+        .expect("orchestrator defaults must parse")
+    else {
+        panic!("unexpected invocation");
+    };
+
+    assert_eq!(args.api_url, "https://api.anthropic.com");
+    assert_eq!(args.poll_timeout, Duration::from_secs(300));
+    assert_eq!(args.loop_timeout, Duration::from_secs(300));
+    assert_eq!(args.timeout_hook_timeout, Duration::from_secs(300));
+    assert_eq!(args.execute_hook_timeout, Duration::ZERO);
+    assert_eq!(args.poll_hook_timeout, Duration::from_secs(30));
+    assert_eq!(args.log_level, LogLevel::Info);
+    assert_eq!(args.sandbox_backend, SandboxBackend::SandboxRuntime);
+    assert_eq!(args.max_poll_failures, 0);
+    assert_eq!(args.reclaim_older_than_ms, 0);
+    assert!(!args.skip_git_config);
+    assert!(!args.skip_container_lock);
+}
+
+/// orchestrator 的路径、hook、整数、duration 和 bool flag 应完整落入类型模型。
+#[test]
+fn orchestrator_overrides_are_typed() {
+    let Invocation::Orchestrator(args) = parse_from(
+        "dev",
+        [
+            "environment-runner",
+            "orchestrator",
+            "--api-url",
+            "http://localhost:8080",
+            "--organization-id",
+            "org-1",
+            "--environment-id",
+            "env-1",
+            "--client-id",
+            "worker-1",
+            "--poll-timeout",
+            "1h30m",
+            "--loop-timeout",
+            "1.5s",
+            "--max-poll-failures",
+            "-1",
+            "--reclaim-older-than-ms",
+            "123",
+            "--execute-hook",
+            "./run.sh",
+            "--sandbox-backend",
+            "none",
+            "--sandbox-settings",
+            "/tmp/sandbox.json",
+            "--service-key-file",
+            "/tmp/key",
+            "--skip-git-config",
+            "--skip-container-lock",
+        ],
+    )
+    .expect("orchestrator overrides must parse") else {
+        panic!("unexpected invocation");
+    };
+
+    assert_eq!(args.api_url, "http://localhost:8080");
+    assert_eq!(args.organization_id.as_deref(), Some("org-1"));
+    assert_eq!(args.environment_id.as_deref(), Some("env-1"));
+    assert_eq!(args.client_id.as_deref(), Some("worker-1"));
+    assert_eq!(args.poll_timeout, Duration::from_secs(5_400));
+    assert_eq!(args.loop_timeout, Duration::from_millis(1_500));
+    assert_eq!(args.max_poll_failures, -1);
+    assert_eq!(args.reclaim_older_than_ms, 123);
+    assert_eq!(args.execute_hook.as_deref(), Some("./run.sh"));
+    assert_eq!(args.sandbox_backend, SandboxBackend::None);
+    assert_eq!(
+        args.sandbox_settings,
+        Some(PathBuf::from("/tmp/sandbox.json"))
+    );
+    assert_eq!(args.service_key_file, Some(PathBuf::from("/tmp/key")));
+    assert!(args.skip_git_config);
+    assert!(args.skip_container_lock);
+}
+
+/// poll 与 setup 的默认值和主要覆盖值应保持 接口。
+#[test]
+fn poll_and_setup_parse_without_runtime_side_effects() {
+    let Invocation::Poll(poll) = parse_from(
+        "dev",
+        [
+            "environment-runner",
+            "poll",
+            "--worker-id",
+            "worker-1",
+            "--service-key-file",
+            "/tmp/key",
+            "--reclaim-older-than-ms",
+            "123",
+        ],
+    )
+    .expect("poll must parse") else {
+        panic!("unexpected invocation");
+    };
+    assert_eq!(poll.worker_id.as_deref(), Some("worker-1"));
+    assert_eq!(poll.service_key_file, Some(PathBuf::from("/tmp/key")));
+    assert_eq!(poll.reclaim_older_than_ms, 123);
+
+    let Invocation::Setup(setup) = parse_from(
+        "dev",
+        [
+            "environment-runner",
+            "setup",
+            "--claude-code-version",
+            "2.0.20",
+            "--skip-sandbox-runtime",
+            "--log-level",
+            "debug",
+        ],
+    )
+    .expect("setup must parse") else {
+        panic!("unexpected invocation");
+    };
+    assert_eq!(setup.claude_code_version, "2.0.20");
+    assert_eq!(setup.sandbox_runtime_version, "latest");
+    assert!(setup.skip_sandbox_runtime);
+    assert_eq!(setup.log_level, LogLevel::Debug);
+}
+
+/// argv0 basename 为 code-sign 时应在其后准确插入隐藏子命令一次。
+#[test]
+fn code_sign_argv0_is_normalized() {
+    let normalized = normalize_argv_for_codesign([
+        OsString::from("/usr/local/bin/code-sign"),
+        OsString::from("-Y"),
+        OsString::from("sign"),
+        OsString::from("payload"),
+    ]);
+    assert_eq!(
+        normalized,
+        [
+            OsString::from("/usr/local/bin/code-sign"),
+            OsString::from("code-sign"),
+            OsString::from("-Y"),
+            OsString::from("sign"),
+            OsString::from("payload"),
+        ]
+    );
+}
+
+/// code-sign 应禁用 help/flag 解析并按旧规则提取 SSH sign 参数。
+#[test]
+fn code_sign_preserves_and_interprets_raw_arguments() {
+    let Invocation::CodeSign(args) = parse_from(
+        "dev",
+        [
+            "/usr/local/bin/code-sign",
+            "-Y",
+            "sign",
+            "-n",
+            "git",
+            "-f",
+            "/tmp/key.pub",
+            "payload",
+        ],
+    )
+    .expect("argv0 code-sign must parse") else {
+        panic!("unexpected invocation");
+    };
+    assert_eq!(args.raw_args.first(), Some(&OsString::from("-Y")));
+
+    let CodeSignOperation::SshSign(sign) = args
+        .parse_operation()
+        .expect("SSH sign operation must be recognized");
+    assert_eq!(sign.file_path, PathBuf::from("payload"));
+    assert_eq!(sign.key_file, Some(PathBuf::from("/tmp/key.pub")));
+    assert_eq!(sign.namespace, Some(OsString::from("git")));
+}
+
+/// 非 SSH sign 调用应保留当前命令的明确失败，而不是形成伪成功操作。
+#[test]
+fn code_sign_rejects_unsupported_operation() {
+    let args = CodeSignArgs {
+        raw_args: vec![OsString::from("--help")],
+    };
+    let error = args
+        .parse_operation()
+        .expect_err("unsupported operation must fail");
+    assert!(error.contains("currently only SSH-style signing"));
+}
+
+/// duration 解析器应覆盖默认值、组合、小数和微秒拼写。
+#[test]
+fn duration_parser_supports_cli_syntax() {
+    assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+    assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+    assert_eq!(
+        parse_duration("1.5s").unwrap(),
+        Duration::from_millis(1_500)
+    );
+    assert_eq!(parse_duration("1h30m").unwrap(), Duration::from_secs(5_400));
+    assert_eq!(parse_duration("2µs").unwrap(), Duration::from_micros(2));
+    assert_eq!(parse_duration("+2s").unwrap(), Duration::from_secs(2));
+    assert_eq!(parse_duration("0.5ns").unwrap(), Duration::ZERO);
+    assert!(parse_duration("5").is_err());
+    assert!(parse_duration("-1s").is_err());
+}
+
+/// 日志级别应严格接受四个受支持值并返回稳定错误。
+#[test]
+fn log_level_parser_accepts_supported_values() {
+    assert_eq!(parse_log_level("debug"), Ok(LogLevel::Debug));
+    assert_eq!(parse_log_level("info"), Ok(LogLevel::Info));
+    assert_eq!(parse_log_level("warn"), Ok(LogLevel::Warn));
+    assert_eq!(parse_log_level("error"), Ok(LogLevel::Error));
+    let error = parse_log_level("verbose").expect_err("verbose is unsupported");
+    assert!(error.contains("invalid log level"));
+}
+
+/// 未知 flag 保留 Clap 的错误文本和退出码。
+#[test]
+fn unknown_flag_uses_native_clap_error() {
+    let error = parse_from(
+        "dev",
+        ["environment-runner", "poll", "--definitely-unknown"],
+    )
+    .expect_err("unknown flag must fail");
+    assert_eq!(error.kind(), CliErrorKind::Usage);
+    assert_eq!(error.exit_code(), 2);
+    assert!(error.rendered().starts_with("error:"));
+    assert!(error.rendered().contains("Usage:"));
+}
+
+/// completion 缺少 shell、提供未知 shell 或旧 Cobra 选项时均使用 Clap 原生 usage error。
+#[test]
+fn completion_shell_errors_use_native_clap_behavior() {
+    for argv in [
+        vec!["environment-runner", "completion"],
+        vec!["environment-runner", "completion", "bsh"],
+        vec![
+            "environment-runner",
+            "completion",
+            "zsh",
+            "--no-descriptions",
+        ],
+    ] {
+        let error = parse_from("dev", argv).expect_err("completion shell must be valid");
+        assert_eq!(error.kind(), CliErrorKind::Usage);
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(error.stream(), OutputStream::Stderr);
+    }
+}
+
+/// 无参数打印命令只产生显式调用标记，不在解析测试中写 stdout。
+#[test]
+fn print_sandbox_settings_is_a_real_invocation() {
+    let invocation = parse_from("dev", ["environment-runner", "print-sandbox-settings"])
+        .expect("print command must parse");
+    assert_eq!(
+        invocation,
+        Invocation::PrintSandboxSettings(PrintSandboxSettingsArgs)
+    );
+}
+
+/// 替代：保留日志解析，并由 Clap 直接验证必填参数。
+#[test]
+fn parse_log_level_and_require_session() {
+    for (value, expected) in [
+        ("debug", LogLevel::Debug),
+        ("info", LogLevel::Info),
+        ("warn", LogLevel::Warn),
+        ("error", LogLevel::Error),
+    ] {
+        assert_eq!(parse_log_level(value), Ok(expected));
+    }
+    let error = parse_log_level("verbose").expect_err("verbose must be rejected");
+    assert!(error.contains("invalid log level"));
+
+    let error = parse_from("dev", ["environment-runner", "task-run"])
+        .expect_err("task-run without --session must fail before dispatch");
+    assert_eq!(error.kind(), CliErrorKind::Usage);
+    assert_eq!(error.exit_code(), 2);
+    assert!(error.rendered().contains("--session"));
+}
+
+/// 包括空文件回退环境变量。
+#[test]
+fn load_service_key_reads_file_or_environment() {
+    // 父测试进程只启动隔离子进程，不在自身读写全局环境。
+    if !crate::internal::enter_isolated_process_test(concat!(
+        module_path!(),
+        "::load_service_key_reads_file_or_environment"
+    )) {
+        return;
+    }
+    // 环境变量属于整个测试进程；同步测试使用 blocking_lock 与异步用例共享
+    // 同一把 crate 级锁，确保读写期间没有并行子进程观察到临时配置。
+    let _process_state = crate::internal::PROCESS_STATE_TEST_LOCK.blocking_lock();
+    let mut environment = ScopedEnvironment::new();
+    environment.remove("ENVIRONMENT_SERVICE_KEY");
+    assert_eq!(load_service_key(None).unwrap(), "");
+
+    environment.set("ENVIRONMENT_SERVICE_KEY", OsStr::new("env-key"));
+    assert_eq!(load_service_key(None).unwrap(), "env-key");
+
+    let directory = TempDir::new().unwrap();
+    let key_path = directory.path().join("service-key");
+    fs::write(&key_path, b" file-key \n").unwrap();
+    assert_eq!(
+        load_service_key(Some(&key_path)).unwrap(),
+        "file-key",
+        "文件 service key 必须 trim 首尾空白"
+    );
+
+    let empty_path = directory.path().join("empty-key");
+    fs::write(&empty_path, b" \n").unwrap();
+    assert_eq!(
+        load_service_key(Some(&empty_path)).unwrap(),
+        "env-key",
+        "setup 与 poll 不同：空文件必须继续回退环境变量"
+    );
+
+    let missing = directory.path().join("missing-key");
+    let error = load_service_key(Some(&missing)).expect_err("missing file must fail");
+    assert!(error.contains("failed to read service key file"));
+    assert!(error.contains(&format!("{:?}", missing.display().to_string())));
+}
+
+/// 验证 whoami 路径、认证头和失败包装。
+#[tokio::test(flavor = "current_thread")]
+async fn run_api_healthcheck_requests_whoami() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/environments/whoami"))
+        .and(header("Authorization", "Bearer service-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "type": "environment_whoami",
+            "organization_uuid": "org-1",
+            "environment_id": "env-1"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    run_api_healthcheck(&CancellationToken::new(), &server.uri(), "service-key")
+        .await
+        .expect("healthy whoami response must pass");
+    server.verify().await;
+
+    let failing = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/environments/whoami"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("nope\n"))
+        .expect(1)
+        .mount(&failing)
+        .await;
+    let error = run_api_healthcheck(&CancellationToken::new(), &failing.uri(), "service-key")
+        .await
+        .expect_err("non-200 whoami response must fail");
+    assert!(error.contains("API connectivity healthcheck failed"));
+    failing.verify().await;
+}
+
+///
+/// 把 PATH 清空可以证明两个安装都 skip 时不会偷偷运行 npm；非法日志值由 Clap
+/// value parser 提前拒绝。
+#[tokio::test(flavor = "current_thread")]
+async fn run_setup_skip_installations_and_preflight() {
+    // 父测试进程只启动隔离子进程，不在自身读写全局环境。
+    if !crate::internal::enter_isolated_process_test(concat!(
+        module_path!(),
+        "::run_setup_skip_installations_and_preflight"
+    )) {
+        return;
+    }
+    // PATH 是进程全局状态；即使本测试证明不会启动 npm，清空期间也不能
+    // 让其他并行测试的 Git/Claude 子进程观察到该临时值。
+    let _process_state = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
+    let mut environment = ScopedEnvironment::new();
+    environment.remove("ENVIRONMENT_SERVICE_KEY");
+    environment.set("PATH", OsStr::new(""));
+    let arguments = SetupArgs {
+        log_level: LogLevel::Info,
+        claude_code_version: "latest".to_owned(),
+        sandbox_runtime_version: "latest".to_owned(),
+        skip_claude_code: true,
+        skip_sandbox_runtime: true,
+        api_url: "https://api.example.test".to_owned(),
+        service_key_file: None,
+    };
+    run_setup(&arguments, &CancellationToken::new())
+        .await
+        .expect("skip-everything setup must not require npm");
+
+    let error = parse_from(
+        "dev",
+        [
+            "environment-runner",
+            "setup",
+            "--skip-claude-code",
+            "--skip-sandbox-runtime",
+            "--log-level",
+            "bad",
+        ],
+    )
+    .expect_err("invalid log level must fail parsing");
+    assert!(error.rendered().contains("invalid log level"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn check_npm_available_uses_path() {
+    // 父测试进程只启动隔离子进程，不在自身读写全局环境。
+    if !crate::internal::enter_isolated_process_test(concat!(
+        module_path!(),
+        "::check_npm_available_uses_path"
+    )) {
+        return;
+    }
+    // fake npm 的安装、两次 PATH 切换和守卫恢复必须属于同一全局串行区间。
+    let _process_state = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
+    let directory = TempDir::new().unwrap();
+    let npm = directory.path().join("npm");
+    fs::write(&npm, b"#!/bin/sh\nprintf '9.9.9\\n'\n").unwrap();
+    fs::set_permissions(&npm, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut environment = ScopedEnvironment::new();
+    environment.set("PATH", directory.path().as_os_str());
+    check_npm_available(&CancellationToken::new())
+        .await
+        .expect("fake npm on PATH must pass");
+
+    let missing_path = TempDir::new().unwrap();
+    environment.set("PATH", missing_path.path().as_os_str());
+    let error = check_npm_available(&CancellationToken::new())
+        .await
+        .expect_err("PATH without npm must fail");
+    assert!(error.contains("npm not found in PATH"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn current_sandbox_runtime_skips_installation() {
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    install_sandbox_runtime(&cancellation, "current")
+        .await
+        .expect("current must skip npm even when already cancelled");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn setup_command_registers_and_runs_skip_mode() {
+    // 父测试进程只启动隔离子进程，不在自身读写全局环境。
+    if !crate::internal::enter_isolated_process_test(concat!(
+        module_path!(),
+        "::setup_command_registers_and_runs_skip_mode"
+    )) {
+        return;
+    }
+    // setup 会读取 service key 环境变量；即使该分支不执行外部命令，也必须与
+    // 其他修改 PATH/HOME 的测试串行，满足 Rust 2024 对进程环境访问的约束。
+    let _process_state = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
+    assert_eq!(
+        command("dev")
+            .find_subcommand("setup")
+            .expect("setup must be registered")
+            .get_name(),
+        "setup"
+    );
+
+    let mut environment = ScopedEnvironment::new();
+    environment.remove("ENVIRONMENT_SERVICE_KEY");
+    let Invocation::Setup(arguments) = parse_from(
+        "dev",
+        [
+            "environment-runner",
+            "setup",
+            "--skip-claude-code",
+            "--skip-sandbox-runtime",
+            "--log-level",
+            "debug",
+        ],
+    )
+    .expect("setup skip mode must parse") else {
+        panic!("unexpected invocation");
+    };
+    run_setup(&arguments, &CancellationToken::new())
+        .await
+        .expect("setup skip mode must run");
+}
+
+///
+/// 这里使用精确 stdout 快照，验证输出保持 JSON 数字精度和内容。
+#[tokio::test(flavor = "current_thread")]
+async fn poll_command_prints_work_and_null() {
+    let directory = TempDir::new().unwrap();
+    let key_path = write_service_key(&directory, "service-key\n");
+    let server = MockServer::start().await;
+    mount_whoami(&server, "service-key", "org-1", "env-1", 1).await;
+    Mock::given(method("GET"))
+        .and(path("/v1/environments/env-1/work/poll"))
+        .and(header("Authorization", "Bearer service-key"))
+        .and(header("Anthropic-Worker-ID", "worker-1"))
+        .and(query_param("reclaim_older_than_ms", "123"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"z":"<\u2028&>","type":"work","state":"available","secret":"secret","number":1.0,"id":"work-1","environment_id":"env-1","data":{"type":"session","id":"session-1"},"big":9007199254740993}"#,
+            "application/json",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut arguments = poll_arguments(&server, key_path.clone());
+    arguments.worker_id = Some("worker-1".to_owned());
+    arguments.reclaim_older_than_ms = 123;
+    let mut output = Vec::new();
+    run_poll(&arguments, &CancellationToken::new(), &mut output)
+        .await
+        .expect("work poll must succeed");
+    assert_eq!(
+        execute_command_with_stdout(output),
+        concat!(
+            "{\n",
+            "  \"big\": 9007199254740993,\n",
+            "  \"data\": {\n",
+            "    \"id\": \"session-1\",\n",
+            "    \"type\": \"session\"\n",
+            "  },\n",
+            "  \"environment_id\": \"env-1\",\n",
+            "  \"id\": \"work-1\",\n",
+            "  \"number\": 1.0,\n",
+            "  \"secret\": \"secret\",\n",
+            "  \"state\": \"available\",\n",
+            "  \"type\": \"work\",\n",
+            "  \"z\": \"<\u{2028}&>\"\n",
+            "}\n"
+        )
+    );
+    server.verify().await;
+
+    let empty = MockServer::start().await;
+    mount_whoami(&empty, "service-key", "org-1", "env-1", 1).await;
+    Mock::given(method("GET"))
+        .and(path("/v1/environments/env-1/work/poll"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("null", "application/json"))
+        .expect(1)
+        .mount(&empty)
+        .await;
+    let mut output = Vec::new();
+    run_poll(
+        &poll_arguments(&empty, key_path),
+        &CancellationToken::new(),
+        &mut output,
+    )
+    .await
+    .expect("empty poll must succeed");
+    assert_eq!(execute_command_with_stdout(output), "null\n");
+    empty.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn poll_command_reports_service_key_and_identity_errors() {
+    let directory = TempDir::new().unwrap();
+    let empty_key = write_service_key(&directory, " \n");
+    let mut output = Vec::new();
+    let error = run_poll(
+        &PollArgs {
+            api_url: "https://api.example.test".to_owned(),
+            organization_id: None,
+            environment_id: None,
+            worker_id: None,
+            service_key_file: Some(empty_key),
+            reclaim_older_than_ms: 0,
+            log_level: LogLevel::Info,
+        },
+        &CancellationToken::new(),
+        &mut output,
+    )
+    .await
+    .expect_err("empty explicit key file must not fall back to the environment");
+    assert!(error.contains("service key is required"));
+
+    let key_path = write_service_key(&directory, "service-key\n");
+    let server = MockServer::start().await;
+    mount_whoami(&server, "service-key", "org-real", "env-real", 1).await;
+    let mut arguments = poll_arguments(&server, key_path);
+    arguments.organization_id = Some("org-other".to_owned());
+    let error = run_poll(&arguments, &CancellationToken::new(), &mut Vec::new())
+        .await
+        .expect_err("organization mismatch must stop before poll");
+    assert!(error.contains("does not match token's organization"));
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn poll_command_uses_provided_identity_when_whoami_fails() {
+    let directory = TempDir::new().unwrap();
+    let key_path = write_service_key(&directory, "file-key\n");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/environments/whoami"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable\n"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/environments/env-fallback/work/poll"))
+        .and(header("Authorization", "Bearer file-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw("null", "application/json"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut arguments = poll_arguments(&server, key_path);
+    arguments.organization_id = Some("org-fallback".to_owned());
+    arguments.environment_id = Some("env-fallback".to_owned());
+    let mut output = Vec::new();
+    run_poll(&arguments, &CancellationToken::new(), &mut output)
+        .await
+        .expect("explicit identity must permit whoami fallback");
+    assert_eq!(output, b"null\n");
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn poll_command_reports_invalid_work_json() {
+    let directory = TempDir::new().unwrap();
+    let key_path = write_service_key(&directory, "service-key\n");
+    let server = MockServer::start().await;
+    mount_whoami(&server, "service-key", "org-1", "env-1", 1).await;
+    Mock::given(method("GET"))
+        .and(path("/v1/environments/env-1/work/poll"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"id":"work-1","type":"work","environment_id":"env-1","state":"available","data":{"type":"session","id":"session-1"},"secret":"secret","extra":"#,
+            "application/json",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = run_poll(
+        &poll_arguments(&server, key_path),
+        &CancellationToken::new(),
+        &mut Vec::new(),
+    )
+    .await
+    .expect_err("poller must reject invalid JSON before raw printing");
+    assert!(error.contains("failed to deserialize work response"));
+    server.verify().await;
+}
+
+/// code-sign 的原始 argv 解析测试，特别保护 Git/OpenSSH 传入的字面 `--`。
+#[test]
+fn code_sign_parses_ssh_arguments() {
+    let Invocation::CodeSign(arguments) = parse_from(
+        "dev",
+        [
+            "environment-runner",
+            "code-sign",
+            "-Y",
+            "sign",
+            "-n",
+            "git",
+            "-f",
+            "/tmp/key.pub",
+            "payload",
+        ],
+    )
+    .expect("SSH argv must bypass Clap flag parsing") else {
+        panic!("unexpected invocation");
+    };
+    let CodeSignOperation::SshSign(sign) = arguments.parse_operation().unwrap();
+    assert_eq!(sign.file_path, PathBuf::from("payload"));
+    assert_eq!(sign.key_file, Some(PathBuf::from("/tmp/key.pub")));
+    assert_eq!(sign.namespace, Some(OsString::from("git")));
+
+    let Invocation::CodeSign(arguments) = parse_from(
+        "dev",
+        [
+            "environment-runner",
+            "code-sign",
+            "-Y",
+            "sign",
+            "--",
+            "payload",
+        ],
+    )
+    .expect("literal -- must be retained") else {
+        panic!("unexpected invocation");
+    };
+    assert_eq!(
+        arguments.raw_args,
+        ["-Y", "sign", "--", "payload"].map(OsString::from)
+    );
+    assert_eq!(
+        arguments.parse_operation().unwrap_err(),
+        "no file specified to sign",
+        "the parser keeps the raw separator but reports the missing file operand"
+    );
+}
+
+/// 端到端验证 code-sign 直接使用 ingress token 请求后台并写出 `.sig`。
+#[tokio::test(flavor = "current_thread")]
+async fn ssh_sign_calls_backend_and_writes_signature() {
+    // 父测试进程只启动隔离子进程，不在自身读写全局环境。
+    if !crate::internal::enter_isolated_process_test(concat!(
+        module_path!(),
+        "::ssh_sign_calls_backend_and_writes_signature"
+    )) {
+        return;
+    }
+    // `run_code_sign` 会通过 PATH 执行 Git 探测 object format，因此与修改 PATH 的
+    // 测试使用同一把 crate 级锁，保持默认 sha1 分支的真实成因。
+    let _process_state = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
+    let server = MockServer::start().await;
+    let directory = TempDir::new().unwrap();
+    let token_path = directory.path().join("session-token");
+    fs::write(&token_path, "signing-token").unwrap();
+    let source = json!({
+        "type": "git_repository",
+        "git_info": {"type": "github", "repo": "anthropic/demo", "ref": "main"}
+    });
+    let context = CodeSignContext {
+        session_id: "session-123".to_owned(),
+        signing_server_url: server.uri(),
+        use_code_sessions: false,
+        sources: vec![CodeSignSource {
+            directory: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            source: source.clone(),
+        }],
+    };
+    let serialized_context = serde_json::to_string(&context).unwrap();
+    let mut environment = ScopedEnvironment::new();
+    environment.set(CODESIGN_CONTEXT_ENV, OsStr::new(&serialized_context));
+    environment.set("CLAUDE_SESSION_INGRESS_TOKEN_FILE", token_path.as_os_str());
+
+    let payload = directory.path().join("payload");
+    fs::write(&payload, b"payload").unwrap();
+    let signature = PathBuf::from(format!("{}.sig", payload.display()));
+    let expected_request = json!({
+        "contents": "payload",
+        "source": source,
+        "git_object_format": "sha1"
+    });
+    mount_code_sign_response(
+        &server,
+        &expected_request,
+        200,
+        json!({"signature": "signed"}),
+    )
+    .await;
+    let arguments = code_sign_arguments(&payload);
+    run_code_sign(&arguments)
+        .await
+        .expect("direct signing request must succeed");
+    assert_eq!(fs::read_to_string(&signature).unwrap(), "signed");
+    assert_eq!(
+        fs::metadata(&signature).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    server.verify().await;
+
+    server.reset().await;
+    mount_code_sign_response(&server, &expected_request, 503, json!("busy")).await;
+    let error = run_code_sign(&arguments)
+        .await
+        .expect_err("remote status must fail signing");
+    assert!(error.starts_with("signing server returned status 503:"));
+    server.verify().await;
+}
+
+/// 所有修改进程环境的 cmd 测试共享一把锁，并在 scope 结束时逆序恢复原值。
+///
+/// Rust 2024 把进程环境写入标成 unsafe；这些测试只在 current-thread runtime 中
+/// 修改，并通过该 scope 串行化本模块的所有相关写入。
+struct ScopedEnvironment {
+    _lock: MutexGuard<'static, ()>,
+    previous: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl ScopedEnvironment {
+    /// 获取全局环境锁；poison 只表示前一个测试 panic，恢复后仍可继续清理环境。
+    fn new() -> Self {
+        Self {
+            _lock: PROCESS_ENVIRONMENT_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            previous: Vec::new(),
+        }
+    }
+
+    /// 设置变量，并且只在第一次改动该 key 时记录原值。
+    fn set(&mut self, key: &'static str, value: &OsStr) {
+        self.remember(key);
+        // SAFETY: `ScopedEnvironment` 持有本模块唯一的进程环境写锁，测试使用
+        // current-thread runtime，且 Drop 会在释放锁前恢复原值。PATH 的调用点还会
+        // 在整个 scope 内持有 crate 级 `PROCESS_STATE_TEST_LOCK`。
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    /// 删除变量，并在 scope 结束时恢复。
+    fn remove(&mut self, key: &'static str) {
+        self.remember(key);
+        // SAFETY: 与 `set` 相同，写入期间持有独占测试锁。
+        unsafe { std::env::remove_var(key) };
+    }
+
+    fn remember(&mut self, key: &'static str) {
+        if self.previous.iter().all(|(known, _)| *known != key) {
+            self.previous.push((key, std::env::var_os(key)));
+        }
+    }
+}
+
+impl Drop for ScopedEnvironment {
+    fn drop(&mut self) {
+        for (key, previous) in self.previous.drain(..).rev() {
+            // SAFETY: 恢复仍发生在独占锁释放之前。
+            unsafe {
+                if let Some(value) = previous {
+                    std::env::set_var(key, value);
+                } else {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+}
+
+static PROCESS_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+/// 创建测试 service key 文件；TempDir 生命周期覆盖整个请求。
+fn write_service_key(directory: &TempDir, contents: &str) -> PathBuf {
+    let path = directory.path().join(format!(
+        "service-key-{}",
+        directory.path().read_dir().unwrap().count()
+    ));
+    fs::write(&path, contents).unwrap();
+    path
+}
+
+/// 把命令写入的原始 stdout 缓冲转成文本快照。
+///
+/// Rust 命令层把 writer 显式注入 `run_poll`，因此无需替换进程全局 stdout；仍在同一
+/// helper 统一执行 UTF-8 校验，确保测试不会用有损转换掩盖字节差异。
+fn execute_command_with_stdout(output: Vec<u8>) -> String {
+    String::from_utf8(output).expect("command stdout must be UTF-8")
+}
+
+/// 构造最小 poll 参数，测试按需覆盖身份、worker 和 reclaim 字段。
+fn poll_arguments(server: &MockServer, service_key_file: PathBuf) -> PollArgs {
+    PollArgs {
+        api_url: server.uri(),
+        organization_id: None,
+        environment_id: None,
+        worker_id: None,
+        service_key_file: Some(service_key_file),
+        reclaim_older_than_ms: 0,
+        log_level: LogLevel::Info,
+    }
+}
+
+/// 挂载一次成功 whoami；独立 helper 让 poll 测试只描述各自差异。
+async fn mount_whoami(
+    server: &MockServer,
+    service_key: &str,
+    organization_id: &str,
+    environment_id: &str,
+    expected_calls: u64,
+) {
+    Mock::given(method("GET"))
+        .and(path("/v1/environments/whoami"))
+        .and(header(
+            "Authorization",
+            format!("Bearer {service_key}").as_str(),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "type": "environment_whoami",
+            "organization_uuid": organization_id,
+            "environment_id": environment_id
+        })))
+        .expect(expected_calls)
+        .mount(server)
+        .await;
+}
+
+/// 生成完整的 SSH sign 原始参数，使用绝对临时文件避免 current_dir 副作用。
+fn code_sign_arguments(payload: &std::path::Path) -> CodeSignArgs {
+    CodeSignArgs {
+        raw_args: vec![
+            OsString::from("-Y"),
+            OsString::from("sign"),
+            OsString::from("-n"),
+            OsString::from("git"),
+            OsString::from("-f"),
+            OsString::from("ignored-key.pub"),
+            payload.as_os_str().to_owned(),
+        ],
+    }
+}
+
+/// 挂载一个带严格认证与核心请求体匹配的远端签名响应。
+async fn mount_code_sign_response(
+    server: &MockServer,
+    request: &Value,
+    status: u16,
+    response: Value,
+) {
+    Mock::given(method("POST"))
+        .and(path("/v1/session_ingress/sources/sign-commit/session-123"))
+        .and(header("Authorization", "Bearer signing-token"))
+        .and(header("Content-Type", "application/json"))
+        .and(header("anthropic-version", "2023-06-01"))
+        .and(body_partial_json(request))
+        .respond_with(ResponseTemplate::new(status).set_body_json(response))
+        .expect(1)
+        .mount(server)
+        .await;
+}
