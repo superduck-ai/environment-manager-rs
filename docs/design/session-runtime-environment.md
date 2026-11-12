@@ -60,6 +60,8 @@ Brain 模式 Manager 使用会话 ingress token 主动请求 OMA 的工具领取
 
 领取以 OMA 的 NATS 唤醒为主路径，长轮询为兜底：只要还有空闲槽位就以 25 秒长轮询领取，执行中的调用不会使领取改为短轮询。领取返回 410 表示沙箱已退役，Manager 停止领取并进入排空。
 
+执行截止以 started 响应中的 `deadline_at` 为准：OMA 在提交点按开始时间加执行预算计算，领取响应中的 `deadline_at` 只是排队期限，排队时间不消耗执行预算。
+
 started 是提交点：Manager 只有在 started 返回 running 后才启动工具，OMA 可以独立回收提交点之前的调用。结果状态只描述发生了什么：`succeeded`、`failed` 或 `interrupted`，`interrupted` 通过 `Oma-Result-Reason` 给出 `stop_requested`、`deadline` 或 `executor_shutdown`，附带中断前的部分输出。未知工具与输入校验失败直接以 `failed` 上报。
 
 Manager 退出使用排空和中止两个信号：先停止领取并放弃在途领取请求，尚未 started 的调用发送 reject；执行中的调用有 10 秒宽限期自然结束；宽限期后中止进程组，以 `interrupted` + `executor_shutdown` 写入 ledger 并上报，结果末尾追加退出说明；再给 5 秒上报预算，超时后保留 ledger 留待下次启动补报。

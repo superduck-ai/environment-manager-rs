@@ -262,7 +262,7 @@ impl Runner {
             .json()
             .await
     }
-    /// 在提交点 started 被接受后执行工具，按停止请求、deadline 或退出中止并记录中断原因。
+    /// 在提交点 started 被接受后执行工具，按 started 返回的执行截止、停止请求或退出中止并记录中断原因。
     async fn execute(&self, call: Call, signals: &Signals) -> std::io::Result<()> {
         if uuid::Uuid::parse_str(&call.call_uuid).is_err() {
             return Err(std::io::Error::other("invalid call UUID"));
@@ -322,7 +322,9 @@ impl Runner {
         let cancellation = signals.abort.child_token();
         let execution = tool.handle(cancellation.clone(), call.input.clone());
         tokio::pin!(execution);
-        let delay = (call.deadline_at - Utc::now()).to_std().unwrap_or_default();
+        let delay = (accepted.deadline_at - Utc::now())
+            .to_std()
+            .unwrap_or_default();
         let deadline = tokio::time::sleep(delay);
         tokio::pin!(deadline);
         let heartbeat = self.heartbeat(&call, &cancellation);
@@ -1071,5 +1073,30 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_deadline_starts_at_commit_not_at_claim() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let runner = short_runner(&server, directory.path()).await;
+        let call = bash_call(
+            "sleep 0.5; echo finished",
+            chrono::Duration::milliseconds(100),
+        );
+        Mock::given(method("POST"))
+            .and(path(format!("/{}/events", call.call_uuid)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"call_uuid":call.call_uuid,"attempt":call.attempt,"tool":"bash","state":"running","deadline_at":Utc::now() + chrono::Duration::seconds(30)})))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        runner.execute(call, &Signals::default()).await.unwrap();
+        let results = reported_results(&server).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(header(&results[0], "Oma-Result-Status"), "succeeded");
+        assert!(String::from_utf8_lossy(&results[0].body).contains("finished"));
     }
 }
