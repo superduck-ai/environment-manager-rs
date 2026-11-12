@@ -56,6 +56,6 @@ relay 区分 CONNECT 与 absolute-form HTTP：前者沿用 TLS 隧道，后者�
 
 ## 内置工具领取
 
-Brain 模式 Manager 使用会话 ingress token 主动请求 OMA 的工具领取接口，按空闲槽位领取并最多同时执行 4 个调用。注册表继续提供 Bash、Read、Write、Edit、Grep 和 Glob 的输入校验与执行。started 响应为 running 后，先原子保存 started 标记并同步，再执行工具。结果字节写入 ledger 后按 SHA-256 幂等上报。重复交付读取 ledger 并重报结果。
+Brain 模式 Manager 使用会话 ingress token 主动请求 OMA 的工具领取接口，按空闲槽位领取并最多同时执行 4 个调用。注册表继续提供 Bash、Read、Write、Edit、Grep 和 Glob 的输入校验与执行。started 响应为 running 后，先原子保存 started 标记并同步，再执行工具。结果字节写入 ledger 后按 SHA-256 幂等上报。OMA 只交付 pending 调用，已 running 的调用不会再次交付，因此 Manager 启动领取循环前先扫描 ledger：删除未完成 rename 的临时文件，并按文件名中的调用 UUID 与 attempt 补报每个已保存的结果，补报期间同样发送心跳。上报成功或收到永久拒绝后删除该结果文件；关闭期间未完成的补报保留文件，留待下次启动。started 标记保留，用于拒绝同一调用的重复执行。
 
 心跳与执行 deadline 同时推进，心跳网络等待不会阻止本地停止。收到取消或本地到期后终止进程组，等待退出，再上报包含部分输出的 stopped 结果。Manager 的 HTTP MCP 入口已移除。

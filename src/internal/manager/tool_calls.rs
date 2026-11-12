@@ -64,6 +64,11 @@ pub(super) async fn run(
 impl Runner {
     async fn claim_loop(self: Arc<Self>, cancellation: CancellationToken) -> std::io::Result<()> {
         let mut executions = tokio::task::JoinSet::new();
+        for call in self.saved_results().await? {
+            let runner = self.clone();
+            let parent = cancellation.clone();
+            executions.spawn(async move { runner.replay(call, &parent).await });
+        }
         loop {
             while let Some(result) = executions.try_join_next() {
                 Self::execution_finished(result);
@@ -126,6 +131,55 @@ impl Runner {
         }
     }
 
+    async fn saved_results(&self) -> std::io::Result<Vec<Call>> {
+        let mut calls = Vec::new();
+        let mut entries = tokio::fs::read_dir(&self.directory).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.ends_with(".tmp") {
+                tokio::fs::remove_file(entry.path()).await?;
+                continue;
+            }
+            let Some((call_uuid, attempt)) = name
+                .strip_suffix(".result")
+                .and_then(|stem| stem.rsplit_once('-'))
+            else {
+                continue;
+            };
+            let (Ok(_), Ok(attempt)) = (uuid::Uuid::parse_str(call_uuid), attempt.parse()) else {
+                continue;
+            };
+            calls.push(Call {
+                call_uuid: call_uuid.to_owned(),
+                attempt,
+                tool: String::new(),
+                input: Value::Null,
+                state: String::new(),
+                deadline_at: Utc::now(),
+            });
+        }
+        Ok(calls)
+    }
+
+    async fn replay(&self, call: Call, parent: &CancellationToken) -> std::io::Result<()> {
+        let bytes = tokio::fs::read(self.ledger(&call, "result")).await?;
+        let completion: Completion = serde_json::from_slice(&bytes)?;
+        if self.report(&call, completion, parent).await? {
+            self.forget(&call).await?;
+        }
+        Ok(())
+    }
+
+    async fn forget(&self, call: &Call) -> std::io::Result<()> {
+        match tokio::fs::remove_file(self.ledger(call, "result")).await {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+    }
+
     fn ledger(&self, call: &Call, suffix: &str) -> PathBuf {
         self.directory
             .join(format!("{}-{}.{}", call.call_uuid, call.attempt, suffix))
@@ -146,9 +200,8 @@ impl Runner {
             return Err(std::io::Error::other("invalid call UUID"));
         }
         let result_path = self.ledger(&call, "result");
-        if let Ok(bytes) = tokio::fs::read(&result_path).await {
-            let result: Completion = serde_json::from_slice(&bytes)?;
-            return self.report(&call, result, parent).await;
+        if tokio::fs::try_exists(&result_path).await? {
+            return self.replay(call, parent).await;
         }
         let marker = self.directory.join(format!("{}.started", call.call_uuid));
         if tokio::fs::try_exists(&marker).await? {
@@ -252,14 +305,17 @@ impl Runner {
             .await?
             .sync_all()
             .await?;
-        self.report(call, completion, parent).await
+        if self.report(call, completion, parent).await? {
+            self.forget(call).await?;
+        }
+        Ok(())
     }
     async fn report(
         &self,
         call: &Call,
         completion: Completion,
         parent: &CancellationToken,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<bool> {
         let hash = format!("{:x}", Sha256::digest(&completion.body));
         let report_cancellation = parent.child_token();
         let heartbeat = self.heartbeat(call, &report_cancellation);
@@ -296,11 +352,11 @@ impl Runner {
                     ]
                     .contains(&response.status())
                 {
-                    return Ok(());
+                    return Ok(true);
                 }
             }
             tokio::select! {
-                ()=parent.cancelled()=>return Ok(()),
+                ()=parent.cancelled()=>return Ok(false),
                 ()=tokio::time::sleep(delay)=>{},
                 ()=&mut heartbeat,if !heartbeat_done=>{heartbeat_done=true;}
             }
@@ -447,7 +503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_delivery_reports_saved_bytes_without_executing_again() {
+    async fn repeated_delivery_after_settled_report_does_not_execute_again() {
         let server = MockServer::start().await;
         let directory = tempfile::tempdir().unwrap();
         let call = Call {
@@ -462,7 +518,7 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path(format!("/{}/result", call.call_uuid)))
             .respond_with(ResponseTemplate::new(200))
-            .expect(2)
+            .expect(1)
             .mount(&server)
             .await;
         let runner = Runner {
@@ -477,6 +533,7 @@ mod tests {
             .execute(call.clone(), &CancellationToken::new())
             .await
             .unwrap();
+        let settled = call.clone();
         runner
             .execute(call, &CancellationToken::new())
             .await
@@ -487,5 +544,143 @@ mod tests {
                 .unwrap(),
             b"x"
         );
+        assert!(
+            !tokio::fs::try_exists(runner.ledger(&settled, "result"))
+                .await
+                .unwrap()
+        );
+    }
+
+    fn saved_call() -> Call {
+        Call {
+            call_uuid: uuid::Uuid::new_v4().to_string(),
+            attempt: 2,
+            tool: "bash".into(),
+            input: json!({"command":"printf x >> counter"}),
+            state: "dispatched".into(),
+            deadline_at: Utc::now() + chrono::Duration::seconds(30),
+        }
+    }
+
+    async fn runner_with_saved_result(
+        server: &MockServer,
+        directory: &std::path::Path,
+        call: &Call,
+    ) -> Arc<Runner> {
+        let runner = Arc::new(Runner {
+            client: Client::new(),
+            endpoint: server.uri(),
+            token: "test".into(),
+            registry: Arc::new(Registry::builtin(directory.to_path_buf(), None)),
+            directory: directory.join("ledger"),
+        });
+        tokio::fs::create_dir_all(&runner.directory).await.unwrap();
+        let completion = Completion {
+            status: "succeeded".into(),
+            body: br#"{"content":[{"type":"text","text":"saved"}],"isError":false}"#.to_vec(),
+        };
+        tokio::fs::write(
+            runner.ledger(call, "result"),
+            serde_json::to_vec(&completion).unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(runner.ledger(call, "tmp"), b"partial")
+            .await
+            .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/claims"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"calls": []})))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/{}/events", call.call_uuid)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"call_uuid":call.call_uuid,"attempt":call.attempt,"tool":"bash","state":"running","deadline_at":call.deadline_at})))
+            .mount(server)
+            .await;
+        runner
+    }
+
+    #[tokio::test]
+    async fn transient_report_failure_keeps_saved_result_for_next_start() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let call = saved_call();
+        let runner = runner_with_saved_result(&server, directory.path(), &call).await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/{}/result", call.call_uuid)))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(runner.clone().claim_loop(cancellation.clone()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| request.method.as_str() != "PUT")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            tokio::fs::try_exists(runner.ledger(&call, "result"))
+                .await
+                .unwrap()
+        );
+        assert!(!directory.path().join("counter").exists());
+    }
+
+    #[tokio::test]
+    async fn saved_result_is_reported_on_start_without_executing_again() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let call = saved_call();
+        let runner = runner_with_saved_result(&server, directory.path(), &call).await;
+        Mock::given(method("PUT"))
+            .and(path(format!("/{}/result", call.call_uuid)))
+            .and(wiremock::matchers::header("Oma-Tool-Call-Attempt", "2"))
+            .and(wiremock::matchers::header("Oma-Result-Status", "succeeded"))
+            .and(wiremock::matchers::body_string(
+                r#"{"content":[{"type":"text","text":"saved"}],"isError":false}"#,
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(runner.clone().claim_loop(cancellation.clone()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while tokio::fs::try_exists(runner.ledger(&call, "result"))
+                .await
+                .unwrap()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            !tokio::fs::try_exists(runner.ledger(&call, "tmp"))
+                .await
+                .unwrap()
+        );
+        assert!(!directory.path().join("counter").exists());
     }
 }
