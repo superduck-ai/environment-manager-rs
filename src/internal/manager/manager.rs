@@ -121,9 +121,11 @@ impl Manager {
     /// MCP 注册和环境初始化在同一并行阶段执行；两条路径都返回拥有所有权的结果，
     /// 不通过 join handle 后写裸指针。
     pub async fn run(&mut self, cancellation: &CancellationToken) -> Result<(), ManagerError> {
-        let mut runtime_mcp = None;
-        let result = self.run_session(cancellation, &mut runtime_mcp).await;
-        if let Some(runtime) = runtime_mcp {
+        let mut runtime_tool_calls = None;
+        let result = self
+            .run_session(cancellation, &mut runtime_tool_calls)
+            .await;
+        if let Some(runtime) = runtime_tool_calls {
             runtime.shutdown().await;
         }
         result
@@ -132,7 +134,7 @@ impl Manager {
     async fn run_session(
         &mut self,
         cancellation: &CancellationToken,
-        runtime_mcp: &mut Option<super::runtime_mcp::RuntimeMcpServer>,
+        runtime_tool_calls: &mut Option<super::runtime_tool_calls::RuntimeToolCalls>,
     ) -> Result<(), ManagerError> {
         let started = Instant::now();
         // 恢复结构保留该字段但 Run 不消费；显式读取避免把协议字段误判为死代码。
@@ -399,14 +401,22 @@ impl Manager {
         if cancellation.is_cancelled() {
             return Ok(());
         }
-        *runtime_mcp = Some(
-            super::runtime_mcp::RuntimeMcpServer::start(
-                &claude_config,
-                cancellation,
-                agent_proxy.as_ref(),
-            )
-            .await?,
-        );
+        if skip_claude_code {
+            *runtime_tool_calls = Some(
+                super::runtime_tool_calls::RuntimeToolCalls::start(
+                    &claude_config,
+                    cancellation,
+                    agent_proxy.as_ref(),
+                    self.session_config
+                        .as_ref()
+                        .and_then(|session| session.startup_context.as_ref())
+                        .map(|context| context.api_base_url.as_str())
+                        .unwrap_or_default(),
+                    auth_context.get_session_ingress_token(),
+                )
+                .await?,
+            );
+        }
 
         if skip_claude_code {
             tracing::info!(

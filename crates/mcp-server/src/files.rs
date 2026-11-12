@@ -109,8 +109,8 @@ pub async fn read(a: &Value) -> ToolResult {
     let lines: Vec<_> = content.split_terminator('\n').collect();
     let start = a.get("start_line").and_then(util::int);
     let end = a.get("end_line").and_then(util::int);
-    let mut s = start.unwrap_or(0);
-    let mut e = end.unwrap_or(lines.len() as i64);
+    let mut s = start.unwrap_or(0).max(0);
+    let mut e = end.unwrap_or_else(|| s.saturating_add(2000).min(lines.len() as i64));
     if start.is_some() || end.is_some() {
         s = s.max(0);
         if s >= lines.len() as i64 {
@@ -126,18 +126,16 @@ pub async fn read(a: &Value) -> ToolResult {
             ));
         }
     }
-    ToolResult::text(
-        util::truncate(
-            lines[s as usize..e as usize]
-                .iter()
-                .enumerate()
-                .map(|(i, line)| format!("{}\t{line}", i + s as usize + 1))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            "read",
-        )
-        .await,
-    )
+    let mut output = lines[s as usize..e as usize]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{}\t{line}", i + s as usize + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if end.is_none() && (e as usize) < lines.len() {
+        output.push_str("\n\n[Read output limited to 2000 lines. Use start_line/end_line to read the remaining content.]");
+    }
+    ToolResult::text(util::truncate(output, "read").await)
 }
 /// 根据文件名评分给出拼写建议，平分时保持目录排序。
 async fn similar(path: &Path) -> Option<PathBuf> {

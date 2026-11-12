@@ -413,7 +413,6 @@ fn configure_process_environment(home: &TempDir) -> EnvironmentRestore {
     restore.set("SKIP_PLUGIN_MARKETPLACE", "true");
     restore.set("SKIP_GIT_CONFIG", "true");
     restore.set("TUNNEL_ENABLED", "");
-    restore.set("ENVRUNNER_RUNTIME_MCP_ADDR", "127.0.0.1:0");
     restore
 }
 
@@ -1256,12 +1255,11 @@ async fn test_setup_mcp_server_with_registration_wraps_factory_error() {
     );
 }
 
-/// The embedded server is available with the initialized environment even without Claude.
 #[tokio::test]
-async fn runtime_mcp_starts_in_skip_mode_and_stops_with_manager() {
+async fn tool_claims_use_initialized_environment_and_stop_with_manager() {
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::runtime_mcp_starts_in_skip_mode_and_stops_with_manager"
+        "::tool_claims_use_initialized_environment_and_stop_with_manager"
     )) {
         return;
     }
@@ -1269,10 +1267,10 @@ async fn runtime_mcp_starts_in_skip_mode_and_stops_with_manager() {
     let home = TempDir::new().unwrap();
     let mut restore = configure_process_environment(&home);
     restore.set("RUNTIME_MCP_PROCESS_VALUE", "from-process");
-    let reservation = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
-    let port = reservation.local_addr().unwrap().port();
-    drop(reservation);
-    restore.set("ENVRUNNER_RUNTIME_MCP_ADDR", format!("0.0.0.0:{port}"));
+    restore.set(
+        "OMA_TOOL_CALL_LEDGER",
+        home.path().join("ledger").to_str().unwrap(),
+    );
     let mut environment = fake_environment(None);
     environment.cwd = home.path().to_str().unwrap().into();
     environment
@@ -1317,61 +1315,36 @@ async fn runtime_mcp_starts_in_skip_mode_and_stops_with_manager() {
     startup
         .environment_variables
         .insert("RUNTIME_MCP_SHARED_VALUE".into(), "from-startup".into());
+    startup.api_base_url = proxy_server.uri();
+    let first = uuid::Uuid::new_v4().to_string();
+    let second = uuid::Uuid::new_v4().to_string();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let claims_count = count.clone();
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/code/sandbox/tool-calls/claims"))
+        .respond_with(move |_:&wiremock::Request| {
+            let index=claims_count.fetch_add(1,Ordering::SeqCst);
+            let calls=match index {
+                0=>json!([{"call_uuid":first,"attempt":1,"tool":"bash","state":"dispatched","deadline_at":chrono::Utc::now()+chrono::Duration::seconds(60),"input":{"command":"test -n \"$http_proxy\" && test \"$http_proxy\" = \"$https_proxy\" && test \"$http_proxy\" != http://127.0.0.1:1 && test \"$NO_PROXY\" != '*' && test -f \"$SSL_CERT_FILE\" && printf '%s|%s|%s|%s|%s|%s' \"$PWD\" \"$RUNTIME_MCP_PROCESS_VALUE\" \"$RUNTIME_MCP_TEST_VALUE\" \"$RUNTIME_MCP_CONFIG_VALUE\" \"$RUNTIME_MCP_STARTUP_VALUE\" \"$RUNTIME_MCP_SHARED_VALUE\""}}]),
+                1=>json!([{"call_uuid":second,"attempt":1,"tool":"bash","state":"dispatched","deadline_at":chrono::Utc::now()+chrono::Duration::seconds(60),"input":{"command":"trap 'touch stopped; exit 0' TERM; touch ready; sleep 30"}}]),
+                _=>json!([]),
+            };
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({"calls":calls}))
+        }).mount(&proxy_server).await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path_regex("/v1/code/sandbox/tool-calls/.*/events"))
+        .respond_with(|request:&wiremock::Request| {
+            let id=request.url.path().split('/').nth(5).unwrap();
+            wiremock::ResponseTemplate::new(200).set_body_json(json!({"call_uuid":id,"attempt":1,"tool":"bash","state":"running","deadline_at":chrono::Utc::now()+chrono::Duration::seconds(60)}))
+        }).mount(&proxy_server).await;
+    wiremock::Mock::given(wiremock::matchers::method("PUT"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .mount(&proxy_server)
+        .await;
     let cancellation = CancellationToken::new();
     let run_token = cancellation.clone();
     let task = tokio::spawn(async move { manager.run(&run_token).await });
-    let url = format!("http://127.0.0.1:{port}/mcp");
-    let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bash","arguments":{"command":"test -n \"$http_proxy\" && test \"$http_proxy\" = \"$https_proxy\" && test \"$http_proxy\" != http://127.0.0.1:1 && test \"$NO_PROXY\" != '*' && test -f \"$SSL_CERT_FILE\" && printf '%s|%s|%s|%s|%s|%s' \"$PWD\" \"$RUNTIME_MCP_PROCESS_VALUE\" \"$RUNTIME_MCP_TEST_VALUE\" \"$RUNTIME_MCP_CONFIG_VALUE\" \"$RUNTIME_MCP_STARTUP_VALUE\" \"$RUNTIME_MCP_SHARED_VALUE\""},"_meta":mcp_server::protocol::request_meta()}});
-    let client = reqwest::Client::new();
-    let response = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let result = client
-                .post(&url)
-                .header("host", "sandbox.external.example")
-                .header("accept", "application/json, text/event-stream")
-                .header("mcp-protocol-version", "2026-07-28")
-                .header("mcp-method", "tools/call")
-                .header("mcp-name", "bash")
-                .json(&request)
-                .send()
-                .await;
-            if let Ok(response) = result {
-                break response;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(response.status().is_success());
-    let text = response.text().await.unwrap();
-    let result: serde_json::Value = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .find_map(|data| {
-            serde_json::from_str::<serde_json::Value>(data)
-                .ok()
-                .filter(|value| value.get("result").is_some())
-        })
-        .expect("SSE tool result");
-    let stdout = result["result"]["structuredContent"]["stdout"].clone();
-    let mut long_request = request.clone();
-    long_request["id"] = json!(2);
-    long_request["params"]["arguments"]["command"] =
-        json!("trap 'touch stopped; exit 0' TERM; touch ready; sleep 30");
-    long_request["params"]["_meta"]["progressToken"] = json!(2);
-    let active = client
-        .post(&url)
-        .header("host", "sandbox.external.example")
-        .header("accept", "application/json, text/event-stream")
-        .header("mcp-protocol-version", "2026-07-28")
-        .header("mcp-method", "tools/call")
-        .header("mcp-name", "bash")
-        .json(&long_request)
-        .send()
-        .await
-        .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while !home.path().join("ready").exists() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
@@ -1384,17 +1357,14 @@ async fn runtime_mcp_starts_in_skip_mode_and_stops_with_manager() {
         .unwrap()
         .unwrap()
         .unwrap();
-    let _listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
-        .await
-        .expect("manager released MCP listener");
-    let _ = active.text().await;
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while !home.path().join("stopped").exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("shutdown cancelled the active Bash process group");
+    let requests = proxy_server.received_requests().await.unwrap();
+    let result = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .unwrap();
+    let result: serde_json::Value = serde_json::from_slice(&result.body).unwrap();
+    let stdout = result["structuredContent"]["stdout"].clone();
+    assert!(home.path().join("stopped").exists());
     assert_eq!(
         stdout,
         format!(
@@ -1404,69 +1374,4 @@ async fn runtime_mcp_starts_in_skip_mode_and_stops_with_manager() {
     );
     assert!(std::env::var_os("RUNTIME_MCP_STARTUP_VALUE").is_none());
     assert!(!executor.execute_called.load(Ordering::SeqCst));
-}
-
-#[tokio::test]
-async fn runtime_mcp_bind_failure_prevents_executor_creation() {
-    if !crate::internal::enter_isolated_process_test(concat!(
-        module_path!(),
-        "::runtime_mcp_bind_failure_prevents_executor_creation"
-    )) {
-        return;
-    }
-    let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
-    let home = TempDir::new().unwrap();
-    let mut restore = configure_process_environment(&home);
-    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    restore.set(
-        "ENVRUNNER_RUNTIME_MCP_ADDR",
-        occupied.local_addr().unwrap().to_string(),
-    );
-    let (mut manager, _, factory_call) = new_manager_for_test(
-        "fake",
-        fake_environment(None),
-        SessionMode::SetupOnly,
-        true,
-        None,
-    );
-    let error = manager.run(&CancellationToken::new()).await.unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("failed to start runtime MCP server")
-    );
-    assert!(factory_call.lock().unwrap().session_id.is_empty());
-}
-
-#[tokio::test]
-async fn runtime_mcp_stops_when_executor_factory_fails() {
-    if !crate::internal::enter_isolated_process_test(concat!(
-        module_path!(),
-        "::runtime_mcp_stops_when_executor_factory_fails"
-    )) {
-        return;
-    }
-    let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
-    let home = TempDir::new().unwrap();
-    let mut restore = configure_process_environment(&home);
-    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = reservation.local_addr().unwrap();
-    drop(reservation);
-    restore.set("ENVRUNNER_RUNTIME_MCP_ADDR", address.to_string());
-    let (mut manager, _, _) = new_manager_for_test(
-        "fake",
-        fake_environment(None),
-        SessionMode::SetupOnly,
-        true,
-        None,
-    );
-    manager.executor_factory = Arc::new(move |_, _, _, _, _, _, _, _| {
-        std::net::TcpStream::connect(address).expect("MCP starts before executor creation");
-        Err(Box::new(std::io::Error::other("factory failed")) as BoxError)
-    });
-    let error = manager.run(&CancellationToken::new()).await.unwrap_err();
-    assert!(error.to_string().contains("factory failed"));
-    let _listener = tokio::net::TcpListener::bind(address)
-        .await
-        .expect("error path released MCP listener");
 }

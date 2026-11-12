@@ -175,7 +175,10 @@ pub async fn truncate(text: String, tool: &str) -> String {
     if fs::create_dir_all(OUTPUT_DIR).await.is_err()
         || fs::write(&path, text.as_bytes()).await.is_err()
     {
-        return text;
+        return format!(
+            "{}\n\n[Output truncated. Use a narrower path, line range or search pattern.]",
+            text.chars().take(threshold).collect::<String>()
+        );
     }
     let mut preview: String = text.chars().take(2000).collect();
     if let Some(i) = preview.rfind('\n')

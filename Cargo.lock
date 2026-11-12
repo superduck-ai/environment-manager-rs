@@ -679,6 +679,7 @@ dependencies = [
  "hyper-util",
  "insta",
  "libc",
+ "mcp-server",
  "nix",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -692,7 +693,6 @@ dependencies = [
  "prost",
  "prost-build",
  "protoc-bin-vendored",
- "mcp-server",
  "quote",
  "rand 0.9.5",
  "reqwest",
@@ -700,6 +700,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2",
  "syn 2.0.118",
  "tar",
  "tempfile",
@@ -1522,6 +1523,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "mcp-server"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "gif",
+ "image",
+ "image-webp",
+ "jsonschema",
+ "libc",
+ "nix",
+ "rand 0.9.5",
+ "regex",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2126,31 +2152,6 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
-
-[[package]]
-name = "mcp-server"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64 0.22.1",
- "chrono",
- "gif",
- "image",
- "image-webp",
- "jsonschema",
- "libc",
- "nix",
- "rand 0.9.5",
- "regex",
- "reqwest",
- "rmcp",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
-]
 
 [[package]]
 name = "quick-error"
@@ -2764,6 +2765,17 @@ name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
