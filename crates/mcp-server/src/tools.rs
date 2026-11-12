@@ -91,6 +91,7 @@ pub trait Tool: Send + Sync {
     /// 返回完整 MCP 工具声明。
     fn definition(&self) -> Value;
     /// Build a tool-specific failure, preserving any declared output schema.
+    /// 构造该工具的失败结果，并保留其声明的输出 schema。
     fn error_result(&self, message: String) -> ToolResult {
         ToolResult::error(message)
     }
@@ -194,6 +195,7 @@ impl Tool for Builtin {
         }
         definition
     }
+    /// 构造该工具的失败结果，并保留其声明的输出 schema。
     fn error_result(&self, message: String) -> ToolResult {
         if util::string(&self.definition, "name") == "bash" {
             bash::not_started(message)
@@ -261,6 +263,7 @@ impl Tool for Alias {
         d["name"] = json!(self.name);
         d
     }
+    /// 构造该工具的失败结果，并保留其声明的输出 schema。
     fn error_result(&self, message: String) -> ToolResult {
         self.target.error_result(message)
     }

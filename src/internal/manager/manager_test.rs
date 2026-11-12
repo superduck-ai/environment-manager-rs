@@ -1318,6 +1318,7 @@ async fn tool_claims_use_initialized_environment_and_stop_with_manager() {
     startup.api_base_url = proxy_server.uri();
     let first = uuid::Uuid::new_v4().to_string();
     let second = uuid::Uuid::new_v4().to_string();
+    let second_id = second.clone();
     let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let claims_count = count.clone();
     wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -1352,16 +1353,35 @@ async fn tool_claims_use_initialized_environment_and_stop_with_manager() {
     .await
     .unwrap();
     cancellation.cancel();
-    tokio::time::timeout(std::time::Duration::from_secs(7), task)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        super::tool_calls::DRAIN_GRACE
+            + super::tool_calls::ABORT_BUDGET
+            + std::time::Duration::from_secs(2),
+        task,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
     let requests = proxy_server.received_requests().await.unwrap();
     let result = requests
         .iter()
         .find(|request| request.method.as_str() == "PUT")
         .unwrap();
+    let interrupted = requests
+        .iter()
+        .find(|request| {
+            request.method.as_str() == "PUT" && request.url.path().contains(second_id.as_str())
+        })
+        .unwrap();
+    assert_eq!(
+        interrupted.headers.get("Oma-Result-Status").unwrap(),
+        "interrupted"
+    );
+    assert_eq!(
+        interrupted.headers.get("Oma-Result-Reason").unwrap(),
+        "executor_shutdown"
+    );
     let result: serde_json::Value = serde_json::from_slice(&result.body).unwrap();
     let stdout = result["structuredContent"]["stdout"].clone();
     assert!(home.path().join("stopped").exists());

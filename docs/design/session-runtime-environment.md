@@ -58,4 +58,8 @@ relay 区分 CONNECT 与 absolute-form HTTP：前者沿用 TLS 隧道，后者�
 
 Brain 模式 Manager 使用会话 ingress token 主动请求 OMA 的工具领取接口，按空闲槽位领取并最多同时执行 4 个调用。注册表继续提供 Bash、Read、Write、Edit、Grep 和 Glob 的输入校验与执行。started 响应为 running 后，先原子保存 started 标记并同步，再执行工具。结果字节写入 ledger 后按 SHA-256 幂等上报。OMA 只交付 pending 调用，已 running 的调用不会再次交付，因此 Manager 启动领取循环前先扫描 ledger：删除未完成 rename 的临时文件，并按文件名中的调用 UUID 与 attempt 补报每个已保存的结果，补报期间同样发送心跳。上报成功或收到永久拒绝后删除该结果文件；关闭期间未完成的补报保留文件，留待下次启动。started 标记保留，用于拒绝同一调用的重复执行。
 
+started 是提交点：Manager 只有在 started 返回 running 后才启动工具，OMA 可以独立回收提交点之前的调用。结果状态只描述发生了什么：`succeeded`、`failed` 或 `interrupted`，`interrupted` 通过 `Oma-Result-Reason` 给出 `stop_requested`、`deadline` 或 `executor_shutdown`，附带中断前的部分输出。未知工具与输入校验失败直接以 `failed` 上报。
+
+Manager 退出使用排空和中止两个信号：先停止领取并放弃在途领取请求，尚未 started 的调用发送 reject；执行中的调用有 10 秒宽限期自然结束；宽限期后中止进程组，以 `interrupted` + `executor_shutdown` 写入 ledger 并上报，结果末尾追加退出说明；再给 5 秒上报预算，超时后保留 ledger 留待下次启动补报。
+
 心跳与执行 deadline 同时推进，心跳网络等待不会阻止本地停止。收到取消或本地到期后终止进程组，等待退出，再上报包含部分输出的 stopped 结果。Manager 的 HTTP MCP 入口已移除。

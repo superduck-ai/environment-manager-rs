@@ -131,6 +131,7 @@ impl Manager {
         result
     }
 
+    /// 执行一次会话启动流程，Brain 模式下启动工具调用领取循环。
     async fn run_session(
         &mut self,
         cancellation: &CancellationToken,
