@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(super) const DRAIN_GRACE: Duration = Duration::from_secs(10);
 pub(super) const ABORT_BUDGET: Duration = Duration::from_secs(5);
+const CLAIM_BLOCK_MS: u64 = 25_000;
 const SHUTDOWN_NOTE: &str =
     "Sandbox manager shut down before the command finished; the output above may be partial.";
 
@@ -114,11 +115,10 @@ impl Runner {
                 continue;
             }
             let slots = 4 - executions.len();
-            let block_ms = if executions.is_empty() { 25000 } else { 1000 };
             let request = self
                 .client
                 .post(format!(
-                    "{}/claims?block_ms={block_ms}&max={slots}",
+                    "{}/claims?block_ms={CLAIM_BLOCK_MS}&max={slots}",
                     self.endpoint
                 ))
                 .bearer_auth(&self.token)
@@ -128,6 +128,10 @@ impl Runner {
                 response = request => response,
             };
             if let Ok(response) = response {
+                if response.status() == StatusCode::GONE {
+                    tracing::info!("sandbox no longer accepts tool calls; stopping claims");
+                    break;
+                }
                 if response.status().is_success() {
                     if let Ok(claims) = response.json::<Claims>().await {
                         if claims.calls.is_empty() {
@@ -993,5 +997,79 @@ mod tests {
         let completion: Completion =
             serde_json::from_value(json!({"status": "stopped", "body": []})).unwrap();
         assert_eq!(completion.wire(), ("interrupted", Some("stop_requested")));
+    }
+
+    #[tokio::test]
+    async fn retired_sandbox_stops_claiming() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let runner = short_runner(&server, directory.path()).await;
+        Mock::given(method("POST"))
+            .and(path("/claims"))
+            .and(wiremock::matchers::query_param("block_ms", "25000"))
+            .respond_with(ResponseTemplate::new(410))
+            .expect(1)
+            .mount(&server)
+            .await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            runner.claim_loop(CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn busy_manager_keeps_long_polling_for_free_slots() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let runner = short_runner(&server, directory.path()).await;
+        let call = bash_call("touch running; sleep 30", chrono::Duration::seconds(60));
+        mount_events(&server, &call, "running").await;
+        let delivered = std::sync::atomic::AtomicBool::new(false);
+        let first = json!({"calls": [{"call_uuid": call.call_uuid, "attempt": 1, "tool": "bash", "state": "dispatched", "deadline_at": call.deadline_at, "input": call.input}]});
+        Mock::given(method("POST"))
+            .and(path("/claims"))
+            .respond_with(move |_: &wiremock::Request| {
+                if delivered.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"calls": []}))
+                        .set_delay(Duration::from_secs(30))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(first.clone())
+                }
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(runner.clone().claim_loop(cancellation.clone()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !directory.path().join("running").exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let claims: Vec<_> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.url.path() == "/claims")
+            .collect();
+        assert_eq!(claims.len(), 2, "a running call caused short claim polling");
+        assert!(claims[1].url.query().unwrap().contains("block_ms=25000"));
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }
