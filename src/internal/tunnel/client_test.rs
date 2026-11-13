@@ -51,7 +51,7 @@ async fn start_tunnel_server() -> (
     let (header_tx, header_rx) = mpsc::unbounded_channel();
     let (socket_tx, socket_rx) = mpsc::unbounded_channel();
     let router = Router::new().route(
-        "/anthropic.session_ingress.api.v1alpha.TunnelService/Tunnel",
+        "/v2/sandbox/tunnel",
         any(move |headers: HeaderMap, ws: WebSocketUpgrade| {
             let header_tx = header_tx.clone();
             let socket_tx = socket_tx.clone();
@@ -139,7 +139,7 @@ async fn test_tunnel_endpoint_matches_connect_path() {
     .unwrap();
     assert_eq!(
         client.tunnel_endpoint(),
-        "wss://example.com/base/anthropic.session_ingress.api.v1alpha.TunnelService/Tunnel"
+        "wss://example.com/base/v2/sandbox/tunnel"
     );
 }
 

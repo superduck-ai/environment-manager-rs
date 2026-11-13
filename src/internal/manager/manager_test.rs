@@ -1470,3 +1470,106 @@ async fn runtime_mcp_stops_when_executor_factory_fails() {
         .await
         .expect("error path released MCP listener");
 }
+
+/// 构造 brain 模式（跳过 Claude Code）的 manager 并注入记录调用的 tunnel factory。
+fn new_brain_manager_with_tunnel(
+    tunnel: Arc<FakeTunnelClient>,
+    factory_called: Arc<AtomicBool>,
+) -> (Manager, Arc<FakeExecutor>) {
+    let (mut manager, executor, _) = new_manager_for_test(
+        "fake",
+        fake_environment(None),
+        SessionMode::SetupOnly,
+        true,
+        None,
+    );
+    manager.claude_config.as_mut().unwrap().skip_claude_code = true;
+    let factory_tunnel: Arc<dyn TunnelClient> = tunnel;
+    manager.set_tunnel_client_factory(Some(Arc::new(
+        move |_manager, api_base_url, auth_token, _auth_context| {
+            assert_eq!(api_base_url, "https://api.example.com");
+            assert_eq!(auth_token, "session-token");
+            factory_called.store(true, Ordering::SeqCst);
+            Ok(Arc::clone(&factory_tunnel))
+        },
+    )));
+    (manager, executor)
+}
+
+/// 验证 brain 模式未启用 tunnel 时不创建 client，且关闭信号仍正常结束 manager。
+#[tokio::test]
+async fn test_brain_mode_skips_tunnel_when_disabled() {
+    if !crate::internal::enter_isolated_process_test(concat!(
+        module_path!(),
+        "::test_brain_mode_skips_tunnel_when_disabled"
+    )) {
+        return;
+    }
+    let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
+    let home = TempDir::new().expect("create HOME");
+    let _environment_restore = configure_process_environment(&home);
+    let tunnel = Arc::new(FakeTunnelClient {
+        connect_called: AtomicBool::new(false),
+        close_called: AtomicBool::new(false),
+    });
+    let factory_called = Arc::new(AtomicBool::new(false));
+    let (mut manager, executor) =
+        new_brain_manager_with_tunnel(Arc::clone(&tunnel), Arc::clone(&factory_called));
+    let cancellation = CancellationToken::new();
+    let run_token = cancellation.clone();
+    let task = tokio::spawn(async move { manager.run(&run_token).await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    cancellation.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("brain manager stops")
+        .expect("join brain manager")
+        .expect("brain manager run succeeds");
+    assert!(!factory_called.load(Ordering::SeqCst));
+    assert!(!tunnel.connect_called.load(Ordering::SeqCst));
+    assert!(!executor.execute_called.load(Ordering::SeqCst));
+}
+
+/// 验证 brain 模式启用 tunnel 后与关闭信号并发运行，直到进程退出才取消并关闭。
+#[tokio::test]
+async fn test_brain_mode_runs_tunnel_until_shutdown() {
+    if !crate::internal::enter_isolated_process_test(concat!(
+        module_path!(),
+        "::test_brain_mode_runs_tunnel_until_shutdown"
+    )) {
+        return;
+    }
+    let _process_lock = crate::internal::PROCESS_STATE_TEST_LOCK.lock().await;
+    let home = TempDir::new().expect("create HOME");
+    let mut environment_restore = configure_process_environment(&home);
+    environment_restore.set("TUNNEL_ENABLED", "true");
+    let tunnel = Arc::new(FakeTunnelClient {
+        connect_called: AtomicBool::new(false),
+        close_called: AtomicBool::new(false),
+    });
+    let factory_called = Arc::new(AtomicBool::new(false));
+    let (mut manager, executor) =
+        new_brain_manager_with_tunnel(Arc::clone(&tunnel), Arc::clone(&factory_called));
+    let cancellation = CancellationToken::new();
+    let run_token = cancellation.clone();
+    let task = tokio::spawn(async move { manager.run(&run_token).await });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !tunnel.connect_called.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("brain mode starts tunnel");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!task.is_finished(), "tunnel must not end the brain manager");
+    assert!(!tunnel.close_called.load(Ordering::SeqCst));
+    cancellation.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .expect("brain manager stops")
+        .expect("join brain manager")
+        .expect("brain manager run succeeds");
+    assert!(factory_called.load(Ordering::SeqCst));
+    assert!(tunnel.close_called.load(Ordering::SeqCst));
+    assert!(!executor.execute_called.load(Ordering::SeqCst));
+}
