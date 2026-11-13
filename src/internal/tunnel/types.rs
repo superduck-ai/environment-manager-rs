@@ -104,6 +104,22 @@ pub struct Client {
     pub(crate) reader: tokio::sync::Mutex<Option<LocalWebSocketStream>>,
     /// 收到 pong 的最近单调时刻，用于 90 秒存活门禁。
     pub(crate) last_pong_time: Mutex<std::time::Instant>,
+    /// 当前连接协商出的每流发送额度。
+    pub(crate) flow_control: super::flow::FlowControl,
+    /// 流控模式下每个本地 WebSocket 的写队列；读循环只入队，不等待本地写入。
+    pub(crate) local_ws_queues: Mutex<BTreeMap<String, super::local_ws::LocalWsQueue>>,
+    /// 收到的入站帧计数（数据帧与 pong），供时钟跳变探测判断连接是否仍然存活。
+    pub(crate) inbound_frames: std::sync::atomic::AtomicU64,
+    /// 时钟跳变探测失败后置位，使下一次重连跳过退避；读取即清。
+    pub(crate) skip_reconnect_backoff: std::sync::atomic::AtomicBool,
+    /// 墙上时钟来源；测试注入以模拟进程冻结后的时间跳变。
+    pub(crate) wall_clock: Arc<dyn Fn() -> std::time::SystemTime + Send + Sync>,
+    /// 时钟跳变探测的 tick 间隔。
+    pub(crate) clock_jump_tick: std::time::Duration,
+    /// 判定时间跳变后等待任意入站帧的时限。
+    pub(crate) clock_jump_probe_timeout: std::time::Duration,
+    /// 流控模式下单次写入的超时；未协商流控时用 `WEBSOCKET_WRITE_TIMEOUT`。
+    pub(crate) flow_controlled_write_timeout: std::time::Duration,
 }
 
 /// HTTP Tunnel 响应适配器；空 request ID 会回填请求侧 ID。
