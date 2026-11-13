@@ -38,6 +38,21 @@ target/docker-linux-arm64/aarch64-unknown-linux-gnu/release/environment-manager
 
 该 GNU 可执行文件要求目标系统提供 glibc 2.34 或更新版本及所需动态库。缓存配置、验证和产物提升流程见 [Linux ARM64 构建与发布指南](scripts/linux-arm64/README.md)。
 
+## 独立于沙箱镜像升级
+
+Open Managed Agents 可以在不重建沙箱镜像的情况下替换 Manager。将发布产物（例如 `dist/environment-manager_linux_arm64` 及其 `.sha256`）交给 OMA 的 `environment_runner.manager_artifact`：
+
+```yaml
+environment_runner:
+  manager_artifact:
+    path: /srv/oma/environment-manager_linux_arm64
+    # 或使用 url，此时 sha256 必填：
+    # url: https://artifacts.example.com/environment-manager_linux_arm64
+    # sha256: <environment-manager_linux_arm64.sha256 中的值>
+```
+
+OMA 的 Runner 在每次新建或恢复（`--session-mode resume-cached`）Sandbox、执行 `provision-packages` 和 `task-run` 之前，把该二进制上传到 `/tmp/oma/environment-manager/<sha256>/environment-manager`，校验 SHA-256，并以 `--version` 做冒烟检查，然后用它替代镜像内的 `/usr/local/bin/environment-manager`。使用 `path` 时原子替换文件即可让后续 Sandbox 使用新版本。产物架构必须与 Sandbox 一致，`--version` 必须在没有其他参数时以 0 退出。完整合同见 OMA 的 `docs/design/be/e2b-sandbox-image-contract.md`。
+
 ## 使用方式
 
 可执行文件名为 `environment-manager`，帮助信息和补全脚本使用兼容的命令名 `environment-runner`。
