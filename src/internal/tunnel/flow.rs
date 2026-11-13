@@ -2,8 +2,8 @@
 //!
 //! 握手双方都声明 `flow-control-v1` 后启用：每个流（HTTP request ID 或 WebSocket
 //! tunnel ID）初始拥有 1 MiB 发送额度，发送 `http_chunk` / `ws_message` 前等待额度大于
-//! 零，发送后扣除整帧数据长度（允许透支一帧）。服务端消费后通过 `window_update` 归还
-//! 额度。未协商时所有操作立即返回，行为与旧协议一致。
+//! 零，发送后扣除 `data.len() + 64`（即 `frame_cost`，允许透支一帧）。服务端消费后
+//! 通过 `window_update` 归还额度。未协商时所有操作立即返回，行为与旧协议一致。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -89,8 +89,8 @@ impl FlowControl {
     }
 
     /// 切换到新连接：关闭并清空旧连接的全部额度，唤醒仍在等待的发送方。
-    pub(crate) fn reset(&self, enabled: bool) {
-        self.enabled.store(enabled, Ordering::SeqCst);
+    pub(crate) fn begin_connection(&self, flow_control: bool) {
+        self.enabled.store(flow_control, Ordering::SeqCst);
         let drained = std::mem::take(&mut *self.lock_streams());
         for credit in drained.into_values() {
             credit.close();

@@ -25,7 +25,7 @@ pub(crate) enum LocalWsItem {
 }
 
 /// 一个本地 WebSocket 的写队列句柄。
-pub(crate) struct LocalWsWriter {
+pub(crate) struct LocalWsQueue {
     /// 入队端；丢弃后写任务在排空队列后结束。
     pub(crate) sender: mpsc::UnboundedSender<LocalWsItem>,
     /// 已收到但尚未通过 `window_update` 归还的字节数。
@@ -35,7 +35,8 @@ pub(crate) struct LocalWsWriter {
 impl Client {
     /// 流控模式下把服务端消息放入对应 tunnel 的写队列，不等待本地写入。
     ///
-    /// 服务端在额度耗尽后仍发送视为协议错误：只关闭该 tunnel 并回报 `ws_error`。
+    /// 服务端在额度耗尽后仍发送视为协议错误：只关闭该 tunnel 并回报 `ws_close`
+    /// （1008，`flow control window exceeded`）。
     pub(crate) fn enqueue_local_ws_message(
         self: &Arc<Self>,
         cancellation: &CancellationToken,
@@ -43,11 +44,11 @@ impl Client {
     ) {
         let tunnel_id = message.tunnel_id.clone();
         let cost = frame_cost(message.data.len());
-        let (sender, unacknowledged) = self.local_ws_writer(cancellation, &tunnel_id);
+        let (sender, unacknowledged) = self.local_ws_queue(cancellation, &tunnel_id);
         if unacknowledged.fetch_add(cost, Ordering::SeqCst) >= FLOW_CONTROL_WINDOW {
             tracing::error!("tunnel_id" = ?(tunnel_id.clone()), "{}", "ws_tunnel_flow_control_violation");
-            self.remove_local_ws_writer(&tunnel_id);
-            self.flow.close(&tunnel_id);
+            self.remove_local_ws_queue(&tunnel_id);
+            self.flow_control.close(&tunnel_id);
             let close = WsTunnelClose {
                 tunnel_id,
                 code: 1008,
@@ -70,7 +71,7 @@ impl Client {
     /// 流控模式下把关闭请求排在已入队消息之后；没有写队列时返回 `false`。
     pub(crate) fn enqueue_local_ws_close(&self, message: WsTunnelClose) -> bool {
         let writer = self
-            .ws_writers
+            .local_ws_queues
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&message.tunnel_id);
@@ -81,21 +82,21 @@ impl Client {
     }
 
     /// 丢弃 tunnel 的写队列句柄；写任务排空后自然结束。
-    pub(crate) fn remove_local_ws_writer(&self, tunnel_id: &str) {
-        self.ws_writers
+    pub(crate) fn remove_local_ws_queue(&self, tunnel_id: &str) {
+        self.local_ws_queues
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(tunnel_id);
     }
 
     /// 返回已有写队列，或创建队列并启动写任务。
-    fn local_ws_writer(
+    fn local_ws_queue(
         self: &Arc<Self>,
         cancellation: &CancellationToken,
         tunnel_id: &str,
     ) -> (mpsc::UnboundedSender<LocalWsItem>, Arc<AtomicI64>) {
         let mut writers = self
-            .ws_writers
+            .local_ws_queues
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(writer) = writers.get(tunnel_id) {
@@ -105,7 +106,7 @@ impl Client {
         let unacknowledged = Arc::new(AtomicI64::new(0));
         writers.insert(
             tunnel_id.to_owned(),
-            LocalWsWriter {
+            LocalWsQueue {
                 sender: sender.clone(),
                 unacknowledged: Arc::clone(&unacknowledged),
             },
@@ -117,7 +118,7 @@ impl Client {
         let task_unacknowledged = Arc::clone(&unacknowledged);
         tokio::spawn(async move {
             client
-                .run_local_ws_writer(
+                .run_local_ws_queue(
                     task_cancellation,
                     task_tunnel_id,
                     receiver,
@@ -129,7 +130,7 @@ impl Client {
     }
 
     /// 依次写出队列中的消息与关闭帧，并按写出量回 `window_update`。
-    async fn run_local_ws_writer(
+    async fn run_local_ws_queue(
         self: Arc<Self>,
         cancellation: CancellationToken,
         tunnel_id: String,
@@ -148,7 +149,7 @@ impl Client {
                         .send_message_with_timeout(
                             &cancellation,
                             message,
-                            self.local_ws_write_timeout,
+                            self.flow_controlled_write_timeout,
                         )
                         .await
                     {
@@ -181,7 +182,7 @@ impl Client {
                 }
             }
         }
-        self.remove_local_ws_writer(&tunnel_id);
+        self.remove_local_ws_queue(&tunnel_id);
     }
 
     /// 本地写失败或超时后通知服务端：以 1011 关闭该流，并结束其额度与写队列。
@@ -189,8 +190,8 @@ impl Client {
     /// 写失败时 `WsHandler` 已从 registry 移除并取消本地连接，这里负责让调用方立即
     /// 得到明确的关闭，而不是悬挂到自身超时。
     pub(crate) async fn report_local_ws_write_failure(&self, tunnel_id: &str, error: &TunnelError) {
-        self.flow.close(tunnel_id);
-        self.remove_local_ws_writer(tunnel_id);
+        self.flow_control.close(tunnel_id);
+        self.remove_local_ws_queue(tunnel_id);
         let detail = error.to_string();
         let reason = if detail.contains("timed out") {
             "local websocket write timed out"

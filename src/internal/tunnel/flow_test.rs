@@ -1,4 +1,4 @@
-//! 每流流控、本地 WebSocket 写队列、重连退避与冻结探测测试。
+//! 每流流控、本地 WebSocket 写队列、重连退避与时钟跳变探测测试。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -176,7 +176,7 @@ async fn chunk_bytes_within(socket: &mut WebSocket, request_id: &str, wait: Dura
 #[tokio::test]
 async fn test_flow_control_acquire_fails_when_stream_closed_or_reset() {
     let flow = FlowControl::default();
-    flow.reset(true);
+    flow.begin_connection(true);
     assert!(flow.acquire("unknown", 1).await.is_err());
     flow.open("closed");
     flow.acquire("closed", usize::try_from(FLOW_CONTROL_WINDOW).unwrap())
@@ -197,18 +197,18 @@ async fn test_flow_control_acquire_fails_when_stream_closed_or_reset() {
     let waiting = Arc::clone(&flow);
     let waiter = tokio::spawn(async move { waiting.acquire("reset", 1).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    flow.reset(true);
+    flow.begin_connection(true);
     assert!(waiter.await.unwrap().is_err());
 }
 
 #[tokio::test]
 async fn test_flow_control_waits_for_window_update() {
     let flow = Arc::new(FlowControl::default());
-    flow.reset(false);
+    flow.begin_connection(false);
     flow.acquire("legacy", 10 * 1024 * 1024).await.unwrap();
     flow.acquire("legacy", 10 * 1024 * 1024).await.unwrap();
 
-    flow.reset(true);
+    flow.begin_connection(true);
     flow.open("stream");
     flow.acquire(
         "stream",
@@ -268,7 +268,7 @@ async fn test_legacy_server_does_not_limit_chunks() {
         headers.get("x-tunnel-capabilities").unwrap(),
         "flow-control-v1"
     );
-    assert!(!client.flow.is_enabled());
+    assert!(!client.flow_control.is_enabled());
     let (cancellation, run) = run_client(&client);
     send_request(&mut socket, http_request("legacy", target_port, "/big")).await;
     let received = chunk_bytes_within(&mut socket, "legacy", Duration::from_millis(800)).await;
@@ -283,7 +283,7 @@ async fn test_legacy_server_does_not_limit_chunks() {
 async fn test_http_chunks_stop_at_window_until_window_update() {
     let (target_port, target) = streaming_target(4 * 1024 * 1024).await;
     let (client, mut socket, _headers, server) = connected_client(true, Vec::new()).await;
-    assert!(client.flow.is_enabled());
+    assert!(client.flow_control.is_enabled());
     let (cancellation, run) = run_client(&client);
     send_request(&mut socket, http_request("bounded", target_port, "/big")).await;
     let first = chunk_bytes_within(&mut socket, "bounded", Duration::from_millis(500)).await;
@@ -415,8 +415,8 @@ fn jumping_clock(offset: Arc<AtomicU64>) -> ClientOption {
         client.wall_clock = Arc::new(move || {
             SystemTime::now() + Duration::from_secs(offset.load(Ordering::SeqCst))
         });
-        client.freeze_tick = Duration::from_millis(50);
-        client.freeze_probe_timeout = Duration::from_millis(300);
+        client.clock_jump_tick = Duration::from_millis(50);
+        client.clock_jump_probe_timeout = Duration::from_millis(300);
     })
 }
 
@@ -430,8 +430,8 @@ async fn test_clock_jump_without_inbound_frame_requests_immediate_reconnect() {
     offset.store(60, Ordering::SeqCst);
     let result = timeout(Duration::from_secs(3), run).await.unwrap().unwrap();
     let error = result.unwrap_err().to_string();
-    assert!(error.contains("process freeze"), "{error}");
-    assert!(client.reconnect_immediately.load(Ordering::SeqCst));
+    assert!(error.contains("lost after clock jump"), "{error}");
+    assert!(client.skip_reconnect_backoff.load(Ordering::SeqCst));
     server.abort();
 }
 
@@ -449,7 +449,7 @@ async fn test_clock_jump_with_live_connection_keeps_running() {
         !run.is_finished(),
         "live connection was dropped after a clock jump"
     );
-    assert!(!client.reconnect_immediately.load(Ordering::SeqCst));
+    assert!(!client.skip_reconnect_backoff.load(Ordering::SeqCst));
     cancellation.cancel();
     let _ = run.await;
     reader.abort();
@@ -466,7 +466,7 @@ fn test_frame_cost_charges_fixed_overhead_for_every_frame() {
 #[tokio::test]
 async fn test_zero_length_frames_consume_credit() {
     let flow = Arc::new(FlowControl::default());
-    flow.reset(true);
+    flow.begin_connection(true);
     flow.open("empty");
     let frames = FLOW_CONTROL_WINDOW / FLOW_CONTROL_FRAME_OVERHEAD;
     for _ in 0..frames {
@@ -498,7 +498,7 @@ async fn open_local_websocket(
 ) {
     let (local_port, received, local) = local_websocket_server().await;
     let option: ClientOption = Box::new(move |client: &mut Client| {
-        client.local_ws_write_timeout = write_timeout;
+        client.flow_controlled_write_timeout = write_timeout;
     });
     let (client, mut socket, _headers, server) = connected_client(true, vec![option]).await;
     let (cancellation, run) = run_client(&client);

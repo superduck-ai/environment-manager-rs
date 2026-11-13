@@ -1471,8 +1471,8 @@ async fn runtime_mcp_stops_when_executor_factory_fails() {
         .expect("error path released MCP listener");
 }
 
-/// 构造 brain 模式（跳过 Claude Code）的 manager 并注入记录调用的 tunnel factory。
-fn new_brain_manager_with_tunnel(
+/// 构造 skip_claude_code 模式（即 brain，`ENVRUNNER_SKIP_CLAUDE_CODE`）的 manager 并注入记录调用的 tunnel factory。
+fn new_skip_claude_code_manager_with_tunnel(
     tunnel: Arc<FakeTunnelClient>,
     factory_called: Arc<AtomicBool>,
 ) -> (Manager, Arc<FakeExecutor>) {
@@ -1496,12 +1496,12 @@ fn new_brain_manager_with_tunnel(
     (manager, executor)
 }
 
-/// 验证 brain 模式未启用 tunnel 时不创建 client，且关闭信号仍正常结束 manager。
+/// 验证 skip_claude_code 模式未启用 tunnel 时不创建 client，且关闭信号仍正常结束 manager。
 #[tokio::test]
-async fn test_brain_mode_skips_tunnel_when_disabled() {
+async fn test_skip_claude_code_mode_skips_tunnel_when_disabled() {
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::test_brain_mode_skips_tunnel_when_disabled"
+        "::test_skip_claude_code_mode_skips_tunnel_when_disabled"
     )) {
         return;
     }
@@ -1514,7 +1514,7 @@ async fn test_brain_mode_skips_tunnel_when_disabled() {
     });
     let factory_called = Arc::new(AtomicBool::new(false));
     let (mut manager, executor) =
-        new_brain_manager_with_tunnel(Arc::clone(&tunnel), Arc::clone(&factory_called));
+        new_skip_claude_code_manager_with_tunnel(Arc::clone(&tunnel), Arc::clone(&factory_called));
     let cancellation = CancellationToken::new();
     let run_token = cancellation.clone();
     let task = tokio::spawn(async move { manager.run(&run_token).await });
@@ -1522,20 +1522,20 @@ async fn test_brain_mode_skips_tunnel_when_disabled() {
     cancellation.cancel();
     tokio::time::timeout(std::time::Duration::from_secs(10), task)
         .await
-        .expect("brain manager stops")
-        .expect("join brain manager")
-        .expect("brain manager run succeeds");
+        .expect("skip_claude_code manager stops")
+        .expect("join skip_claude_code manager")
+        .expect("skip_claude_code manager run succeeds");
     assert!(!factory_called.load(Ordering::SeqCst));
     assert!(!tunnel.connect_called.load(Ordering::SeqCst));
     assert!(!executor.execute_called.load(Ordering::SeqCst));
 }
 
-/// 验证 brain 模式启用 tunnel 后与关闭信号并发运行，直到进程退出才取消并关闭。
+/// 验证 skip_claude_code 模式启用 tunnel 后与关闭信号并发运行，直到进程退出才取消并关闭。
 #[tokio::test]
-async fn test_brain_mode_runs_tunnel_until_shutdown() {
+async fn test_skip_claude_code_mode_runs_tunnel_until_shutdown() {
     if !crate::internal::enter_isolated_process_test(concat!(
         module_path!(),
-        "::test_brain_mode_runs_tunnel_until_shutdown"
+        "::test_skip_claude_code_mode_runs_tunnel_until_shutdown"
     )) {
         return;
     }
@@ -1549,7 +1549,7 @@ async fn test_brain_mode_runs_tunnel_until_shutdown() {
     });
     let factory_called = Arc::new(AtomicBool::new(false));
     let (mut manager, executor) =
-        new_brain_manager_with_tunnel(Arc::clone(&tunnel), Arc::clone(&factory_called));
+        new_skip_claude_code_manager_with_tunnel(Arc::clone(&tunnel), Arc::clone(&factory_called));
     let cancellation = CancellationToken::new();
     let run_token = cancellation.clone();
     let task = tokio::spawn(async move { manager.run(&run_token).await });
@@ -1559,16 +1559,19 @@ async fn test_brain_mode_runs_tunnel_until_shutdown() {
         }
     })
     .await
-    .expect("brain mode starts tunnel");
+    .expect("skip_claude_code mode starts tunnel");
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(!task.is_finished(), "tunnel must not end the brain manager");
+    assert!(
+        !task.is_finished(),
+        "tunnel must not end the skip_claude_code manager"
+    );
     assert!(!tunnel.close_called.load(Ordering::SeqCst));
     cancellation.cancel();
     tokio::time::timeout(std::time::Duration::from_secs(10), task)
         .await
-        .expect("brain manager stops")
-        .expect("join brain manager")
-        .expect("brain manager run succeeds");
+        .expect("skip_claude_code manager stops")
+        .expect("join skip_claude_code manager")
+        .expect("skip_claude_code manager run succeeds");
     assert!(factory_called.load(Ordering::SeqCst));
     assert!(tunnel.close_called.load(Ordering::SeqCst));
     assert!(!executor.execute_called.load(Ordering::SeqCst));
