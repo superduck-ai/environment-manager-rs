@@ -292,6 +292,10 @@ pub async fn run(
     for (k, v) in env {
         merged.insert(k.into(), v.into());
     }
+    if let Some((call_id, call_uuid)) = crate::execution::current_tool_identity() {
+        merged.insert("OMA_TOOL_CALL_ID".into(), call_id.into());
+        merged.insert("OMA_TOOL_CALL_UUID".into(), call_uuid.into());
+    }
     use std::os::unix::ffi::OsStrExt;
     if merged
         .iter()
@@ -451,7 +455,7 @@ pub async fn run(
             reason = "[cancelled; process group terminated]".into();
             execution_status = ExecutionStatus::Cancelled;
         },
-        _ = tokio::time::sleep(Duration::from_secs(timeout)) => {
+        _ = crate::execution::execution_timeout(Duration::from_secs(timeout)) => {
             if on_timeout == "background" {
                 crate::logging::info("bash: command continues in background", &[("pid", &pid.to_string()), ("output_file", &output.to_string_lossy()), ("waited_seconds", &timeout.to_string())]);
                 let preview = tail(&output, 2000).await.map(|(text, _)| if text.is_empty() { "(no output yet)".into() } else { text }).unwrap_or_else(|e| format!("(output not readable: {e})"));

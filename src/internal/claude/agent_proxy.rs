@@ -394,6 +394,29 @@ async fn handle_connection_with_handshake_timeout(
     let Some(request) = read_connect_request(&mut client_stream, cancellation).await? else {
         return Ok(());
     };
+    let _oauth_wait = if request.target == "http://oma.internal/oauth" {
+        let header = request
+            .http_head
+            .as_deref()
+            .unwrap_or("")
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("X-OMA-Tool-Call")
+                    .then(|| value.trim())
+            });
+        let wait = header
+            .and_then(crate::internal::mcp::servers::runtime_tools::execution::pause_running_tool);
+        if wait.is_none() {
+            client_stream
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await?;
+            return Ok(());
+        }
+        wait
+    } else {
+        None
+    };
     // websocket_url: wss://api.example.com/v1/code/upstreamproxy/ws
     let websocket_request = config.build_websocket_request()?;
     let websocket_config = WebSocketConfig::default()

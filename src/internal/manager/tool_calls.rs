@@ -17,6 +17,8 @@ const SHUTDOWN_NOTE: &str =
 #[derive(Clone, Deserialize)]
 struct Call {
     call_uuid: String,
+    #[serde(default)]
+    call_id: String,
     attempt: u32,
     tool: String,
     #[serde(default)]
@@ -216,6 +218,7 @@ impl Runner {
                 continue;
             };
             calls.push(Call {
+                call_id: String::new(),
                 call_uuid: call_uuid.to_owned(),
                 attempt,
                 tool: String::new(),
@@ -320,12 +323,16 @@ impl Runner {
             .sync_all()
             .await?;
         let cancellation = signals.abort.child_token();
-        let execution = tool.handle(cancellation.clone(), call.input.clone());
+        let clock = crate::internal::mcp::servers::runtime_tools::execution::ToolClock::for_call(
+            call.call_id.clone(),
+            call.call_uuid.clone(),
+        );
+        let execution = clock.scope(tool.handle(cancellation.clone(), call.input.clone()));
         tokio::pin!(execution);
         let delay = (accepted.deadline_at - Utc::now())
             .to_std()
             .unwrap_or_default();
-        let deadline = tokio::time::sleep(delay);
+        let deadline = clock.sleep(delay);
         tokio::pin!(deadline);
         let heartbeat = self.heartbeat(&call, &cancellation);
         tokio::pin!(heartbeat);
@@ -508,6 +515,7 @@ mod tests {
         let server = MockServer::start().await;
         let directory = tempfile::tempdir().unwrap();
         let call = Call {
+            call_id: "test-call".into(),
             call_uuid: uuid::Uuid::new_v4().to_string(),
             attempt: 1,
             tool: "bash".into(),
@@ -617,6 +625,7 @@ mod tests {
         let server = MockServer::start().await;
         let directory = tempfile::tempdir().unwrap();
         let call = Call {
+            call_id: "test-call".into(),
             call_uuid: uuid::Uuid::new_v4().to_string(),
             attempt: 1,
             tool: "bash".into(),
@@ -662,6 +671,7 @@ mod tests {
 
     fn saved_call() -> Call {
         Call {
+            call_id: "test-call".into(),
             call_uuid: uuid::Uuid::new_v4().to_string(),
             attempt: 2,
             tool: "bash".into(),
@@ -798,6 +808,7 @@ mod tests {
 
     fn bash_call(command: &str, deadline: chrono::Duration) -> Call {
         Call {
+            call_id: "test-call".into(),
             call_uuid: uuid::Uuid::new_v4().to_string(),
             attempt: 1,
             tool: "bash".into(),
