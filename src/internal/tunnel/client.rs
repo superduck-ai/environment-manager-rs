@@ -39,8 +39,9 @@ use super::{
     WsTunnelOpened, new_handler, new_ws_handler, tunnel_request, tunnel_response,
 };
 
-/// 不能改为普通 `/ws` 路径。
-const TUNNEL_SERVICE_PATH: &str = "/anthropic.session_ingress.api.v1alpha.TunnelService/Tunnel";
+/// 端口隧道 WebSocket 路径，必须与 oma-server 的 `porttunnel.Path` 一致；放在 `/v2` 下，
+/// 只按 `/v1`、`/v2` 前缀转发到 oma-server 的入口也能到达。
+const TUNNEL_PATH: &str = "/v2/sandbox/tunnel";
 /// 后端 WebSocket 握手超时。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 读循环每次等待下一帧的最长时间。
@@ -52,7 +53,18 @@ const PONG_TIMEOUT: Duration = Duration::from_secs(90);
 /// 单次响应、ping 或 close frame 写入上限。
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 重连退避上限。
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// 重连退避起点；连接成功建立过之后，下一次断开从这里重新开始。
+const MIN_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// 流控模式下单次写入的超时；未协商流控时用 `WEBSOCKET_WRITE_TIMEOUT`。
+/// 写入已不在读循环中，与网关写调用方的 30 秒对称。
+const FLOW_CONTROLLED_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 时钟跳变探测的 tick 间隔。
+const CLOCK_JUMP_TICK: Duration = Duration::from_secs(1);
+/// 相邻 tick 的墙上时钟差超过该值视为时钟跳变（可能是进程冻结、NTP 校时等）。
+const CLOCK_JUMP_THRESHOLD: Duration = Duration::from_secs(5);
+/// 检测到时钟跳变后等待任意入站帧的时限。
+const CLOCK_JUMP_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 代理 CONNECT 响应 header 的最大尺寸，防止错误代理无界占用内存。
 const MAX_PROXY_RESPONSE_HEADER: usize = 64 * 1024;
 /// `httparse` 需要调用方提供 header 槽位；代理握手不使用这些字段，只需设置合理上限。
@@ -117,6 +129,14 @@ pub fn new_client(
         writer: tokio::sync::Mutex::new(None),
         reader: tokio::sync::Mutex::new(None),
         last_pong_time: std::sync::Mutex::new(Instant::now()),
+        flow_control: super::flow::FlowControl::default(),
+        local_ws_queues: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        inbound_frames: std::sync::atomic::AtomicU64::new(0),
+        skip_reconnect_backoff: std::sync::atomic::AtomicBool::new(false),
+        wall_clock: Arc::new(std::time::SystemTime::now),
+        clock_jump_tick: CLOCK_JUMP_TICK,
+        clock_jump_probe_timeout: CLOCK_JUMP_PROBE_TIMEOUT,
+        flow_controlled_write_timeout: FLOW_CONTROLLED_WRITE_TIMEOUT,
     };
     for option in options {
         option(&mut client);
@@ -154,12 +174,16 @@ impl Client {
             })?;
             request.headers_mut().insert("x-session-id", value);
         }
+        request.headers_mut().insert(
+            super::flow::CAPABILITIES_HEADER,
+            HeaderValue::from_static(super::flow::FLOW_CONTROL_CAPABILITY),
+        );
 
         let connected = tokio::select! {
             () = cancellation.cancelled() => return Err(TunnelError::message("operation cancelled")),
             result = tokio::time::timeout(CONNECT_TIMEOUT, connect_websocket(request)) => result,
         };
-        let (socket, _response) = match connected {
+        let (socket, response) = match connected {
             Ok(Ok(connected)) => connected,
             Ok(Err(error)) => {
                 return Err(TunnelError::message(format!(
@@ -175,13 +199,15 @@ impl Client {
 
         let (writer, reader) = socket.split();
         self.drop_connection().await;
+        let flow_control = super::flow::response_enables_flow_control(response.headers());
+        self.flow_control.begin_connection(flow_control);
         *self.writer.lock().await = Some(writer);
         *self.reader.lock().await = Some(reader);
         *self
             .last_pong_time
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
-        tracing::info!("session_id" = ?(self.session_id.clone()), "{}", "tunnel_connected");
+        tracing::info!("session_id" = ?(self.session_id.clone()), "flow_control" = ?(flow_control), "{}", "tunnel_connected");
         Ok(())
     }
 
@@ -204,12 +230,14 @@ impl Client {
         let run_cancellation = cancellation.child_token();
         let read = self.read_loop(run_cancellation.clone(), reader);
         let ping = self.ping_loop(run_cancellation.clone());
-        tokio::pin!(read, ping);
+        let clock_jump = self.clock_jump_loop(run_cancellation.clone());
+        tokio::pin!(read, ping, clock_jump);
 
         let result = tokio::select! {
             () = cancellation.cancelled() => Err(TunnelError::message("operation cancelled")),
             result = &mut read => result,
             result = &mut ping => result,
+            result = &mut clock_jump => result,
         };
         run_cancellation.cancel();
         self.close_connection().await;
@@ -217,13 +245,13 @@ impl Client {
     }
 
     ///
-    /// Connect 自身使用指数退避重试；连接运行结束后再使用独立的 1–30 秒抖动退避。
-    /// 只有调用方取消或不可恢复的取消错误才退出该长期循环。
+    /// Connect 自身使用 1–5 秒指数抖动退避重试；连接成功建立过之后，下一次断开从
+    /// 最小延迟重新开始。时钟跳变探测判定连接已失效时跳过退避立即重连。只有调用方取消或
+    /// 不可恢复的取消错误才退出该长期循环。
     pub async fn connect_and_run(
         self: &Arc<Self>,
         cancellation: &CancellationToken,
     ) -> Result<(), TunnelError> {
-        let mut delay = Duration::from_secs(1);
         loop {
             self.connect_with_retries(cancellation).await?;
             let result = self.run(cancellation).await;
@@ -234,13 +262,18 @@ impl Client {
             if let Err(error) = result {
                 tracing::warn!("error" = ?(error.to_string()), "{}", "tunnel_run_failed");
             }
+            if self
+                .skip_reconnect_backoff
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                continue;
+            }
 
-            let wait = add_jitter(delay);
+            let wait = add_jitter(MIN_RETRY_DELAY);
             tokio::select! {
                 () = cancellation.cancelled() => return Err(TunnelError::message("operation cancelled")),
                 () = tokio::time::sleep(wait) => {}
             }
-            delay = std::cmp::min(delay.saturating_mul(2), MAX_RETRY_DELAY);
         }
     }
 
@@ -255,19 +288,15 @@ impl Client {
     #[must_use]
     /// 返回当前 API base URL 派生出的 WebSocket tunnel 端点。
     pub fn tunnel_endpoint(&self) -> String {
-        format!(
-            "{}{}",
-            self.ws_url.trim_end_matches('/'),
-            TUNNEL_SERVICE_PATH
-        )
+        format!("{}{}", self.ws_url.trim_end_matches('/'), TUNNEL_PATH)
     }
 
-    /// 使用 1–30 秒退避持续握手，成功后返回。
+    /// 使用 1–5 秒退避持续握手，成功后返回。
     async fn connect_with_retries(
         &self,
         cancellation: &CancellationToken,
     ) -> Result<(), TunnelError> {
-        let mut delay = Duration::from_secs(1);
+        let mut delay = MIN_RETRY_DELAY;
         loop {
             match self.connect(cancellation).await {
                 Ok(()) => return Ok(()),
@@ -279,7 +308,7 @@ impl Client {
                         () = cancellation.cancelled() => return Err(TunnelError::message("operation cancelled")),
                         () = tokio::time::sleep(wait) => {}
                     }
-                    delay = std::cmp::min(delay.saturating_mul(2), MAX_RETRY_DELAY);
+                    delay = next_retry_delay(delay);
                 }
             }
         }
@@ -298,12 +327,16 @@ impl Client {
     ) -> Result<(), TunnelError> {
         loop {
             let data = read_tunnel_data_message(&cancellation, &mut reader, READ_TIMEOUT, || {
+                self.inbound_frames
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 *self
                     .last_pong_time
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
             })
             .await?;
+            self.inbound_frames
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
             let request = match decode_tunnel_request(&data) {
                 Ok(request) => request,
@@ -374,6 +407,7 @@ impl Client {
                 });
             }
             Some(tunnel_request::Payload::HttpCancel(cancel)) => {
+                self.flow_control.close(&cancel.request_id);
                 self.handle_http_cancel(Ok(cancel));
             }
             Some(tunnel_request::Payload::WsOpen(request)) => {
@@ -383,13 +417,23 @@ impl Client {
                 });
             }
             Some(tunnel_request::Payload::WsMessage(message)) => {
-                self.handle_ws_message(&cancellation, Ok(message)).await;
+                if self.flow_control.is_enabled() {
+                    self.enqueue_local_ws_message(&cancellation, message);
+                } else {
+                    self.handle_ws_message(&cancellation, Ok(message)).await;
+                }
             }
             Some(tunnel_request::Payload::WsClose(message)) => {
-                self.handle_ws_close(&cancellation, Ok(message)).await;
+                self.flow_control.close(&message.tunnel_id);
+                if !self.enqueue_local_ws_close(message.clone()) {
+                    self.handle_ws_close(&cancellation, Ok(message)).await;
+                }
+            }
+            Some(tunnel_request::Payload::WindowUpdate(update)) => {
+                self.flow_control.grant(&update.stream_id, update.bytes);
             }
             None => {
-                tracing::warn!("{}", "tunnel_request_empty_payload");
+                tracing::debug!("{}", "tunnel_request_empty_payload");
             }
         }
     }
@@ -415,6 +459,11 @@ impl Client {
             client: Arc::clone(self),
             request_id: request.request_id.clone(),
         });
+        self.flow_control.open(&request.request_id);
+        let _flow_guard = FlowStreamGuard {
+            client: self,
+            stream_id: request.request_id.clone(),
+        };
         if let Some(registry) = &self.action_registry
             && request.port == 0
             && request.path.starts_with("/__control/")
@@ -482,6 +531,7 @@ impl Client {
             client: Arc::clone(self),
             tunnel_id: request.tunnel_id.clone(),
         });
+        self.flow_control.open(&request.tunnel_id);
         let Some(handler) = &self.ws_handler else {
             let _ = sender
                 .send_error(WsTunnelError {
@@ -522,7 +572,8 @@ impl Client {
         };
         let tunnel_id = message.tunnel_id.clone();
         if let Err(error) = handler.send_message(cancellation, message).await {
-            tracing::error!("tunnel_id" = ?(tunnel_id), "error" = ?(error.to_string()), "{}", "ws_tunnel_message_failed");
+            tracing::error!("tunnel_id" = ?(tunnel_id.clone()), "error" = ?(error.to_string()), "{}", "ws_tunnel_message_failed");
+            self.report_local_ws_write_failure(&tunnel_id, &error).await;
         }
     }
 
@@ -552,7 +603,7 @@ impl Client {
     }
 
     /// 序列化 lowerCamel ProtoJSON 并写入主 Tunnel text frame。
-    async fn send_response(&self, response: TunnelResponse) -> Result<(), TunnelError> {
+    pub(super) async fn send_response(&self, response: TunnelResponse) -> Result<(), TunnelError> {
         let data = encode_protojson(&response)
             .map_err(|error| TunnelError::message(format!("serialize response: {error}")))?;
         let text = String::from_utf8(data)
@@ -568,8 +619,88 @@ impl Client {
     }
 
     /// 关闭主连接并忽略诊断性 close-frame 错误，供运行循环统一清理。
+    ///
+    /// 同时重置流控，唤醒仍在等待额度的发送方，并丢弃本地 WebSocket 写队列。
     async fn close_connection(&self) {
+        self.flow_control.begin_connection(false);
+        self.local_ws_queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         let _ = self.close_web_socket().await;
+    }
+
+    /// 每 tick 比较墙上时钟；相邻两次差值超过阈值时探测连接是否仍然存活。
+    ///
+    /// 探测发出 ping 并要求在时限内收到任何入站帧；收不到则置位跳过退避并返回
+    /// 错误结束本次运行，收到则继续运行，避免把 Docker 冻结后仍存活的连接无谓断开。
+    async fn clock_jump_loop(&self, cancellation: CancellationToken) -> Result<(), TunnelError> {
+        let mut interval = tokio::time::interval(self.clock_jump_tick);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        let mut previous = (self.wall_clock)();
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => return Err(TunnelError::message("operation cancelled")),
+                _ = interval.tick() => {}
+            }
+            let now = (self.wall_clock)();
+            let jumped = now
+                .duration_since(previous)
+                .is_ok_and(|elapsed| elapsed > CLOCK_JUMP_THRESHOLD);
+            if jumped {
+                tracing::info!("session_id" = ?(self.session_id.clone()), "{}", "tunnel_clock_jump_detected");
+                self.probe_after_clock_jump(&cancellation).await?;
+            }
+            previous = (self.wall_clock)();
+        }
+    }
+
+    /// 时钟跳变后发 ping，并在时限内等待计数器变化（任何入站帧都算）。
+    async fn probe_after_clock_jump(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), TunnelError> {
+        let before = self
+            .inbound_frames
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let probe = async {
+            {
+                let mut writer = self.writer.lock().await;
+                let writer = writer
+                    .as_mut()
+                    .ok_or_else(|| TunnelError::message("not connected"))?;
+                writer
+                    .send(Message::Ping(Vec::new().into()))
+                    .await
+                    .map_err(|error| TunnelError::message(format!("write tunnel ping: {error}")))?;
+            }
+            while self
+                .inbound_frames
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == before
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok::<(), TunnelError>(())
+        };
+        let result = tokio::select! {
+            () = cancellation.cancelled() => return Err(TunnelError::message("operation cancelled")),
+            result = tokio::time::timeout(self.clock_jump_probe_timeout, probe) => result,
+        };
+        let reason = match result {
+            Ok(Ok(())) => {
+                tracing::info!("session_id" = ?(self.session_id.clone()), "{}", "tunnel_alive_after_clock_jump");
+                return Ok(());
+            }
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => "no inbound frame after clock jump".to_owned(),
+        };
+        self.skip_reconnect_backoff
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Err(TunnelError::message(format!(
+            "tunnel connection lost after clock jump (possible process freeze): {reason}"
+        )))
     }
 
     /// 发送正常 close frame 后丢弃主连接读写半部。
@@ -615,10 +746,17 @@ impl ResponseSender for HttpResponseSender {
     }
 
     /// 把 HTTP body chunk 包装进 TunnelResponse；空 request ID 自动回填。
+    ///
+    /// 流控启用时先等待该请求的发送额度，额度等待可被 `http_cancel` 与断线打断。
     async fn send_chunk(&self, mut chunk: HttpTunnelResponseChunk) -> Result<(), ActionError> {
         if chunk.request_id.is_empty() {
             chunk.request_id.clone_from(&self.request_id);
         }
+        self.client
+            .flow_control
+            .acquire(&chunk.request_id, chunk.data.len())
+            .await
+            .map_err(|error| Box::new(error) as ActionError)?;
         self.client
             .send_response(TunnelResponse {
                 payload: Some(tunnel_response::Payload::HttpChunk(chunk)),
@@ -656,11 +794,16 @@ impl WsResponseSender for ClientWsResponseSender {
             .map_err(|error| Box::new(error) as WsSenderError)
     }
 
-    /// 包装本地 WS data message 并回填空 tunnel ID。
+    /// 包装本地 WS data message 并回填空 tunnel ID；流控启用时先等待发送额度。
     async fn send_message(&self, mut message: WsTunnelMessage) -> Result<(), WsSenderError> {
         if message.tunnel_id.is_empty() {
             message.tunnel_id.clone_from(&self.tunnel_id);
         }
+        self.client
+            .flow_control
+            .acquire(&message.tunnel_id, message.data.len())
+            .await
+            .map_err(|error| Box::new(error) as WsSenderError)?;
         self.client
             .send_response(TunnelResponse {
                 payload: Some(tunnel_response::Payload::WsMessage(message)),
@@ -669,11 +812,13 @@ impl WsResponseSender for ClientWsResponseSender {
             .map_err(|error| Box::new(error) as WsSenderError)
     }
 
-    /// 包装本地 WS close message 并回填空 tunnel ID。
+    /// 包装本地 WS close message 并回填空 tunnel ID；该流的额度与写队列随之结束。
     async fn send_close(&self, mut message: WsTunnelClose) -> Result<(), WsSenderError> {
         if message.tunnel_id.is_empty() {
             message.tunnel_id.clone_from(&self.tunnel_id);
         }
+        self.client.flow_control.close(&message.tunnel_id);
+        self.client.remove_local_ws_queue(&message.tunnel_id);
         self.client
             .send_response(TunnelResponse {
                 payload: Some(tunnel_response::Payload::WsClose(message)),
@@ -682,11 +827,13 @@ impl WsResponseSender for ClientWsResponseSender {
             .map_err(|error| Box::new(error) as WsSenderError)
     }
 
-    /// 包装本地 WS protocol error 并回填空 tunnel ID。
+    /// 包装本地 WS protocol error 并回填空 tunnel ID；该流的额度与写队列随之结束。
     async fn send_error(&self, mut response: WsTunnelError) -> Result<(), WsSenderError> {
         if response.tunnel_id.is_empty() {
             response.tunnel_id.clone_from(&self.tunnel_id);
         }
+        self.client.flow_control.close(&response.tunnel_id);
+        self.client.remove_local_ws_queue(&response.tunnel_id);
         self.client
             .send_response(TunnelResponse {
                 payload: Some(tunnel_response::Payload::WsError(response)),
@@ -694,6 +841,26 @@ impl WsResponseSender for ClientWsResponseSender {
             .await
             .map_err(|error| Box::new(error) as WsSenderError)
     }
+}
+
+/// HTTP 请求处理结束时释放该请求的流控额度。
+struct FlowStreamGuard<'client> {
+    /// 持有额度表的客户端。
+    client: &'client Client,
+    /// 需要释放的 request ID。
+    stream_id: String,
+}
+
+impl Drop for FlowStreamGuard<'_> {
+    /// 请求结束（含 panic 展开）时关闭该流的额度。
+    fn drop(&mut self) {
+        self.client.flow_control.close(&self.stream_id);
+    }
+}
+
+/// 计算下一次握手重试的基础延迟：翻倍并以 5 秒封顶，抖动由调用方叠加。
+pub(super) fn next_retry_delay(delay: Duration) -> Duration {
+    std::cmp::min(delay.saturating_mul(2), MAX_RETRY_DELAY)
 }
 
 /// 使用进程级代理环境快照建立 WebSocket。
@@ -779,8 +946,8 @@ pub(super) fn tunnel_websocket_config() -> WebSocketConfig {
 /// 在一个不可重置的 deadline 内读取下一条 Tunnel 应用消息。
 ///
 /// `reader` 的 ping/pong 和库内部 frame 在同一绝对 deadline 内继续读，不得通过
-/// 刷控制帧让连接永不超时。`on_pong` 只更新
-/// 独立的 90 秒 pong 存活时钟，不影响本 deadline。
+/// 刷控制帧让连接永不超时。`on_inbound_frame` 在每收到一个非数据帧（目前是 pong）时
+/// 调用一次，用于刷新 90 秒存活时钟与入站计数，不影响本 deadline。
 ///
 /// # 返回
 /// 成功时返回 text/binary 的原始字节；调用方取消、连接结束、
@@ -789,7 +956,7 @@ pub(super) async fn read_tunnel_data_message<S, F>(
     cancellation: &CancellationToken,
     reader: &mut S,
     read_timeout: Duration,
-    mut on_pong: F,
+    mut on_inbound_frame: F,
 ) -> Result<Vec<u8>, TunnelError>
 where
     S: futures_util::Stream<Item = Result<Message, WebSocketError>> + Unpin,
@@ -807,7 +974,7 @@ where
             match message {
                 Message::Text(data) => return Ok(data.as_bytes().to_vec()),
                 Message::Binary(data) => return Ok(data.to_vec()),
-                Message::Pong(_) => on_pong(),
+                Message::Pong(_) => on_inbound_frame(),
                 Message::Ping(_) => {}
                 Message::Frame(_) => {}
                 Message::Close(frame) => {

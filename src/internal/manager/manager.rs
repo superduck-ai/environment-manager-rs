@@ -33,7 +33,7 @@ use super::{
     types::{
         ClaudeExecutorFactory, CreateTunnelClientFunc, EnvironmentLeaseAdapter, Manager,
         ManagerApiClient, ManagerError, ManagerLeaseRequest, ManagerLeaseRuntime,
-        ManagerObservability, McpRegistrationBatch,
+        ManagerObservability, McpRegistrationBatch, TunnelClient,
     },
 };
 
@@ -413,13 +413,31 @@ impl Manager {
                 "{}",
                 "ENVRUNNER_SKIP_CLAUDE_CODE mode: environment initialized, waiting for shutdown signal"
             );
+            let tunnel_client = self.create_session_tunnel_client(&session_id, &auth_context);
+            let tunnel_cancellation = cancellation.child_token();
+            let tunnel_future = async {
+                if let Some(client) = tunnel_client.as_ref() {
+                    run_session_tunnel(
+                        Arc::clone(client),
+                        tunnel_cancellation.clone(),
+                        &session_id,
+                    )
+                    .await;
+                }
+                std::future::pending::<()>().await;
+            };
             let result = tokio::select! {
                 biased;
                 () = wait_for_shutdown_signal(cancellation) => Ok(()),
                 failure = claude::wait_for_agent_proxy_failure(agent_proxy.as_mut()) => {
                     Err(ManagerError::message(failure))
                 }
+                () = tunnel_future => Ok(()),
             };
+            tunnel_cancellation.cancel();
+            if let Some(client) = tunnel_client {
+                let _ = client.close().await;
+            }
             if let Some(proxy) = agent_proxy.take() {
                 proxy.shutdown().await;
             }
@@ -739,6 +757,48 @@ impl Manager {
         )))
     }
 
+    /// 按 `TUNNEL_ENABLED`、已注册 factory 与 startup context 创建会话 tunnel client。
+    ///
+    /// 未启用、未注册或 factory 失败时返回 `None` 并记录原因；调用方负责运行与关闭。
+    fn create_session_tunnel_client(
+        &self,
+        session_id: &str,
+        auth_context: &AuthContext,
+    ) -> Option<Arc<dyn TunnelClient>> {
+        if !is_tunnel_enabled(self.create_tunnel_client_func.as_ref()) {
+            if self.create_tunnel_client_func.is_some() {
+                tracing::info!("session_id" = ?(session_id), "{}", "Tunnel client disabled");
+            } else {
+                tracing::info!("session_id" = ?(session_id), "{}", "Tunnel client not registered");
+            }
+            return None;
+        }
+        let Some(startup_context) = self
+            .session_config
+            .as_ref()
+            .and_then(|session| session.startup_context.as_ref())
+        else {
+            tracing::warn!("session_id" = ?(session_id), "{}", "Tunnel requested but startup context is unavailable");
+            return None;
+        };
+        let factory = self
+            .create_tunnel_client_func
+            .as_ref()
+            .expect("is_tunnel_enabled requires a registered factory");
+        match factory(
+            self,
+            &startup_context.api_base_url,
+            auth_context.get_session_ingress_token(),
+            Some(auth_context),
+        ) {
+            Ok(client) => Some(client),
+            Err(error) => {
+                tracing::error!("session_id" = ?(session_id), "error" = ?(error.to_string()), "{}", "Failed to create tunnel client");
+                None
+            }
+        }
+    }
+
     /// 创建可选 tunnel，令它与 Claude executor 并发运行，并解释取消为正常退出。
     #[allow(clippy::too_many_arguments)]
     async fn execute_claude_and_tunnel(
@@ -751,36 +811,7 @@ impl Manager {
         using_lease_context: bool,
         agent_proxy: Option<claude::AgentProxyHandle>,
     ) -> Result<(), ManagerError> {
-        let mut tunnel_client = None;
-        if is_tunnel_enabled(self.create_tunnel_client_func.as_ref()) {
-            if let Some(startup_context) = self
-                .session_config
-                .as_ref()
-                .and_then(|session| session.startup_context.as_ref())
-            {
-                let factory = self
-                    .create_tunnel_client_func
-                    .as_ref()
-                    .expect("is_tunnel_enabled requires a registered factory");
-                match factory(
-                    self,
-                    &startup_context.api_base_url,
-                    auth_context.get_session_ingress_token(),
-                    Some(auth_context),
-                ) {
-                    Ok(client) => tunnel_client = Some(client),
-                    Err(error) => {
-                        tracing::error!("session_id" = ?(session_id), "error" = ?(error.to_string()), "{}", "Failed to create tunnel client")
-                    }
-                }
-            } else {
-                tracing::warn!("session_id" = ?(session_id), "{}", "Tunnel requested but startup context is unavailable");
-            }
-        } else if self.create_tunnel_client_func.is_some() {
-            tracing::info!("session_id" = ?(session_id), "{}", "Tunnel client disabled");
-        } else {
-            tracing::info!("session_id" = ?(session_id), "{}", "Tunnel client not registered");
-        }
+        let tunnel_client = self.create_session_tunnel_client(session_id, auth_context);
 
         tracing::info!("session_id" = ?(session_id), "session_mode" = ?(self.session_mode.as_str()), "{}", "Starting Claude Code execution");
         let run_cancellation = executor_cancellation.child_token();
@@ -795,30 +826,15 @@ impl Manager {
             (result, was_cancelled)
         };
 
-        let (execution_result, execution_was_cancelled) = if let Some(client) =
-            tunnel_client.as_ref()
-        {
-            let tunnel_run_client = Arc::clone(client);
-            let tunnel_token = run_cancellation.clone();
-            let tunnel_session_id = session_id.to_owned();
-            let tunnel_future = async move {
-                match tunnel_run_client.connect_and_run(&tunnel_token).await {
-                    Err(error) if tunnel_token.is_cancelled() => {
-                        tracing::info!("session_id" = ?(&tunnel_session_id), "error" = ?(error.to_string()), "{}", "Tunnel client stopped after cancellation")
-                    }
-                    Err(error) => {
-                        tracing::error!("session_id" = ?(&tunnel_session_id), "error" = ?(error.to_string()), "{}", "Tunnel client failed")
-                    }
-                    Ok(()) => {
-                        tracing::info!("session_id" = ?(&tunnel_session_id), "{}", "Tunnel client stopped")
-                    }
-                }
+        let (execution_result, execution_was_cancelled) =
+            if let Some(client) = tunnel_client.as_ref() {
+                let tunnel_future =
+                    run_session_tunnel(Arc::clone(client), run_cancellation.clone(), session_id);
+                let (execution_result, ()) = tokio::join!(execute_future, tunnel_future);
+                execution_result
+            } else {
+                execute_future.await
             };
-            let (execution_result, ()) = tokio::join!(execute_future, tunnel_future);
-            execution_result
-        } else {
-            execute_future.await
-        };
 
         if let Some(client) = tunnel_client {
             let _ = client.close().await;
@@ -885,6 +901,25 @@ impl Manager {
     pub(super) fn log_diag(&self, event: &str, fields: BTreeMap<String, Value>) {
         if let Some(observability) = &self.observability {
             observability.log_env_manager_no_pii(event, fields);
+        }
+    }
+}
+
+/// 运行 tunnel 长连接直到取消或不可恢复错误，并按退出原因记录日志。
+async fn run_session_tunnel(
+    client: Arc<dyn TunnelClient>,
+    cancellation: CancellationToken,
+    session_id: &str,
+) {
+    match client.connect_and_run(&cancellation).await {
+        Err(error) if cancellation.is_cancelled() => {
+            tracing::info!("session_id" = ?(session_id), "error" = ?(error.to_string()), "{}", "Tunnel client stopped after cancellation")
+        }
+        Err(error) => {
+            tracing::error!("session_id" = ?(session_id), "error" = ?(error.to_string()), "{}", "Tunnel client failed")
+        }
+        Ok(()) => {
+            tracing::info!("session_id" = ?(session_id), "{}", "Tunnel client stopped")
         }
     }
 }

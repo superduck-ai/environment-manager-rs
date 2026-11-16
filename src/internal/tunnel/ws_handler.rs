@@ -211,16 +211,22 @@ impl WsHandler {
             })?;
             Message::Text(text.into())
         };
-        let mut sink = tunnel.sink.lock().await;
-        let error = match tokio::time::timeout(write_timeout, sink.send(outbound)).await {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(error)) => error.to_string(),
+        // 同一个 deadline 同时覆盖等待写锁与实际写入：两者都算“这次写入被阻塞”。
+        let deadline = tokio::time::Instant::now() + write_timeout;
+        let error = match tokio::time::timeout_at(deadline, tunnel.sink.lock()).await {
             Err(_) => "timed out".to_owned(),
+            Ok(mut sink) => {
+                let result = tokio::time::timeout_at(deadline, sink.send(outbound)).await;
+                // timeout 会先丢弃未完成的 send future；随后必须释放写锁再取消读半部，
+                // 否则清理任务可能等待同一 split socket，形成不必要的锁顺序依赖。
+                drop(sink);
+                match result {
+                    Ok(Ok(())) => return Ok(()),
+                    Ok(Err(error)) => error.to_string(),
+                    Err(_) => "timed out".to_owned(),
+                }
+            }
         };
-
-        // timeout 会先丢弃未完成的 send future；随后必须释放写锁再取消读半部，
-        // 否则清理任务可能等待同一 split socket，形成不必要的锁顺序依赖。
-        drop(sink);
         Self::close_tunnel_instance(&self.tunnels, Arc::clone(&tunnel)).await;
         Err(TunnelError::message(format!(
             "write websocket message: {error}"
