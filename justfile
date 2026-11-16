@@ -7,3 +7,7 @@ default: build
 build *args:
     scripts/linux-arm64/docker-build.sh "$@"
 
+alias build-arm64 := build
+
+build-amd64 *args:
+    scripts/linux-amd64/docker-build.sh "$@"

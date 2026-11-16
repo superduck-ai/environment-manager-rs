@@ -22,19 +22,25 @@ cargo build --locked --release
 ./target/release/environment-manager --help
 ```
 
-通过 Docker 构建 Linux ARM64 版本，在仓库根目录执行：
+通过 Docker 构建 Linux ARM64 或 AMD64 版本，在仓库根目录执行：
 
 ```sh
 scripts/linux-arm64/docker-build.sh
+scripts/linux-amd64/docker-build.sh
 # 已安装 just 时也可以执行：
 just build
+just build-arm64
+just build-amd64
 ```
 
-Docker 必须支持 `linux/arm64`；x86_64 宿主需要 ARM64 模拟。镜像使用 AlmaLinux 9、Rust 1.97.0，并通过 rsproxy 下载 Rust 工具链和 Cargo 依赖。产物路径为：
+`just build` 继续默认构建 ARM64。Docker 必须支持目标平台，跨宿主架构构建需要模拟能力。两种镜像均使用 AlmaLinux 9、Rust 1.97.0，并通过 rsproxy 下载 Rustup 工具链和 Cargo 依赖。编译产物按架构分开保存：
 
 ```text
 target/docker-linux-arm64/aarch64-unknown-linux-gnu/release/environment-manager
+target/docker-linux-amd64/x86_64-unknown-linux-gnu/release/environment-manager
 ```
+
+构建成功后，还会生成 `dist/local/environment-manager_linux_arm64` 或 `dist/local/environment-manager_linux_amd64` 及对应的 `.sha256` 文件。这些是本地构建产物，ARM64 候选验证和正式发布流程保持独立。构建参数会透传给 Cargo；`RUST_BUILD_JOBS` 默认 `6`，也可通过 Cargo 的 `--jobs` 参数覆盖；`RUST_BUILD_IMAGE` 可覆盖本地构建镜像标签。存在未提交改动时 Git 元数据带 `-dirty` 后缀，也可显式提供 `BUILD_GIT_HASH` / `BUILD_TIME`。
 
 该 GNU 可执行文件要求目标系统提供 glibc 2.34 或更新版本及所需动态库。缓存配置、验证和产物提升流程见 [Linux ARM64 构建与发布指南](scripts/linux-arm64/README.md)。
 

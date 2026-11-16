@@ -22,19 +22,25 @@ cargo build --locked --release
 ./target/release/environment-manager --help
 ```
 
-To build Linux ARM64 using Docker, run from the repository root:
+To build Linux ARM64 or AMD64 using Docker, run from the repository root:
 
 ```sh
 scripts/linux-arm64/docker-build.sh
+scripts/linux-amd64/docker-build.sh
 # Or, with just installed:
 just build
+just build-arm64
+just build-amd64
 ```
 
-Docker must support `linux/arm64`; an x86_64 host needs ARM64 emulation. The image uses AlmaLinux 9, Rust 1.97.0, and rsproxy for Rust and Cargo downloads. The output is:
+`just build` continues to default to ARM64. Docker must support the requested platform; building for a different host architecture requires emulation. Both images use AlmaLinux 9, Rust 1.97.0, and rsproxy for Rustup and Cargo downloads. Compiled binaries are stored separately:
 
 ```text
 target/docker-linux-arm64/aarch64-unknown-linux-gnu/release/environment-manager
+target/docker-linux-amd64/x86_64-unknown-linux-gnu/release/environment-manager
 ```
+
+Successful builds also write `dist/local/environment-manager_linux_arm64` or `dist/local/environment-manager_linux_amd64`, plus the corresponding `.sha256` file. These are local build outputs; the ARM64 candidate verification and release workflow remains separate. Build arguments are forwarded to Cargo. `RUST_BUILD_JOBS` defaults to `6`, and Cargo's `--jobs` argument can override it; `RUST_BUILD_IMAGE` overrides the local builder image tag. Git metadata includes a `-dirty` suffix for uncommitted changes, and explicit `BUILD_GIT_HASH` / `BUILD_TIME` values can be supplied when needed.
 
 This GNU executable requires glibc 2.34 or newer and its dynamic library dependencies on the target system. See the [Linux ARM64 build and release guide](scripts/linux-arm64/README.md) for cache settings, verification, and artifact promotion.
 
