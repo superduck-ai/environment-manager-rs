@@ -6,7 +6,8 @@
 #[allow(clippy::module_inception)]
 mod manager;
 mod mcp;
-mod runtime_mcp;
+mod runtime_tool_calls;
+mod tool_calls;
 mod tunnel_register;
 mod types;
 
