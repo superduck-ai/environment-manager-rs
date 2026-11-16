@@ -42,6 +42,8 @@ This GNU executable requires glibc 2.34 or newer and its dynamic library depende
 
 Open Managed Agents can replace the Manager without rebuilding the sandbox image. Point OMA's `environment_runner.manager_artifact` at a release artifact (for example `dist/environment-manager_linux_arm64` and its `.sha256`):
 
+Choose either `path` or `url`. When using `url`, remove `path` and provide the SHA-256 value in `sha256`.
+
 ```yaml
 environment_runner:
   manager_artifact:
@@ -51,7 +53,7 @@ environment_runner:
     # sha256: <value from environment-manager_linux_arm64.sha256>
 ```
 
-Every time the OMA Runner creates or resumes (`--session-mode resume-cached`) a sandbox, it uploads the binary to `/tmp/oma/environment-manager/<sha256>/environment-manager` before running `provision-packages` and `task-run`. It verifies the SHA-256, runs `--version` as a smoke test, and then uses that binary instead of the image's `/usr/local/bin/environment-manager`. With `path`, atomically replacing the file is enough for later sandboxes to pick up the new build. The artifact must match the sandbox architecture, and `--version` must exit 0 when called with no other arguments. See OMA's `docs/design/be/e2b-sandbox-image-contract.md` for the full contract.
+When the OMA Runner creates a new sandbox or a replacement sandbox for an existing Session (`--session-mode resume-cached`), it uploads the binary to `/tmp/oma/environment-manager/<sha256>/environment-manager` before running `provision-packages` and `task-run`. It verifies the SHA-256, runs `--version` as a smoke test, and then uses that binary instead of the image's `/usr/local/bin/environment-manager`. Resuming a paused E2B sandbox with its existing process does not replace the running Manager. With `path`, atomically replacing the file is enough for later sandboxes to pick up the new build. The artifact must match the sandbox architecture, and `--version` must exit 0 when called with no other arguments. See OMA's `docs/design/be/e2b-sandbox-image-contract.md` for the full contract.
 
 ## Usage
 
