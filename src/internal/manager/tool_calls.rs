@@ -132,21 +132,21 @@ impl Runner {
                     tracing::info!("sandbox no longer accepts tool calls; stopping claims");
                     break;
                 }
-                if response.status().is_success() {
-                    if let Ok(claims) = response.json::<Claims>().await {
-                        if claims.calls.is_empty() {
-                            tokio::select! {
-                                () = draining.cancelled() => break,
-                                () = tokio::time::sleep(Duration::from_millis(100)) => {},
-                            }
+                if response.status().is_success()
+                    && let Ok(claims) = response.json::<Claims>().await
+                {
+                    if claims.calls.is_empty() {
+                        tokio::select! {
+                            () = draining.cancelled() => break,
+                            () = tokio::time::sleep(Duration::from_millis(100)) => {},
                         }
-                        for call in claims.calls.into_iter().take(slots) {
-                            let runner = self.clone();
-                            let signals = signals.clone();
-                            executions.spawn(async move { runner.execute(call, &signals).await });
-                        }
-                        continue;
                     }
+                    for call in claims.calls.into_iter().take(slots) {
+                        let runner = self.clone();
+                        let signals = signals.clone();
+                        executions.spawn(async move { runner.execute(call, &signals).await });
+                    }
+                    continue;
                 }
             }
             tokio::select! {
@@ -361,13 +361,12 @@ impl Runner {
         loop {
             tokio::select! {()=cancellation.cancelled()=>return,_=interval.tick()=>{}}
             let state = tokio::select! {()=cancellation.cancelled()=>return,state=self.event(call,"heartbeat")=>state};
-            if let Ok(state) = state {
-                if ["cancel_requested", "lost", "cancelled", "expired"]
+            if let Ok(state) = state
+                && ["cancel_requested", "lost", "cancelled", "expired"]
                     .contains(&state.state.as_str())
-                {
-                    cancellation.cancel();
-                    return;
-                }
+            {
+                cancellation.cancel();
+                return;
             }
         }
     }
@@ -450,8 +449,8 @@ impl Runner {
                     ()=&mut heartbeat,if !heartbeat_done=>{heartbeat_done=true;}
                 }
             };
-            if let Ok(response) = response {
-                if response.status().is_success()
+            if let Ok(response) = response
+                && (response.status().is_success()
                     || [
                         StatusCode::BAD_REQUEST,
                         StatusCode::PAYLOAD_TOO_LARGE,
@@ -460,10 +459,9 @@ impl Runner {
                         StatusCode::NOT_FOUND,
                         StatusCode::CONFLICT,
                     ]
-                    .contains(&response.status())
-                {
-                    return Ok(true);
-                }
+                    .contains(&response.status()))
+            {
+                return Ok(true);
             }
             tokio::select! {
                 ()=halt.cancelled()=>return Ok(false),
@@ -919,7 +917,8 @@ mod tests {
     async fn shutdown_lets_running_call_finish_within_grace() {
         let server = MockServer::start().await;
         let directory = tempfile::tempdir().unwrap();
-        let runner = short_runner(&server, directory.path()).await;
+        let mut runner = short_runner(&server, directory.path()).await;
+        Arc::get_mut(&mut runner).unwrap().drain_grace = DRAIN_GRACE;
         let call = bash_call("sleep 0.1; echo finished", chrono::Duration::seconds(30));
         mount_events(&server, &call, "running").await;
         Mock::given(method("PUT"))
