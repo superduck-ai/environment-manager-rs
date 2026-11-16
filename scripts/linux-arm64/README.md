@@ -8,6 +8,7 @@
 
 ```bash
 just build
+just build-arm64
 # 或直接调用脚本
 scripts/linux-arm64/docker-build.sh
 ```
@@ -19,6 +20,11 @@ scripts/linux-arm64/docker-build.sh
 ```text
 target/docker-linux-arm64/aarch64-unknown-linux-gnu/release/environment-manager
 ```
+
+日常构建由 `scripts/linux/docker-build.sh` 统一编排，ARM64 入口保持兼容；
+AMD64 使用 `just build-amd64` 或 `scripts/linux-amd64/docker-build.sh`。
+构建还会在 `dist/local` 输出带架构后缀的二进制及 SHA-256 文件，
+这些本地产物不替代下文的 ARM64 正式候选与提升门禁。
 
 镜像使用 AlmaLinux 9 ARM64 和 Rust 1.97.0，目标是
 `aarch64-unknown-linux-gnu`，链接 glibc。运行目标系统需提供 glibc 2.34
@@ -37,7 +43,9 @@ export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
 配置文件名，与 `~/.cargo/config` 作用相同。默认使用 rsproxy sparse 索引，
 同时保留 Git 索引配置，启用 `git-fetch-with-cli`。
 依赖下载缓存保存在 Docker 的 `environment-manager-arm64-registry` 和
-`environment-manager-arm64-git` 卷中，编译缓存位于 `target/docker-linux-arm64`。
+`environment-manager-arm64-git` 卷中；AMD64 共享这两个与架构无关的下载缓存，
+编译缓存分别位于 `target/docker-linux-arm64` 和 `target/docker-linux-amd64`。
+并行编译数由 `RUST_BUILD_JOBS` 控制，默认 6。
 Linux 宿主上，容器默认以 root 写入挂载目录，产物可能归 root 所有。
 
 也可以单独创建镜像，并进入交互式编译环境：
